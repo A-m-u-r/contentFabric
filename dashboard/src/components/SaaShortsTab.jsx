@@ -14,6 +14,36 @@ const CACHE_KEY = 'saasshorts_cache';
 const CACHE_VERSION = 2;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
+function voiceLanguageScore(voice, language) {
+  const labels = voice.labels || {};
+  const haystack = [
+    voice.name,
+    voice.category,
+    labels.accent,
+    labels.language,
+    labels.description,
+    labels.use_case,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (language === 'ru') {
+    if (haystack.includes('russian') || haystack.includes('russia') || haystack.includes('рус')) return 0;
+    if (haystack.includes('slavic') || haystack.includes('eastern european')) return 1;
+    return 3;
+  }
+
+  if (language === 'es') {
+    if (haystack.includes('spanish') || haystack.includes('latin')) return 0;
+    return 2;
+  }
+
+  if (haystack.includes('american') || haystack.includes('british') || haystack.includes('english')) return 0;
+  return 1;
+}
+
+function sortVoicesForLanguage(voices, language) {
+  return [...voices].sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language));
+}
+
 function loadCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
@@ -53,7 +83,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   // Step 0: URL input
   const [url, setUrl] = useState(() => loadCache()?.url || '');
-  const [videoMode, setVideoMode] = useState('lowcost'); // "lowcost" or "premium"
+  const [videoMode, setVideoMode] = useState('premium'); // "lowcost" or "premium"
   const [description, setDescription] = useState(() => loadCache()?.description || '');
   const [topic, setTopic] = useState(() => loadCache()?.topic || '');
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
@@ -139,8 +169,11 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       'ru-female': '21m00Tcm4TlvDq8ikWAM',  // Multilingual fallback
       'ru-male': '29vD33N1CtxCmqQRPOHJ',    // Multilingual fallback
     };
-    // If we have fetched voices, pick the first matching one; otherwise use hardcoded default
-    const matchingVoice = voices.find(v => (v.labels?.gender || '').toLowerCase() === actorGender);
+    // Prefer a voice that matches both gender and selected language/accent.
+    const matchingVoice = sortVoicesForLanguage(
+      voices.filter(v => (v.labels?.gender || '').toLowerCase() === actorGender),
+      language
+    )[0];
     if (matchingVoice) {
       setSelectedVoice(matchingVoice.voice_id);
     } else {
@@ -467,10 +500,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     }`}
                   >
                     <div className="flex items-center justify-between mb-1">
-                      <span className={`text-sm font-semibold ${videoMode === 'lowcost' ? 'text-green-300' : 'text-zinc-300'}`}>Low Cost</span>
-                      <span className="text-xs font-mono text-green-400 bg-green-500/10 px-2 py-0.5 rounded-full">~$0.80</span>
+                      <span className={`text-sm font-semibold ${videoMode === 'lowcost' ? 'text-green-300' : 'text-zinc-300'}`}>Low Cost Draft</span>
+                      <span className="text-xs font-mono text-green-400 bg-green-500/10 px-2 py-0.5 rounded-full">~$0.65</span>
                     </div>
-                    <p className="text-[11px] text-zinc-500 leading-relaxed">Hailuo 2.3 img2video + VEED Lipsync. Good movement + lip-sync. Recommended.</p>
+                    <p className="text-[11px] text-zinc-500 leading-relaxed">Cheap test mode. Uses a short Hailuo clip with VEED lipsync, so longer videos can loop or drift.</p>
                   </button>
                   <button
                     onClick={() => setVideoMode('premium')}
@@ -482,9 +515,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   >
                     <div className="flex items-center justify-between mb-1">
                       <span className={`text-sm font-semibold ${videoMode === 'premium' ? 'text-violet-300' : 'text-zinc-300'}`}>Premium</span>
-                      <span className="text-xs font-mono text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">~$2.00</span>
+                      <span className="text-xs font-mono text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">~$2.50</span>
                     </div>
-                    <p className="text-[11px] text-zinc-500 leading-relaxed">Kling Avatar v2 Standard. Full integrated movement. Best quality.</p>
+                    <p className="text-[11px] text-zinc-500 leading-relaxed">Recommended for publishing. Kling Avatar v2 generates the full actor video from the voice.</p>
                   </button>
                 </div>
               </div>
@@ -951,21 +984,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                         // Only show voices that match the selected gender
                         return gender === actorGender;
                       })
-                      .sort((a, b) => {
-                        const aAccent = (a.labels?.accent || '').toLowerCase();
-                        const bAccent = (b.labels?.accent || '').toLowerCase();
-                        if (language === 'es') {
-                          // Spanish/latin accents first, then everything else
-                          const aScore = (aAccent.includes('spanish') || aAccent.includes('latin')) ? 0 : 1;
-                          const bScore = (bAccent.includes('spanish') || bAccent.includes('latin')) ? 0 : 1;
-                          return aScore - bScore;
-                        }
-                        // English: american/british first
-                        const aScore = (aAccent.includes('american') || aAccent.includes('british')) ? 0 : 1;
-                        const bScore = (bAccent.includes('american') || bAccent.includes('british')) ? 0 : 1;
-                        return aScore - bScore;
-                      })
+                      .sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language))
                     : [];
+                  const hasLanguageVoice = filtered.some((v) => voiceLanguageScore(v, language) === 0);
 
                   if (filtered.length > 0) {
                     return (
@@ -998,6 +1019,11 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                             {selectedVoice === v.voice_id && <Check size={14} className="text-violet-400 shrink-0" />}
                           </button>
                         ))}
+                        {language === 'ru' && !hasLanguageVoice && (
+                          <p className="text-[10px] text-amber-400/80 pt-1">
+                            No Russian-accent ElevenLabs voice found. Add or select a Russian voice for natural Russian speech.
+                          </p>
+                        )}
                       </div>
                     );
                   }
@@ -1022,6 +1048,14 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                       { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
                     ],
                   };
+                  defaults['ru-female'] = [
+                    { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (multilingual fallback)' },
+                    { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (multilingual fallback)' },
+                  ];
+                  defaults['ru-male'] = [
+                    { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (multilingual fallback)' },
+                    { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (multilingual fallback)' },
+                  ];
                   const key = `${language}-${actorGender}`;
                   const opts = defaults[key] || defaults['en-female'];
                   return (
