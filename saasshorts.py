@@ -372,12 +372,13 @@ def generate_scripts(
     style: str = "ugc",
     language: str = "en",
     actor_gender: str = "female",
+    topic: str = None,
 ) -> list:
     """Generate video scripts based on SaaS analysis."""
     from google import genai
     from google.genai import types
 
-    lang_name = "Spanish" if language == "es" else "English"
+    lang_name = {"es": "Spanish", "ru": "Russian"}.get(language, "English")
     print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang_name})...")
 
     client = genai.Client(api_key=gemini_key)
@@ -397,6 +398,12 @@ LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in SPANISH (
 Use natural casual Spanish like a real person would speak on TikTok. Contractions, slang OK.
 Examples of Spanish UGC hooks: "Tío, no me puedo creer que nadie me haya dicho esto antes...", "Si usas Excel para esto, necesitas ver esto YA", "Os voy a enseñar algo que me ha cambiado la vida..."
 """
+    elif language == "ru":
+        lang_instructions = """
+LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in RUSSIAN.
+Use natural casual Russian like a real person would speak in Reels/TikTok. Keep it punchy, direct, and conversational.
+Examples of Russian UGC hooks: "Ты срываешься вечером не потому, что слабая", "Хватит начинать заново каждый понедельник", "Вот что съесть в 17:00, чтобы вечером не снести холодильник".
+"""
     else:
         lang_instructions = """
 LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in ENGLISH.
@@ -404,9 +411,19 @@ Use natural casual American English like a real person on TikTok. Contractions, 
 Examples of English UGC hooks: "Okay so I just found this tool and...", "Stop doing this manually, there's a better way", "I can't believe nobody told me about this sooner..."
 """
 
+    topic_instructions = ""
+    if topic:
+        topic_instructions = f"""
+CURRENT VIDEO TOPIC:
+{topic}
+
+Every generated script MUST focus on this exact topic. Do not drift into generic product promotion.
+"""
+
     prompt = f"""You are a viral short-form video scriptwriter for TikTok/Instagram Reels.
 Generate {num_scripts} video scripts to promote this product/business.
 {lang_instructions}
+{topic_instructions}
 PRODUCT ANALYSIS:
 {json.dumps(analysis, indent=2)}
 
@@ -505,7 +522,7 @@ RULES:
 - B-roll prompts: cinematic, specific, detailed visual descriptions
 - Each script should use a different pain point / angle
 - Vary actor demographics across scripts
-- CTA MUST always mention "link in bio" / "enlace en la bio". Examples: "Link in bio, go try it", "Check the link in my bio", "El enlace está en la bio, probadlo"
+- CTA MUST be natural for the selected language. For English/Spanish, mention "link in bio" / "enlace en la bio". For Russian, use a DM CTA if the product context suggests it, e.g. "Напиши НЕДЕЛЯ — пришлю чеклист", otherwise use "ссылка в профиле".
 - Write ALL text in {lang_name}
 - Actor gender: {actor_gender}. ALL actor_description fields MUST describe a {actor_gender} person. Use diverse ages/ethnicities across scripts.
 - IMPORTANT: actor_description MUST ALWAYS be in ENGLISH regardless of script language. Only describe physical appearance: age, gender, ethnicity, hair, clothing. NO actions, NO background, NO scene description.
@@ -544,6 +561,142 @@ RULES:
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
     return scripts
+
+
+def _estimate_speech_duration(text: str) -> int:
+    """Rough speech duration for UI/timing metadata."""
+    words = [w for w in re.split(r"\s+", text.strip()) if w]
+    # UGC-style narration averages about 2.4-2.7 words/sec.
+    return max(12, min(75, round(len(words) / 2.5)))
+
+
+def _split_text_for_segments(text: str, parts: int = 5) -> list:
+    sentences = re.split(r"(?<=[.!?…])\s+", text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return [""] * parts
+
+    chunks = [""] * parts
+    for i, sentence in enumerate(sentences):
+        idx = min(parts - 1, round(i * parts / max(1, len(sentences))))
+        chunks[idx] = f"{chunks[idx]} {sentence}".strip()
+    return chunks
+
+
+def build_custom_script(
+    custom_script: str,
+    analysis: dict,
+    style: str = "ugc",
+    language: str = "en",
+    actor_gender: str = "female",
+    topic: str = None,
+) -> dict:
+    """Create a SaaSShorts script object without rewriting user narration."""
+    narration = custom_script.strip()
+    if not narration:
+        raise ValueError("Custom script is empty")
+
+    duration = _estimate_speech_duration(narration)
+    chunks = _split_text_for_segments(narration, 5)
+    title_base = (topic or analysis.get("product_name") or "Custom Script").strip()
+    title = title_base[:80] or "Custom Script"
+    product_name = analysis.get("product_name") or title
+    product_desc = analysis.get("description") or analysis.get("value_proposition") or product_name
+    language_cta = {
+        "ru": "Напиши НЕДЕЛЯ",
+        "es": "Enlace en la bio",
+        "en": "Link in bio",
+    }.get(language, "Link in bio")
+
+    hook_words = re.sub(r"\s+", " ", narration).split(" ")[:6]
+    hook_text = " ".join(hook_words).strip(" .,!?") or title
+
+    actor_noun = "woman" if actor_gender == "female" else "man"
+    actor_description = (
+        f"a 30 year old natural looking european {actor_noun}, casual everyday outfit, "
+        "friendly trustworthy face, minimal styling, authentic UGC look"
+    )
+
+    broll_problem = (
+        f"Vertical smartphone-style b-roll showing the problem behind: {topic or product_desc}. "
+        "Realistic home setting, natural light, authentic everyday scene, no text overlays."
+    )
+    broll_demo = (
+        f"Vertical smartphone-style b-roll showing the product/result for {product_name}: "
+        "phone tracker, checklist, simple food prep, clean table, realistic UGC look, no text overlays."
+    )
+
+    # Keep a familiar 5-part structure for preview and b-roll timing. The final
+    # voiceover uses full_narration exactly, so this does not rewrite the script.
+    t1 = min(5, max(3, round(duration * 0.20)))
+    t2 = min(duration - 7, t1 + max(3, round(duration * 0.15)))
+    t3 = min(duration - 4, t2 + max(4, round(duration * 0.28)))
+    t4 = min(duration - 2, t3 + max(3, round(duration * 0.18)))
+
+    return {
+        "title": title,
+        "style": style,
+        "duration_seconds": duration,
+        "target_platform": "instagram",
+        "hook_text": hook_text,
+        "segments": [
+            {
+                "type": "hook",
+                "start": 0,
+                "end": t1,
+                "narration": chunks[0],
+                "visual": "actor_talking",
+                "broll_prompt": None,
+                "emotion": "direct",
+                "subtitle_text": hook_text,
+            },
+            {
+                "type": "problem",
+                "start": t1,
+                "end": t2,
+                "narration": chunks[1],
+                "visual": "broll",
+                "broll_prompt": broll_problem,
+                "emotion": "frustrated",
+                "subtitle_text": chunks[1][:80] or "Problem",
+            },
+            {
+                "type": "solution",
+                "start": t2,
+                "end": t3,
+                "narration": chunks[2],
+                "visual": "actor_talking",
+                "broll_prompt": None,
+                "emotion": "confident",
+                "subtitle_text": chunks[2][:80] or "Solution",
+            },
+            {
+                "type": "demo",
+                "start": t3,
+                "end": t4,
+                "narration": chunks[3],
+                "visual": "broll",
+                "broll_prompt": broll_demo,
+                "emotion": "calm",
+                "subtitle_text": chunks[3][:80] or "Demo",
+            },
+            {
+                "type": "cta",
+                "start": t4,
+                "end": duration,
+                "narration": chunks[4],
+                "visual": "actor_talking",
+                "broll_prompt": None,
+                "emotion": "confident",
+                "subtitle_text": language_cta,
+            },
+        ],
+        "full_narration": narration,
+        "actor_description": actor_description,
+        "hashtags": ["#reels", "#shorts", "#ugc"] if language != "ru" else ["#рилс", "#привычки", "#питание"],
+        "caption": topic or product_desc,
+        "custom_script": True,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════

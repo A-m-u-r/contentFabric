@@ -1648,6 +1648,7 @@ from saasshorts import (
     research_saas_online,
     analyze_saas,
     generate_scripts,
+    build_custom_script,
     generate_full_video,
     generate_actor_images,
     get_elevenlabs_voices,
@@ -1661,6 +1662,9 @@ saas_jobs: Dict[str, Dict] = {}
 class SaaSAnalyzeRequest(BaseModel):
     url: Optional[str] = None
     description: Optional[str] = None  # Manual product/business description
+    topic: Optional[str] = None
+    script_mode: str = "ai"  # "ai" or "custom"
+    custom_script: Optional[str] = None
     num_scripts: int = 3
     style: str = "ugc"
     language: str = "en"
@@ -1673,11 +1677,15 @@ async def saasshorts_analyze(
     x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
 ):
     """Analyze a URL or manual description and generate video scripts."""
+    is_custom = req.script_mode == "custom"
     gemini_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
-    if not gemini_key:
+    if not is_custom and not gemini_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key")
 
-    if not req.url and not req.description:
+    if is_custom and not (req.custom_script or "").strip():
+        raise HTTPException(status_code=400, detail="Provide a custom script")
+
+    if not is_custom and not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
 
     try:
@@ -1686,11 +1694,44 @@ async def saasshorts_analyze(
         def run_analysis():
             web_research = None
 
-            if req.url and req.url.strip():
+            if is_custom:
+                context = (req.description or req.topic or "Custom video").strip()
+                analysis = {
+                    "product_name": (req.topic or context).split("\n")[0].strip()[:60] or "Custom Script",
+                    "description": req.description or req.topic or "",
+                    "value_proposition": req.description or req.topic or "",
+                    "target_audience": "custom script audience",
+                    "key_features": [req.description] if req.description else [],
+                    "pain_points": [],
+                    "tone": "custom user-provided narration",
+                    "topic": req.topic or "",
+                }
+                scripts = [
+                    build_custom_script(
+                        req.custom_script,
+                        analysis,
+                        req.style,
+                        req.language,
+                        req.actor_gender,
+                        topic=req.topic,
+                    )
+                ]
+            elif req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
                 web_research = research_saas_online(req.url, gemini_key)
                 analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
+                if req.topic:
+                    analysis["topic"] = req.topic
+                scripts = generate_scripts(
+                    analysis,
+                    gemini_key,
+                    req.num_scripts,
+                    req.style,
+                    req.language,
+                    req.actor_gender,
+                    topic=req.topic,
+                )
             else:
                 # Manual description: build analysis from description
                 analysis = {
@@ -1701,9 +1742,17 @@ async def saasshorts_analyze(
                     "key_features": [req.description],
                     "pain_points": [],
                     "tone": "casual and authentic",
+                    "topic": req.topic or "",
                 }
-
-            scripts = generate_scripts(analysis, gemini_key, req.num_scripts, req.style, req.language, req.actor_gender)
+                scripts = generate_scripts(
+                    analysis,
+                    gemini_key,
+                    req.num_scripts,
+                    req.style,
+                    req.language,
+                    req.actor_gender,
+                    topic=req.topic,
+                )
             return {
                 "analysis": analysis,
                 "scripts": scripts,

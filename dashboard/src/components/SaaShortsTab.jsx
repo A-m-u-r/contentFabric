@@ -11,6 +11,7 @@ const STYLE_OPTIONS = [
 ];
 
 const CACHE_KEY = 'saasshorts_cache';
+const CACHE_VERSION = 2;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
 function loadCache() {
@@ -18,6 +19,10 @@ function loadCache() {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const cache = JSON.parse(raw);
+    if (cache.version !== CACHE_VERSION) {
+      localStorage.removeItem(CACHE_KEY);
+      return null;
+    }
     if (Date.now() - cache.timestamp > CACHE_MAX_AGE) {
       localStorage.removeItem(CACHE_KEY);
       return null;
@@ -26,10 +31,15 @@ function loadCache() {
   } catch { return null; }
 }
 
-function saveCache(url, analysis, webResearch, scripts) {
+function saveCache(input, analysis, webResearch, scripts) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({
-      url, analysis, webResearch, scripts, timestamp: Date.now(),
+      version: CACHE_VERSION,
+      ...input,
+      analysis,
+      webResearch,
+      scripts,
+      timestamp: Date.now(),
     }));
   } catch { /* localStorage full */ }
 }
@@ -44,7 +54,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Step 0: URL input
   const [url, setUrl] = useState(() => loadCache()?.url || '');
   const [videoMode, setVideoMode] = useState('lowcost'); // "lowcost" or "premium"
-  const [description, setDescription] = useState('');
+  const [description, setDescription] = useState(() => loadCache()?.description || '');
+  const [topic, setTopic] = useState(() => loadCache()?.topic || '');
+  const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
+  const [customScript, setCustomScript] = useState(() => loadCache()?.customScript || '');
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('en');
   const [actorGender, setActorGender] = useState('female');
@@ -123,6 +136,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       'en-male': '29vD33N1CtxCmqQRPOHJ',    // Drew
       'es-female': 'EXAVITQu4vr4xnSDxMaL',  // Bella
       'es-male': 'ErXwobaYiN019PkySvjV',     // Antoni
+      'ru-female': '21m00Tcm4TlvDq8ikWAM',  // Multilingual fallback
+      'ru-male': '29vD33N1CtxCmqQRPOHJ',    // Multilingual fallback
     };
     // If we have fetched voices, pick the first matching one; otherwise use hardcoded default
     const matchingVoice = voices.find(v => (v.labels?.gender || '').toLowerCase() === actorGender);
@@ -185,8 +200,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   };
 
   const handleAnalyze = async () => {
-    if (!url.trim() && !description.trim()) return;
-    if (!geminiApiKey) {
+    const isCustom = scriptMode === 'custom';
+    if (isCustom && !customScript.trim()) return;
+    if (!isCustom && !url.trim() && !description.trim()) return;
+    if (!isCustom && !geminiApiKey) {
       setAnalyzeError('Gemini API key required. Set it in Settings.');
       return;
     }
@@ -204,6 +221,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         body: JSON.stringify({
           url: url.trim() || undefined,
           description: description.trim() || undefined,
+          topic: topic.trim() || undefined,
+          script_mode: scriptMode,
+          custom_script: isCustom ? customScript.trim() : undefined,
           num_scripts: numScripts,
           style,
           language,
@@ -225,7 +245,13 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       setFromCache(false);
 
       // Cache results
-      saveCache(url.trim(), data.analysis, data.web_research, data.scripts);
+      saveCache({
+        url: url.trim(),
+        description: description.trim(),
+        topic: topic.trim(),
+        scriptMode,
+        customScript: isCustom ? customScript.trim() : '',
+      }, data.analysis, data.web_research, data.scripts);
 
       // Pre-fill actor description and narration from first script
       if (data.scripts.length > 0) {
@@ -482,6 +508,29 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </div>
 
               <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Script Input Mode</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {[
+                    { id: 'ai', label: 'AI generate scripts', desc: 'Use product + topic as a brief' },
+                    { id: 'custom', label: 'Use my exact script', desc: 'Keep narration text unchanged' },
+                  ].map((mode) => (
+                    <button
+                      key={mode.id}
+                      onClick={() => setScriptMode(mode.id)}
+                      className={`p-3 rounded-xl border text-left transition-all ${
+                        scriptMode === mode.id
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="text-xs font-semibold">{mode.label}</div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">{mode.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   {url.trim() ? 'Extra context' : 'Describe your product/business'} <span className="text-zinc-600">{url.trim() ? '(optional)' : '(required if no URL)'}</span>
                 </label>
@@ -495,11 +544,44 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </div>
 
               <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-2">
+                  Current video topic <span className="text-zinc-600">(optional, but recommended)</span>
+                </label>
+                <textarea
+                  value={topic}
+                  onChange={(e) => setTopic(e.target.value)}
+                  rows={2}
+                  className="input-field resize-none text-sm"
+                  placeholder="e.g. Почему вечерний срыв начинается утром; What to eat at 5 PM to avoid night cravings..."
+                />
+                <p className="text-[10px] text-zinc-600 mt-1">AI mode will generate scripts around this topic. Custom mode uses it for title, hook overlay, caption and b-roll prompts.</p>
+              </div>
+
+              {scriptMode === 'custom' && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2">
+                    Exact narration script <span className="text-zinc-600">(required)</span>
+                  </label>
+                  <textarea
+                    value={customScript}
+                    onChange={(e) => setCustomScript(e.target.value)}
+                    rows={7}
+                    className="input-field resize-none font-mono text-xs"
+                    placeholder={`Ты срываешься вечером не потому, что слабая.\nЧасто проблема начинается утром: кофе вместо завтрака, маленький обед...\nНапиши "НЕДЕЛЯ" - пришлю чеклист антисрыв-вечера.`}
+                  />
+                  <p className="text-[10px] text-zinc-600 mt-1">
+                    {customScript.length} chars &middot; ~{Math.max(1, Math.round(customScript.trim().split(/\s+/).filter(Boolean).length / 2.5))}s speech. This text will not be rewritten before video generation.
+                  </p>
+                </div>
+              )}
+
+              <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-3">Language</label>
                 <div className="flex gap-2 mb-6">
                   {[
                     { id: 'en', label: 'English', flag: '🇺🇸' },
                     { id: 'es', label: 'Español', flag: '🇪🇸' },
+                    { id: 'ru', label: 'Русский', flag: '🇷🇺' },
                   ].map((l) => (
                     <button
                       key={l.id}
@@ -584,18 +666,18 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
               <button
                 onClick={handleAnalyze}
-                disabled={analyzing || (!url.trim() && !description.trim())}
+                disabled={analyzing || (scriptMode === 'custom' ? !customScript.trim() : (!url.trim() && !description.trim()))}
                 className="btn-primary w-full py-3 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {analyzing ? (
                   <>
                     <Loader2 size={16} className="animate-spin" />
-                    {url.trim() ? 'Scraping + Researching web + Generating scripts... (45-90s)' : 'Generating scripts... (20-40s)'}
+                    {scriptMode === 'custom' ? 'Preparing custom script...' : (url.trim() ? 'Scraping + Researching web + Generating scripts... (45-90s)' : 'Generating scripts... (20-40s)')}
                   </>
                 ) : (
                   <>
                     <Sparkles size={16} />
-                    {url.trim() ? 'Research & Generate Scripts' : 'Generate Scripts'}
+                    {scriptMode === 'custom' ? 'Prepare Custom Script' : (url.trim() ? 'Research & Generate Scripts' : 'Generate Scripts')}
                   </>
                 )}
               </button>
@@ -859,7 +941,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               {/* Voice Selection */}
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <Volume2 size={14} /> Voice {language === 'es' ? '(Spanish)' : '(English)'}
+                  <Volume2 size={14} /> Voice {language === 'es' ? '(Spanish)' : language === 'ru' ? '(Russian)' : '(English)'}
                 </label>
                 {(() => {
                   // Filter voices by language/accent
