@@ -44,6 +44,19 @@ function sortVoicesForLanguage(voices, language) {
   return [...voices].sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language));
 }
 
+function voiceFitLabel(voice, language) {
+  const score = voiceLanguageScore(voice, language);
+  if (language === 'ru') {
+    if (score === 0) return 'Russian fit';
+    if (score === 1) return 'Close accent';
+    return 'Not Russian';
+  }
+  if (language === 'es') {
+    return score === 0 ? 'Spanish fit' : 'Other accent';
+  }
+  return score === 0 ? 'English fit' : 'Other accent';
+}
+
 function loadCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
@@ -1006,6 +1019,15 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               <div className="text-[10px] text-zinc-500">
                                 {v.labels?.accent || ''} {v.labels?.gender || ''} {v.category ? `· ${v.category}` : ''}
                               </div>
+                              {language === 'ru' && (
+                                <span className={`inline-flex mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${
+                                  voiceLanguageScore(v, language) === 0
+                                    ? 'bg-green-500/15 text-green-300'
+                                    : 'bg-amber-500/15 text-amber-300'
+                                }`}>
+                                  {voiceFitLabel(v, language)}
+                                </span>
+                              )}
                             </div>
                             {v.preview_url && (
                               <button
@@ -1064,6 +1086,47 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     </select>
                   );
                 })()}
+                {(() => {
+                  if (language !== 'ru' || !selectedVoice) return null;
+                  const selectedVoiceMeta = voices.find((v) => v.voice_id === selectedVoice);
+
+                  if (!selectedVoiceMeta) {
+                    return (
+                      <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                        Custom voice ID selected. Make sure this ElevenLabs voice is Russian or Russian-accented before generating.
+                      </div>
+                    );
+                  }
+
+                  const selectedScore = voiceLanguageScore(selectedVoiceMeta, language);
+                  if (selectedScore === 0) {
+                    return (
+                      <div className="mt-2 p-2.5 rounded-lg border border-green-500/20 bg-green-500/10 text-[11px] text-green-200">
+                        Selected voice looks Russian-compatible.
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                      Selected voice looks non-Russian ({selectedVoiceMeta.labels?.accent || 'unknown accent'}). For natural Russian speech, paste a Russian ElevenLabs voice ID below or add a Russian voice in ElevenLabs.
+                    </div>
+                  );
+                })()}
+                <div className="mt-3">
+                  <label className="block text-[11px] font-medium text-zinc-400 mb-1">
+                    Custom ElevenLabs voice ID
+                  </label>
+                  <input
+                    value={selectedVoice}
+                    onChange={(e) => setSelectedVoice(e.target.value.trim())}
+                    className="input-field text-xs font-mono"
+                    placeholder="Paste Russian voice_id from ElevenLabs..."
+                  />
+                  <p className="text-[10px] text-zinc-600 mt-1">
+                    Use this if your Russian voice exists in ElevenLabs but does not appear in the filtered list.
+                  </p>
+                </div>
                 <p className="text-[10px] text-zinc-600 mt-1">
                   {language === 'es'
                     ? `Voces ${actorGender === 'female' ? 'femeninas' : 'masculinas'} · Todas hablan español con modelo multilingual · Click altavoz para preview`
