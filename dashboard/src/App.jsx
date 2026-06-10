@@ -134,7 +134,7 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
-  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || import.meta.env.VITE_GEMINI_API_KEY || '');
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
