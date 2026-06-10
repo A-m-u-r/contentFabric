@@ -16,9 +16,14 @@ const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
 function voiceLanguageScore(voice, language) {
   const labels = voice.labels || {};
+  const verifiedLanguages = (voice.verified_languages || [])
+    .map((item) => [item.language, item.locale, item.accent, item.model_id].filter(Boolean).join(' '))
+    .join(' ');
   const haystack = [
     voice.name,
     voice.category,
+    voice.description,
+    verifiedLanguages,
     labels.accent,
     labels.language,
     labels.description,
@@ -26,7 +31,7 @@ function voiceLanguageScore(voice, language) {
   ].filter(Boolean).join(' ').toLowerCase();
 
   if (language === 'ru') {
-    if (haystack.includes('russian') || haystack.includes('russia') || haystack.includes('рус')) return 0;
+    if (haystack.includes('russian') || haystack.includes('russia') || haystack.includes('ru ') || haystack.endsWith('ru') || haystack.includes('рус')) return 0;
     if (haystack.includes('slavic') || haystack.includes('eastern european')) return 1;
     return 3;
   }
@@ -42,6 +47,27 @@ function voiceLanguageScore(voice, language) {
 
 function sortVoicesForLanguage(voices, language) {
   return [...voices].sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language));
+}
+
+function voiceMatchesGenderOrUnknown(voice, actorGender) {
+  const gender = (voice.labels?.gender || '').toLowerCase();
+  return !gender || gender === actorGender;
+}
+
+function voiceVisibleForLanguage(voice, language, actorGender) {
+  const score = voiceLanguageScore(voice, language);
+  if (language === 'ru') {
+    return score <= 1 || voiceMatchesGenderOrUnknown(voice, actorGender);
+  }
+  return voiceMatchesGenderOrUnknown(voice, actorGender);
+}
+
+function voiceLanguageSummary(voice) {
+  const verified = voice.verified_languages || [];
+  if (verified.length > 0) {
+    return verified.map((item) => item.language || item.locale).filter(Boolean).join(', ');
+  }
+  return voice.labels?.language || '';
 }
 
 function voiceFitLabel(voice, language) {
@@ -184,7 +210,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     };
     // Prefer a voice that matches both gender and selected language/accent.
     const matchingVoice = sortVoicesForLanguage(
-      voices.filter(v => (v.labels?.gender || '').toLowerCase() === actorGender),
+      voices.filter(v => voiceVisibleForLanguage(v, language, actorGender)),
       language
     )[0];
     if (matchingVoice) {
@@ -993,9 +1019,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   // Filter voices by language/accent
                   const filtered = voices.length > 0
                     ? voices.filter((v) => {
-                        const gender = (v.labels?.gender || '').toLowerCase();
-                        // Only show voices that match the selected gender
-                        return gender === actorGender;
+                        return voiceVisibleForLanguage(v, language, actorGender);
                       })
                       .sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language))
                     : [];
@@ -1017,7 +1041,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                             <div className="flex-1 min-w-0">
                               <div className="text-sm font-medium truncate">{v.name}</div>
                               <div className="text-[10px] text-zinc-500">
-                                {v.labels?.accent || ''} {v.labels?.gender || ''} {v.category ? `· ${v.category}` : ''}
+                                {[voiceLanguageSummary(v), v.labels?.accent, v.labels?.gender, v.category].filter(Boolean).join(' · ')}
                               </div>
                               {language === 'ru' && (
                                 <span className={`inline-flex mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${

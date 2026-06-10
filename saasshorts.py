@@ -1100,23 +1100,58 @@ def generate_voiceover(
 
 def get_elevenlabs_voices(elevenlabs_key: str) -> list:
     """Fetch available voices from ElevenLabs."""
-    url = f"{ELEVENLABS_API_BASE}/voices"
     headers = {"xi-api-key": elevenlabs_key}
 
-    with httpx.Client(timeout=15.0) as client:
-        resp = client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
+    voices_data = []
+    try:
+        next_page_token = None
+        with httpx.Client(timeout=20.0) as client:
+            for _ in range(5):
+                params = {
+                    "page_size": 100,
+                    "include_total_count": "true",
+                    "sort": "created_at_unix",
+                    "sort_direction": "desc",
+                }
+                if next_page_token:
+                    params["next_page_token"] = next_page_token
+
+                resp = client.get(
+                    "https://api.elevenlabs.io/v2/voices",
+                    headers=headers,
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                voices_data.extend(data.get("voices", []))
+                if not data.get("has_more") or not data.get("next_page_token"):
+                    break
+                next_page_token = data.get("next_page_token")
+    except Exception:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(f"{ELEVENLABS_API_BASE}/voices", headers=headers)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            voices_data = data.get("voices", [])
 
     voices = []
-    for v in data.get("voices", []):
+    seen = set()
+    for v in voices_data:
+        voice_id = v.get("voice_id")
+        if not voice_id or voice_id in seen:
+            continue
+        seen.add(voice_id)
         voices.append({
-            "voice_id": v["voice_id"],
-            "name": v["name"],
+            "voice_id": voice_id,
+            "name": v.get("name", ""),
             "category": v.get("category", ""),
             "labels": v.get("labels", {}),
+            "description": v.get("description", ""),
             "preview_url": v.get("preview_url", ""),
+            "verified_languages": v.get("verified_languages", []),
+            "is_owner": v.get("is_owner", False),
+            "created_at_unix": v.get("created_at_unix"),
         })
 
     return voices
