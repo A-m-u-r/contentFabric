@@ -37,7 +37,87 @@ DEFAULT_VOICES = {
 }
 
 
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",")
+    if model.strip()
+]
+GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "2"))
+
+
+class GeminiTemporaryError(Exception):
+    """Raised when Gemini is temporarily unavailable after retry/fallback attempts."""
+
+
+def _gemini_model_chain() -> list:
+    models = [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]
+    seen = set()
+    chain = []
+    for model in models:
+        if model and model not in seen:
+            chain.append(model)
+            seen.add(model)
+    return chain
+
+
+def _is_retryable_gemini_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "503",
+            "unavailable",
+            "high demand",
+            "429",
+            "rate limit",
+            "resource_exhausted",
+            "resource exhausted",
+            "temporarily",
+            "connecterror",
+            "connection",
+            "ssl",
+            "eof",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _generate_gemini_content(client, *, contents, config=None):
+    last_error = None
+    models = _gemini_model_chain()
+
+    for model_index, model in enumerate(models):
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
+            try:
+                if model_index > 0 or attempt > 0:
+                    print(f"[Gemini] trying model={model} attempt={attempt + 1}")
+                return client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as error:
+                last_error = error
+                retryable = _is_retryable_gemini_error(error)
+                if not retryable:
+                    raise
+
+                if attempt < GEMINI_MAX_RETRIES:
+                    delay = min(2 ** attempt, 8)
+                    print(f"[Gemini] temporary failure on {model}; retrying in {delay}s: {error}")
+                    time.sleep(delay)
+                    continue
+
+                if model_index < len(models) - 1:
+                    next_model = models[model_index + 1]
+                    print(f"[Gemini] {model} unavailable; falling back to {next_model}")
+                    break
+
+    raise GeminiTemporaryError(
+        f"Gemini models are temporarily unavailable after retries: {last_error}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -100,8 +180,8 @@ Return a comprehensive JSON research report:
 
 Be thorough. Use REAL data from your search results, not made-up information."""
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
+    response = _generate_gemini_content(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -332,8 +412,8 @@ Return a JSON object:
 IMPORTANT: Use REAL pain points from user reviews when available. Real frustrations make the best UGC content.
 Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
+    response = _generate_gemini_content(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
@@ -531,8 +611,8 @@ RULES:
 - Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
 - Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
+    response = _generate_gemini_content(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",

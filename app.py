@@ -1649,6 +1649,7 @@ from saasshorts import (
     analyze_saas,
     generate_scripts,
     build_custom_script,
+    GeminiTemporaryError,
     generate_full_video,
     generate_actor_images,
     get_elevenlabs_voices,
@@ -1762,6 +1763,8 @@ async def saasshorts_analyze(
         result = await loop.run_in_executor(None, run_analysis)
         return result
 
+    except GeminiTemporaryError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
