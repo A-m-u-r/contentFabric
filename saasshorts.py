@@ -880,6 +880,17 @@ def _fal_upload_file(file_path: str, fal_key: str) -> str:
     headers = {"Authorization": f"Key {fal_key}"}
 
     filename = os.path.basename(file_path)
+    cache_path = f"{file_path}.fal_url.txt"
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached_url = f.read().strip()
+            if cached_url.startswith(("http://", "https://")):
+                print(f"[fal.ai] Reusing uploaded {filename} -> {cached_url}")
+                return cached_url
+        except Exception as e:
+            print(f"[fal.ai] Upload URL cache ignored for {filename}: {e}")
+
     ext = os.path.splitext(filename)[1].lower()
     content_types = {
         ".png": "image/png",
@@ -892,15 +903,30 @@ def _fal_upload_file(file_path: str, fal_key: str) -> str:
     }
     content_type = content_types.get(ext, "application/octet-stream")
 
-    # Initiate upload
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(
-            "https://rest.alpha.fal.ai/storage/upload/initiate",
-            headers={**headers, "Content-Type": "application/json"},
-            json={"file_name": filename, "content_type": content_type},
-        )
-        resp.raise_for_status()
-        upload_info = resp.json()
+    file_size = os.path.getsize(file_path)
+    print(f"[fal.ai] Uploading {filename} ({file_size} bytes)...")
+
+    upload_info = None
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=180.0) as client:
+                resp = client.post(
+                    "https://rest.alpha.fal.ai/storage/upload/initiate",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"file_name": filename, "content_type": content_type},
+                )
+                resp.raise_for_status()
+                upload_info = resp.json()
+            break
+        except Exception as e:
+            last_error = e
+            print(f"[fal.ai] Upload init failed for {filename} (attempt {attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(3 * attempt)
+
+    if not upload_info:
+        raise Exception(f"fal.ai upload init failed for {filename}: {last_error}")
 
     upload_url = upload_info["upload_url"]
     file_url = upload_info["file_url"]
@@ -909,13 +935,33 @@ def _fal_upload_file(file_path: str, fal_key: str) -> str:
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.put(
-            upload_url,
-            content=file_bytes,
-            headers={"Content-Type": content_type},
-        )
-        resp.raise_for_status()
+    uploaded = False
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=600.0) as client:
+                resp = client.put(
+                    upload_url,
+                    content=file_bytes,
+                    headers={"Content-Type": content_type},
+                )
+                resp.raise_for_status()
+            uploaded = True
+            break
+        except Exception as e:
+            last_error = e
+            print(f"[fal.ai] Upload failed for {filename} (attempt {attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(5 * attempt)
+
+    if not uploaded:
+        raise Exception(f"fal.ai upload failed for {filename}: {last_error}")
+
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(file_url)
+    except Exception as e:
+        print(f"[fal.ai] Could not write upload URL cache for {filename}: {e}")
 
     print(f"[fal.ai] Uploaded {filename} → {file_url}")
     return file_url
@@ -1186,7 +1232,7 @@ def generate_talking_head_lowcost(
             "audio_url": audio_url,
         },
         fal_key,
-        timeout=900,
+        timeout=1200,
     )
 
     print(f"[SaaSShorts]   VEED Lipsync response keys: {list(lipsync_result.keys())}")
@@ -1633,7 +1679,7 @@ def generate_full_video(
     video_mode = config.get("video_mode", "premium")
     if not _exists(talking_head):
         if video_mode == "lowcost":
-            log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This can take 2-15 minutes.")
+            log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This can take 2-20 minutes.")
             talking_head = generate_talking_head_lowcost(actor_img, audio_path, fal_key, talking_head)
         else:
             log("[3/6] Generating talking head video (Kling Avatar v2)... This can take 2-15 minutes.")
