@@ -2236,6 +2236,10 @@ async def saasshorts_actor_gallery():
 class SaaSGenerateRequest(BaseModel):
     script: dict
     voice_id: Optional[str] = None
+    tts_provider: str = "auto"  # "auto", "elevenlabs", or "fal_minimax"
+    minimax_voice_id: Optional[str] = None
+    actor_gender: Optional[str] = None
+    language: Optional[str] = None
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
     retry_job_id: Optional[str] = None
@@ -2254,7 +2258,7 @@ async def saasshorts_generate(
 
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
-    if not elevenlabs_key:
+    if req.tts_provider == "elevenlabs" and not elevenlabs_key:
         raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
@@ -2317,6 +2321,10 @@ async def saasshorts_generate(
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
         "voice_id": req.voice_id or "21m00Tcm4TlvDq8ikWAM",
+        "tts_provider": req.tts_provider or "auto",
+        "minimax_voice_id": req.minimax_voice_id,
+        "actor_gender": req.actor_gender or "female",
+        "language": req.language or req.script.get("language", "en"),
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
@@ -2345,6 +2353,7 @@ async def saasshorts_generate(
                     "video_filename": video_filename,
                     "duration": result.get("duration", 0),
                     "cost_estimate": result.get("cost_estimate", {}),
+                    "tts_provider": result.get("tts_provider", req.tts_provider),
                     "script": req.script,
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
@@ -2362,6 +2371,7 @@ async def saasshorts_generate(
                         "language": req.script.get("language", "en"),
                         "duration": result.get("duration", 0),
                         "video_mode": req.video_mode,
+                        "tts_provider": result.get("tts_provider", req.tts_provider),
                         "product_name": req.script.get("_product_name", ""),
                         "product_url": req.script.get("_product_url", ""),
                         "segments": req.script.get("segments", []),

@@ -10,6 +10,35 @@ const STYLE_OPTIONS = [
   { id: 'comparison', label: 'Before/After', desc: 'Comparison style' },
 ];
 
+const TTS_PROVIDER_OPTIONS = [
+  { id: 'auto', label: 'Auto fallback', desc: 'ElevenLabs first, fal MiniMax if needed' },
+  { id: 'elevenlabs', label: 'ElevenLabs', desc: 'Best voice quality, may need paid plan' },
+  { id: 'fal_minimax', label: 'fal MiniMax', desc: 'Russian TTS via fal.ai balance' },
+];
+
+const MINIMAX_VOICE_OPTIONS = {
+  ru: [
+    { id: 'Russian_AmbitiousWoman', name: 'Ambitious Woman', desc: 'confident female' },
+    { id: 'Russian_BrightHeroine', name: 'Bright Heroine', desc: 'energetic female' },
+    { id: 'Russian_ReliableMan', name: 'Reliable Man', desc: 'calm male' },
+    { id: 'Russian_AttractiveGuy', name: 'Attractive Guy', desc: 'confident male' },
+  ],
+  es: [
+    { id: 'Spanish_ConfidentWoman', name: 'Confident Woman', desc: 'female' },
+    { id: 'Spanish_ReliableMan', name: 'Reliable Man', desc: 'male' },
+  ],
+  en: [
+    { id: 'Wise_Woman', name: 'Wise Woman', desc: 'female' },
+    { id: 'Deep_Voice_Man', name: 'Deep Voice Man', desc: 'male' },
+  ],
+};
+
+function defaultMiniMaxVoice(language, actorGender) {
+  if (language === 'ru') return actorGender === 'male' ? 'Russian_ReliableMan' : 'Russian_AmbitiousWoman';
+  if (language === 'es') return actorGender === 'male' ? 'Spanish_ReliableMan' : 'Spanish_ConfidentWoman';
+  return actorGender === 'male' ? 'Deep_Voice_Man' : 'Wise_Woman';
+}
+
 const CACHE_KEY = 'saasshorts_cache';
 const CACHE_VERSION = 2;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
@@ -143,7 +172,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
+  const [ttsProvider, setTtsProvider] = useState('auto');
   const [selectedVoice, setSelectedVoice] = useState('21m00Tcm4TlvDq8ikWAM');
+  const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
   const [editedNarration, setEditedNarration] = useState('');
   const [actorOptions, setActorOptions] = useState([]);
@@ -218,6 +249,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     } else {
       setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
     }
+  }, [actorGender, language]);
+
+  useEffect(() => {
+    setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
   }, [actorGender, language]);
 
   // Poll generation status
@@ -352,7 +387,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       alert('fal.ai API key required. Set it in Settings.');
       return;
     }
-    if (!elevenLabsKey) {
+    if (ttsProvider === 'elevenlabs' && !elevenLabsKey) {
       alert('ElevenLabs API key required. Set it in Settings.');
       return;
     }
@@ -372,16 +407,22 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         scriptToSend.full_narration = editedNarration;
       }
 
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Fal-Key': falKey,
+      };
+      if (elevenLabsKey) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+
       const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
-          'X-ElevenLabs-Key': elevenLabsKey,
-        },
+        headers,
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          tts_provider: ttsProvider,
+          minimax_voice_id: minimaxVoice,
+          actor_gender: actorGender,
+          language,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
           video_mode: videoMode,
@@ -418,16 +459,22 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         scriptToSend.full_narration = editedNarration;
       }
 
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Fal-Key': falKey,
+      };
+      if (elevenLabsKey) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+
       const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
-          'X-ElevenLabs-Key': elevenLabsKey,
-        },
+        headers,
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          tts_provider: ttsProvider,
+          minimax_voice_id: minimaxVoice,
+          actor_gender: actorGender,
+          language,
           actor_description: actorDescription || undefined,
           retry_job_id: jobId,
           video_mode: videoMode,
@@ -1010,7 +1057,63 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 Script: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
 
+              {/* TTS Provider */}
+              <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                  <Volume2 size={14} /> TTS Provider
+                </label>
+                <div className="grid sm:grid-cols-3 gap-2">
+                  {TTS_PROVIDER_OPTIONS.map((option) => (
+                    <button
+                      key={option.id}
+                      onClick={() => setTtsProvider(option.id)}
+                      className={`p-3 rounded-lg border text-left transition-all ${
+                        ttsProvider === option.id
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="text-sm font-semibold">{option.label}</div>
+                      <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                {ttsProvider === 'auto' && (
+                  <p className="text-[10px] text-zinc-500 mt-2">
+                    Tries ElevenLabs first. If a library voice requires a paid plan or fails, generation continues with fal MiniMax.
+                  </p>
+                )}
+                {ttsProvider === 'fal_minimax' && (
+                  <p className="text-[10px] text-zinc-500 mt-2">
+                    Uses fal.ai balance for voiceover. ElevenLabs key is not required in this mode.
+                  </p>
+                )}
+              </div>
+
+              {(ttsProvider === 'auto' || ttsProvider === 'fal_minimax') && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2">
+                    fal MiniMax fallback voice
+                  </label>
+                  <select
+                    value={minimaxVoice}
+                    onChange={(e) => setMinimaxVoice(e.target.value)}
+                    className="input-field"
+                  >
+                    {(MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en).map((voice) => (
+                      <option key={voice.id} value={voice.id}>
+                        {voice.name} - {voice.desc}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[10px] text-zinc-600 mt-1">
+                    Used immediately in fal MiniMax mode, or only if ElevenLabs fails in Auto fallback mode.
+                  </p>
+                </div>
+              )}
+
               {/* Voice Selection */}
+              {ttsProvider !== 'fal_minimax' && (
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
                   <Volume2 size={14} /> Voice {language === 'es' ? '(Spanish)' : language === 'ru' ? '(Russian)' : '(English)'}
@@ -1157,6 +1260,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     : `${actorGender === 'female' ? 'Female' : 'Male'} voices · Click speaker to preview`}
                 </p>
               </div>
+              )}
 
               {/* Actor Selection: Gallery + Generate New */}
               <div>
@@ -1362,10 +1466,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </div>
 
               {/* Missing keys warning */}
-              {(!falKey || !elevenLabsKey) && (
+              {(!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey)) && (
                 <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-center gap-2 text-sm text-amber-400">
                   <AlertCircle size={14} />
-                  {!falKey && 'fal.ai API key missing. '}{!elevenLabsKey && 'ElevenLabs API key missing. '}
+                  {!falKey && 'fal.ai API key missing. '}{ttsProvider === 'elevenlabs' && !elevenLabsKey && 'ElevenLabs API key missing. '}
                   Set them in Settings.
                 </div>
               )}
@@ -1377,7 +1481,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </button>
               <button
                 onClick={handleGenerate}
-                disabled={!falKey || !elevenLabsKey || !selectedActor || generating}
+                disabled={!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey) || !selectedActor || generating}
                 className="btn-primary px-6 py-2 text-sm flex items-center gap-2 disabled:opacity-50"
               >
                 {generating ? (

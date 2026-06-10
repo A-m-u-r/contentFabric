@@ -1098,6 +1098,130 @@ def generate_voiceover(
     return output_path
 
 
+def generate_voiceover_minimax(
+    text: str,
+    fal_key: str,
+    output_path: str,
+    voice_id: str = "Russian_AmbitiousWoman",
+) -> str:
+    """Generate voiceover audio using fal.ai MiniMax Speech-02 HD."""
+    print(f"[SaaSShorts] Generating fal MiniMax voiceover ({len(text)} chars, {voice_id})...")
+
+    result = _fal_run(
+        "fal-ai/minimax/speech-02-hd",
+        {
+            "text": text,
+            "voice_setting": {
+                "voice_id": voice_id,
+                "speed": 1.0,
+                "vol": 1.0,
+                "pitch": 0,
+                "english_normalization": False,
+            },
+            "output_format": "mp3",
+        },
+        fal_key,
+        timeout=600,
+    )
+
+    audio = result.get("audio") or result.get("file") or result.get("output")
+    audio_url = audio.get("url") if isinstance(audio, dict) else audio
+    if not audio_url:
+        raise Exception(f"fal MiniMax TTS returned no audio URL: {result}")
+
+    with httpx.Client(timeout=180.0) as client:
+        resp = client.get(audio_url)
+        resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+
+    print(f"[SaaSShorts] fal MiniMax voiceover: {output_path}")
+    return output_path
+
+
+def _minimax_voice_for(language: str, actor_gender: str, voice_id: str = None) -> str:
+    if voice_id:
+        return voice_id
+    if language == "ru":
+        return "Russian_ReliableMan" if actor_gender == "male" else "Russian_AmbitiousWoman"
+    if language == "es":
+        return "Spanish_ReliableMan" if actor_gender == "male" else "Spanish_ConfidentWoman"
+    return "Deep_Voice_Man" if actor_gender == "male" else "Wise_Woman"
+
+
+def _tts_signature(
+    text: str,
+    provider: str,
+    elevenlabs_voice_id: str,
+    minimax_voice_id: str,
+    language: str,
+    actor_gender: str,
+) -> str:
+    payload = {
+        "text": text,
+        "provider": provider,
+        "elevenlabs_voice_id": elevenlabs_voice_id,
+        "minimax_voice_id": minimax_voice_id,
+        "language": language,
+        "actor_gender": actor_gender,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _read_tts_metadata(audio_path: str) -> dict:
+    meta_path = f"{audio_path}.meta.json"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_tts_metadata(audio_path: str, metadata: dict) -> None:
+    meta_path = f"{audio_path}.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def generate_voiceover_with_fallback(
+    text: str,
+    output_path: str,
+    *,
+    provider: str,
+    fal_key: str,
+    elevenlabs_key: str = None,
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM",
+    minimax_voice_id: str = None,
+    language: str = "en",
+    actor_gender: str = "female",
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Generate TTS with an optional ElevenLabs -> fal MiniMax fallback."""
+    provider = (provider or "auto").lower()
+    minimax_voice_id = _minimax_voice_for(language, actor_gender, minimax_voice_id)
+
+    if provider == "fal_minimax" or (provider == "auto" and not elevenlabs_key):
+        if provider == "auto" and not elevenlabs_key:
+            log("[1/6] ElevenLabs key missing; using fal MiniMax TTS fallback.")
+        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id)
+        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
+
+    if provider not in ("auto", "elevenlabs"):
+        raise Exception(f"Unknown TTS provider: {provider}")
+    if not elevenlabs_key:
+        raise Exception("ElevenLabs API key is required for ElevenLabs TTS.")
+
+    try:
+        generate_voiceover(text, elevenlabs_key, output_path, elevenlabs_voice_id)
+        return {"path": output_path, "provider": "elevenlabs", "voice_id": elevenlabs_voice_id}
+    except Exception as error:
+        if provider != "auto":
+            raise
+        log(f"[1/6] ElevenLabs TTS failed; falling back to fal MiniMax TTS: {error}")
+        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id)
+        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
+
+
 def get_elevenlabs_voices(elevenlabs_key: str) -> list:
     """Fetch available voices from ElevenLabs."""
     headers = {"xi-api-key": elevenlabs_key}
@@ -1640,8 +1764,12 @@ def generate_full_video(
         script: A single script object from generate_scripts()
         config: {
             "fal_key": str,
-            "elevenlabs_key": str,
-            "voice_id": str (optional),
+            "elevenlabs_key": str (optional when tts_provider is fal_minimax),
+            "voice_id": str (optional ElevenLabs voice),
+            "tts_provider": str (optional: auto, elevenlabs, fal_minimax),
+            "minimax_voice_id": str (optional),
+            "language": str (optional),
+            "actor_gender": str (optional),
             "actor_description": str (optional, overrides script),
         }
         output_dir: Directory to write output files
@@ -1653,8 +1781,16 @@ def generate_full_video(
     os.makedirs(output_dir, exist_ok=True)
 
     fal_key = config["fal_key"]
-    elevenlabs_key = config["elevenlabs_key"]
+    elevenlabs_key = config.get("elevenlabs_key")
     voice_id = config.get("voice_id", "21m00Tcm4TlvDq8ikWAM")
+    tts_provider = config.get("tts_provider", "auto")
+    language = config.get("language") or script.get("language", "en")
+    actor_gender = config.get("actor_gender", "female")
+    minimax_voice_id = _minimax_voice_for(
+        language,
+        actor_gender,
+        config.get("minimax_voice_id"),
+    )
     actor_desc = config.get("actor_description") or script.get("actor_description", "a young professional in their late 20s, wearing a casual modern outfit, clean background")
 
     title_slug = re.sub(r"[^a-z0-9]+", "_", script.get("title", "video").lower())[:30]
@@ -1674,6 +1810,38 @@ def generate_full_video(
 
     def _exists(path):
         return os.path.exists(path) and os.path.getsize(path) > 0
+
+    def _remove_if_exists(path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    tts_cache_signature = _tts_signature(
+        full_narration,
+        tts_provider,
+        voice_id,
+        minimax_voice_id,
+        language,
+        actor_gender,
+    )
+    tts_metadata = _read_tts_metadata(audio_path)
+    if _exists(audio_path) and tts_metadata.get("signature") != tts_cache_signature:
+        log("[1/6] TTS settings changed; regenerating voice-dependent assets.")
+        for stale_path in (
+            audio_path,
+            f"{audio_path}.meta.json",
+            f"{audio_path}.fal_url.txt",
+            talking_head,
+            f"{talking_head}.fal_url.txt",
+            srt_path,
+            final_path,
+        ):
+            _remove_if_exists(stale_path)
+        tts_metadata = {}
+
+    tts_provider_used = tts_metadata.get("provider") or tts_provider
 
     # ── Step 1 & 2: Generate actor image + voiceover in parallel ──
     # If user pre-selected an actor image, copy it
@@ -1697,13 +1865,30 @@ def generate_full_video(
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_img = executor.submit(generate_actor_image, actor_desc, fal_key, actor_img) if need_img else None
             future_voice = executor.submit(
-                generate_voiceover, full_narration, elevenlabs_key, audio_path, voice_id
+                generate_voiceover_with_fallback,
+                full_narration,
+                audio_path,
+                provider=tts_provider,
+                fal_key=fal_key,
+                elevenlabs_key=elevenlabs_key,
+                elevenlabs_voice_id=voice_id,
+                minimax_voice_id=minimax_voice_id,
+                language=language,
+                actor_gender=actor_gender,
+                log=log,
             ) if need_voice else None
 
             if future_img:
                 actor_img = future_img.result()
             if future_voice:
-                audio_path = future_voice.result()
+                voice_result = future_voice.result()
+                audio_path = voice_result["path"]
+                tts_provider_used = voice_result["provider"]
+                _write_tts_metadata(audio_path, {
+                    "signature": tts_cache_signature,
+                    "provider": voice_result["provider"],
+                    "voice_id": voice_result["voice_id"],
+                })
 
         log("[2/6] Actor image and voiceover ready.")
     else:
@@ -1785,10 +1970,13 @@ def generate_full_video(
 
     # Cost estimate
     audio_duration = _get_media_duration(audio_path)
+    tts_cost_key = "voiceover_fal_minimax" if tts_provider_used == "fal_minimax" else "voiceover_elevenlabs"
+    tts_cost = round(len(full_narration) * (0.0001 if tts_provider_used == "fal_minimax" else 0.00003), 3)
+
     if video_mode == "lowcost":
         cost = {
             "actor_image_flux": 0.05,
-            "voiceover_elevenlabs": round(len(full_narration) * 0.00003, 3),
+            tts_cost_key: tts_cost,
             "hailuo_img2video": 0.19,
             "veed_lipsync": 0.20,
             "broll_flux": round(len(broll_clips) * 0.05, 2),
@@ -1797,7 +1985,7 @@ def generate_full_video(
     else:
         cost = {
             "actor_image_flux": 0.05,
-            "voiceover_elevenlabs": round(len(full_narration) * 0.00003, 3),
+            tts_cost_key: tts_cost,
             "talking_head_kling": round(audio_duration * 0.056, 2),
             "broll_kling": round(len(broll_clips) * 5 * 0.07, 2),
             "ffmpeg_compositing": 0.00,
@@ -1811,4 +1999,5 @@ def generate_full_video(
         "actor_image": actor_img,
         "duration": audio_duration,
         "cost_estimate": cost,
+        "tts_provider": tts_provider_used,
     }
