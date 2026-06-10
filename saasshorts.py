@@ -798,8 +798,11 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
     submit_url = f"{FAL_QUEUE_BASE}/{model_id}"
     print(f"[fal.ai] Submitting to {submit_url}...")
 
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(submit_url, headers=headers, json=input_data)
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(submit_url, headers=headers, json=input_data)
+    except httpx.RequestError as e:
+        raise Exception(f"fal.ai submit request failed for {model_id} at {submit_url}: {e}") from e
 
     if resp.status_code >= 400:
         print(f"[fal.ai] Submit error: {resp.text[:500]}")
@@ -841,9 +844,15 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
 
         if status == "COMPLETED":
             print(f"[fal.ai] ✅ Completed in {elapsed}s! Fetching result...")
-            with httpx.Client(timeout=120.0) as client:
-                result_resp = client.get(response_url, headers=poll_headers)
-                return result_resp.json()
+            try:
+                with httpx.Client(timeout=120.0) as client:
+                    result_resp = client.get(response_url, headers=poll_headers)
+                    result_resp.raise_for_status()
+                    return result_resp.json()
+            except httpx.RequestError as e:
+                raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
+            except httpx.HTTPStatusError as e:
+                raise Exception(f"fal.ai result fetch error ({e.response.status_code}) for {model_id}: {e.response.text[:300]}") from e
 
         elif status in ("FAILED", "CANCELLED"):
             error = status_data.get("error", "unknown error")
@@ -863,9 +872,15 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
             status_data = poll_resp.json()
         if status_data.get("status") == "COMPLETED":
             print(f"[fal.ai] Completed after timeout window. Fetching result for {request_id}...")
-            with httpx.Client(timeout=120.0) as client:
-                result_resp = client.get(response_url, headers=poll_headers)
-                return result_resp.json()
+            try:
+                with httpx.Client(timeout=120.0) as client:
+                    result_resp = client.get(response_url, headers=poll_headers)
+                    result_resp.raise_for_status()
+                    return result_resp.json()
+            except httpx.RequestError as e:
+                raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
+            except httpx.HTTPStatusError as e:
+                raise Exception(f"fal.ai result fetch error ({e.response.status_code}) for {model_id}: {e.response.text[:300]}") from e
     except Exception as e:
         print(f"[fal.ai] Final fetch after timeout failed: {e}")
 
@@ -1103,9 +1118,16 @@ def generate_voiceover_minimax(
     fal_key: str,
     output_path: str,
     voice_id: str = "Russian_AmbitiousWoman",
+    language: str = "en",
 ) -> str:
     """Generate voiceover audio using fal.ai MiniMax Speech-02 HD."""
     print(f"[SaaSShorts] Generating fal MiniMax voiceover ({len(text)} chars, {voice_id})...")
+
+    language_boost = {
+        "ru": "Russian",
+        "es": "Spanish",
+        "en": "English",
+    }.get(language, "auto")
 
     result = _fal_run(
         "fal-ai/minimax/speech-02-hd",
@@ -1118,7 +1140,14 @@ def generate_voiceover_minimax(
                 "pitch": 0,
                 "english_normalization": False,
             },
-            "output_format": "mp3",
+            "audio_setting": {
+                "sample_rate": "44100",
+                "bitrate": "256000",
+                "format": "mp3",
+                "channel": "1",
+            },
+            "language_boost": language_boost,
+            "output_format": "url",
         },
         fal_key,
         timeout=600,
@@ -1129,11 +1158,16 @@ def generate_voiceover_minimax(
     if not audio_url:
         raise Exception(f"fal MiniMax TTS returned no audio URL: {result}")
 
-    with httpx.Client(timeout=180.0) as client:
-        resp = client.get(audio_url)
-        resp.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(resp.content)
+    try:
+        with httpx.Client(timeout=180.0) as client:
+            resp = client.get(audio_url)
+            resp.raise_for_status()
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+    except httpx.RequestError as e:
+        raise Exception(f"fal MiniMax audio download failed at {audio_url}: {e}") from e
+    except httpx.HTTPStatusError as e:
+        raise Exception(f"fal MiniMax audio download error ({e.response.status_code}): {e.response.text[:300]}") from e
 
     print(f"[SaaSShorts] fal MiniMax voiceover: {output_path}")
     return output_path
@@ -1203,7 +1237,7 @@ def generate_voiceover_with_fallback(
     if provider == "fal_minimax" or (provider == "auto" and not elevenlabs_key):
         if provider == "auto" and not elevenlabs_key:
             log("[1/6] ElevenLabs key missing; using fal MiniMax TTS fallback.")
-        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id)
+        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id, language)
         return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
 
     if provider not in ("auto", "elevenlabs"):
@@ -1218,7 +1252,7 @@ def generate_voiceover_with_fallback(
         if provider != "auto":
             raise
         log(f"[1/6] ElevenLabs TTS failed; falling back to fal MiniMax TTS: {error}")
-        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id)
+        generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id, language)
         return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
 
 

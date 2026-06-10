@@ -1132,9 +1132,17 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     return (
                       <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
                         {filtered.map((v) => (
-                          <button
+                          <div
                             key={v.voice_id}
+                            role="button"
+                            tabIndex={0}
                             onClick={() => setSelectedVoice(v.voice_id)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                setSelectedVoice(v.voice_id);
+                              }
+                            }}
                             className={`w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-all ${
                               selectedVoice === v.voice_id
                                 ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
@@ -1166,7 +1174,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               </button>
                             )}
                             {selectedVoice === v.voice_id && <Check size={14} className="text-violet-400 shrink-0" />}
-                          </button>
+                          </div>
                         ))}
                         {language === 'ru' && !hasLanguageVoice && (
                           <p className="text-[10px] text-amber-400/80 pt-1">
