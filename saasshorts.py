@@ -855,7 +855,24 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
         print(f"[fal.ai] {model_id}: {status}{pos_info} ({elapsed}s)")
         time.sleep(5)
 
-    raise Exception(f"fal.ai job timed out after {timeout}s for {model_id}")
+    # One last fetch prevents losing a paid result if the job completed just
+    # after the local polling window or during a transient status request error.
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            poll_resp = client.get(f"{status_url}?logs=1", headers=poll_headers)
+            status_data = poll_resp.json()
+        if status_data.get("status") == "COMPLETED":
+            print(f"[fal.ai] Completed after timeout window. Fetching result for {request_id}...")
+            with httpx.Client(timeout=120.0) as client:
+                result_resp = client.get(response_url, headers=poll_headers)
+                return result_resp.json()
+    except Exception as e:
+        print(f"[fal.ai] Final fetch after timeout failed: {e}")
+
+    raise Exception(
+        f"fal.ai job timed out after {timeout}s for {model_id} "
+        f"(request_id={request_id}, status_url={status_url})"
+    )
 
 
 def _fal_upload_file(file_path: str, fal_key: str) -> str:
@@ -949,7 +966,7 @@ def generate_actor_images(
                 "seed": random.randint(0, 999999),
             },
             fal_key,
-            timeout=300,
+            timeout=1200,
         )
         images = result.get("images") or result.get("output", [])
         if not images:
@@ -1089,7 +1106,7 @@ def generate_talking_head(
             ),
         },
         fal_key,
-        timeout=600,
+        timeout=1200,
     )
 
     video_url = result["video"]["url"]
@@ -1137,7 +1154,7 @@ def generate_talking_head_lowcost(
                 ),
             },
             fal_key,
-            timeout=300,
+            timeout=1200,
         )
 
         print(f"[SaaSShorts]   Hailuo response keys: {list(hailuo_result.keys())}")
@@ -1207,7 +1224,7 @@ def generate_broll(
             "safety_tolerance": 5,
         },
         fal_key,
-        timeout=300,
+        timeout=1200,
     )
 
     # Flux 2 Pro returns images in "images" or "output" key
@@ -1616,10 +1633,10 @@ def generate_full_video(
     video_mode = config.get("video_mode", "premium")
     if not _exists(talking_head):
         if video_mode == "lowcost":
-            log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This takes 2-5 minutes.")
+            log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This can take 2-15 minutes.")
             talking_head = generate_talking_head_lowcost(actor_img, audio_path, fal_key, talking_head)
         else:
-            log("[3/6] Generating talking head video (Kling Avatar v2)... This takes 2-5 minutes.")
+            log("[3/6] Generating talking head video (Kling Avatar v2)... This can take 2-15 minutes.")
             talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head)
         log("[3/6] Talking head ready.")
     else:
