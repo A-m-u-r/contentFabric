@@ -10,6 +10,7 @@ import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import { getApiUrl } from './config';
+import { useRuntimeLocalization } from './localization/runtimeLocalization';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -134,6 +135,8 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
+  useRuntimeLocalization('ru');
+
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || import.meta.env.VITE_GEMINI_API_KEY || '');
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {

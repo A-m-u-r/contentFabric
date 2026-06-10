@@ -59,7 +59,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
   const [customScript, setCustomScript] = useState(() => loadCache()?.customScript || '');
   const [style, setStyle] = useState('ugc');
-  const [language, setLanguage] = useState('en');
+  const [language, setLanguage] = useState('ru');
   const [actorGender, setActorGender] = useState('female');
   const [numScripts, setNumScripts] = useState(3);
   const [analyzing, setAnalyzing] = useState(false);
