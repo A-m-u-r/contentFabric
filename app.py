@@ -7,6 +7,7 @@ import shutil
 import glob
 import time
 import asyncio
+import datetime
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from contextlib import asynccontextmanager
@@ -95,6 +96,8 @@ async def cleanup_jobs():
             for job_id in os.listdir(OUTPUT_DIR):
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
+                    if job_id.startswith("saas_") and glob.glob(os.path.join(job_path, "*_final.mp4")):
+                        continue
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
                         print(f"🧹 Purging old job: {job_id}")
                         shutil.rmtree(job_path, ignore_errors=True)
@@ -185,6 +188,127 @@ app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
+
+
+def _local_saas_video_id(job_dir_name: str) -> str:
+    if job_dir_name.startswith("saas_"):
+        return job_dir_name.replace("saas_", "", 1)[:8]
+    return job_dir_name[:8]
+
+
+def _local_video_url(job_dir_name: str, file_path: str) -> str:
+    return f"/videos/{job_dir_name}/{os.path.basename(file_path)}"
+
+
+def _read_local_gallery_meta(job_dir: str) -> Optional[dict]:
+    meta_path = os.path.join(job_dir, "gallery_metadata.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _infer_local_gallery_meta(job_dir: str) -> Optional[dict]:
+    job_dir_name = os.path.basename(job_dir)
+    video_files = sorted(
+        glob.glob(os.path.join(job_dir, "*_final.mp4")),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    )
+    if not video_files:
+        return None
+
+    video_path = video_files[0]
+    actor_files = []
+    for pattern in ("*_actor.png", "selected_actor.png", "__actor.png"):
+        actor_files.extend(glob.glob(os.path.join(job_dir, pattern)))
+    actor_path = actor_files[0] if actor_files else ""
+
+    job_id = job_dir_name.replace("saas_", "", 1)
+    job_result = globals().get("saas_jobs", {}).get(job_id, {}).get("result", {})
+    script = job_result.get("script", {}) if isinstance(job_result, dict) else {}
+    cost = job_result.get("cost_estimate", {}) if isinstance(job_result, dict) else {}
+
+    return {
+        "video_id": _local_saas_video_id(job_dir_name),
+        "video_url": _local_video_url(job_dir_name, video_path),
+        "actor_url": _local_video_url(job_dir_name, actor_path) if actor_path else "",
+        "created_at": datetime.datetime.utcfromtimestamp(os.path.getmtime(video_path)).isoformat() + "Z",
+        "title": script.get("title") or os.path.splitext(os.path.basename(video_path))[0],
+        "hook_text": script.get("hook_text", ""),
+        "caption": script.get("caption", ""),
+        "hashtags": script.get("hashtags", []),
+        "full_narration": script.get("full_narration", ""),
+        "actor_description": script.get("actor_description", ""),
+        "style": script.get("style", "ugc"),
+        "language": script.get("language", "ru"),
+        "duration": job_result.get("duration", 0) if isinstance(job_result, dict) else 0,
+        "video_mode": "lowcost" if "hailuo" in " ".join(os.listdir(job_dir)).lower() else "premium",
+        "product_name": script.get("_product_name", ""),
+        "product_url": script.get("_product_url", ""),
+        "segments": script.get("segments", []),
+        "cost_estimate": cost,
+        "source": "local",
+    }
+
+
+def write_local_saas_gallery_entry(job_id: str, result: dict, metadata: dict) -> Optional[dict]:
+    try:
+        job_dir_name = f"saas_{job_id}"
+        job_dir = os.path.join(OUTPUT_DIR, job_dir_name)
+        video_path = result.get("video_path", "")
+        if not video_path or not os.path.exists(video_path):
+            return None
+
+        actor_path = result.get("actor_image", "")
+        entry = dict(metadata)
+        entry.update({
+            "video_id": job_id[:8],
+            "video_url": _local_video_url(job_dir_name, video_path),
+            "actor_url": _local_video_url(job_dir_name, actor_path) if actor_path and os.path.exists(actor_path) else "",
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "source": "local",
+        })
+
+        with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=2)
+        return entry
+    except Exception as e:
+        print(f"⚠️ Local gallery metadata write failed: {e}")
+        return None
+
+
+def list_local_saas_gallery(limit: int = 50) -> List[dict]:
+    videos = []
+    for job_dir in glob.glob(os.path.join(OUTPUT_DIR, "saas_*")):
+        if not os.path.isdir(job_dir):
+            continue
+        meta = _read_local_gallery_meta(job_dir) or _infer_local_gallery_meta(job_dir)
+        if meta and meta.get("video_url"):
+            videos.append(meta)
+
+    videos.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return videos[:limit] if limit else videos
+
+
+def list_combined_video_gallery(limit: int = 50) -> List[dict]:
+    remote = list_video_gallery(limit) or []
+    local = list_local_saas_gallery(limit) or []
+
+    combined = []
+    seen = set()
+    for item in [*local, *remote]:
+        key = item.get("video_id") or item.get("video_url")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        combined.append(item)
+
+    combined.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return combined[:limit] if limit else combined
 
 class ProcessRequest(BaseModel):
     url: str
@@ -1855,7 +1979,7 @@ async def saasshorts_video_gallery(limit: int = 50):
     """List all UGC videos from the public gallery."""
     try:
         loop = asyncio.get_running_loop()
-        videos = await loop.run_in_executor(None, list_video_gallery, limit)
+        videos = await loop.run_in_executor(None, list_combined_video_gallery, limit)
         return {"videos": videos, "total": len(videos)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1950,7 +2074,7 @@ async def gallery_html_page():
     """SEO gallery page with all generated UGC videos."""
     import html as html_mod
     loop = asyncio.get_running_loop()
-    videos = await loop.run_in_executor(None, list_video_gallery, 100)
+    videos = await loop.run_in_executor(None, list_combined_video_gallery, 100)
 
     cards_html = ""
     ld_items = []
@@ -2021,7 +2145,7 @@ async def video_html_page(video_id: str):
     """SEO individual video page with og:video meta tags."""
     import html as html_mod
     loop = asyncio.get_running_loop()
-    videos = await loop.run_in_executor(None, list_video_gallery, 200)
+    videos = await loop.run_in_executor(None, list_combined_video_gallery, 200)
     meta = next((v for v in videos if v.get("video_id") == video_id), None)
     if not meta:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -2243,6 +2367,11 @@ async def saasshorts_generate(
                         "segments": req.script.get("segments", []),
                         "cost_estimate": result.get("cost_estimate", {}),
                     }
+                    local_gallery_result = write_local_saas_gallery_entry(job_id, result, gallery_meta)
+                    if local_gallery_result:
+                        saas_jobs[job_id]["result"]["gallery_video_id"] = local_gallery_result["video_id"]
+                        log_msg("Saved to local UGC gallery.")
+
                     gallery_result = upload_video_to_gallery(
                         video_path=result["video_path"],
                         actor_image_path=result.get("actor_image", ""),
@@ -2252,6 +2381,8 @@ async def saasshorts_generate(
                     if gallery_result:
                         saas_jobs[job_id]["result"]["gallery_video_id"] = gallery_result["video_id"]
                         log_msg("📤 Uploaded to public gallery.")
+                    if not gallery_result and local_gallery_result:
+                        log_msg("Public S3 gallery not configured; using local UGC gallery.")
                 except Exception as gallery_err:
                     log_msg(f"⚠️ Gallery upload skipped: {gallery_err}")
 
