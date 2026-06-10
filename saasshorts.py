@@ -550,7 +550,7 @@ Return a JSON array:
                 "end": 9,
                 "narration": "Voiceover describing the pain point",
                 "visual": "broll",
-                "broll_prompt": "REQUIRED: visual of the problem, e.g. person frustrated at laptop, cluttered spreadsheet on screen",
+                "broll_prompt": "REQUIRED: visual of the problem relevant to the product, e.g. realistic everyday scene showing the pain point. Avoid laptop/screens unless the product requires them.",
                 "emotion": "frustrated",
                 "subtitle_text": "Pain phrase"
             }},
@@ -570,7 +570,7 @@ Return a JSON array:
                 "end": 21,
                 "narration": "Voiceover showing the product in action",
                 "visual": "broll",
-                "broll_prompt": "REQUIRED: visual of the product/result, e.g. clean dashboard with metrics, modern app interface",
+                "broll_prompt": "REQUIRED: visual of the product/result, e.g. real-world result, checklist, phone tracker, product in use, or app interface only if relevant",
                 "emotion": "excited",
                 "subtitle_text": "Result phrase"
             }},
@@ -606,8 +606,9 @@ RULES:
 - Write ALL text in {lang_name}
 - Actor gender: {actor_gender}. ALL actor_description fields MUST describe a {actor_gender} person. Use diverse ages/ethnicities across scripts.
 - IMPORTANT: actor_description MUST ALWAYS be in ENGLISH regardless of script language. Only describe physical appearance: age, gender, ethnicity, hair, clothing. NO actions, NO background, NO scene description.
-- Actors must look European, attractive but natural, slightly nerdy/tech vibe. Vary across: blonde, brunette, redhead. Ages 22-35.
-- If female: casual summer look (tank top, camisole, simple tee). If male: casual tee or hoodie.
+- Actors must look European, attractive but natural, trustworthy premium wellness / UGC creator vibe. Vary across: blonde, brunette, redhead. Ages 24-38.
+- Avoid office/tech-worker cues in actor_description: no laptop, no monitor, no headset, no headphones, no microphone, no gaming chair, no visible screens.
+- If female: minimalist premium casual look (turtleneck, simple tee, blazer, knit top). If male: clean premium casual tee, knit, blazer, or overshirt.
 - Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
 - Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
 
@@ -910,9 +911,9 @@ def generate_actor_images(
     """Generate multiple hyper-realistic actor portrait options using Flux 2 Pro."""
     print(f"[SaaSShorts] 🎨 Generating {num_options} actor image options (Flux 2 Pro)...")
 
-    # Clean description: strip scene/actions, keep only physical appearance
+    # Clean description: strip obvious actions, but preserve user-specified outfit/background.
     clean_desc = description
-    for remove in ["hablando", "talking", "sentad", "sitting", "desde", "from", "con una", "with a", "detrás", "behind"]:
+    for remove in ["hablando", "talking", "sentad", "sitting"]:
         if remove in clean_desc.lower():
             idx = clean_desc.lower().find(remove)
             if idx > 10:
@@ -920,11 +921,19 @@ def generate_actor_images(
 
     import random
     img_num = random.randint(1000, 9999)
+    realism_guardrails = (
+        "Sharp realistic smartphone portrait, natural skin texture, normal human facial asymmetry, "
+        "not over-smoothed, not CGI, not beauty-filtered, not a studio headshot. "
+        "Use only the outfit/background/details explicitly described by the user. "
+        "If no background is described, use a simple neutral wall or clean home interior. "
+        "Do NOT include laptop, computer monitor, visible screens, headphones, headset, microphone, "
+        "office desk, gaming chair, heavy blur, artificial bokeh, text, logos, extra hands, or props."
+    )
 
     if product_description:
-        prompt = f"""IMG_{img_num}.jpg Raw candid selfie of {clean_desc}, casually holding {product_description}, showing it to the camera with a natural smile. Product clearly visible in hand. Casual and real, not an ad. Low quality front camera, soft room lighting. Reddit selfie."""
+        prompt = f"""IMG_{img_num}.jpg Realistic candid selfie portrait of {clean_desc}, casually holding {product_description}, showing it to the camera with a natural subtle smile. Product clearly visible in hand. Casual and real, not an ad. {realism_guardrails}"""
     else:
-        prompt = f"""IMG_{img_num}.jpg Raw candid selfie of {clean_desc}, sitting at their desk at home, looking at camera with a relaxed natural smile. Headphones around neck, monitor glow behind them. Not posed, casual and real. Low quality front camera, soft room lighting. Reddit selfie."""
+        prompt = f"""IMG_{img_num}.jpg Realistic candid selfie portrait of {clean_desc}, looking directly at the camera with a calm natural expression and subtle confident smile. Not posed, casual and real. {realism_guardrails}"""
 
     print(f"[SaaSShorts]   Prompt: {prompt[:120]}...{' (with product)' if product_description else ''}")
 
