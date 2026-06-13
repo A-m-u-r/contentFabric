@@ -1677,10 +1677,15 @@ def composite_video(
 
     if not broll_clips:
         # Simple: talking head + subtitles only
+        norm = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
+            "fps=30,setsar=1"
+        )
         cmd = [
             "ffmpeg", "-y",
             "-i", talking_head_path,
-            "-vf", sub_filter,
+            "-vf", f"{norm},{sub_filter}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
             "-c:a", "aac", "-b:a", "128k",
             output_path,
@@ -1732,8 +1737,13 @@ def composite_video(
     filter_parts = []
     concat_parts = []
 
-    # Normalize all segments to same resolution and fps for concat
-    norm = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1"
+    # Normalize all segments to vertical cover. This avoids the old landscape
+    # letterbox look where the avatar was tiny inside a 9:16 black frame.
+    norm = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
+        "fps=30,setsar=1"
+    )
 
     for j, seg in enumerate(segments):
         if seg["type"] == "th":
