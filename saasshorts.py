@@ -18,6 +18,7 @@ import json
 import time
 import subprocess
 import httpx
+import textwrap
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1517,6 +1518,127 @@ def generate_broll(
 # Phase 4: Compositing (FFmpeg)
 # ═══════════════════════════════════════════════════════════════════════
 
+def _write_text_asset(path: str, text: str) -> str:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def _ffmpeg_filter_path(path: str) -> str:
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def _wrapped_text(text: str, width: int = 24, max_lines: int = 4) -> str:
+    text = " ".join(str(text or "").replace("\n", " ").split())
+    lines = textwrap.wrap(text, width=width, max_lines=max_lines, placeholder="...")
+    return "\n".join(lines)
+
+
+def generate_product_broll(
+    segment: dict,
+    script: dict,
+    output_path: str,
+    duration: str = "5",
+) -> str:
+    """
+    Generate clean product-style b-roll locally with FFmpeg.
+    This avoids synthetic stock-looking AI scenes and does not spend fal credits.
+    """
+    print("[SaaSShorts] Generating product mockup b-roll...")
+
+    dur_secs = int(duration)
+    base = output_path.replace(".mp4", "")
+    product_name = (
+        script.get("_product_name")
+        or script.get("product_name")
+        or script.get("title")
+        or "Product"
+    )
+    segment_type = segment.get("type", "demo")
+    language = script.get("language", "en")
+
+    if segment_type == "problem":
+        eyebrow = "ПРОБЛЕМА" if language == "ru" else "PROBLEM"
+        bullets = ["триггер", "тяга", "автопилот"] if language == "ru" else ["trigger", "craving", "autopilot"]
+    else:
+        eyebrow = "ПЛАН" if language == "ru" else "PLAN"
+        bullets = ["чеклист", "трекер", "7 дней"] if language == "ru" else ["checklist", "tracker", "7 days"]
+
+    source_text = segment.get("subtitle_text") or segment.get("narration") or product_name
+    title_text = _wrapped_text(product_name, width=22, max_lines=2)
+    body_text = _wrapped_text(source_text, width=24, max_lines=3)
+
+    eyebrow_path = _write_text_asset(f"{base}_eyebrow.txt", eyebrow)
+    title_path = _write_text_asset(f"{base}_title.txt", title_text)
+    body_path = _write_text_asset(f"{base}_body.txt", body_text)
+    bullet_paths = [
+        _write_text_asset(f"{base}_bullet_{i}.txt", f"✓ {bullet}")
+        for i, bullet in enumerate(bullets)
+    ]
+
+    font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    fade_out_start = max(dur_secs - 0.25, 0)
+
+    vf_parts = [
+        "drawbox=x=0:y=0:w=1080:h=1920:color=0x101014@1:t=fill",
+        "drawbox=x=86:y=230:w=908:h=1340:color=0x1b1b22@1:t=fill",
+        "drawbox=x=116:y=260:w=848:h=1280:color=0xffffff@0.035:t=fill",
+        "drawbox=x=150:y=330:w=780:h=1060:color=0x0d1117@1:t=fill",
+        "drawbox=x=190:y=390:w=700:h=90:color=0x8b5cf6@0.18:t=fill",
+        (
+            f"drawtext=fontfile={font_bold}:textfile='{_ffmpeg_filter_path(eyebrow_path)}':"
+            "fontcolor=0xC4B5FD:fontsize=34:x=190:y=292"
+        ),
+        (
+            f"drawtext=fontfile={font_bold}:textfile='{_ffmpeg_filter_path(title_path)}':"
+            "fontcolor=white:fontsize=56:line_spacing=12:x=190:y=515"
+        ),
+        (
+            f"drawtext=fontfile={font_regular}:textfile='{_ffmpeg_filter_path(body_path)}':"
+            "fontcolor=0xD4D4D8:fontsize=38:line_spacing=12:x=190:y=710"
+        ),
+    ]
+
+    for i, path in enumerate(bullet_paths):
+        y = 980 + i * 115
+        vf_parts.extend([
+            f"drawbox=x=190:y={y}:w=700:h=78:color=0xffffff@0.08:t=fill",
+            (
+                f"drawtext=fontfile={font_bold}:textfile='{_ffmpeg_filter_path(path)}':"
+                f"fontcolor=white:fontsize=34:x=225:y={y + 18}"
+            ),
+        ])
+
+    vf_parts.extend([
+        "drawbox=x=220:y=1325:w=640:h=6:color=0x8b5cf6@0.65:t=fill",
+        f"fade=t=in:st=0:d=0.2,fade=t=out:st={fade_out_start:.2f}:d=0.25",
+        "setsar=1",
+    ])
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=0x101014:s=1080x1920:r=30:d={dur_secs}",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-vf", ",".join(vf_parts),
+        "-t", str(dur_secs),
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    for path in [eyebrow_path, title_path, body_path, *bullet_paths]:
+        if os.path.exists(path):
+            os.remove(path)
+
+    print(f"[SaaSShorts] Product mockup b-roll: {output_path}")
+    return output_path
+
+
 def _get_media_duration(path: str) -> float:
     """Get duration of a media file using ffprobe."""
     cmd = [
@@ -1953,17 +2075,24 @@ def generate_full_video(
         log("[3/6] ✅ Talking head cached, skipping.")
 
     # ── Step 4: Generate b-roll clips ──
-    broll_segments = [
-        seg for seg in script.get("segments", [])
-        if seg.get("broll_prompt") and seg.get("visual") == "broll"
-    ]
+    broll_mode = (config.get("broll_mode") or "mockup").lower()
+    if broll_mode not in ("off", "mockup", "ai"):
+        broll_mode = "mockup"
+
+    broll_segments = []
+    if broll_mode != "off":
+        broll_segments = [
+            seg for seg in script.get("segments", [])
+            if seg.get("broll_prompt") and seg.get("visual") == "broll"
+        ]
 
     broll_clips = []
     if broll_segments:
         # Check which b-roll clips need generating
         broll_to_generate = []
+        broll_suffix = "mockup" if broll_mode == "mockup" else "ai"
         for i, seg in enumerate(broll_segments):
-            broll_path = os.path.join(output_dir, f"{title_slug}_broll_{i}.mp4")
+            broll_path = os.path.join(output_dir, f"{title_slug}_broll_{broll_suffix}_{i}.mp4")
             if _exists(broll_path):
                 broll_clips.append({
                     "path": broll_path,
@@ -1975,13 +2104,19 @@ def generate_full_video(
                 broll_to_generate.append((i, seg, broll_path))
 
         if broll_to_generate:
-            log(f"[4/6] Generating {len(broll_to_generate)} b-roll clips...")
+            mode_label = "product mockup" if broll_mode == "mockup" else "AI image"
+            log(f"[4/6] Generating {len(broll_to_generate)} {mode_label} b-roll clips...")
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {}
                 for i, seg, broll_path in broll_to_generate:
-                    future = executor.submit(
-                        generate_broll, seg["broll_prompt"], fal_key, broll_path
-                    )
+                    if broll_mode == "mockup":
+                        future = executor.submit(
+                            generate_product_broll, seg, {**script, "language": language}, broll_path
+                        )
+                    else:
+                        future = executor.submit(
+                            generate_broll, seg["broll_prompt"], fal_key, broll_path
+                        )
                     futures[future] = {"seg": seg, "path": broll_path}
 
                 for future in as_completed(futures):
@@ -1998,6 +2133,8 @@ def generate_full_video(
                         log(f"  ⚠️ B-roll failed (skipping): {e}")
         else:
             log("[4/6] ✅ All b-roll cached, skipping.")
+    elif broll_mode == "off":
+        log("[4/6] B-roll disabled, using talking head only.")
     else:
         log("[4/6] No b-roll segments in script, skipping.")
 
@@ -2023,7 +2160,6 @@ def generate_full_video(
             tts_cost_key: tts_cost,
             "hailuo_img2video": 0.19,
             "veed_lipsync": 0.20,
-            "broll_flux": round(len(broll_clips) * 0.05, 2),
             "ffmpeg_compositing": 0.00,
         }
     else:
@@ -2031,9 +2167,14 @@ def generate_full_video(
             "actor_image_flux": 0.05,
             tts_cost_key: tts_cost,
             "talking_head_kling": round(audio_duration * 0.056, 2),
-            "broll_kling": round(len(broll_clips) * 5 * 0.07, 2),
             "ffmpeg_compositing": 0.00,
         }
+    if broll_mode == "ai":
+        cost["broll_flux"] = round(len(broll_clips) * 0.05, 2)
+    elif broll_mode == "mockup":
+        cost["broll_mockups"] = 0.00
+    else:
+        cost["broll_disabled"] = 0.00
     cost["total"] = round(sum(cost.values()), 2)
 
     return {
@@ -2044,4 +2185,5 @@ def generate_full_video(
         "duration": audio_duration,
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
+        "broll_mode": broll_mode,
     }

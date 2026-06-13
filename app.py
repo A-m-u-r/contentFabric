@@ -2244,6 +2244,7 @@ class SaaSGenerateRequest(BaseModel):
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
     retry_job_id: Optional[str] = None
     video_mode: str = "lowcost"  # "lowcost" or "premium"
+    broll_mode: str = "mockup"  # "off", "mockup", or "ai"
 
 
 @app.post("/api/saasshorts/generate")
@@ -2328,6 +2329,7 @@ async def saasshorts_generate(
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
+        "broll_mode": req.broll_mode or "mockup",
     }
 
     async def run_generation():
@@ -2354,6 +2356,7 @@ async def saasshorts_generate(
                     "duration": result.get("duration", 0),
                     "cost_estimate": result.get("cost_estimate", {}),
                     "tts_provider": result.get("tts_provider", req.tts_provider),
+                    "broll_mode": result.get("broll_mode", req.broll_mode),
                     "script": req.script,
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
@@ -2372,6 +2375,7 @@ async def saasshorts_generate(
                         "duration": result.get("duration", 0),
                         "video_mode": req.video_mode,
                         "tts_provider": result.get("tts_provider", req.tts_provider),
+                        "broll_mode": result.get("broll_mode", req.broll_mode),
                         "product_name": req.script.get("_product_name", ""),
                         "product_url": req.script.get("_product_url", ""),
                         "segments": req.script.get("segments", []),

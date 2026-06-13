@@ -16,6 +16,12 @@ const TTS_PROVIDER_OPTIONS = [
   { id: 'fal_minimax', label: 'fal MiniMax', desc: 'Russian TTS via fal.ai balance' },
 ];
 
+const BROLL_MODE_OPTIONS = [
+  { id: 'mockup', label: 'Product mockups', desc: 'Clean local inserts, no AI stock scenes' },
+  { id: 'off', label: 'Off', desc: 'Talking head only, fewer distractions' },
+  { id: 'ai', label: 'AI b-roll', desc: 'Flux image inserts, can look synthetic' },
+];
+
 const MINIMAX_VOICE_OPTIONS = {
   ru: [
     { id: 'Russian_AmbitiousWoman', name: 'Ambitious Woman', desc: 'confident female' },
@@ -173,6 +179,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
   const [ttsProvider, setTtsProvider] = useState('auto');
+  const [brollMode, setBrollMode] = useState('mockup');
   const [selectedVoice, setSelectedVoice] = useState('21m00Tcm4TlvDq8ikWAM');
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
@@ -426,6 +433,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
           video_mode: videoMode,
+          broll_mode: brollMode,
         }),
       });
 
@@ -478,6 +486,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           actor_description: actorDescription || undefined,
           retry_job_id: jobId,
           video_mode: videoMode,
+          broll_mode: brollMode,
         }),
       });
 
@@ -1269,6 +1278,32 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 </p>
               </div>
               )}
+
+              {/* B-roll Mode */}
+              <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                  <Film size={14} /> B-roll
+                </label>
+                <div className="grid sm:grid-cols-3 gap-2">
+                  {BROLL_MODE_OPTIONS.map((option) => (
+                    <button
+                      key={option.id}
+                      onClick={() => setBrollMode(option.id)}
+                      className={`p-3 rounded-lg border text-left transition-all ${
+                        brollMode === option.id
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="text-sm font-semibold">{option.label}</div>
+                      <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-zinc-600 mt-2">
+                  Product mockups are the default for this offer because dramatic AI lifestyle scenes often reduce trust.
+                </p>
+              </div>
 
               {/* Actor Selection: Gallery + Generate New */}
               <div>
