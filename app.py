@@ -2612,6 +2612,8 @@ async def saasshorts_generate(
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
+    resolved_language = req.language or req.script.get("language") or "en"
+
     config = {
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
@@ -2619,7 +2621,7 @@ async def saasshorts_generate(
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
         "actor_gender": req.actor_gender or "female",
-        "language": req.language or req.script.get("language", "en"),
+        "language": resolved_language,
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
@@ -2658,6 +2660,7 @@ async def saasshorts_generate(
                     "head_source": result.get("head_source", "generated"),
                     "head_template_id": result.get("head_template_id"),
                     "lipsync_model": result.get("lipsync_model"),
+                    "language": resolved_language,
                     "script": req.script,
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
@@ -2672,7 +2675,7 @@ async def saasshorts_generate(
                         "full_narration": req.script.get("full_narration", ""),
                         "actor_description": req.script.get("actor_description", ""),
                         "style": req.script.get("style", "ugc"),
-                        "language": req.script.get("language", "en"),
+                        "language": resolved_language,
                         "duration": result.get("duration", 0),
                         "video_mode": req.video_mode,
                         "tts_provider": result.get("tts_provider", req.tts_provider),
