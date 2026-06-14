@@ -262,7 +262,7 @@ function App() {
 
   useEffect(() => {
     if (uploadPostKey && userProfiles.length === 0) {
-      fetchUserProfiles();
+      fetchUserProfiles({ silent: true });
     }
   }, [uploadPostKey]);
 
@@ -300,7 +300,7 @@ function App() {
   }, [status, jobId]);
 
 
-  const fetchUserProfiles = async () => {
+  const fetchUserProfiles = async ({ silent = false } = {}) => {
     if (!uploadPostKey) return;
     try {
       const res = await fetch(getApiUrl('/api/social/user'), {
@@ -315,16 +315,16 @@ function App() {
           setUploadUserId(data.profiles[0].username);
         }
       } else {
-        alert("No profiles found for this API Key.");
+        if (!silent) alert("No profiles found for this API Key.");
       }
     } catch (e) {
-      alert("Error fetching User Profiles. Please check key.");
+      if (!silent) alert("Error fetching User Profiles. Please check key.");
       console.error(e);
     }
   };
 
   const handleProcess = async (data) => {
-    if (!apiKey || !uploadPostKey) {
+    if (!apiKey) {
       setShowKeyModal(true);
       return;
     }
@@ -375,7 +375,7 @@ function App() {
   // --- UI Components ---
 
   const Sidebar = () => (
-    <div className="w-20 lg:w-64 bg-surface border-r border-white/5 flex flex-col h-full shrink-0 transition-all duration-300">
+    <div className="relative z-20 w-20 lg:w-64 bg-surface border-r border-white/5 flex flex-col h-full shrink-0 transition-all duration-300">
       <div className="p-6 flex items-center gap-3">
         <div className="w-8 h-8 bg-white/5 rounded-lg flex items-center justify-center shrink-0 overflow-hidden border border-white/5">
           <img src="/logo-openshorts.png" alt="Logo" className="w-full h-full object-cover" />
@@ -477,7 +477,7 @@ function App() {
     <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
       <Sidebar />
 
-      <main className="flex-1 flex flex-col h-full overflow-hidden relative">
+      <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden relative">
         {/* Background Gradients */}
         <div className="absolute inset-0 overflow-hidden -z-10 pointer-events-none">
           <div className="absolute -top-[10%] -right-[10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
@@ -506,36 +506,28 @@ function App() {
               />
             )}
 
-            {(!apiKey || !uploadPostKey) && (
+            {!apiKey && (
               <button
                 onClick={() => setActiveTab('settings')}
                 className="text-xs text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-1 rounded-full border border-amber-500/30 transition-colors flex items-center gap-1.5"
-                title="Click to configure your API keys"
+                title="Click to configure your API key"
               >
                 <AlertTriangle size={12} />
-                {!apiKey && !uploadPostKey
-                  ? 'Gemini & Upload-Post keys missing'
-                  : !apiKey
-                    ? 'Gemini API Key Missing'
-                    : 'Upload-Post API Key Missing'}
+                Gemini API Key Missing
               </button>
             )}
           </div>
         </header>
 
-        {/* Persistent Missing Keys Banner — visible on every screen */}
-        {(!apiKey || !uploadPostKey) && activeTab !== 'settings' && (
+        {/* Persistent Missing Key Banner — visible on every screen */}
+        {!apiKey && activeTab !== 'settings' && (
           <div className="mx-6 mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-4 shrink-0 animate-[fadeIn_0.3s_ease-out]">
             <div className="flex items-center gap-3 text-sm text-amber-200">
               <KeyRound size={16} className="shrink-0 text-amber-400" />
               <div>
-                <span className="font-semibold">Required API keys missing.</span>{' '}
+                <span className="font-semibold">Required API key missing.</span>{' '}
                 <span className="text-amber-200/80">
-                  {!apiKey && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !apiKey
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                  Set your Gemini API key to use OpenShorts.
                 </span>
               </div>
             </div>
@@ -576,13 +568,13 @@ function App() {
               </div>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
 
-              <div className={`glass-panel p-6 mt-8 ${!uploadPostKey ? 'border-amber-500/30 ring-1 ring-amber-500/20' : ''}`}>
+              <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-semibold">Social Integration</h2>
-                  <span className="text-[10px] bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded text-amber-400 uppercase tracking-wider">Required</span>
+                  <span className="text-[10px] bg-white/5 border border-white/10 px-2 py-0.5 rounded text-zinc-400 uppercase tracking-wider">Optional</span>
                 </div>
                 <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
+                  Needed only if you want one-click publishing to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
                   Includes a <strong>free tier</strong> (no credit card required).
                 </p>
                 <div className="space-y-4">
@@ -595,7 +587,7 @@ function App() {
                       className="input-field"
                       placeholder="ey..."
                     />
-                    <button onClick={fetchUserProfiles} className="btn-primary py-2 px-4 text-sm">
+                    <button onClick={() => fetchUserProfiles()} className="btn-primary py-2 px-4 text-sm">
                       Connect
                     </button>
                   </div>
@@ -850,7 +842,9 @@ function App() {
 
           {/* View: UGC Gallery */}
           {activeTab === 'ugc-gallery' && (
-            <UGCGallery />
+            <div className="h-full overflow-y-auto custom-scrollbar p-6 md:p-8">
+              <UGCGallery falKey={falKey} />
+            </div>
           )}
 
           {/* View: Thumbnails */}
@@ -1013,15 +1007,9 @@ function App() {
       {showKeyModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowKeyModal(false)}>
           <div className="bg-[#18181b] border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-bold text-white">
-              {!apiKey && !uploadPostKey
-                ? 'Required API Keys Missing'
-                : !apiKey
-                  ? 'Gemini API Key Required'
-                  : 'Upload-Post API Key Required'}
-            </h2>
+            <h2 className="text-lg font-bold text-white">Gemini API Key Required</h2>
             <p className="text-sm text-zinc-400">
-              OpenShorts needs both a <strong className="text-zinc-200">Gemini</strong> API key and an <strong className="text-zinc-200">Upload-Post</strong> API key. Both have free tiers.
+              OpenShorts needs a <strong className="text-zinc-200">Gemini</strong> API key for analysis and script generation. Upload-Post is optional and only needed for publishing.
             </p>
 
             {/* Gemini block */}
@@ -1053,15 +1041,15 @@ function App() {
             </div>
 
             {/* Upload-Post block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!uploadPostKey ? 'bg-violet-500/5 border-violet-500/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
+            <div className={`rounded-lg p-4 space-y-2 border ${!uploadPostKey ? 'bg-white/5 border-white/10' : 'bg-white/5 border-white/10 opacity-70'}`}>
               <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {uploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
+                {uploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-zinc-500" />}
                 Upload-Post API Key {uploadPostKey && <span className="text-green-400">— set</span>}
               </p>
               {!uploadPostKey && (
                 <>
                   <p className="text-xs text-zinc-400">
-                    Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
+                    Optional. Add it only if you want to publish directly to TikTok, Instagram Reels, and YouTube Shorts.
                   </p>
                   <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
                     <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-violet-400 underline">app.upload-post.com</a></li>

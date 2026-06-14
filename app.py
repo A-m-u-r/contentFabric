@@ -8,6 +8,7 @@ import glob
 import time
 import asyncio
 import datetime
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from contextlib import asynccontextmanager
@@ -200,6 +201,24 @@ def _local_video_url(job_dir_name: str, file_path: str) -> str:
     return f"/videos/{job_dir_name}/{os.path.basename(file_path)}"
 
 
+def _job_id_from_saas_video_url(video_url: str) -> Optional[str]:
+    if not video_url:
+        return None
+    parsed = urlparse(video_url)
+    if parsed.scheme or parsed.netloc:
+        return None
+
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 3 or parts[0] != "videos":
+        return None
+
+    job_dir = parts[1]
+    if not job_dir.startswith("saas_"):
+        return None
+    job_id = job_dir.replace("saas_", "", 1)
+    return job_id or None
+
+
 def _read_local_gallery_meta(job_dir: str) -> Optional[dict]:
     meta_path = os.path.join(job_dir, "gallery_metadata.json")
     if not os.path.exists(meta_path):
@@ -246,7 +265,7 @@ def _infer_local_gallery_meta(job_dir: str) -> Optional[dict]:
         "style": script.get("style", "ugc"),
         "language": script.get("language", "ru"),
         "duration": job_result.get("duration", 0) if isinstance(job_result, dict) else 0,
-        "video_mode": "lowcost" if "hailuo" in " ".join(os.listdir(job_dir)).lower() else "premium",
+        "video_mode": "lowcost" if "hailuo" in " ".join(os.listdir(job_dir)).lower() else "standard",
         "product_name": script.get("_product_name", ""),
         "product_url": script.get("_product_url", ""),
         "segments": script.get("segments", []),
@@ -1775,6 +1794,7 @@ from saasshorts import (
     build_custom_script,
     GeminiTemporaryError,
     generate_full_video,
+    apply_lipsync_to_saas_job,
     generate_actor_images,
     get_elevenlabs_voices,
     DEFAULT_VOICES,
@@ -1899,9 +1919,81 @@ class SaaSActorRequest(BaseModel):
     product_description: Optional[str] = None
 
 
+ACTOR_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _output_file_url(file_path: str) -> str:
+    rel_path = os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/")
+    return f"/videos/{rel_path}"
+
+
+def _write_local_actor_metadata(file_path: str, url: str, description: str = "", storage: str = "local") -> None:
+    meta_path = os.path.splitext(file_path)[0] + ".json"
+    meta = {
+        "url": url,
+        "key": os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"),
+        "description": description,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "storage": storage,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _read_local_actor_metadata(file_path: str) -> dict:
+    meta_path = os.path.splitext(file_path)[0] + ".json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "url": _output_file_url(file_path),
+        "key": os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"),
+        "description": "",
+        "created_at": datetime.datetime.utcfromtimestamp(os.path.getmtime(file_path)).isoformat() + "Z",
+        "storage": "local",
+    }
+
+
+def list_local_actor_gallery() -> List[dict]:
+    """List actor images saved on local disk, used when S3 is not configured."""
+    image_paths = []
+    actor_dirs = [os.path.join(OUTPUT_DIR, "actor_uploads")]
+    actor_dirs.extend(glob.glob(os.path.join(OUTPUT_DIR, "saas_actors_*")))
+
+    for actor_dir in actor_dirs:
+        if not os.path.isdir(actor_dir):
+            continue
+        for ext in ACTOR_IMAGE_EXTENSIONS:
+            image_paths.extend(glob.glob(os.path.join(actor_dir, f"*{ext}")))
+            image_paths.extend(glob.glob(os.path.join(actor_dir, f"*{ext.upper()}")))
+
+    images = []
+    seen_paths = set()
+    for file_path in image_paths:
+        abs_path = os.path.abspath(file_path)
+        if abs_path in seen_paths:
+            continue
+        seen_paths.add(abs_path)
+        if os.path.getsize(file_path) < 1000:
+            continue
+        entry = _read_local_actor_metadata(file_path)
+        entry.setdefault("url", _output_file_url(file_path))
+        entry.setdefault("key", os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"))
+        entry.setdefault("description", "")
+        entry.setdefault("storage", "local")
+        images.append(entry)
+
+    images.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return images
+
+
 @app.post("/api/saasshorts/actor-upload")
 async def saasshorts_actor_upload(file: UploadFile = File(...)):
-    """Upload a custom actor image (stored locally only, not S3)."""
+    """Upload a custom actor image and save it to the reusable actor gallery when possible."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -1921,7 +2013,18 @@ async def saasshorts_actor_upload(file: UploadFile = File(...)):
         with open(file_path, "wb") as f:
             f.write(content)
 
-        return {"url": f"/videos/actor_uploads/{filename}"}
+        local_url = f"/videos/actor_uploads/{filename}"
+        saved_url = upload_actor_to_s3(file_path, description="Uploaded actor")
+        final_url = saved_url or local_url
+        storage = "s3" if saved_url else "local"
+        _write_local_actor_metadata(file_path, final_url, description="Uploaded actor", storage=storage)
+
+        return {
+            "url": final_url,
+            "local_url": local_url,
+            "saved": True,
+            "storage": storage,
+        }
 
     except HTTPException:
         raise
@@ -1966,7 +2069,9 @@ async def saasshorts_actor_options(
                 urls.append(s3_url)
             else:
                 # Fallback to local URL if S3 fails
-                urls.append(f"/videos/saas_actors_{job_id}/{os.path.basename(p)}")
+                local_url = f"/videos/saas_actors_{job_id}/{os.path.basename(p)}"
+                _write_local_actor_metadata(p, local_url, description=desc, storage="local")
+                urls.append(local_url)
 
         return {"images": urls}
 
@@ -2088,7 +2193,12 @@ async def gallery_html_page():
         product = html_mod.escape(v.get("product_name", ""))
         caption = html_mod.escape(v.get("caption", "")[:120])
 
-        mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>' if mode == "lowcost" else '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
+        if mode == "lowcost":
+            mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>'
+        elif mode == "premium":
+            mode_badge = '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
+        else:
+            mode_badge = '<span style="background:#3b82f6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">STANDARD</span>'
 
         cards_html += f'''
         <a href="/video/{video_id}" style="text-decoration:none;color:inherit">
@@ -2115,11 +2225,11 @@ async def gallery_html_page():
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI UGC Video Gallery | OpenShorts</title>
-<meta name="description" content="Browse {len(videos)} AI-generated UGC marketing videos. Create viral TikTok and Instagram Reels for your SaaS product.">
+<meta name="description" content="Browse {len(videos)} AI-generated UGC marketing videos. Create viral TikTok and Instagram Reels for your product or business.">
 <meta name="robots" content="index, follow">
 <meta property="og:title" content="AI UGC Video Gallery | OpenShorts">
 <meta property="og:type" content="website">
-<meta property="og:description" content="Browse AI-generated UGC marketing videos for SaaS products.">
+<meta property="og:description" content="Browse AI-generated UGC marketing videos for products and businesses.">
 <script type="application/ld+json">{ld_json}</script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -2134,7 +2244,7 @@ h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
 <body>
 <nav><strong style="font-size:18px">OpenShorts</strong><a href="/" class="cta">Create Your Video</a></nav>
 <h1>AI-Generated UGC Videos</h1>
-<p class="subtitle">{len(videos)} videos generated · Low Cost & Premium modes</p>
+<p class="subtitle">{len(videos)} videos generated · Low Cost, Standard & Premium modes</p>
 <div class="grid">{cards_html}</div>
 <div style="text-align:center;padding:40px"><a href="/" class="cta">Create Your Own UGC Video</a></div>
 </body></html>'''
@@ -2167,7 +2277,7 @@ async def video_html_page(video_id: str):
 
     ld_json = f'{{"@context":"https://schema.org","@type":"VideoObject","name":"{title}","description":"{caption}","thumbnailUrl":"{actor_url}","contentUrl":"{video_url}","uploadDate":"{created}","duration":"PT{int(duration)}S","width":1080,"height":1920,"inLanguage":"{language}"}}'
 
-    mode_label = "Low Cost" if mode == "lowcost" else "Premium"
+    mode_label = "Low Cost" if mode == "lowcost" else ("Premium" if mode == "premium" else "Standard")
 
     return f'''<!DOCTYPE html>
 <html lang="{language}">
@@ -2224,10 +2334,21 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 
 @app.get("/api/saasshorts/actor-gallery")
 async def saasshorts_actor_gallery():
-    """List all previously generated actor images from public S3."""
+    """List reusable actor images from S3 and local fallback storage."""
     try:
         loop = asyncio.get_running_loop()
-        images = await loop.run_in_executor(None, list_actor_gallery)
+        remote_images = await loop.run_in_executor(None, list_actor_gallery)
+        local_images = await loop.run_in_executor(None, list_local_actor_gallery)
+
+        by_url = {}
+        for entry in (local_images or []) + (remote_images or []):
+            url = entry.get("url")
+            if not url:
+                continue
+            by_url[url] = entry
+
+        images = list(by_url.values())
+        images.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return {"images": images}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2243,8 +2364,15 @@ class SaaSGenerateRequest(BaseModel):
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
     retry_job_id: Optional[str] = None
-    video_mode: str = "lowcost"  # "lowcost" or "premium"
+    video_mode: str = "standard"  # "lowcost", "standard", or "premium"
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
+
+
+class SaaSLipSyncRequest(BaseModel):
+    job_id: Optional[str] = None
+    video_url: Optional[str] = None
+    model: str = "sync-3"  # "sync-3", "lipsync-2-pro", or "lipsync-2"
+    sync_mode: str = "cut_off"
 
 
 @app.post("/api/saasshorts/generate")
@@ -2253,7 +2381,7 @@ async def saasshorts_generate(
     x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
     x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
 ):
-    """Generate a SaaS UGC video from a script. Returns a job_id for polling."""
+    """Generate a UGC video from a script. Returns a job_id for polling."""
     fal_key = x_fal_key
     elevenlabs_key = x_elevenlabs_key
 
@@ -2292,7 +2420,7 @@ async def saasshorts_generate(
         os.makedirs(job_output_dir, exist_ok=True)
         saas_jobs[job_id] = {
             "status": "processing",
-            "logs": ["SaaSShorts job started."],
+            "logs": ["AI Shorts job started."],
             "result": None,
             "output_dir": job_output_dir,
         }
@@ -2338,7 +2466,7 @@ async def saasshorts_generate(
             loop = asyncio.get_running_loop()
 
             def log_msg(msg):
-                print(f"[SaaSShorts Job {job_id[:8]}] {msg}")
+                print(f"[AI Shorts Job {job_id[:8]}] {msg}")
                 if job_id in saas_jobs:
                     saas_jobs[job_id]["logs"].append(msg)
 
@@ -2401,7 +2529,7 @@ async def saasshorts_generate(
                     log_msg(f"⚠️ Gallery upload skipped: {gallery_err}")
 
         except Exception as e:
-            print(f"[SaaSShorts] ❌ Job {job_id} failed: {e}")
+            print(f"[AI Shorts] ❌ Job {job_id} failed: {e}")
             if job_id in saas_jobs:
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
@@ -2413,11 +2541,139 @@ async def saasshorts_generate(
     return {"job_id": job_id, "status": "processing"}
 
 
+@app.post("/api/saasshorts/lipsync")
+async def saasshorts_lipsync(
+    req: SaaSLipSyncRequest,
+    x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
+):
+    """Run standalone lip-sync on an existing AI Shorts job and update its final video."""
+    fal_key = x_fal_key
+    if not fal_key:
+        raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
+
+    job_id = req.job_id or _job_id_from_saas_video_url(req.video_url or "")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Provide job_id or a local gallery video_url")
+
+    existing_job = saas_jobs.get(job_id)
+    if existing_job and existing_job.get("status") == "processing":
+        raise HTTPException(status_code=409, detail="This AI Shorts job is already processing")
+
+    job_output_dir = (
+        existing_job.get("output_dir")
+        if existing_job
+        else os.path.join(OUTPUT_DIR, f"saas_{job_id}")
+    )
+    if not job_output_dir or not os.path.isdir(job_output_dir):
+        raise HTTPException(status_code=404, detail="AI Shorts job output not found")
+
+    previous_result = dict(existing_job.get("result") or {}) if existing_job else {}
+    previous_meta = _read_local_gallery_meta(job_output_dir) or {}
+    previous_cost = previous_result.get("cost_estimate") or previous_meta.get("cost_estimate") or {}
+
+    saas_jobs[job_id] = {
+        "status": "processing",
+        "logs": [f"Lip-sync post-process started ({req.model}, {req.sync_mode})."],
+        "result": previous_result or None,
+        "output_dir": job_output_dir,
+    }
+
+    async def run_lipsync():
+        await concurrency_semaphore.acquire()
+        try:
+            loop = asyncio.get_running_loop()
+
+            def log_msg(msg):
+                print(f"[AI Shorts LipSync {job_id[:8]}] {msg}")
+                if job_id in saas_jobs:
+                    saas_jobs[job_id]["logs"].append(msg)
+
+            def run():
+                return apply_lipsync_to_saas_job(
+                    job_output_dir,
+                    fal_key,
+                    model=req.model,
+                    sync_mode=req.sync_mode,
+                    log=log_msg,
+                )
+
+            result = await loop.run_in_executor(None, run)
+
+            cost = dict(previous_cost) if isinstance(previous_cost, dict) else {}
+            lip_cost = result.get("lipsync_cost_estimate")
+            if lip_cost is not None:
+                cost_key = f"lipsync_{req.model.replace('-', '_')}"
+                cost[cost_key] = lip_cost
+                cost["total"] = round(
+                    sum(v for k, v in cost.items() if k != "total" and isinstance(v, (int, float))),
+                    2,
+                )
+
+            meta = dict(previous_meta)
+            script = previous_result.get("script") or {
+                "title": meta.get("title", ""),
+                "caption": meta.get("caption", ""),
+                "hashtags": meta.get("hashtags", []),
+                "full_narration": meta.get("full_narration", ""),
+            }
+
+            video_filename = result["video_filename"]
+            cache_bust = int(time.time())
+            completed_result = {
+                **previous_result,
+                "video_url": f"/videos/saas_{job_id}/{video_filename}?v={cache_bust}",
+                "video_filename": video_filename,
+                "duration": result.get("duration", previous_result.get("duration", 0)),
+                "cost_estimate": cost,
+                "script": script,
+                "lipsync_model": req.model,
+                "lipsync_sync_mode": req.sync_mode,
+            }
+
+            if job_id in saas_jobs:
+                saas_jobs[job_id]["status"] = "completed"
+                saas_jobs[job_id]["result"] = completed_result
+                saas_jobs[job_id]["logs"].append("Lip-sync post-process completed!")
+
+            gallery_meta = {
+                **meta,
+                "title": script.get("title") or meta.get("title", ""),
+                "hook_text": meta.get("hook_text", ""),
+                "caption": script.get("caption") or meta.get("caption", ""),
+                "hashtags": script.get("hashtags") or meta.get("hashtags", []),
+                "full_narration": script.get("full_narration") or meta.get("full_narration", ""),
+                "actor_description": meta.get("actor_description", ""),
+                "style": meta.get("style", "ugc"),
+                "language": meta.get("language", "ru"),
+                "duration": completed_result["duration"],
+                "video_mode": meta.get("video_mode", previous_result.get("video_mode", "")),
+                "tts_provider": meta.get("tts_provider", previous_result.get("tts_provider", "")),
+                "broll_mode": meta.get("broll_mode", previous_result.get("broll_mode", "")),
+                "segments": meta.get("segments", []),
+                "cost_estimate": cost,
+                "lipsync_model": req.model,
+                "lipsync_sync_mode": req.sync_mode,
+            }
+            write_local_saas_gallery_entry(job_id, result, gallery_meta)
+
+        except Exception as e:
+            print(f"[AI Shorts] Lip-sync job {job_id} failed: {e}")
+            if job_id in saas_jobs:
+                saas_jobs[job_id]["status"] = "failed"
+                saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
+        finally:
+            concurrency_semaphore.release()
+
+    asyncio.create_task(run_lipsync())
+
+    return {"job_id": job_id, "status": "processing"}
+
+
 @app.get("/api/saasshorts/status/{job_id}")
 async def saasshorts_status(job_id: str):
-    """Poll SaaSShorts job status."""
+    """Poll AI Shorts job status."""
     if job_id not in saas_jobs:
-        raise HTTPException(status_code=404, detail="SaaSShorts job not found")
+        raise HTTPException(status_code=404, detail="AI Shorts job not found")
 
     job = saas_jobs[job_id]
     return {

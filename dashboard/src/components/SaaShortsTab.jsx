@@ -22,6 +22,40 @@ const BROLL_MODE_OPTIONS = [
   { id: 'ai', label: 'AI b-roll', desc: 'Flux image inserts, can look synthetic' },
 ];
 
+const VIDEO_MODE_OPTIONS = [
+  {
+    id: 'lowcost',
+    label: 'Супер дешёвый',
+    price: 'from ~$0.45',
+    accent: 'green',
+    desc: 'Draft mode: Hailuo + VEED lipsync. Cheap, but can loop or drift.',
+  },
+  {
+    id: 'standard',
+    label: 'Средний',
+    price: 'from ~$0.75',
+    accent: 'blue',
+    desc: 'Kling Avatar v2 Standard. Good baseline for tests and daily volume.',
+  },
+  {
+    id: 'premium',
+    label: 'Премиум',
+    price: 'from ~$1.45',
+    accent: 'violet',
+    desc: 'Kling Avatar v2 Pro. Best choice when the video is going to publish.',
+  },
+];
+
+function videoModeOption(mode) {
+  return VIDEO_MODE_OPTIONS.find((option) => option.id === mode) || VIDEO_MODE_OPTIONS[1];
+}
+
+const LIPSYNC_MODEL_OPTIONS = [
+  { id: 'sync-3', label: 'Sync 3', desc: 'Best quality, final publish', pricePerMinute: 8 },
+  { id: 'lipsync-2-pro', label: 'Lipsync 2 Pro', desc: 'Strong quality, close-up repair', pricePerMinute: 5 },
+  { id: 'lipsync-2', label: 'Lipsync 2', desc: 'Cheaper test pass', pricePerMinute: 3 },
+];
+
 const MINIMAX_VOICE_OPTIONS = {
   ru: [
     { id: 'Russian_AmbitiousWoman', name: 'Ambitious Woman', desc: 'confident female' },
@@ -118,6 +152,96 @@ function voiceFitLabel(voice, language) {
   return score === 0 ? 'English fit' : 'Other accent';
 }
 
+function OptionPicker({ value, onChange, options, disabled = false, placeholder = 'Select...', className = '', renderValue, renderOption }) {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((option) => option.value === value);
+
+  return (
+    <div
+      className={`relative ${className}`}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false);
+      }}
+    >
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((prev) => !prev)}
+        className="input-field w-full min-h-[44px] py-2 pr-10 text-left flex items-center justify-between gap-3 disabled:opacity-50"
+      >
+        <span className="min-w-0 truncate">
+          {selected ? (renderValue ? renderValue(selected) : selected.label) : placeholder}
+        </span>
+        <ChevronDown size={16} className={`shrink-0 text-zinc-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {open && !disabled && (
+        <div className="absolute z-50 mt-2 w-full max-h-72 overflow-y-auto rounded-xl border border-white/10 bg-zinc-950 shadow-2xl custom-scrollbar">
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                onChange(option.value);
+                setOpen(false);
+              }}
+              className={`w-full px-3 py-2.5 text-left transition-colors ${
+                option.value === value
+                  ? 'bg-violet-500/20 text-violet-200'
+                  : 'text-zinc-300 hover:bg-white/10'
+              }`}
+            >
+              {renderOption ? renderOption(option) : (
+                <div className="flex items-center justify-between gap-3">
+                  <span className="truncate text-sm">{option.label}</span>
+                  {option.value === value && <Check size={14} className="text-violet-300 shrink-0" />}
+                </div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function estimateSpeechSeconds(text) {
+  const words = (text || '').trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(12, Math.min(75, Math.round(words / 2.5)));
+}
+
+function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor }) {
+  const seconds = estimateSpeechSeconds(text);
+  const ttsRate = ttsProvider === 'fal_minimax' ? 0.0001 : 0.00003;
+  const voiceCost = (text || '').length * ttsRate;
+  const actorCost = hasSelectedActor ? 0 : 0.05;
+  let videoCost = 0;
+
+  if (videoMode === 'lowcost') {
+    videoCost = 0.19 + 0.20;
+  } else if (videoMode === 'premium') {
+    videoCost = seconds * 0.115;
+  } else {
+    videoCost = seconds * 0.0562;
+  }
+
+  const brollCost = brollMode === 'ai' ? 0.10 : 0;
+  const total = actorCost + voiceCost + videoCost + brollCost;
+  return {
+    seconds,
+    actorCost,
+    voiceCost,
+    videoCost,
+    brollCost,
+    total,
+  };
+}
+
+function formatUsd(value) {
+  return `$${Math.max(value, 0).toFixed(2)}`;
+}
+
 function loadCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
@@ -157,7 +281,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   // Step 0: URL input
   const [url, setUrl] = useState(() => loadCache()?.url || '');
-  const [videoMode, setVideoMode] = useState('premium'); // "lowcost" or "premium"
+  const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
   const [description, setDescription] = useState(() => loadCache()?.description || '');
   const [topic, setTopic] = useState(() => loadCache()?.topic || '');
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
@@ -186,10 +310,12 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [editedNarration, setEditedNarration] = useState('');
   const [actorOptions, setActorOptions] = useState([]);
   const [selectedActor, setSelectedActor] = useState(null);
+  const [actorSource, setActorSource] = useState('saved');
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
+  const [actorUploadStatus, setActorUploadStatus] = useState('');
   const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
   const [productDescription, setProductDescription] = useState('');
 
@@ -199,6 +325,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [genLogs, setGenLogs] = useState([]);
   const [genStatus, setGenStatus] = useState('idle');
   const [genResult, setGenResult] = useState(null);
+  const [lipSyncModel, setLipSyncModel] = useState('sync-3');
+  const [lipSyncing, setLipSyncing] = useState(false);
 
   // Publish
   const [publishing, setPublishing] = useState(false);
@@ -213,8 +341,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   // Pre-fill from cache on mount
   useEffect(() => {
-    if (fromCache && scripts.length > 0 && !actorDescription) {
-      setActorDescription(scripts[0].actor_description || '');
+    if (fromCache && scripts.length > 0) {
       setEditedNarration(scripts[0].full_narration || '');
     }
   }, []);
@@ -273,6 +400,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
             // Job lost (server restart) — treat as failed so Retry appears
             setGenStatus('failed');
             setGenerating(false);
+            setLipSyncing(false);
             setGenLogs((prev) => [...prev, 'Job lost after server restart. Click Retry to resume from cached assets.']);
             clearInterval(interval);
             return;
@@ -284,11 +412,13 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
             setGenStatus('completed');
             setGenResult(data.result);
             setGenerating(false);
+            setLipSyncing(false);
             setStep(4);
             clearInterval(interval);
           } else if (data.status === 'failed') {
             setGenStatus('failed');
             setGenerating(false);
+            setLipSyncing(false);
             clearInterval(interval);
           }
         } catch (e) {
@@ -369,7 +499,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
       // Pre-fill actor description and narration from first script
       if (data.scripts.length > 0) {
-        setActorDescription(data.scripts[0].actor_description || '');
+        setActorDescription('');
         setEditedNarration(data.scripts[0].full_narration || '');
       }
 
@@ -384,7 +514,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const handleSelectScript = (idx) => {
     setSelectedScript(idx);
     if (scripts[idx]) {
-      setActorDescription(scripts[idx].actor_description || '');
+      setActorDescription('');
+      setActorOptions([]);
       setEditedNarration(scripts[idx].full_narration || '');
     }
   };
@@ -505,6 +636,96 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     }
   };
 
+  const handleLipSync = async () => {
+    if (!jobId) {
+      alert('No generated video job to lip-sync.');
+      return;
+    }
+    if (!falKey) {
+      alert('fal.ai API key required. Set it in Settings.');
+      return;
+    }
+
+    const selected = LIPSYNC_MODEL_OPTIONS.find((item) => item.id === lipSyncModel);
+    setLipSyncing(true);
+    setGenerating(true);
+    setGenLogs([`Starting lip-sync post-process (${selected?.label || lipSyncModel})...`]);
+    setGenStatus('processing');
+    setStep(3);
+
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/lipsync'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Fal-Key': falKey,
+        },
+        body: JSON.stringify({
+          job_id: jobId,
+          model: lipSyncModel,
+          sync_mode: 'cut_off',
+        }),
+      });
+
+      if (!res.ok) {
+        let msg = 'Lip-sync failed to start';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+    } catch (e) {
+      setGenStatus('failed');
+      setGenLogs((prev) => [...prev, `Lip-sync error: ${e.message}`]);
+      setGenerating(false);
+      setLipSyncing(false);
+    }
+  };
+
+  const refreshActorGallery = async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/actor-gallery'));
+      if (res.ok) {
+        const data = await res.json();
+        setActorGallery(data.images || []);
+      }
+    } catch (e) {
+      console.error('Actor gallery refresh failed:', e);
+    }
+  };
+
+  const handleActorUpload = async (file) => {
+    if (!file) return;
+    const localPreview = URL.createObjectURL(file);
+    setActorUploadStatus('Uploading and saving...');
+    setUploadedActorPreview({ localPreview, serverUrl: null });
+    setSelectedActor(null);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/actor-upload'), {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = 'Upload failed';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+
+      const data = await res.json();
+      if (data.url) {
+        setUploadedActorPreview({ localPreview, serverUrl: data.url });
+        setSelectedActor(data.url);
+        setActorUploadStatus(data.saved ? 'Saved to avatars and selected.' : 'Selected locally. S3 gallery save unavailable.');
+        if (data.saved) await refreshActorGallery();
+      }
+    } catch (err) {
+      console.error('Upload failed:', err);
+      setActorUploadStatus(err.message || 'Upload failed');
+    }
+  };
+
   const handleCopy = (text, label) => {
     navigator.clipboard.writeText(text);
     setCopied(label);
@@ -526,9 +747,27 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     setGenStatus('idle');
     setGenResult(null);
     setGenerating(false);
+    setLipSyncing(false);
     setActorDescription('');
     setEditedNarration('');
   };
+
+  const estimateInputText = (() => {
+    if (scriptMode === 'custom' && customScript.trim()) return customScript;
+    if (editedNarration.trim()) return editedNarration;
+    if (scripts[selectedScript]?.full_narration) return scripts[selectedScript].full_narration;
+    return [description, topic].filter(Boolean).join(' ');
+  })();
+
+  const estimateForMode = (modeId) => estimateSaasVideoCost({
+    text: estimateInputText,
+    videoMode: modeId,
+    ttsProvider,
+    brollMode,
+    hasSelectedActor: Boolean(selectedActor),
+  });
+
+  const estimateModePriceLabel = (modeId) => `~${formatUsd(estimateForMode(modeId).total)}`;
 
   // ─── Render Steps ─────────────────────────────────────────────────
 
@@ -585,35 +824,41 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               {/* Video Mode Selector */}
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-3">Video Mode</label>
-                <div className="grid grid-cols-2 gap-3">
-                  <button
-                    onClick={() => setVideoMode('lowcost')}
-                    className={`p-4 rounded-xl border text-left transition-all ${
-                      videoMode === 'lowcost'
-                        ? 'border-green-500/50 bg-green-500/10 ring-1 ring-green-500/30'
-                        : 'border-white/10 bg-white/5 hover:bg-white/10'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className={`text-sm font-semibold ${videoMode === 'lowcost' ? 'text-green-300' : 'text-zinc-300'}`}>Low Cost Draft</span>
-                      <span className="text-xs font-mono text-green-400 bg-green-500/10 px-2 py-0.5 rounded-full">~$0.65</span>
-                    </div>
-                    <p className="text-[11px] text-zinc-500 leading-relaxed">Cheap test mode. Uses a short Hailuo clip with VEED lipsync, so longer videos can loop or drift.</p>
-                  </button>
-                  <button
-                    onClick={() => setVideoMode('premium')}
-                    className={`p-4 rounded-xl border text-left transition-all ${
-                      videoMode === 'premium'
-                        ? 'border-violet-500/50 bg-violet-500/10 ring-1 ring-violet-500/30'
-                        : 'border-white/10 bg-white/5 hover:bg-white/10'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className={`text-sm font-semibold ${videoMode === 'premium' ? 'text-violet-300' : 'text-zinc-300'}`}>Premium</span>
-                      <span className="text-xs font-mono text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-full">~$2.50</span>
-                    </div>
-                    <p className="text-[11px] text-zinc-500 leading-relaxed">Recommended for publishing. Kling Avatar v2 generates the full actor video from the voice.</p>
-                  </button>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {VIDEO_MODE_OPTIONS.map((mode) => {
+                    const active = videoMode === mode.id;
+                    const activeClass =
+                      mode.id === 'lowcost' ? 'border-green-500/50 bg-green-500/10 ring-1 ring-green-500/30' :
+                      mode.id === 'standard' ? 'border-blue-500/50 bg-blue-500/10 ring-1 ring-blue-500/30' :
+                      'border-violet-500/50 bg-violet-500/10 ring-1 ring-violet-500/30';
+                    const textClass =
+                      active && mode.id === 'lowcost' ? 'text-green-300' :
+                      active && mode.id === 'standard' ? 'text-blue-300' :
+                      active && mode.id === 'premium' ? 'text-violet-300' :
+                      'text-zinc-300';
+                    const priceClass =
+                      mode.id === 'lowcost' ? 'text-green-400 bg-green-500/10' :
+                      mode.id === 'standard' ? 'text-blue-400 bg-blue-500/10' :
+                      'text-violet-400 bg-violet-500/10';
+
+                    return (
+                      <button
+                        key={mode.id}
+                        onClick={() => setVideoMode(mode.id)}
+                        className={`p-4 rounded-xl border text-left transition-all ${
+                          active ? activeClass : 'border-white/10 bg-white/5 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <span className={`text-sm font-semibold ${textClass}`}>{mode.label}</span>
+                          <span className={`text-xs font-mono px-2 py-0.5 rounded-full whitespace-nowrap ${priceClass}`}>
+                            {estimateModePriceLabel(mode.id)}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-zinc-500 leading-relaxed">{mode.desc}</p>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -621,13 +866,13 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 <label className="block text-sm font-medium text-zinc-300 mb-2">Website URL <span className="text-zinc-600">(optional)</span></label>
                 <div className="flex gap-3">
                   <div className="relative flex-1">
-                    <Globe size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+                    <Globe size={18} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500" />
                     <input
                       type="url"
                       value={url}
                       onChange={(e) => setUrl(e.target.value)}
                       placeholder="https://your-website.com"
-                      className="input-field pl-10"
+                      className="input-field !pl-12"
                       onKeyDown={(e) => e.key === 'Enter' && handleAnalyze()}
                     />
                   </div>
@@ -1104,17 +1349,25 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   <label className="block text-sm font-medium text-zinc-300 mb-2">
                     fal MiniMax fallback voice
                   </label>
-                  <select
+                  <OptionPicker
                     value={minimaxVoice}
-                    onChange={(e) => setMinimaxVoice(e.target.value)}
-                    className="input-field"
-                  >
-                    {(MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en).map((voice) => (
-                      <option key={voice.id} value={voice.id}>
-                        {voice.name} - {voice.desc}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setMinimaxVoice}
+                    options={(MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en).map((voice) => ({
+                      value: voice.id,
+                      label: `${voice.name} - ${voice.desc}`,
+                      name: voice.name,
+                      desc: voice.desc,
+                    }))}
+                    renderOption={(option) => (
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold truncate">{option.name}</div>
+                          <div className="text-[10px] text-zinc-500 truncate">{option.desc}</div>
+                        </div>
+                        {option.value === minimaxVoice && <Check size={14} className="text-violet-300 shrink-0" />}
+                      </div>
+                    )}
+                  />
                   <p className="text-[10px] text-zinc-600 mt-1">
                     Used immediately in fal MiniMax mode, or only if ElevenLabs fails in Auto fallback mode.
                   </p>
@@ -1225,9 +1478,11 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   const key = `${language}-${actorGender}`;
                   const opts = defaults[key] || defaults['en-female'];
                   return (
-                    <select value={selectedVoice} onChange={(e) => setSelectedVoice(e.target.value)} className="input-field">
-                      {opts.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
-                    </select>
+                    <OptionPicker
+                      value={selectedVoice}
+                      onChange={setSelectedVoice}
+                      options={opts.map((o) => ({ value: o.id, label: o.name }))}
+                    />
                   );
                 })()}
                 {(() => {
@@ -1306,6 +1561,129 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </div>
 
               {/* Actor Selection: Gallery + Generate New */}
+              <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                  <User size={14} /> AI Actor
+                </label>
+
+                <div className="grid grid-cols-2 gap-1 bg-white/5 p-1 rounded-xl mb-3">
+                  {[
+                    { id: 'saved', label: 'Saved' },
+                    { id: 'upload', label: 'Upload' },
+                  ].map((source) => (
+                    <button
+                      key={source.id}
+                      type="button"
+                      onClick={() => setActorSource(source.id)}
+                      className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                        actorSource === source.id
+                          ? 'bg-violet-500/25 text-violet-200'
+                          : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/5'
+                      }`}
+                    >
+                      {source.label}
+                    </button>
+                  ))}
+                </div>
+
+                {actorSource === 'saved' && (
+                  <div className="space-y-3">
+                    {loadingGallery ? (
+                      <p className="text-xs text-zinc-500 flex items-center gap-1">
+                        <Loader2 size={12} className="animate-spin" /> Loading saved avatars...
+                      </p>
+                    ) : actorGallery.length > 0 ? (
+                      <div className="grid grid-cols-4 sm:grid-cols-6 gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+                        {actorGallery.map((img, i) => (
+                          <button
+                            key={img.url}
+                            type="button"
+                            onClick={() => setSelectedActor(img.url)}
+                            className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
+                              selectedActor === img.url
+                                ? 'border-violet-500 ring-2 ring-violet-500/30 scale-[1.02]'
+                                : 'border-white/10 hover:border-white/30'
+                            }`}
+                            title={img.description || `Saved avatar ${i + 1}`}
+                          >
+                            <img src={img.url} alt={`Actor ${i + 1}`} className="w-full h-full object-cover" />
+                            {selectedActor === img.url && (
+                              <div className="absolute top-1 right-1 w-5 h-5 bg-violet-500 rounded-full flex items-center justify-center shadow-lg">
+                                <Check size={10} className="text-white" />
+                              </div>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="p-3 rounded-xl border border-dashed border-white/15 bg-white/5 text-xs text-zinc-500">
+                        No saved avatars yet. Create avatars in UGC Gallery / Avatars, or upload a photo here.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {actorSource === 'upload' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-3">
+                      <label className="flex-1 flex items-center justify-center gap-2 text-sm bg-white/5 text-zinc-400 px-4 py-3 rounded-xl border border-dashed border-white/20 hover:bg-white/10 hover:border-white/30 transition-colors cursor-pointer">
+                        <Upload size={14} />
+                        <span>Upload and save avatar</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            await handleActorUpload(file);
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                      {uploadedActorPreview && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (uploadedActorPreview.serverUrl) {
+                              setSelectedActor(uploadedActorPreview.serverUrl);
+                            }
+                          }}
+                          className={`relative w-16 h-20 rounded-lg overflow-hidden border-2 transition-all flex-shrink-0 ${
+                            selectedActor === uploadedActorPreview.serverUrl
+                              ? 'border-violet-500 ring-2 ring-violet-500/30'
+                              : 'border-white/20 hover:border-white/40'
+                          }`}
+                        >
+                          <img src={uploadedActorPreview.localPreview} alt="Uploaded" className="w-full h-full object-cover" />
+                          {selectedActor === uploadedActorPreview.serverUrl && (
+                            <div className="absolute top-1 right-1 w-4 h-4 bg-violet-500 rounded-full flex items-center justify-center">
+                              <Check size={8} className="text-white" />
+                            </div>
+                          )}
+                          {!uploadedActorPreview.serverUrl && (
+                            <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                              <Loader2 size={12} className="animate-spin text-white" />
+                            </div>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                    {actorUploadStatus && (
+                      <p className={`text-[10px] ${actorUploadStatus.toLowerCase().includes('fail') ? 'text-red-300' : 'text-zinc-500'}`}>
+                        {actorUploadStatus}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {!selectedActor && (
+                  <p className="text-xs text-amber-400 mt-3 flex items-center gap-1">
+                    <AlertCircle size={12} /> Select or upload an actor to continue
+                  </p>
+                )}
+              </div>
+
+              {false && (
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
                   <User size={14} /> AI Actor — Choose Your Actor
@@ -1480,6 +1858,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 )}
               </div>
 
+              )}
+
               {/* Narration Edit */}
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
@@ -1491,22 +1871,52 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   rows={5}
                   className="input-field resize-none font-mono text-xs"
                 />
-                <p className="text-[10px] text-zinc-600 mt-1">{editedNarration.length} chars &middot; ~{Math.round(editedNarration.split(' ').length / 2.5)}s speech</p>
+                <p className="text-[10px] text-zinc-600 mt-1">{editedNarration.length} chars &middot; ~{estimateSpeechSeconds(editedNarration)}s speech</p>
               </div>
 
               {/* Cost Estimate */}
-              <div className="p-3 bg-white/5 rounded-lg border border-white/10">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-zinc-400">Estimated cost</span>
-                  <span className="text-green-400 font-semibold">~${videoMode === 'lowcost' ? '0.65' : '2.50'}</span>
-                </div>
-                <div className="text-[10px] text-zinc-600 mt-1">
-                  {videoMode === 'lowcost'
-                    ? 'Flux image ($0.05) + ElevenLabs voice ($0.10) + Hailuo 2.3 img2video ($0.19) + VEED Lipsync ($0.20) + Flux b-roll ($0.10)'
-                    : 'Flux image ($0.05) + ElevenLabs voice ($0.10) + Kling avatar ($1.69) + Kling b-roll ($0.70)'
-                  }
-                </div>
-              </div>
+              {(() => {
+                const estimate = estimateSaasVideoCost({
+                  text: editedNarration,
+                  videoMode,
+                  ttsProvider,
+                  brollMode,
+                  hasSelectedActor: Boolean(selectedActor),
+                });
+                const costDetails =
+                  videoMode === 'lowcost'
+                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешевый черновой режим, качество может плыть.'
+                    : videoMode === 'premium'
+                      ? 'Озвучка + Kling Avatar v2 Pro. Лучший вариант для публикации.'
+                      : 'Озвучка + Kling Avatar v2 Standard. Баланс цены и качества.';
+
+                return (
+                  <div className="max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-300">Примерная стоимость</div>
+                        <div className="text-[11px] text-zinc-600 mt-1">{costDetails}</div>
+                      </div>
+                      <span className="text-lg text-green-400 font-semibold whitespace-nowrap">{formatUsd(estimate.total)}</span>
+                    </div>
+
+                    <div className="mt-4 space-y-2 text-sm">
+                      {[
+                        ['Длительность', `~${estimate.seconds} сек`],
+                        ['Озвучка', formatUsd(estimate.voiceCost)],
+                        ['Видео', formatUsd(estimate.videoCost)],
+                        ['Аватар', formatUsd(estimate.actorCost)],
+                        ['B-roll', formatUsd(estimate.brollCost)],
+                      ].map(([label, value]) => (
+                        <div key={label} className="flex items-center justify-between gap-4 border-t border-white/5 pt-2 first:border-t-0 first:pt-0">
+                          <span className="text-zinc-500">{label}</span>
+                          <span className="font-mono text-zinc-300">{value}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Missing keys warning */}
               {(!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey)) && (
@@ -1532,7 +1942,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 ) : !selectedActor ? (
                   <><User size={14} /> Select an actor first</>
                 ) : (
-                  <><Film size={14} /> Generate Video (~${videoMode === 'lowcost' ? '0.65' : '2.00'})</>
+                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor) }).total)})</>
                 )}
               </button>
             </div>
@@ -1559,39 +1969,80 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
               {/* Progress steps */}
               <div className="space-y-2 mb-4">
-                {[
-                  'Generating actor image + voiceover',
-                  'Creating talking head video (2-5 min)',
-                  'Generating b-roll clips',
-                  'Compositing final video',
-                ].map((label, i) => {
+                {(() => {
                   const logStr = genLogs.join(' ').toLowerCase();
-                  const stepDone =
-                    i === 0 ? logStr.includes('[2/6]') || logStr.includes('[3/6]') :
-                    i === 1 ? logStr.includes('[3/6]') && (logStr.includes('[4/6]') || logStr.includes('talking head ready')) :
-                    i === 2 ? logStr.includes('[5/6]') || logStr.includes('[6/6]') :
-                    genStatus === 'completed';
-                  const stepActive =
-                    i === 0 ? logStr.includes('[1/6]') && !stepDone :
-                    i === 1 ? (logStr.includes('[3/6]') && !logStr.includes('[4/6]')) :
-                    i === 2 ? (logStr.includes('[4/6]') && !logStr.includes('[5/6]') && !logStr.includes('[6/6]')) :
-                    logStr.includes('[6/6]') && genStatus !== 'completed';
+                  const isLipSyncJob = logStr.includes('lip-sync') || logStr.includes('lipsync');
+                  const noBroll = !isLipSyncJob && brollMode === 'off';
+                  const labels = isLipSyncJob
+                    ? [
+                      'Finding cached head + voiceover',
+                      'Running lip-sync model',
+                      'Re-compositing final video',
+                      'Saving updated result',
+                    ]
+                    : [
+                      'Generating actor image + voiceover',
+                      'Creating talking head video (2-5 min)',
+                      ...(noBroll ? [] : [
+                        brollMode === 'mockup'
+                          ? 'Preparing product mockup inserts'
+                          : 'Generating b-roll clips',
+                      ]),
+                      'Adding subtitles + assembling final video',
+                    ];
 
-                  return (
-                    <div key={i} className="flex items-center gap-3 text-sm">
-                      {stepDone ? (
-                        <Check size={14} className="text-green-400" />
-                      ) : stepActive ? (
-                        <Loader2 size={14} className="text-violet-400 animate-spin" />
-                      ) : (
-                        <div className="w-3.5 h-3.5 rounded-full border border-white/20" />
-                      )}
-                      <span className={stepDone ? 'text-zinc-400' : stepActive ? 'text-white' : 'text-zinc-600'}>
-                        {label}
-                      </span>
-                    </div>
-                  );
-                })}
+                  return labels.map((label, i) => {
+                    const normalStepDone = () => {
+                      if (i === 0) return logStr.includes('[2/6]') || logStr.includes('[3/6]');
+                      if (i === 1) {
+                        return logStr.includes('[4/6]') || logStr.includes('[5/6]') || logStr.includes('[6/6]') || logStr.includes('talking head ready') || genStatus === 'completed';
+                      }
+                      if (noBroll) return genStatus === 'completed';
+                      if (i === 2) return logStr.includes('[5/6]') || logStr.includes('[6/6]') || genStatus === 'completed';
+                      return genStatus === 'completed';
+                    };
+                    const normalStepActive = () => {
+                      if (i === 0) return logStr.includes('[1/6]') && !normalStepDone();
+                      if (i === 1) return logStr.includes('[3/6]') && !normalStepDone();
+                      if (noBroll) {
+                        return (logStr.includes('[4/6]') || logStr.includes('[5/6]') || logStr.includes('[6/6]')) && genStatus !== 'completed';
+                      }
+                      if (i === 2) return logStr.includes('[4/6]') && !logStr.includes('[5/6]') && !logStr.includes('[6/6]');
+                      return (logStr.includes('[5/6]') || logStr.includes('[6/6]')) && genStatus !== 'completed';
+                    };
+                    const stepDone = isLipSyncJob
+                      ? (
+                        i === 0 ? logStr.includes('[lipsync 1/3]') || logStr.includes('[lipsync 2/3]') :
+                        i === 1 ? logStr.includes('[lipsync 2/3]') || logStr.includes('[lipsync 3/3]') :
+                        i === 2 ? logStr.includes('[lipsync 3/3]') || genStatus === 'completed' :
+                        genStatus === 'completed'
+                      )
+                      : normalStepDone();
+                    const stepActive = isLipSyncJob
+                      ? (
+                        i === 0 ? logStr.includes('post-process started') && !stepDone :
+                        i === 1 ? logStr.includes('[lipsync 1/3]') && !logStr.includes('[lipsync 2/3]') :
+                        i === 2 ? logStr.includes('[lipsync 2/3]') && !logStr.includes('[lipsync 3/3]') :
+                        logStr.includes('[lipsync 3/3]') && genStatus !== 'completed'
+                      )
+                      : normalStepActive();
+
+                    return (
+                      <div key={i} className="flex items-center gap-3 text-sm">
+                        {stepDone ? (
+                          <Check size={14} className="text-green-400" />
+                        ) : stepActive ? (
+                          <Loader2 size={14} className="text-violet-400 animate-spin" />
+                        ) : (
+                          <div className="w-3.5 h-3.5 rounded-full border border-white/20" />
+                        )}
+                        <span className={stepDone ? 'text-zinc-400' : stepActive ? 'text-white' : 'text-zinc-600'}>
+                          {label}
+                        </span>
+                      </div>
+                    );
+                  });
+                })()}
               </div>
 
               {/* Logs Terminal */}
@@ -1652,7 +2103,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
             <div className="glass-panel p-6">
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Sparkles className="text-yellow-400" size={18} />
-                Your SaaS Short is Ready!
+                Your AI Short is Ready!
               </h2>
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1743,6 +2194,58 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     >
                       <RefreshCw size={14} /> New Video
                     </button>
+                  </div>
+
+                  {/* Standalone Lip-sync */}
+                  <div className="p-4 bg-violet-500/5 rounded-xl border border-violet-500/20 space-y-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-zinc-300 flex items-center gap-2">
+                        <Volume2 size={14} /> Improve lip-sync
+                      </h3>
+                      <p className="text-xs text-zinc-500 mt-1">
+                        Re-sync the current talking-head video to the saved voiceover, then rebuild the final edit.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3">
+                      <OptionPicker
+                        value={lipSyncModel}
+                        onChange={setLipSyncModel}
+                        disabled={lipSyncing || generating}
+                        options={LIPSYNC_MODEL_OPTIONS.map((option) => ({
+                          value: option.id,
+                          label: `${option.label} - ${option.desc}`,
+                          ...option,
+                        }))}
+                        renderOption={(option) => (
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold truncate">{option.label}</div>
+                              <div className="text-[10px] text-zinc-500 truncate">{option.desc}</div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-[10px] text-zinc-500">${option.pricePerMinute}/min</span>
+                              {option.value === lipSyncModel && <Check size={14} className="text-violet-300" />}
+                            </div>
+                          </div>
+                        )}
+                      />
+                      <button
+                        onClick={handleLipSync}
+                        disabled={lipSyncing || generating || !jobId}
+                        className="btn-secondary px-4 py-2 text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        {lipSyncing ? (
+                          <><Loader2 size={14} className="animate-spin" /> Syncing...</>
+                        ) : (
+                          <><Volume2 size={14} /> Re-sync lips</>
+                        )}
+                      </button>
+                    </div>
+                    {genResult.lipsync_model && (
+                      <p className="text-[11px] text-violet-300">
+                        Last post-process: {genResult.lipsync_model} / {genResult.lipsync_sync_mode || 'cut_off'}
+                      </p>
+                    )}
                   </div>
 
                   {/* Publish to Social Media */}

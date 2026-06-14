@@ -1,9 +1,9 @@
 """
-SaaSShorts: AI-powered UGC video generator for SaaS products.
+AI Shorts: AI-powered UGC video generator for products and businesses.
 
-Generates viral TikTok/Instagram Reels content from a SaaS URL.
+Generates viral TikTok/Instagram Reels content from a URL or product brief.
 Pipeline:
-  1. Scrape & analyze SaaS website (Gemini)
+  1. Scrape & analyze product/business website (Gemini)
   2. Generate video scripts (hook → problem → solution → CTA)
   3. Generate AI actor portrait (Flux Pro via fal.ai)
   4. Generate voiceover (ElevenLabs TTS)
@@ -14,6 +14,7 @@ Pipeline:
 
 import os
 import re
+import glob
 import json
 import time
 import subprocess
@@ -127,7 +128,7 @@ def _generate_gemini_content(client, *, contents, config=None):
 
 def research_saas_online(url: str, gemini_key: str) -> dict:
     """
-    Use Gemini with Google Search grounding to deeply research a SaaS product
+    Use Gemini with Google Search grounding to deeply research a product or business
     across the internet: reviews, Reddit threads, Twitter, competitor comparisons,
     pricing complaints, user testimonials, etc.
     """
@@ -141,13 +142,13 @@ def research_saas_online(url: str, gemini_key: str) -> dict:
     # Extract domain name for search queries
     domain = url.replace("https://", "").replace("http://", "").split("/")[0]
 
-    prompt = f"""You are a world-class SaaS market researcher. Research this product thoroughly using Google Search.
+    prompt = f"""You are a world-class product and business market researcher. Research this product or business thoroughly using Google Search.
 
 Product URL: {url}
 Domain: {domain}
 
 SEARCH AND INVESTIGATE:
-1. What does this SaaS product do? (search their website, Product Hunt, G2, Capterra)
+1. What does this product or business do? (search their website, Product Hunt, G2, Capterra, marketplaces, reviews, and social posts when relevant)
 2. What are REAL user reviews saying? (G2, Capterra, TrustPilot, Reddit, Twitter/X)
 3. What are the most common complaints and pain points users mention?
 4. Who are their main competitors and how do they compare?
@@ -229,7 +230,7 @@ Be thorough. Use REAL data from your search results, not made-up information."""
 
 
 def scrape_website(url: str) -> dict:
-    """Scrape a SaaS website to extract key content for analysis."""
+    """Scrape a product or business website to extract key content for analysis."""
     from bs4 import BeautifulSoup
 
     print(f"[SaaSShorts] 🌐 Scraping {url}...")
@@ -319,7 +320,7 @@ def scrape_website(url: str) -> dict:
 
 def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None) -> dict:
     """
-    Deep analysis of a SaaS product combining website scraping + web research.
+    Deep analysis of a product or business combining website scraping + web research.
     Uses Gemini 3 Flash for synthesis.
     """
     from google import genai
@@ -362,7 +363,7 @@ Content angles found online:
 {json.dumps(web_research.get('content_angles_from_web', []), indent=2)}
 """
 
-    prompt = f"""You are an expert SaaS marketing analyst and UGC content strategist. Analyze this SaaS product for creating viral UGC-style marketing videos.
+    prompt = f"""You are an expert product marketing analyst and UGC content strategist. Analyze this product or business for creating viral UGC-style marketing videos.
 
 You have TWO sources of information:
 1. The product's OWN WEBSITE (scraped content)
@@ -384,7 +385,7 @@ Headings: {json.dumps(scraped_data['headings'][:15])}
 
 Return a JSON object:
 {{
-    "product_name": "Name of the SaaS",
+    "product_name": "Name of the product or business",
     "one_liner": "One-sentence description",
     "target_audience": ["audience 1", "audience 2", "audience 3"],
     "pain_points": [
@@ -421,7 +422,7 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
     raw = response.text
     if not raw:
-        raise Exception("Gemini returned empty response for SaaS analysis")
+        raise Exception("Gemini returned empty response for product analysis")
 
     text = raw.strip()
     if text.startswith("```"):
@@ -455,7 +456,7 @@ def generate_scripts(
     actor_gender: str = "female",
     topic: str = None,
 ) -> list:
-    """Generate video scripts based on SaaS analysis."""
+    """Generate video scripts based on product/business analysis."""
     from google import genai
     from google.genai import types
 
@@ -588,7 +589,7 @@ Return a JSON array:
         ],
         "full_narration": "All narration text joined (only actor_talking segments)",
         "actor_description": "Specific person description: age, gender, ethnicity, hair style, clothing. Casual everyday look.",
-        "hashtags": ["#saas", "#productivity", "#techtools"],
+        "hashtags": ["#reels", "#product", "#ugc"],
         "caption": "Suggested Instagram/TikTok caption"
     }}
 ]
@@ -673,7 +674,7 @@ def build_custom_script(
     actor_gender: str = "female",
     topic: str = None,
 ) -> dict:
-    """Create a SaaSShorts script object without rewriting user narration."""
+    """Create an AI Shorts script object without rewriting user narration."""
     narration = custom_script.strip()
     if not narration:
         raise ValueError("Custom script is empty")
@@ -1320,34 +1321,74 @@ def get_elevenlabs_voices(elevenlabs_key: str) -> list:
 # Phase 3: Video Generation
 # ═══════════════════════════════════════════════════════════════════════
 
+KLING_AVATAR_TIERS = {
+    "standard": {
+        "model_id": "fal-ai/kling-video/ai-avatar/v2/standard",
+        "cost_per_second": 0.0562,
+        "label": "Kling Avatar v2 Standard",
+    },
+    "pro": {
+        "model_id": "fal-ai/kling-video/ai-avatar/v2/pro",
+        "cost_per_second": 0.115,
+        "label": "Kling Avatar v2 Pro",
+    },
+}
+
+
+def build_kling_avatar_request(
+    image_url: str,
+    audio_url: str,
+    prompt: str,
+    tier: str = "standard",
+) -> tuple[str, dict]:
+    """Build fal.ai Kling Avatar v2 model id and payload for Standard/Pro."""
+    tier = (tier or "standard").strip().lower()
+    if tier not in KLING_AVATAR_TIERS:
+        raise ValueError(f"Unsupported Kling Avatar tier: {tier}")
+    return KLING_AVATAR_TIERS[tier]["model_id"], {
+        "image_url": image_url,
+        "audio_url": audio_url,
+        "prompt": prompt,
+    }
+
+
+def kling_avatar_cost_per_second(tier: str = "standard") -> float:
+    tier = (tier or "standard").strip().lower()
+    if tier not in KLING_AVATAR_TIERS:
+        raise ValueError(f"Unsupported Kling Avatar tier: {tier}")
+    return KLING_AVATAR_TIERS[tier]["cost_per_second"]
+
+
+def kling_avatar_label(tier: str = "standard") -> str:
+    tier = (tier or "standard").strip().lower()
+    if tier not in KLING_AVATAR_TIERS:
+        raise ValueError(f"Unsupported Kling Avatar tier: {tier}")
+    return KLING_AVATAR_TIERS[tier]["label"]
+
+
 def generate_talking_head(
     image_path: str,
     audio_path: str,
     fal_key: str,
     output_path: str,
+    tier: str = "standard",
 ) -> str:
-    """Generate talking head video using Kling Avatar v2 Standard on fal.ai."""
-    print(f"[SaaSShorts] 🗣️ Generating talking head (Kling Avatar v2)...")
+    """Generate talking head video using Kling Avatar v2 Standard/Pro on fal.ai."""
+    tier = (tier or "standard").strip().lower()
+    print(f"[SaaSShorts] 🗣️ Generating talking head ({kling_avatar_label(tier)})...")
 
     # Upload image and audio to fal.ai CDN
     image_url = _fal_upload_file(image_path, fal_key)
     audio_url = _fal_upload_file(audio_path, fal_key)
 
-    result = _fal_run(
-        "fal-ai/kling-video/ai-avatar/v2/standard",
-        {
-            "image_url": image_url,
-            "audio_url": audio_url,
-            "prompt": (
-                "Natural UGC creator talking to camera. Expressive and energetic. "
-                "Subtle hand gestures to emphasize points. Slight head movements and nods. "
-                "Occasional leaning forward for emphasis. Relaxed shoulders, casual vibe. "
-                "Maintain eye contact with camera. Natural blinking and micro-expressions."
-            ),
-        },
-        fal_key,
-        timeout=1200,
+    prompt = (
+        "Natural UGC creator talking to camera. Expressive and energetic. "
+        "Subtle hand gestures to emphasize points. Slight head movements and nods. "
+        "Occasional leaning forward for emphasis. Relaxed shoulders, casual vibe. "
+        "Maintain eye contact with camera. Natural blinking and micro-expressions."
     )
+    model_id, payload = build_kling_avatar_request(image_url, audio_url, prompt, tier=tier)
+    result = _fal_run(model_id, payload, fal_key, timeout=1200)
 
     video_url = result["video"]["url"]
 
@@ -1442,6 +1483,240 @@ def generate_talking_head_lowcost(
 
     print(f"[SaaSShorts] ✅ Talking head (low cost): {output_path}")
     return output_path
+
+
+SYNC_LIPSYNC_MODELS = {"sync-3", "lipsync-2-pro", "lipsync-2"}
+SYNC_LIPSYNC_MODES = {"cut_off", "loop", "bounce", "silence", "remap"}
+
+
+def _nonempty(path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def _newest_existing(paths: List[str]) -> Optional[str]:
+    existing = [path for path in paths if _nonempty(path)]
+    if not existing:
+        return None
+    return sorted(existing, key=lambda path: os.path.getmtime(path), reverse=True)[0]
+
+
+def _newest_glob(patterns: List[str], exclude: Callable[[str], bool] = None) -> Optional[str]:
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(glob.glob(pattern))
+    if exclude:
+        candidates = [path for path in candidates if not exclude(path)]
+    return _newest_existing(candidates)
+
+
+def build_sync_lipsync_request(
+    video_url: str,
+    audio_url: str,
+    model: str = "sync-3",
+    sync_mode: str = "cut_off",
+) -> tuple[str, dict]:
+    """Build fal.ai Sync Lipsync model id and payload."""
+    model = (model or "sync-3").strip()
+    sync_mode = (sync_mode or "cut_off").strip()
+
+    if model not in SYNC_LIPSYNC_MODELS:
+        raise ValueError(f"Unsupported lip-sync model: {model}")
+    if sync_mode not in SYNC_LIPSYNC_MODES:
+        raise ValueError(f"Unsupported lip-sync mode: {sync_mode}")
+
+    payload = {
+        "video_url": video_url,
+        "audio_url": audio_url,
+        "sync_mode": sync_mode,
+    }
+    if model == "sync-3":
+        return "fal-ai/sync-lipsync/v3", payload
+
+    payload["model"] = model
+    return "fal-ai/sync-lipsync/v2", payload
+
+
+def resolve_saas_lipsync_assets(output_dir: str) -> dict:
+    """
+    Find cached assets needed for post-generation lip-sync and recomposition.
+    Handles empty slugs from non-Latin titles, e.g. __head.mp4 / __voice.mp3.
+    """
+    if not os.path.isdir(output_dir):
+        raise FileNotFoundError(f"AI Shorts job output directory not found: {output_dir}")
+
+    talking_head = _newest_glob(
+        [os.path.join(output_dir, "*_head.mp4")],
+        exclude=lambda path: "_head_lipsync_" in os.path.basename(path),
+    )
+    if not talking_head:
+        raise FileNotFoundError("Cached talking-head video not found for lip-sync")
+
+    base_name = os.path.basename(talking_head)
+    prefix = base_name[:-len("_head.mp4")] if base_name.endswith("_head.mp4") else os.path.splitext(base_name)[0]
+
+    audio = _newest_existing([
+        os.path.join(output_dir, f"{prefix}_voice.mp3"),
+        os.path.join(output_dir, f"{prefix}_voice.wav"),
+    ]) or _newest_glob([
+        os.path.join(output_dir, "*_voice.mp3"),
+        os.path.join(output_dir, "*_voice.wav"),
+    ])
+    if not audio:
+        raise FileNotFoundError("Cached voiceover audio not found for lip-sync")
+
+    subtitles = _newest_existing([
+        os.path.join(output_dir, f"{prefix}_subs.ass"),
+        os.path.join(output_dir, f"{prefix}_subs.srt"),
+    ]) or _newest_glob([
+        os.path.join(output_dir, "*_subs.ass"),
+        os.path.join(output_dir, "*_subs.srt"),
+    ])
+    if not subtitles:
+        raise FileNotFoundError("Cached subtitles not found for recomposition")
+
+    final = _newest_existing([
+        os.path.join(output_dir, f"{prefix}_final.mp4"),
+    ]) or os.path.join(output_dir, f"{prefix}_final.mp4")
+
+    actor_image = _newest_existing([
+        os.path.join(output_dir, f"{prefix}_actor.png"),
+        os.path.join(output_dir, "selected_actor.png"),
+    ]) or _newest_glob([
+        os.path.join(output_dir, "*_actor.png"),
+        os.path.join(output_dir, "selected_actor.*"),
+    ])
+
+    metadata = {}
+    meta_path = os.path.join(output_dir, "gallery_metadata.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception:
+            metadata = {}
+
+    broll_clips = []
+    broll_segments = [
+        seg for seg in metadata.get("segments", [])
+        if seg.get("visual") == "broll" and seg.get("broll_prompt")
+    ]
+    for i, seg in enumerate(broll_segments):
+        broll_path = _newest_existing([
+            os.path.join(output_dir, f"{prefix}_broll_mockup_{i}.mp4"),
+            os.path.join(output_dir, f"{prefix}_broll_ai_{i}.mp4"),
+            os.path.join(output_dir, f"{prefix}_broll_{i}.mp4"),
+        ]) or _newest_glob([
+            os.path.join(output_dir, f"*_broll_*_{i}.mp4"),
+            os.path.join(output_dir, f"*_broll_{i}.mp4"),
+        ])
+        if broll_path:
+            broll_clips.append({
+                "path": broll_path,
+                "start": seg["start"],
+                "end": seg["end"],
+            })
+
+    return {
+        "prefix": prefix,
+        "talking_head": talking_head,
+        "audio": audio,
+        "subtitles": subtitles,
+        "final": final,
+        "actor_image": actor_image or "",
+        "broll_clips": broll_clips,
+        "hook_text": metadata.get("hook_text", ""),
+        "metadata": metadata,
+    }
+
+
+def generate_sync_lipsync_video(
+    video_path: str,
+    audio_path: str,
+    fal_key: str,
+    output_path: str,
+    model: str = "sync-3",
+    sync_mode: str = "cut_off",
+) -> str:
+    """Run a standalone Sync Lipsync pass on an existing talking-head video."""
+    print(f"[SaaSShorts] Running standalone lip-sync ({model}, {sync_mode})...")
+
+    video_url = _fal_upload_file(video_path, fal_key)
+    audio_url = _fal_upload_file(audio_path, fal_key)
+    model_id, payload = build_sync_lipsync_request(video_url, audio_url, model, sync_mode)
+
+    result = _fal_run(model_id, payload, fal_key, timeout=2400)
+    video = result.get("video")
+    output_url = video.get("url") if isinstance(video, dict) else video
+    if not output_url:
+        raise Exception(f"No video in Sync Lipsync result: {result}")
+
+    with httpx.Client(timeout=300.0) as client:
+        resp = client.get(output_url)
+        resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+
+    print(f"[SaaSShorts] Lip-synced head: {output_path}")
+    return output_path
+
+
+def estimate_sync_lipsync_cost(model: str, duration_seconds: float) -> Optional[float]:
+    """Estimate Sync Lipsync cost for UI metadata."""
+    duration_minutes = max(duration_seconds, 0) / 60
+    if model == "sync-3":
+        return round(duration_minutes * 8.0, 2)
+    if model == "lipsync-2":
+        return round(duration_minutes * 3.0, 2)
+    if model == "lipsync-2-pro":
+        return round(duration_minutes * 5.0, 2)
+    return None
+
+
+def apply_lipsync_to_saas_job(
+    output_dir: str,
+    fal_key: str,
+    model: str = "sync-3",
+    sync_mode: str = "cut_off",
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Post-process an existing AI Shorts job with standalone lip-sync."""
+    assets = resolve_saas_lipsync_assets(output_dir)
+    safe_model = re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_") or "sync_3"
+    lipsynced_head = os.path.join(output_dir, f"{assets['prefix']}_head_lipsync_{safe_model}.mp4")
+
+    log(f"[LipSync 1/3] Uploading cached talking head and voiceover to fal.ai ({model}).")
+    generate_sync_lipsync_video(
+        assets["talking_head"],
+        assets["audio"],
+        fal_key,
+        lipsynced_head,
+        model=model,
+        sync_mode=sync_mode,
+    )
+
+    log("[LipSync 2/3] Re-compositing final video with the lip-synced head.")
+    composite_video(
+        lipsynced_head,
+        assets["broll_clips"],
+        assets["subtitles"],
+        assets["hook_text"],
+        assets["final"],
+    )
+
+    duration = _get_media_duration(assets["audio"])
+    log("[LipSync 3/3] Final video updated.")
+
+    return {
+        "video_path": assets["final"],
+        "video_filename": os.path.basename(assets["final"]),
+        "lipsynced_head": lipsynced_head,
+        "actor_image": assets["actor_image"],
+        "duration": duration,
+        "lipsync_model": model,
+        "lipsync_sync_mode": sync_mode,
+        "lipsync_cost_estimate": estimate_sync_lipsync_cost(model, duration),
+        "metadata": assets["metadata"],
+    }
 
 
 def generate_broll(
@@ -1924,7 +2199,7 @@ def generate_full_video(
     log: Callable[[str], None] = print,
 ) -> dict:
     """
-    Full SaaSShorts video generation pipeline.
+    Full AI Shorts video generation pipeline.
 
     Args:
         script: A single script object from generate_scripts()
@@ -2062,14 +2337,48 @@ def generate_full_video(
         log("[2/6] ✅ Using cached assets.")
 
     # ── Step 3: Generate talking head ──
-    video_mode = config.get("video_mode", "premium")
+    video_mode = (config.get("video_mode") or "standard").lower()
+    if video_mode not in ("lowcost", "standard", "premium"):
+        video_mode = "standard"
+
+    talking_head_meta_path = f"{talking_head}.meta.json"
+
+    def _read_talking_head_mode():
+        try:
+            with open(talking_head_meta_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("video_mode")
+        except Exception:
+            hailuo_cache = talking_head.replace(".mp4", "_hailuo_cache.mp4")
+            if _exists(hailuo_cache):
+                return "lowcost"
+            return "standard"
+
+    def _write_talking_head_mode():
+        with open(talking_head_meta_path, "w", encoding="utf-8") as f:
+            json.dump({"video_mode": video_mode}, f, ensure_ascii=False, indent=2)
+
+    if _exists(talking_head) and _read_talking_head_mode() != video_mode:
+        log("[3/6] Video mode changed; regenerating voice-driven talking head.")
+        for stale_path in (
+            talking_head,
+            f"{talking_head}.fal_url.txt",
+            talking_head_meta_path,
+            srt_path,
+            final_path,
+        ):
+            _remove_if_exists(stale_path)
     if not _exists(talking_head):
         if video_mode == "lowcost":
             log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This can take 2-20 minutes.")
             talking_head = generate_talking_head_lowcost(actor_img, audio_path, fal_key, talking_head)
+        elif video_mode == "premium":
+            log("[3/6] Generating talking head video (Kling Avatar v2 Pro)... This can take 2-20 minutes.")
+            talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head, tier="pro")
         else:
-            log("[3/6] Generating talking head video (Kling Avatar v2)... This can take 2-15 minutes.")
-            talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head)
+            video_mode = "standard"
+            log("[3/6] Generating talking head video (Kling Avatar v2 Standard)... This can take 2-15 minutes.")
+            talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head, tier="standard")
+        _write_talking_head_mode()
         log("[3/6] Talking head ready.")
     else:
         log("[3/6] ✅ Talking head cached, skipping.")
@@ -2154,19 +2463,23 @@ def generate_full_video(
     tts_cost_key = "voiceover_fal_minimax" if tts_provider_used == "fal_minimax" else "voiceover_elevenlabs"
     tts_cost = round(len(full_narration) * (0.0001 if tts_provider_used == "fal_minimax" else 0.00003), 3)
 
+    actor_cost_key = "actor_image_reused" if selected_actor else "actor_image_flux"
+    actor_cost = 0.00 if selected_actor else 0.05
+
     if video_mode == "lowcost":
         cost = {
-            "actor_image_flux": 0.05,
+            actor_cost_key: actor_cost,
             tts_cost_key: tts_cost,
             "hailuo_img2video": 0.19,
             "veed_lipsync": 0.20,
             "ffmpeg_compositing": 0.00,
         }
     else:
+        kling_tier = "pro" if video_mode == "premium" else "standard"
         cost = {
-            "actor_image_flux": 0.05,
+            actor_cost_key: actor_cost,
             tts_cost_key: tts_cost,
-            "talking_head_kling": round(audio_duration * 0.056, 2),
+            f"talking_head_kling_{kling_tier}": round(audio_duration * kling_avatar_cost_per_second(kling_tier), 2),
             "ffmpeg_compositing": 0.00,
         }
     if broll_mode == "ai":
