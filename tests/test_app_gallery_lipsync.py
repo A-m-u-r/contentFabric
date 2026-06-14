@@ -47,6 +47,29 @@ class GalleryLipSyncTests(unittest.TestCase):
             self.assertTrue(resolved["poster_path"].endswith("actor.png"))
         app.OUTPUT_DIR = old_output_dir
 
+    def test_head_templates_are_filtered_by_owner(self):
+        old_output_dir = app.OUTPUT_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            app.OUTPUT_DIR = tmp
+
+            for owner_id in ("user_a", "user_b"):
+                job_id = f"{owner_id}-job"
+                job_dir = os.path.join(tmp, f"saas_{job_id}")
+                os.makedirs(job_dir)
+                with open(os.path.join(job_dir, "__head.mp4"), "wb") as f:
+                    f.write(b"head-video")
+                with open(os.path.join(job_dir, "__actor.png"), "wb") as f:
+                    f.write(b"actor-image")
+                with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+                    json.dump({"title": owner_id, "owner_user_id": owner_id}, f)
+                app.save_local_head_template(job_id, owner_user_id=owner_id)
+
+            templates = app.list_local_head_templates(owner_user_id="user_a")
+            self.assertEqual(len(templates), 1)
+            self.assertEqual(templates[0]["owner_user_id"], "user_a")
+
+        app.OUTPUT_DIR = old_output_dir
+
 
 if __name__ == "__main__":
     unittest.main()

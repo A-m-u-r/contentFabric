@@ -40,7 +40,7 @@ const LIPSYNC_MODEL_OPTIONS = [
   },
 ];
 
-export default function UGCGallery({ falKey }) {
+export default function UGCGallery({ falKey, authToken, usePlatformKeys = false }) {
   const [tab, setTab] = useState('videos');
   const [videos, setVideos] = useState([]);
   const [avatars, setAvatars] = useState([]);
@@ -59,11 +59,14 @@ export default function UGCGallery({ falKey }) {
   const [avatarUploadPreview, setAvatarUploadPreview] = useState(null);
   const [newAvatarUrls, setNewAvatarUrls] = useState([]);
 
+  const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
+  const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
+
   const loadGallery = ({ showLoading = true } = {}) => {
     if (showLoading) setLoading(true);
     return Promise.all([
-      fetch(getApiUrl('/api/saasshorts/gallery?limit=100')).then(r => r.ok ? r.json() : { videos: [] }),
-      fetch(getApiUrl('/api/saasshorts/actor-gallery')).then(r => r.ok ? r.json() : { images: [] }),
+      fetch(getApiUrl('/api/saasshorts/gallery?limit=100'), { headers: authHeaders() }).then(r => r.ok ? r.json() : { videos: [] }),
+      fetch(getApiUrl('/api/saasshorts/actor-gallery'), { headers: authHeaders() }).then(r => r.ok ? r.json() : { images: [] }),
     ])
       .then(([vData, aData]) => {
         const nextVideos = vData.videos || [];
@@ -120,6 +123,7 @@ export default function UGCGallery({ falKey }) {
 
       const res = await fetch(getApiUrl('/api/saasshorts/actor-upload'), {
         method: 'POST',
+        headers: authHeaders(),
         body: formData,
       });
 
@@ -169,11 +173,13 @@ export default function UGCGallery({ falKey }) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
+          ...authHeaders(),
+          ...(falKey && !isManagedKey(falKey) ? { 'X-Fal-Key': falKey } : {}),
         },
         body: JSON.stringify({
           actor_description: prompt,
           num_options: 3,
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -198,7 +204,7 @@ export default function UGCGallery({ falKey }) {
   const pollLipSyncJob = (cardId, jobId) => {
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(getApiUrl(`/api/saasshorts/status/${jobId}`));
+        const res = await fetch(getApiUrl(`/api/saasshorts/status/${jobId}`), { headers: authHeaders() });
         if (!res.ok) return;
         const data = await res.json();
         const lastLog = data.logs?.[data.logs.length - 1] || '';
@@ -250,12 +256,14 @@ export default function UGCGallery({ falKey }) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
+          ...authHeaders(),
+          ...(falKey && !isManagedKey(falKey) ? { 'X-Fal-Key': falKey } : {}),
         },
         body: JSON.stringify({
           video_url: video.video_url,
           model,
           sync_mode: 'cut_off',
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -283,7 +291,7 @@ export default function UGCGallery({ falKey }) {
     try {
       const res = await fetch(getApiUrl('/api/saasshorts/head-templates'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           video_url: video.video_url,
           label: video.title || 'Talking head template',

@@ -275,7 +275,15 @@ function saveCache(input, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
-export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId }) {
+export default function SaaShortsTab({
+  geminiApiKey,
+  elevenLabsKey,
+  falKey,
+  uploadPostKey,
+  uploadUserId,
+  authToken,
+  usePlatformKeys = false,
+}) {
   // Wizard state
   const [step, setStep] = useState(() => {
     const cache = loadCache();
@@ -322,6 +330,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [selectedHeadTemplate, setSelectedHeadTemplate] = useState('');
   const [savingHeadTemplate, setSavingHeadTemplate] = useState(false);
   const [headTemplateStatus, setHeadTemplateStatus] = useState('');
+
+  const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
+  const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
   const [actorUploadStatus, setActorUploadStatus] = useState('');
   const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
@@ -357,7 +368,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Fetch actor gallery on mount
   useEffect(() => {
     setLoadingGallery(true);
-    fetch(getApiUrl('/api/saasshorts/actor-gallery'))
+    fetch(getApiUrl('/api/saasshorts/actor-gallery'), { headers: authHeaders() })
       .then(res => res.ok ? res.json() : { images: [] })
       .then(data => setActorGallery(data.images || []))
       .catch(() => {})
@@ -407,7 +418,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     if (jobId && genStatus === 'processing') {
       interval = setInterval(async () => {
         try {
-          const res = await fetch(getApiUrl(`/api/saasshorts/status/${jobId}`));
+          const res = await fetch(getApiUrl(`/api/saasshorts/status/${jobId}`), { headers: authHeaders() });
           if (res.status === 404) {
             // Job lost (server restart) — treat as failed so Retry appears
             setGenStatus('failed');
@@ -443,9 +454,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   const fetchVoices = async () => {
     try {
-      const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
-        headers: { 'X-ElevenLabs-Key': elevenLabsKey },
-      });
+      const headers = { ...authHeaders() };
+      if (elevenLabsKey && !isManagedKey(elevenLabsKey)) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+      const res = await fetch(getApiUrl(`/api/saasshorts/voices${usePlatformKeys ? '?use_platform_keys=true' : ''}`), { headers });
       if (res.ok) {
         const data = await res.json();
         setVoices(data.voices || []);
@@ -472,7 +483,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Gemini-Key': geminiApiKey,
+          ...authHeaders(),
+          ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
         },
         body: JSON.stringify({
           url: url.trim() || undefined,
@@ -484,6 +496,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           style,
           language,
           actor_gender: actorGender,
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -559,9 +572,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
       const headers = {
         'Content-Type': 'application/json',
-        'X-Fal-Key': falKey,
+        ...authHeaders(),
       };
-      if (elevenLabsKey) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+      if (falKey && !isManagedKey(falKey)) headers['X-Fal-Key'] = falKey;
+      if (elevenLabsKey && !isManagedKey(elevenLabsKey)) headers['X-ElevenLabs-Key'] = elevenLabsKey;
 
       const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
         method: 'POST',
@@ -579,6 +593,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           broll_mode: brollMode,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -614,9 +629,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
       const headers = {
         'Content-Type': 'application/json',
-        'X-Fal-Key': falKey,
+        ...authHeaders(),
       };
-      if (elevenLabsKey) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+      if (falKey && !isManagedKey(falKey)) headers['X-Fal-Key'] = falKey;
+      if (elevenLabsKey && !isManagedKey(elevenLabsKey)) headers['X-ElevenLabs-Key'] = elevenLabsKey;
 
       const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
         method: 'POST',
@@ -634,6 +650,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           broll_mode: brollMode,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -674,12 +691,14 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Fal-Key': falKey,
+          ...authHeaders(),
+          ...(falKey && !isManagedKey(falKey) ? { 'X-Fal-Key': falKey } : {}),
         },
         body: JSON.stringify({
           job_id: jobId,
           model: lipSyncModel,
           sync_mode: 'cut_off',
+          use_platform_keys: usePlatformKeys,
         }),
       });
 
@@ -698,7 +717,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   const refreshActorGallery = async () => {
     try {
-      const res = await fetch(getApiUrl('/api/saasshorts/actor-gallery'));
+      const res = await fetch(getApiUrl('/api/saasshorts/actor-gallery'), { headers: authHeaders() });
       if (res.ok) {
         const data = await res.json();
         setActorGallery(data.images || []);
@@ -711,7 +730,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const refreshHeadTemplates = async () => {
     setLoadingHeadTemplates(true);
     try {
-      const res = await fetch(getApiUrl('/api/saasshorts/head-templates'));
+      const res = await fetch(getApiUrl('/api/saasshorts/head-templates'), { headers: authHeaders() });
       if (res.ok) {
         const data = await res.json();
         setHeadTemplates(data.templates || []);
@@ -733,7 +752,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     try {
       const res = await fetch(getApiUrl('/api/saasshorts/head-templates'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           job_id: jobId,
           label: genResult?.script?.title || 'Talking head template',
@@ -768,6 +787,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     try {
       const res = await fetch(getApiUrl('/api/saasshorts/actor-upload'), {
         method: 'POST',
+        headers: authHeaders(),
         body: formData,
       });
       if (!res.ok) {
@@ -1959,14 +1979,22 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     try {
                       const res = await fetch(getApiUrl('/api/saasshorts/actor-options'), {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Fal-Key': falKey },
-                        body: JSON.stringify({ actor_description: actorDescription, num_options: 3 }),
+                        headers: {
+                          'Content-Type': 'application/json',
+                          ...authHeaders(),
+                          ...(falKey && !isManagedKey(falKey) ? { 'X-Fal-Key': falKey } : {}),
+                        },
+                        body: JSON.stringify({
+                          actor_description: actorDescription,
+                          num_options: 3,
+                          use_platform_keys: usePlatformKeys,
+                        }),
                       });
                       if (res.ok) {
                         const data = await res.json();
                         setActorOptions(data.images || []);
                         // Refresh gallery to include newly uploaded actors
-                        const galRes = await fetch(getApiUrl('/api/saasshorts/actor-gallery'));
+                        const galRes = await fetch(getApiUrl('/api/saasshorts/actor-gallery'), { headers: authHeaders() });
                         if (galRes.ok) {
                           const galData = await galRes.json();
                           setActorGallery(galData.images || []);
@@ -2503,6 +2531,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                                 platforms: selected,
                                 title: genResult.script?.title,
                                 description: genResult.script?.caption || genResult.script?.full_narration,
+                                use_platform_keys: usePlatformKeys,
                               };
                               if (isScheduling && scheduleDate) {
                                 payload.scheduled_date = new Date(scheduleDate).toISOString();
@@ -2510,7 +2539,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               }
                               const res = await fetch(getApiUrl('/api/saasshorts/post'), {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
+                                headers: { 'Content-Type': 'application/json', ...authHeaders() },
                                 body: JSON.stringify(payload),
                               });
                               if (!res.ok) {

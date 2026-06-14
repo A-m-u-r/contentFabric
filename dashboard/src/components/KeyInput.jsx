@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Key, Eye, EyeOff, Check } from 'lucide-react';
 
-export default function KeyInput({ onKeySet, savedKey }) {
+export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccountKey }) {
     const [key, setKey] = useState(savedKey || '');
     const [isVisible, setIsVisible] = useState(false);
     const [isSaved, setIsSaved] = useState(!!savedKey);
@@ -13,6 +13,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
     const handleSave = () => {
         if (key.trim().length > 0) {
             onKeySet(key);
+            if (onAccountSave) onAccountSave(key);
             setIsSaved(true);
         }
     };
@@ -57,7 +58,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                 </button>
             </div>
             <p className="mt-3 text-xs text-zinc-500">
-                Your key is stored locally in your browser for convenience.
+                {hasAccountKey ? 'Gemini key is saved in your account vault.' : 'Your key can be saved to your account vault after login.'}
                 <br />
                 <a
                     href="https://aistudio.google.com/app/apikey"

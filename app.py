@@ -8,6 +8,11 @@ import glob
 import time
 import asyncio
 import datetime
+import base64
+import hashlib
+import hmac
+import secrets
+import sqlite3
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
@@ -26,6 +31,8 @@ UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+AUTH_DB_PATH = os.environ.get("OPENSHORTS_DB_PATH", os.path.join(OUTPUT_DIR, "openshorts.db"))
+KEY_VAULT_SECRET = os.environ.get("OPENSHORTS_KEY_VAULT_SECRET") or os.environ.get("SECRET_KEY") or "openshorts-dev-key-vault-secret"
 
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
@@ -41,6 +48,317 @@ thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+class SubscriptionRequiredError(Exception):
+    pass
+
+
+class PlatformKeyUnavailableError(Exception):
+    pass
+
+
+API_KEY_PROVIDERS = {
+    "gemini": ("GEMINI_API_KEY",),
+    "fal": ("FAL_KEY", "FAL_API_KEY"),
+    "elevenlabs": ("ELEVENLABS_API_KEY", "ELEVENLABS_KEY"),
+    "upload_post": ("UPLOAD_POST_API_KEY", "UPLOAD_POST_KEY"),
+}
+
+
+def _utc_now() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _auth_db() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(AUTH_DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_auth_db() -> None:
+    with _auth_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                subscription_status TEXT NOT NULL DEFAULT 'free',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_keys (
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                encrypted_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, provider),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _public_user(row) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "name": row["name"],
+        "subscription_status": row["subscription_status"],
+        "created_at": row["created_at"],
+    }
+
+
+def _hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return f"pbkdf2_sha256${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        scheme, salt_b64, digest_b64 = stored_hash.split("$", 2)
+        if scheme != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode())
+        expected = base64.urlsafe_b64decode(digest_b64.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _secret_bytes() -> bytes:
+    return hashlib.sha256(KEY_VAULT_SECRET.encode("utf-8")).digest()
+
+
+def _keystream(nonce: bytes, length: int) -> bytes:
+    out = b""
+    counter = 0
+    secret = _secret_bytes()
+    while len(out) < length:
+        out += hashlib.sha256(secret + nonce + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return out[:length]
+
+
+def _encrypt_secret(value: str) -> str:
+    raw = value.encode("utf-8")
+    nonce = secrets.token_bytes(16)
+    stream = _keystream(nonce, len(raw))
+    cipher = bytes(a ^ b for a, b in zip(raw, stream))
+    mac = hmac.new(_secret_bytes(), nonce + cipher, hashlib.sha256).digest()
+    return "v1:" + base64.urlsafe_b64encode(nonce + mac + cipher).decode("ascii")
+
+
+def _decrypt_secret(value: str) -> str:
+    if not value:
+        return ""
+    if not value.startswith("v1:"):
+        return value
+    payload = base64.urlsafe_b64decode(value[3:].encode("ascii"))
+    nonce = payload[:16]
+    mac = payload[16:48]
+    cipher = payload[48:]
+    expected = hmac.new(_secret_bytes(), nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("Key vault secret integrity check failed")
+    stream = _keystream(nonce, len(cipher))
+    return bytes(a ^ b for a, b in zip(cipher, stream)).decode("utf-8")
+
+
+def create_user(email: str, password: str, name: Optional[str] = None) -> dict:
+    email = _normalize_email(email)
+    if not email or "@" not in email:
+        raise ValueError("Valid email is required")
+    if not password or len(password) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    user_id = str(uuid.uuid4())
+    with _auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (id, email, name, password_hash, subscription_status, created_at)
+            VALUES (?, ?, ?, ?, 'free', ?)
+            """,
+            (user_id, email, (name or email.split("@")[0]).strip() or "User", _hash_password(password), _utc_now()),
+        )
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return _public_user(row)
+
+
+def get_user_by_id(user_id: str) -> Optional[dict]:
+    with _auth_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return _public_user(row)
+
+
+def authenticate_user(email: str, password: str) -> Optional[dict]:
+    with _auth_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (_normalize_email(email),)).fetchone()
+    if not row or not _verify_password(password, row["password_hash"]):
+        return None
+    return _public_user(row)
+
+
+def create_session(user_id: str, days: int = 30) -> str:
+    token = "os_" + secrets.token_urlsafe(32)
+    expires_at = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat() + "Z"
+    with _auth_db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (_token_hash(token), user_id, _utc_now(), expires_at),
+        )
+    return token
+
+
+def get_user_by_token(token: str) -> Optional[dict]:
+    if not token:
+        return None
+    with _auth_db() as conn:
+        row = conn.execute(
+            """
+            SELECT users.* FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+            """,
+            (_token_hash(token), _utc_now()),
+        ).fetchone()
+    return _public_user(row)
+
+
+def get_user_from_authorization(authorization: Optional[str]) -> Optional[dict]:
+    if not authorization:
+        return None
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    return get_user_by_token(authorization[len(prefix):].strip())
+
+
+def require_user_from_authorization(authorization: Optional[str]) -> dict:
+    user = get_user_from_authorization(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def set_user_subscription_status(user_id: str, status: str) -> dict:
+    if status not in ("free", "active", "expired"):
+        raise ValueError("Invalid subscription status")
+    with _auth_db() as conn:
+        conn.execute("UPDATE users SET subscription_status = ? WHERE id = ?", (status, user_id))
+    user = get_user_by_id(user_id)
+    if not user:
+        raise ValueError("User not found")
+    return user
+
+
+def upsert_user_api_key(user_id: str, provider: str, api_key: str) -> None:
+    if provider not in API_KEY_PROVIDERS:
+        raise ValueError("Unknown API key provider")
+    if not api_key or not api_key.strip():
+        raise ValueError("API key is required")
+    with _auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO api_keys (user_id, provider, encrypted_value, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, provider)
+            DO UPDATE SET encrypted_value = excluded.encrypted_value, updated_at = excluded.updated_at
+            """,
+            (user_id, provider, _encrypt_secret(api_key.strip()), _utc_now()),
+        )
+
+
+def get_user_api_key(user_id: str, provider: str) -> Optional[str]:
+    with _auth_db() as conn:
+        row = conn.execute(
+            "SELECT encrypted_value FROM api_keys WHERE user_id = ? AND provider = ?",
+            (user_id, provider),
+        ).fetchone()
+    if not row:
+        return None
+    return _decrypt_secret(row["encrypted_value"])
+
+
+def list_user_api_key_status(user_id: str) -> dict:
+    status = {
+        provider: {"has_key": False, "updated_at": None}
+        for provider in API_KEY_PROVIDERS
+    }
+    with _auth_db() as conn:
+        rows = conn.execute(
+            "SELECT provider, updated_at FROM api_keys WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+    for row in rows:
+        if row["provider"] in status:
+            status[row["provider"]] = {"has_key": True, "updated_at": row["updated_at"]}
+    return status
+
+
+def _platform_api_key(provider: str) -> Optional[str]:
+    for env_name in API_KEY_PROVIDERS.get(provider, ()):
+        value = os.environ.get(env_name)
+        if value:
+            return value
+    return None
+
+
+def resolve_effective_api_key(
+    provider: str,
+    user: Optional[dict],
+    header_value: Optional[str],
+    use_platform_keys: bool = False,
+) -> Optional[str]:
+    if use_platform_keys:
+        if not user or user.get("subscription_status") != "active":
+            raise SubscriptionRequiredError("Active subscription is required to use platform API keys")
+        platform_key = _platform_api_key(provider)
+        if not platform_key:
+            raise PlatformKeyUnavailableError(f"Platform {provider} API key is not configured")
+        return platform_key
+
+    if user:
+        saved_key = get_user_api_key(user["id"], provider)
+        if saved_key:
+            return saved_key
+
+    if header_value:
+        return header_value
+
+    if not user:
+        return _platform_api_key(provider)
+
+    return None
+
 
 def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
     """
@@ -166,6 +484,7 @@ async def run_job_wrapper(job_id):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start worker and cleanup
+    init_auth_db()
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     yield
@@ -189,6 +508,90 @@ app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
+
+
+class AuthRegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+
+class AuthLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ApiKeySaveRequest(BaseModel):
+    provider: str
+    api_key: str
+
+
+class AdminSubscriptionRequest(BaseModel):
+    user_id: str
+    status: str
+
+
+@app.post("/api/auth/register")
+async def auth_register(req: AuthRegisterRequest):
+    try:
+        init_auth_db()
+        user = create_user(req.email, req.password, req.name)
+        token = create_session(user["id"])
+        return {"token": token, "user": user, "api_keys": list_user_api_key_status(user["id"])}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Email is already registered")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: AuthLoginRequest):
+    init_auth_db()
+    user = authenticate_user(req.email, req.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_session(user["id"])
+    return {"token": token, "user": user, "api_keys": list_user_api_key_status(user["id"])}
+
+
+@app.get("/api/auth/me")
+async def auth_me(authorization: Optional[str] = Header(None, alias="Authorization")):
+    user = require_user_from_authorization(authorization)
+    return {"user": user, "api_keys": list_user_api_key_status(user["id"])}
+
+
+@app.post("/api/user/api-keys")
+async def user_save_api_key(
+    req: ApiKeySaveRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    try:
+        upsert_user_api_key(user["id"], req.provider, req.api_key)
+        return {"api_keys": list_user_api_key_status(user["id"])}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/user/api-keys")
+async def user_api_keys(authorization: Optional[str] = Header(None, alias="Authorization")):
+    user = require_user_from_authorization(authorization)
+    return {"api_keys": list_user_api_key_status(user["id"])}
+
+
+@app.post("/api/admin/subscription")
+async def admin_subscription_update(
+    req: AdminSubscriptionRequest,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+):
+    admin_token = os.environ.get("OPENSHORTS_ADMIN_TOKEN")
+    if not admin_token or x_admin_token != admin_token:
+        raise HTTPException(status_code=403, detail="Admin token required")
+    try:
+        user = set_user_subscription_status(req.user_id, req.status)
+        return {"user": user}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _local_saas_video_id(job_dir_name: str) -> str:
@@ -274,7 +677,7 @@ def _infer_local_gallery_meta(job_dir: str) -> Optional[dict]:
     }
 
 
-def write_local_saas_gallery_entry(job_id: str, result: dict, metadata: dict) -> Optional[dict]:
+def write_local_saas_gallery_entry(job_id: str, result: dict, metadata: dict, owner_user_id: Optional[str] = None) -> Optional[dict]:
     try:
         job_dir_name = f"saas_{job_id}"
         job_dir = os.path.join(OUTPUT_DIR, job_dir_name)
@@ -284,6 +687,8 @@ def write_local_saas_gallery_entry(job_id: str, result: dict, metadata: dict) ->
 
         actor_path = result.get("actor_image", "")
         entry = dict(metadata)
+        if owner_user_id:
+            entry["owner_user_id"] = owner_user_id
         entry.update({
             "video_id": job_id[:8],
             "video_url": _local_video_url(job_dir_name, video_path),
@@ -300,12 +705,14 @@ def write_local_saas_gallery_entry(job_id: str, result: dict, metadata: dict) ->
         return None
 
 
-def list_local_saas_gallery(limit: int = 50) -> List[dict]:
+def list_local_saas_gallery(limit: int = 50, owner_user_id: Optional[str] = None) -> List[dict]:
     videos = []
     for job_dir in glob.glob(os.path.join(OUTPUT_DIR, "saas_*")):
         if not os.path.isdir(job_dir):
             continue
         meta = _read_local_gallery_meta(job_dir) or _infer_local_gallery_meta(job_dir)
+        if owner_user_id and meta.get("owner_user_id") != owner_user_id:
+            continue
         if meta and meta.get("video_url"):
             videos.append(meta)
 
@@ -313,9 +720,9 @@ def list_local_saas_gallery(limit: int = 50) -> List[dict]:
     return videos[:limit] if limit else videos
 
 
-def list_combined_video_gallery(limit: int = 50) -> List[dict]:
-    remote = list_video_gallery(limit) or []
-    local = list_local_saas_gallery(limit) or []
+def list_combined_video_gallery(limit: int = 50, owner_user_id: Optional[str] = None) -> List[dict]:
+    remote = [] if owner_user_id else (list_video_gallery(limit) or [])
+    local = list_local_saas_gallery(limit, owner_user_id=owner_user_id) or []
 
     combined = []
     seen = set()
@@ -363,7 +770,7 @@ def _read_head_template_metadata(template_dir: str) -> Optional[dict]:
         return None
 
 
-def resolve_head_template_path(template_id_or_url: str) -> dict:
+def resolve_head_template_path(template_id_or_url: str, owner_user_id: Optional[str] = None) -> dict:
     template_id = _safe_head_template_id(template_id_or_url)
     if not template_id:
         raise FileNotFoundError("Invalid talking-head template id")
@@ -379,6 +786,8 @@ def resolve_head_template_path(template_id_or_url: str) -> dict:
 
     poster_path = os.path.join(template_dir, "actor.png")
     metadata = _read_head_template_metadata(template_dir) or {}
+    if owner_user_id and metadata.get("owner_user_id") != owner_user_id:
+        raise FileNotFoundError("Talking-head template not found for this user")
     return {
         "template_id": template_id,
         "head_path": head_path,
@@ -387,7 +796,7 @@ def resolve_head_template_path(template_id_or_url: str) -> dict:
     }
 
 
-def list_local_head_templates() -> List[dict]:
+def list_local_head_templates(owner_user_id: Optional[str] = None) -> List[dict]:
     templates = []
     root = _head_templates_dir()
     if not os.path.isdir(root):
@@ -397,6 +806,8 @@ def list_local_head_templates() -> List[dict]:
         if not os.path.isdir(template_dir):
             continue
         metadata = _read_head_template_metadata(template_dir)
+        if owner_user_id and (not metadata or metadata.get("owner_user_id") != owner_user_id):
+            continue
         if metadata and metadata.get("video_url"):
             templates.append(metadata)
 
@@ -404,7 +815,7 @@ def list_local_head_templates() -> List[dict]:
     return templates
 
 
-def save_local_head_template(job_id: str, label: Optional[str] = None) -> dict:
+def save_local_head_template(job_id: str, label: Optional[str] = None, owner_user_id: Optional[str] = None) -> dict:
     job_dir = os.path.join(OUTPUT_DIR, f"saas_{job_id}")
     if not os.path.isdir(job_dir):
         raise FileNotFoundError("AI Shorts job output not found")
@@ -419,6 +830,10 @@ def save_local_head_template(job_id: str, label: Optional[str] = None) -> dict:
         raise FileNotFoundError("Talking-head source video not found")
 
     metadata = _read_local_gallery_meta(job_dir) or {}
+    existing_owner = metadata.get("owner_user_id")
+    if owner_user_id and existing_owner and existing_owner != owner_user_id:
+        raise FileNotFoundError("AI Shorts job output not found")
+    owner_user_id = owner_user_id or metadata.get("owner_user_id")
     actor_candidates = []
     for pattern in ("*_actor.png", "selected_actor.png", "__actor.png"):
         actor_candidates.extend(glob.glob(os.path.join(job_dir, pattern)))
@@ -448,6 +863,7 @@ def save_local_head_template(job_id: str, label: Optional[str] = None) -> dict:
         "language": metadata.get("language", ""),
         "actor_description": metadata.get("actor_description", ""),
         "source_title": metadata.get("title", ""),
+        "owner_user_id": owner_user_id or "",
     }
     with open(os.path.join(template_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(entry, f, ensure_ascii=False, indent=2)
@@ -587,10 +1003,8 @@ async def process_endpoint(
     url: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None)
 ):
-    api_key = request.headers.get("X-Gemini-Key")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-
+    user = get_user_from_authorization(request.headers.get("Authorization"))
+    use_platform_keys = request.headers.get("X-Use-Platform-Keys", "").lower() in ("1", "true", "yes")
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
 
     # Handle JSON body manually for URL payload
@@ -599,6 +1013,22 @@ async def process_endpoint(
         body = await request.json()
         url = body.get("url")
         ack_flag = bool(body.get("acknowledged"))
+        if body.get("use_platform_keys") is not None:
+            use_platform_keys = bool(body.get("use_platform_keys"))
+
+    try:
+        api_key = resolve_effective_api_key(
+            "gemini",
+            user,
+            request.headers.get("X-Gemini-Key"),
+            use_platform_keys=use_platform_keys,
+        )
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -1311,7 +1741,7 @@ async def translate_clip(
 class SocialPostRequest(BaseModel):
     job_id: str
     clip_index: int
-    api_key: str
+    api_key: Optional[str] = None
     user_id: str
     platforms: List[str] # ["tiktok", "instagram", "youtube"]
     # Optional overrides if frontend wants to edit them
@@ -1319,11 +1749,26 @@ class SocialPostRequest(BaseModel):
     description: Optional[str] = None
     scheduled_date: Optional[str] = None # ISO-8601 string
     timezone: Optional[str] = "UTC"
+    use_platform_keys: bool = False
 
 import httpx
 
 @app.post("/api/social/post")
-async def post_to_socials(req: SocialPostRequest):
+async def post_to_socials(
+    req: SocialPostRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = get_user_from_authorization(authorization)
+    header_key = req.api_key if req.api_key not in ("__saved__", "__platform__") else None
+    try:
+        upload_key = resolve_effective_api_key("upload_post", user, header_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not upload_key:
+        raise HTTPException(status_code=400, detail="Missing Upload-Post API Key")
+
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1351,9 +1796,7 @@ async def post_to_socials(req: SocialPostRequest):
         
         # Prepare form data
         url = "https://api.upload-post.com/api/upload"
-        headers = {
-            "Authorization": f"Apikey {req.api_key}"
-        }
+        headers = {"Authorization": f"Apikey {upload_key}"}
         
         # Prepare data as dict (httpx handles lists for multiple values)
         data_payload = {
@@ -1409,8 +1852,19 @@ async def post_to_socials(req: SocialPostRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/social/user")
-async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key")):
+async def get_social_user(
+    api_key: Optional[str] = Header(None, alias="X-Upload-Post-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    use_platform_keys: bool = False,
+):
     """Proxy to fetch user ID from Upload-Post"""
+    user = get_user_from_authorization(authorization)
+    try:
+        api_key = resolve_effective_api_key("upload_post", user, api_key, use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not api_key:
          raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
          
@@ -1939,16 +2393,24 @@ class SaaSAnalyzeRequest(BaseModel):
     style: str = "ugc"
     language: str = "en"
     actor_gender: str = "female"
+    use_platform_keys: bool = False
 
 
 @app.post("/api/saasshorts/analyze")
 async def saasshorts_analyze(
     req: SaaSAnalyzeRequest,
     x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Analyze a URL or manual description and generate video scripts."""
     is_custom = req.script_mode == "custom"
-    gemini_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
+    user = get_user_from_authorization(authorization)
+    try:
+        gemini_key = resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not is_custom and not gemini_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key")
 
@@ -2042,6 +2504,7 @@ class SaaSActorRequest(BaseModel):
     actor_description: str
     num_options: int = 3
     product_description: Optional[str] = None
+    use_platform_keys: bool = False
 
 
 ACTOR_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
@@ -2052,7 +2515,13 @@ def _output_file_url(file_path: str) -> str:
     return f"/videos/{rel_path}"
 
 
-def _write_local_actor_metadata(file_path: str, url: str, description: str = "", storage: str = "local") -> None:
+def _write_local_actor_metadata(
+    file_path: str,
+    url: str,
+    description: str = "",
+    storage: str = "local",
+    owner_user_id: Optional[str] = None,
+) -> None:
     meta_path = os.path.splitext(file_path)[0] + ".json"
     meta = {
         "url": url,
@@ -2060,6 +2529,7 @@ def _write_local_actor_metadata(file_path: str, url: str, description: str = "",
         "description": description,
         "created_at": datetime.datetime.utcnow().isoformat() + "Z",
         "storage": storage,
+        "owner_user_id": owner_user_id or "",
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -2083,7 +2553,7 @@ def _read_local_actor_metadata(file_path: str) -> dict:
     }
 
 
-def list_local_actor_gallery() -> List[dict]:
+def list_local_actor_gallery(owner_user_id: Optional[str] = None) -> List[dict]:
     """List actor images saved on local disk, used when S3 is not configured."""
     image_paths = []
     actor_dirs = [os.path.join(OUTPUT_DIR, "actor_uploads")]
@@ -2110,6 +2580,8 @@ def list_local_actor_gallery() -> List[dict]:
         entry.setdefault("key", os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"))
         entry.setdefault("description", "")
         entry.setdefault("storage", "local")
+        if owner_user_id and entry.get("owner_user_id") != owner_user_id:
+            continue
         images.append(entry)
 
     images.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -2117,8 +2589,12 @@ def list_local_actor_gallery() -> List[dict]:
 
 
 @app.post("/api/saasshorts/actor-upload")
-async def saasshorts_actor_upload(file: UploadFile = File(...)):
+async def saasshorts_actor_upload(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """Upload a custom actor image and save it to the reusable actor gallery when possible."""
+    user = get_user_from_authorization(authorization)
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -2142,7 +2618,13 @@ async def saasshorts_actor_upload(file: UploadFile = File(...)):
         saved_url = upload_actor_to_s3(file_path, description="Uploaded actor")
         final_url = saved_url or local_url
         storage = "s3" if saved_url else "local"
-        _write_local_actor_metadata(file_path, final_url, description="Uploaded actor", storage=storage)
+        _write_local_actor_metadata(
+            file_path,
+            final_url,
+            description="Uploaded actor",
+            storage=storage,
+            owner_user_id=user.get("id") if user else None,
+        )
 
         return {
             "url": final_url,
@@ -2161,9 +2643,16 @@ async def saasshorts_actor_upload(file: UploadFile = File(...)):
 async def saasshorts_actor_options(
     req: SaaSActorRequest,
     x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Generate multiple actor image options for the user to choose from."""
-    fal_key = x_fal_key
+    user = get_user_from_authorization(authorization)
+    try:
+        fal_key = resolve_effective_api_key("fal", user, x_fal_key, getattr(req, "use_platform_keys", False))
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key")
 
@@ -2195,7 +2684,13 @@ async def saasshorts_actor_options(
             else:
                 # Fallback to local URL if S3 fails
                 local_url = f"/videos/saas_actors_{job_id}/{os.path.basename(p)}"
-                _write_local_actor_metadata(p, local_url, description=desc, storage="local")
+                _write_local_actor_metadata(
+                    p,
+                    local_url,
+                    description=desc,
+                    storage="local",
+                    owner_user_id=user.get("id") if user else None,
+                )
                 urls.append(local_url)
 
         return {"images": urls}
@@ -2205,11 +2700,20 @@ async def saasshorts_actor_options(
 
 
 @app.get("/api/saasshorts/gallery")
-async def saasshorts_video_gallery(limit: int = 50):
+async def saasshorts_video_gallery(
+    limit: int = 50,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """List all UGC videos from the public gallery."""
     try:
+        user = get_user_from_authorization(authorization)
+        owner_user_id = user.get("id") if user else None
         loop = asyncio.get_running_loop()
-        videos = await loop.run_in_executor(None, list_combined_video_gallery, limit)
+        import functools
+        videos = await loop.run_in_executor(
+            None,
+            functools.partial(list_combined_video_gallery, limit, owner_user_id=owner_user_id),
+        )
         return {"videos": videos, "total": len(videos)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2217,22 +2721,39 @@ async def saasshorts_video_gallery(limit: int = 50):
 
 class SaaSPostRequest(BaseModel):
     job_id: str
-    api_key: str
+    api_key: Optional[str] = None
     user_id: str
     platforms: List[str]
     title: Optional[str] = None
     description: Optional[str] = None
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
+    use_platform_keys: bool = False
 
 
 @app.post("/api/saasshorts/post")
-async def saasshorts_post_to_socials(req: SaaSPostRequest):
+async def saasshorts_post_to_socials(
+    req: SaaSPostRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """Post an AI Shorts video to social media via Upload-Post."""
+    user = get_user_from_authorization(authorization)
+    header_key = req.api_key if req.api_key not in ("__saved__", "__platform__") else None
+    try:
+        upload_key = resolve_effective_api_key("upload_post", user, header_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not upload_key:
+        raise HTTPException(status_code=400, detail="Missing Upload-Post API Key")
+
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = saas_jobs[req.job_id]
+    if user and job.get("owner_user_id") and job.get("owner_user_id") != user["id"]:
+        raise HTTPException(status_code=404, detail="Job not found")
     result = job.get("result")
     if not result or not result.get("video_url"):
         raise HTTPException(status_code=400, detail="No video available for this job")
@@ -2253,7 +2774,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest):
             final_description = script.get("full_narration", "Check this out!")
 
         url = "https://api.upload-post.com/api/upload"
-        headers = {"Authorization": f"Apikey {req.api_key}"}
+        headers = {"Authorization": f"Apikey {upload_key}"}
 
         data_payload = {
             "user": req.user_id,
@@ -2458,12 +2979,18 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 
 
 @app.get("/api/saasshorts/actor-gallery")
-async def saasshorts_actor_gallery():
+async def saasshorts_actor_gallery(authorization: Optional[str] = Header(None, alias="Authorization")):
     """List reusable actor images from S3 and local fallback storage."""
     try:
+        user = get_user_from_authorization(authorization)
+        owner_user_id = user.get("id") if user else None
         loop = asyncio.get_running_loop()
-        remote_images = await loop.run_in_executor(None, list_actor_gallery)
-        local_images = await loop.run_in_executor(None, list_local_actor_gallery)
+        remote_images = [] if owner_user_id else await loop.run_in_executor(None, list_actor_gallery)
+        import functools
+        local_images = await loop.run_in_executor(
+            None,
+            functools.partial(list_local_actor_gallery, owner_user_id=owner_user_id),
+        )
 
         by_url = {}
         for entry in (local_images or []) + (remote_images or []):
@@ -2493,6 +3020,7 @@ class SaaSGenerateRequest(BaseModel):
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
     reusable_head_template_id: Optional[str] = None
     reusable_lipsync_model: str = "sync-3"
+    use_platform_keys: bool = False
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -2500,6 +3028,7 @@ class SaaSLipSyncRequest(BaseModel):
     video_url: Optional[str] = None
     model: str = "sync-3"  # "sync-3", "lipsync-2-pro", or "lipsync-2"
     sync_mode: str = "cut_off"
+    use_platform_keys: bool = False
 
 
 class SaaSHeadTemplateSaveRequest(BaseModel):
@@ -2509,24 +3038,38 @@ class SaaSHeadTemplateSaveRequest(BaseModel):
 
 
 @app.get("/api/saasshorts/head-templates")
-async def saasshorts_head_templates():
+async def saasshorts_head_templates(authorization: Optional[str] = Header(None, alias="Authorization")):
     """List reusable talking-head templates saved locally."""
     try:
+        user = get_user_from_authorization(authorization)
+        owner_user_id = user.get("id") if user else None
         loop = asyncio.get_running_loop()
-        templates = await loop.run_in_executor(None, list_local_head_templates)
+        import functools
+        templates = await loop.run_in_executor(
+            None,
+            functools.partial(list_local_head_templates, owner_user_id=owner_user_id),
+        )
         return {"templates": templates, "total": len(templates)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/saasshorts/head-templates")
-async def saasshorts_save_head_template(req: SaaSHeadTemplateSaveRequest):
+async def saasshorts_save_head_template(
+    req: SaaSHeadTemplateSaveRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """Save the cached talking-head video from an AI Shorts job as a reusable template."""
     job_id = req.job_id or _job_id_from_saas_video_url(req.video_url or "")
     if not job_id:
         raise HTTPException(status_code=400, detail="Provide job_id or a local AI Shorts video_url")
     try:
-        template = save_local_head_template(job_id, label=req.label)
+        user = get_user_from_authorization(authorization)
+        template = save_local_head_template(
+            job_id,
+            label=req.label,
+            owner_user_id=user.get("id") if user else None,
+        )
         return {"template": template}
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -2539,10 +3082,17 @@ async def saasshorts_generate(
     req: SaaSGenerateRequest,
     x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
     x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Generate a UGC video from a script. Returns a job_id for polling."""
-    fal_key = x_fal_key
-    elevenlabs_key = x_elevenlabs_key
+    user = get_user_from_authorization(authorization)
+    try:
+        fal_key = resolve_effective_api_key("fal", user, x_fal_key, req.use_platform_keys)
+        elevenlabs_key = resolve_effective_api_key("elevenlabs", user, x_elevenlabs_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
@@ -2571,6 +3121,7 @@ async def saasshorts_generate(
                 "logs": [f"Retrying job {job_id[:8]}... reusing cached assets from disk."],
                 "result": None,
                 "output_dir": job_output_dir,
+                "owner_user_id": user.get("id") if user else None,
             }
 
     if not reused:
@@ -2582,6 +3133,7 @@ async def saasshorts_generate(
             "logs": ["AI Shorts job started."],
             "result": None,
             "output_dir": job_output_dir,
+            "owner_user_id": user.get("id") if user else None,
         }
 
     # If user selected a pre-generated actor, resolve it to a local path
@@ -2608,7 +3160,10 @@ async def saasshorts_generate(
     reusable_head = None
     if req.reusable_head_template_id:
         try:
-            reusable_head = resolve_head_template_path(req.reusable_head_template_id)
+            reusable_head = resolve_head_template_path(
+                req.reusable_head_template_id,
+                owner_user_id=user.get("id") if user else None,
+            )
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -2649,6 +3204,7 @@ async def saasshorts_generate(
 
             if job_id in saas_jobs:
                 video_filename = result["video_filename"]
+                owner_user_id = user.get("id") if user else None
                 saas_jobs[job_id]["status"] = "completed"
                 saas_jobs[job_id]["result"] = {
                     "video_url": f"/videos/saas_{job_id}/{video_filename}",
@@ -2687,18 +3243,26 @@ async def saasshorts_generate(
                         "product_url": req.script.get("_product_url", ""),
                         "segments": req.script.get("segments", []),
                         "cost_estimate": result.get("cost_estimate", {}),
+                        "owner_user_id": owner_user_id or "",
                     }
-                    local_gallery_result = write_local_saas_gallery_entry(job_id, result, gallery_meta)
+                    local_gallery_result = write_local_saas_gallery_entry(
+                        job_id,
+                        result,
+                        gallery_meta,
+                        owner_user_id=owner_user_id,
+                    )
                     if local_gallery_result:
                         saas_jobs[job_id]["result"]["gallery_video_id"] = local_gallery_result["video_id"]
                         log_msg("Saved to local UGC gallery.")
 
-                    gallery_result = upload_video_to_gallery(
-                        video_path=result["video_path"],
-                        actor_image_path=result.get("actor_image", ""),
-                        metadata=gallery_meta,
-                        video_id=job_id[:8],
-                    )
+                    gallery_result = None
+                    if not owner_user_id:
+                        gallery_result = upload_video_to_gallery(
+                            video_path=result["video_path"],
+                            actor_image_path=result.get("actor_image", ""),
+                            metadata=gallery_meta,
+                            video_id=job_id[:8],
+                        )
                     if gallery_result:
                         saas_jobs[job_id]["result"]["gallery_video_id"] = gallery_result["video_id"]
                         log_msg("📤 Uploaded to public gallery.")
@@ -2724,9 +3288,16 @@ async def saasshorts_generate(
 async def saasshorts_lipsync(
     req: SaaSLipSyncRequest,
     x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Run standalone lip-sync on an existing AI Shorts job and update its final video."""
-    fal_key = x_fal_key
+    user = get_user_from_authorization(authorization)
+    try:
+        fal_key = resolve_effective_api_key("fal", user, x_fal_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
 
@@ -2748,6 +3319,8 @@ async def saasshorts_lipsync(
 
     previous_result = dict(existing_job.get("result") or {}) if existing_job else {}
     previous_meta = _read_local_gallery_meta(job_output_dir) or {}
+    if user and previous_meta.get("owner_user_id") and previous_meta.get("owner_user_id") != user["id"]:
+        raise HTTPException(status_code=404, detail="AI Shorts job output not found")
     previous_cost = previous_result.get("cost_estimate") or previous_meta.get("cost_estimate") or {}
 
     saas_jobs[job_id] = {
@@ -2755,6 +3328,7 @@ async def saasshorts_lipsync(
         "logs": [f"Lip-sync post-process started ({req.model}, {req.sync_mode})."],
         "result": previous_result or None,
         "output_dir": job_output_dir,
+        "owner_user_id": user.get("id") if user else previous_meta.get("owner_user_id"),
     }
 
     async def run_lipsync():
@@ -2833,7 +3407,12 @@ async def saasshorts_lipsync(
                 "lipsync_model": req.model,
                 "lipsync_sync_mode": req.sync_mode,
             }
-            write_local_saas_gallery_entry(job_id, result, gallery_meta)
+            write_local_saas_gallery_entry(
+                job_id,
+                result,
+                gallery_meta,
+                owner_user_id=user.get("id") if user else previous_meta.get("owner_user_id"),
+            )
 
         except Exception as e:
             print(f"[AI Shorts] Lip-sync job {job_id} failed: {e}")
@@ -2849,12 +3428,18 @@ async def saasshorts_lipsync(
 
 
 @app.get("/api/saasshorts/status/{job_id}")
-async def saasshorts_status(job_id: str):
+async def saasshorts_status(
+    job_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """Poll AI Shorts job status."""
     if job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="AI Shorts job not found")
 
     job = saas_jobs[job_id]
+    user = get_user_from_authorization(authorization)
+    if user and job.get("owner_user_id") and job.get("owner_user_id") != user["id"]:
+        raise HTTPException(status_code=404, detail="AI Shorts job not found")
     return {
         "status": job["status"],
         "logs": job["logs"],
@@ -2865,13 +3450,21 @@ async def saasshorts_status(job_id: str):
 @app.get("/api/saasshorts/voices")
 async def saasshorts_voices(
     x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    use_platform_keys: bool = False,
 ):
     """List available ElevenLabs voices."""
-    if x_elevenlabs_key:
+    user = get_user_from_authorization(authorization)
+    try:
+        elevenlabs_key = resolve_effective_api_key("elevenlabs", user, x_elevenlabs_key, use_platform_keys)
+    except (SubscriptionRequiredError, PlatformKeyUnavailableError):
+        elevenlabs_key = None
+
+    if elevenlabs_key:
         try:
             loop = asyncio.get_event_loop()
             voices = await loop.run_in_executor(
-                None, get_elevenlabs_voices, x_elevenlabs_key
+                None, get_elevenlabs_voices, elevenlabs_key
             )
             if voices:
                 return {"voices": voices, "source": "elevenlabs"}

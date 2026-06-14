@@ -6,7 +6,19 @@ import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
-export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onPlay, onPause }) {
+export default function ResultCard({
+    clip,
+    index,
+    jobId,
+    uploadPostKey,
+    uploadUserId,
+    geminiApiKey,
+    elevenLabsKey,
+    authToken,
+    usePlatformKeys = false,
+    onPlay,
+    onPause,
+}) {
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
@@ -343,7 +355,8 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 user_id: uploadUserId,
                 platforms: selectedPlatforms,
                 title: postTitle,
-                description: postDescription
+                description: postDescription,
+                use_platform_keys: usePlatformKeys,
             };
 
             if (isScheduling && scheduleDate) {
@@ -355,7 +368,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const res = await fetch(getApiUrl('/api/social/post'), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+                },
                 body: JSON.stringify(payload)
             });
 

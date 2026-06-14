@@ -126,6 +126,8 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
 
 const SESSION_KEY = 'openshorts_session';
 const SESSION_MAX_AGE = 3600000; // 1 hour (matches server job retention)
+const AUTH_TOKEN_KEY = 'openshorts_auth_token';
+const USE_PLATFORM_KEYS_KEY = 'openshorts_use_platform_keys';
 
 // Mock polling function
 const pollJob = async (jobId) => {
@@ -134,8 +136,85 @@ const pollJob = async (jobId) => {
   return res.json();
 };
 
+const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const isRegister = mode === 'register';
+
+  return (
+    <div className="min-h-screen bg-background flex items-center justify-center p-6">
+      <div className="w-full max-w-md glass-panel p-8 space-y-6">
+        <div className="space-y-2">
+          <div className="w-11 h-11 rounded-xl bg-violet-500/15 text-violet-300 flex items-center justify-center">
+            <Shield size={22} />
+          </div>
+          <h1 className="text-2xl font-bold text-white">
+            {isRegister ? 'Создать аккаунт' : 'Войти в аккаунт'}
+          </h1>
+          <p className="text-sm text-zinc-500">
+            Аккаунт нужен, чтобы хранить API-ключи, аватары, talking-head шаблоны и будущую подписку.
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          {isRegister && (
+            <input
+              className="input-field"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Имя"
+            />
+          )}
+          <input
+            className="input-field"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="email@example.com"
+          />
+          <input
+            className="input-field"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Пароль, минимум 8 символов"
+          />
+          {error && (
+            <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+              {error}
+            </div>
+          )}
+          <button
+            className="btn-primary w-full py-3"
+            disabled={loading}
+            onClick={() => onSubmit({ email, password, name })}
+          >
+            {loading ? 'Подождите...' : isRegister ? 'Зарегистрироваться' : 'Войти'}
+          </button>
+        </div>
+
+        <button
+          className="text-sm text-zinc-400 hover:text-white"
+          onClick={() => setMode(isRegister ? 'login' : 'register')}
+        >
+          {isRegister ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Зарегистрироваться'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
 function App() {
   useRuntimeLocalization('ru');
+
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem(AUTH_TOKEN_KEY) || '');
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState('login');
+  const [authError, setAuthError] = useState('');
+  const [apiKeyStatus, setApiKeyStatus] = useState({});
+  const [usePlatformKeys, setUsePlatformKeys] = useState(() => localStorage.getItem(USE_PLATFORM_KEYS_KEY) === '1');
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || import.meta.env.VITE_GEMINI_API_KEY || '');
   // Social API State - Load encrypted or plain
@@ -177,6 +256,15 @@ function App() {
   const [isSyncedPlaying, setIsSyncedPlaying] = useState(false);
   const [syncTrigger, setSyncTrigger] = useState(0);
 
+  const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
+  const hasSavedKey = (provider) => Boolean(apiKeyStatus?.[provider]?.has_key);
+  const canUsePlatformKeys = authUser?.subscription_status === 'active';
+  const usingPlatformKeys = usePlatformKeys && canUsePlatformKeys;
+  const effectiveGeminiKey = usingPlatformKeys ? '__platform__' : (hasSavedKey('gemini') ? '__saved__' : apiKey);
+  const effectiveFalKey = usingPlatformKeys ? '__platform__' : (hasSavedKey('fal') ? '__saved__' : falKey);
+  const effectiveElevenLabsKey = usingPlatformKeys ? '__platform__' : (hasSavedKey('elevenlabs') ? '__saved__' : elevenLabsKey);
+  const effectiveUploadPostKey = usingPlatformKeys ? '__platform__' : (hasSavedKey('upload_post') ? '__saved__' : uploadPostKey);
+
   const handleClipPlay = (startTime) => {
     setSyncedTime(startTime);
     setIsSyncedPlaying(true);
@@ -185,6 +273,97 @@ function App() {
 
   const handleClipPause = () => {
     setIsSyncedPlaying(false);
+  };
+
+  const applyAuthPayload = (data, tokenOverride) => {
+    if (tokenOverride) {
+      setAuthToken(tokenOverride);
+      localStorage.setItem(AUTH_TOKEN_KEY, tokenOverride);
+    }
+    setAuthUser(data.user || null);
+    setApiKeyStatus(data.api_keys || {});
+  };
+
+  const loadMe = async (token = authToken) => {
+    if (!token) {
+      setAuthLoading(false);
+      return;
+    }
+    try {
+      const res = await fetch(getApiUrl('/api/auth/me'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error('Session expired');
+      const data = await res.json();
+      applyAuthPayload(data, token);
+    } catch {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      setAuthToken('');
+      setAuthUser(null);
+      setApiKeyStatus({});
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadMe(authToken);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(USE_PLATFORM_KEYS_KEY, usePlatformKeys ? '1' : '0');
+  }, [usePlatformKeys]);
+
+  const handleAuthSubmit = async ({ email, password, name }) => {
+    setAuthError('');
+    setAuthLoading(true);
+    try {
+      const res = await fetch(getApiUrl(authMode === 'register' ? '/api/auth/register' : '/api/auth/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, name }),
+      });
+      if (!res.ok) {
+        let msg = 'Auth failed';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      applyAuthPayload(data, data.token);
+    } catch (e) {
+      setAuthError(e.message || 'Auth failed');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(SESSION_KEY);
+    setAuthToken('');
+    setAuthUser(null);
+    setApiKeyStatus({});
+    setStatus('idle');
+  };
+
+  const handleSaveApiKey = async (provider, value) => {
+    const cleaned = (value || '').trim();
+    if (!cleaned || cleaned === '__saved__' || cleaned === '__platform__') return;
+    const res = await fetch(getApiUrl('/api/user/api-keys'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify({ provider, api_key: cleaned }),
+    });
+    if (!res.ok) {
+      let msg = 'Не удалось сохранить API-ключ';
+      try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+      throw new Error(msg);
+    }
+    const data = await res.json();
+    setApiKeyStatus(data.api_keys || {});
   };
 
   // Session Recovery: Restore on mount
@@ -261,10 +440,10 @@ function App() {
   }, [falKey]);
 
   useEffect(() => {
-    if (uploadPostKey && userProfiles.length === 0) {
+    if (effectiveUploadPostKey && userProfiles.length === 0) {
       fetchUserProfiles({ silent: true });
     }
-  }, [uploadPostKey]);
+  }, [effectiveUploadPostKey, authToken, usePlatformKeys]);
 
   useEffect(() => {
     let interval;
@@ -301,11 +480,14 @@ function App() {
 
 
   const fetchUserProfiles = async ({ silent = false } = {}) => {
-    if (!uploadPostKey) return;
+    if (!effectiveUploadPostKey) return;
     try {
-      const res = await fetch(getApiUrl('/api/social/user'), {
-        headers: { 'X-Upload-Post-Key': uploadPostKey }
-      });
+      const headers = { ...authHeaders() };
+      if (!['__saved__', '__platform__'].includes(effectiveUploadPostKey)) {
+        headers['X-Upload-Post-Key'] = effectiveUploadPostKey;
+      }
+      const path = `/api/social/user${usingPlatformKeys ? '?use_platform_keys=true' : ''}`;
+      const res = await fetch(getApiUrl(path), { headers });
       if (!res.ok) throw new Error("Failed to fetch");
       const data = await res.json();
       if (data.profiles && data.profiles.length > 0) {
@@ -324,7 +506,7 @@ function App() {
   };
 
   const handleProcess = async (data) => {
-    if (!apiKey) {
+    if (!effectiveGeminiKey) {
       setShowKeyModal(true);
       return;
     }
@@ -335,11 +517,15 @@ function App() {
 
     try {
       let body;
-      const headers = { 'X-Gemini-Key': apiKey };
+      const headers = { ...authHeaders() };
+      if (!['__saved__', '__platform__'].includes(effectiveGeminiKey)) {
+        headers['X-Gemini-Key'] = effectiveGeminiKey;
+      }
+      if (usingPlatformKeys) headers['X-Use-Platform-Keys'] = 'true';
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload, acknowledged: !!data.acknowledged });
+        body = JSON.stringify({ url: data.payload, acknowledged: !!data.acknowledged, use_platform_keys: usingPlatformKeys });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
@@ -349,7 +535,7 @@ function App() {
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
+        headers,
         body
       });
 
@@ -473,6 +659,26 @@ function App() {
     </div>
   );
 
+  if (authLoading && !authUser) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center text-zinc-400">
+        Загрузка аккаунта...
+      </div>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <AuthScreen
+        mode={authMode}
+        setMode={setAuthMode}
+        loading={authLoading}
+        error={authError}
+        onSubmit={handleAuthSubmit}
+      />
+    );
+  }
+
   return (
     <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
       <Sidebar />
@@ -498,6 +704,24 @@ function App() {
           </div>
 
           <div className="flex items-center gap-4">
+            <div className="hidden md:flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-300">
+              <Users size={13} />
+              <span>{authUser.email}</span>
+              <span className={`rounded-full px-2 py-0.5 ${
+                authUser.subscription_status === 'active'
+                  ? 'bg-green-500/15 text-green-300'
+                  : 'bg-zinc-500/15 text-zinc-400'
+              }`}>
+                {authUser.subscription_status === 'active' ? 'Подписка active' : 'Free'}
+              </span>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="text-xs text-zinc-500 hover:text-white flex items-center gap-1.5"
+            >
+              <LogOut size={14} /> Выйти
+            </button>
+
             {userProfiles.length > 0 && (
               <UserProfileSelector
                 profiles={userProfiles}
@@ -506,7 +730,7 @@ function App() {
               />
             )}
 
-            {!apiKey && (
+            {!effectiveGeminiKey && (
               <button
                 onClick={() => setActiveTab('settings')}
                 className="text-xs text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-1 rounded-full border border-amber-500/30 transition-colors flex items-center gap-1.5"
@@ -520,7 +744,7 @@ function App() {
         </header>
 
         {/* Persistent Missing Key Banner — visible on every screen */}
-        {!apiKey && activeTab !== 'settings' && (
+        {!effectiveGeminiKey && activeTab !== 'settings' && (
           <div className="mx-6 mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-4 shrink-0 animate-[fadeIn_0.3s_ease-out]">
             <div className="flex items-center gap-3 text-sm text-amber-200">
               <KeyRound size={16} className="shrink-0 text-amber-400" />
@@ -563,10 +787,39 @@ function App() {
               <div className="flex items-center justify-between mb-8">
                 <h1 className="text-2xl font-bold">Settings</h1>
                 <div className="px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[10px] text-green-400 font-medium flex items-center gap-2">
-                  <Shield size={12} /> Privacy: keys only live in your browser (sent to backend just to process)
+                  <Shield size={12} /> Ключи хранятся в аккаунте на backend
                 </div>
               </div>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              <div className="glass-panel p-5 mb-8 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold">Аккаунт и подписка</h2>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      {authUser.email} · статус: {authUser.subscription_status}
+                    </p>
+                  </div>
+                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={usePlatformKeys}
+                      onChange={(e) => setUsePlatformKeys(e.target.checked)}
+                      disabled={!canUsePlatformKeys}
+                    />
+                    Использовать ключи платформы
+                  </label>
+                </div>
+                {!canUsePlatformKeys && (
+                  <p className="text-xs text-amber-300">
+                    Platform keys будут доступны после активации подписки. Сейчас можно использовать только свои сохранённые ключи.
+                  </p>
+                )}
+              </div>
+              <KeyInput
+                onKeySet={setApiKey}
+                savedKey={apiKey}
+                onAccountSave={(key) => handleSaveApiKey('gemini', key)}
+                hasAccountKey={hasSavedKey('gemini')}
+              />
 
               <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
@@ -587,7 +840,15 @@ function App() {
                       className="input-field"
                       placeholder="ey..."
                     />
-                    <button onClick={() => fetchUserProfiles()} className="btn-primary py-2 px-4 text-sm">
+                    <button
+                      onClick={async () => {
+                        if (uploadPostKey && !['__saved__', '__platform__'].includes(uploadPostKey)) {
+                          await handleSaveApiKey('upload_post', uploadPostKey);
+                        }
+                        await fetchUserProfiles();
+                      }}
+                      className="btn-primary py-2 px-4 text-sm"
+                    >
                       Connect
                     </button>
                   </div>
@@ -609,7 +870,7 @@ function App() {
                     </div>
                     <br />
                     <span className="text-zinc-600 italic">
-                      Keys are only stored in your browser. They are sent to the backend only to process your request, never stored server-side.
+                      Ключ сохраняется в backend vault текущего аккаунта.
                     </span>
                   </p>
                 </div>
@@ -635,10 +896,11 @@ function App() {
                       placeholder="sk_..."
                     />
                     <button
-                      onClick={() => {
+                      onClick={async () => {
                         if (elevenLabsKey) {
                           localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
-                          alert('ElevenLabs API Key saved!');
+                          await handleSaveApiKey('elevenlabs', elevenLabsKey);
+                          alert('ElevenLabs API Key saved to account!');
                         }
                       }}
                       className="btn-primary py-2 px-4 text-sm"
@@ -660,7 +922,7 @@ function App() {
                     </div>
                     <br />
                     <span className="text-zinc-600 italic">
-                      Keys are only stored in your browser. They are sent to the backend only to process your request, never stored server-side.
+                      Ключ сохраняется в backend vault текущего аккаунта.
                     </span>
                   </p>
                 </div>
@@ -686,10 +948,11 @@ function App() {
                       placeholder="fal_..."
                     />
                     <button
-                      onClick={() => {
+                      onClick={async () => {
                         if (falKey) {
                           localStorage.setItem('falKey_v1', encrypt(falKey));
-                          alert('fal.ai API Key saved!');
+                          await handleSaveApiKey('fal', falKey);
+                          alert('fal.ai API Key saved to account!');
                         }
                       }}
                       className="btn-primary py-2 px-4 text-sm"
@@ -711,7 +974,7 @@ function App() {
                     </div>
                     <br />
                     <span className="text-zinc-600 italic">
-                      Keys are only stored in your browser. Sent to backend only to process requests.
+                      Ключ сохраняется в backend vault текущего аккаунта.
                     </span>
                   </p>
                 </div>
@@ -721,7 +984,15 @@ function App() {
 
           {/* View: SaaS Shorts */}
           {activeTab === 'saasshorts' && (
-            <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
+            <SaaShortsTab
+              geminiApiKey={effectiveGeminiKey}
+              elevenLabsKey={effectiveElevenLabsKey}
+              falKey={effectiveFalKey}
+              uploadPostKey={effectiveUploadPostKey}
+              uploadUserId={uploadUserId}
+              authToken={authToken}
+              usePlatformKeys={usingPlatformKeys}
+            />
           )}
 
           {/* View: AI Agent */}
@@ -843,13 +1114,13 @@ function App() {
           {/* View: UGC Gallery */}
           {activeTab === 'ugc-gallery' && (
             <div className="h-full overflow-y-auto custom-scrollbar p-6 md:p-8">
-              <UGCGallery falKey={falKey} />
+              <UGCGallery falKey={effectiveFalKey} authToken={authToken} usePlatformKeys={usingPlatformKeys} />
             </div>
           )}
 
           {/* View: Thumbnails */}
           {activeTab === 'thumbnails' && (
-            <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
+            <ThumbnailStudio geminiApiKey={effectiveGeminiKey} uploadPostKey={effectiveUploadPostKey} uploadUserId={uploadUserId} />
           )}
 
           {/* View: Gallery */}
@@ -972,10 +1243,12 @@ function App() {
                           clip={clip}
                           index={i}
                           jobId={jobId}
-                          uploadPostKey={uploadPostKey}
+                          uploadPostKey={effectiveUploadPostKey}
                           uploadUserId={uploadUserId}
-                          geminiApiKey={apiKey}
-                          elevenLabsKey={elevenLabsKey}
+                          geminiApiKey={effectiveGeminiKey}
+                          elevenLabsKey={effectiveElevenLabsKey}
+                          authToken={authToken}
+                          usePlatformKeys={usingPlatformKeys}
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                         />
@@ -1013,12 +1286,12 @@ function App() {
             </p>
 
             {/* Gemini block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!apiKey ? 'bg-blue-500/5 border-blue-500/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
+            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveGeminiKey ? 'bg-blue-500/5 border-blue-500/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
               <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {apiKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
-                Gemini API Key {apiKey && <span className="text-green-400">— set</span>}
+                {effectiveGeminiKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
+                Gemini API Key {effectiveGeminiKey && <span className="text-green-400">— set</span>}
               </p>
-              {!apiKey && (
+              {!effectiveGeminiKey && (
                 <>
                   <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
                     <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-blue-400 underline">aistudio.google.com/app/apikey</a></li>
@@ -1041,12 +1314,12 @@ function App() {
             </div>
 
             {/* Upload-Post block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!uploadPostKey ? 'bg-white/5 border-white/10' : 'bg-white/5 border-white/10 opacity-70'}`}>
+            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveUploadPostKey ? 'bg-white/5 border-white/10' : 'bg-white/5 border-white/10 opacity-70'}`}>
               <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {uploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-zinc-500" />}
-                Upload-Post API Key {uploadPostKey && <span className="text-green-400">— set</span>}
+                {effectiveUploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-zinc-500" />}
+                Upload-Post API Key {effectiveUploadPostKey && <span className="text-green-400">— set</span>}
               </p>
-              {!uploadPostKey && (
+              {!effectiveUploadPostKey && (
                 <>
                   <p className="text-xs text-zinc-400">
                     Optional. Add it only if you want to publish directly to TikTok, Instagram Reels, and YouTube Shorts.
