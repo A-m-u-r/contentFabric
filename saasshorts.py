@@ -1445,6 +1445,86 @@ def generate_talking_head(
     return output_path
 
 
+def _get_media_stream_duration(path: str, stream_type: str) -> float:
+    """Get the first audio/video stream duration using ffprobe."""
+    selector = "a:0" if stream_type == "audio" else "v:0"
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", selector,
+        "-show_entries", "stream=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip().splitlines()[0])
+    except Exception:
+        pass
+    return 0.0
+
+
+def normalize_talking_head_duration(
+    talking_head_path: str,
+    audio_path: str,
+    log: Callable[[str], None] = print,
+    max_delta: float = 0.25,
+) -> str:
+    """Force talking-head video/audio streams to match the source voiceover duration."""
+    target_duration = _get_media_duration(audio_path)
+    video_duration = _get_media_stream_duration(talking_head_path, "video")
+    embedded_audio_duration = _get_media_stream_duration(talking_head_path, "audio")
+
+    if target_duration <= 0 or video_duration <= 0:
+        return talking_head_path
+
+    video_delta = video_duration - target_duration
+    audio_delta = embedded_audio_duration - target_duration if embedded_audio_duration else 0.0
+    if abs(video_delta) <= max_delta and abs(audio_delta) <= max_delta:
+        return talking_head_path
+
+    log(
+        "[3/6] Normalizing talking-head duration "
+        f"(video {video_duration:.2f}s, embedded audio {embedded_audio_duration:.2f}s, "
+        f"source audio {target_duration:.2f}s)."
+    )
+
+    tmp_path = talking_head_path.replace(".mp4", "_normalized_tmp.mp4")
+    if video_duration < target_duration - max_delta:
+        pad_duration = max(target_duration - video_duration, 0)
+        video_filter = (
+            f"tpad=stop_mode=clone:stop_duration={pad_duration:.3f},"
+            f"trim=duration={target_duration:.3f},setpts=PTS-STARTPTS"
+        )
+    else:
+        video_filter = f"trim=duration={target_duration:.3f},setpts=PTS-STARTPTS"
+
+    filter_complex = (
+        f"[0:v]{video_filter}[v];"
+        f"[1:a]atrim=duration={target_duration:.3f},asetpts=PTS-STARTPTS[a]"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", talking_head_path,
+        "-i", audio_path,
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "[a]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        tmp_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    os.replace(tmp_path, talking_head_path)
+    try:
+        os.remove(f"{talking_head_path}.fal_url.txt")
+    except OSError:
+        pass
+    log("[3/6] Talking-head duration normalized to source audio.")
+    return talking_head_path
+
+
 def generate_talking_head_lowcost(
     image_path: str,
     audio_path: str,
@@ -2117,6 +2197,7 @@ def composite_video(
 
     if not broll_clips:
         # Simple: talking head + subtitles only
+        audio_duration = _get_media_stream_duration(talking_head_path, "audio") or _get_media_duration(talking_head_path)
         norm = (
             "scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
@@ -2125,9 +2206,13 @@ def composite_video(
         cmd = [
             "ffmpeg", "-y",
             "-i", talking_head_path,
+            "-t", f"{audio_duration:.3f}",
             "-vf", f"{norm},{sub_filter}",
+            "-map", "0:v:0",
+            "-map", "0:a:0",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
             "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
             output_path,
         ]
         subprocess.run(cmd, check=True)
@@ -2469,6 +2554,8 @@ def generate_full_video(
         log("[3/6] Talking head ready.")
     else:
         log("[3/6] ✅ Talking head cached, skipping.")
+
+    talking_head = normalize_talking_head_duration(talking_head, audio_path, log=log)
 
     # ── Step 4: Generate b-roll clips ──
     broll_mode = (config.get("broll_mode") or "mockup").lower()
