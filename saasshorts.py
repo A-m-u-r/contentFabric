@@ -1002,6 +1002,8 @@ def generate_actor_images(
     import random
     img_num = random.randint(1000, 9999)
     realism_guardrails = (
+        "Vertical 9:16 smartphone portrait for Instagram Reels, upper torso visible, centered face, "
+        "natural headroom, hands and shoulders inside frame. "
         "Sharp realistic smartphone portrait, natural skin texture, normal human facial asymmetry, "
         "not over-smoothed, not CGI, not beauty-filtered, not a studio headshot. "
         "Use only the outfit/background/details explicitly described by the user. "
@@ -1024,7 +1026,7 @@ def generate_actor_images(
             "fal-ai/flux-2-pro",
             {
                 "prompt": prompt,
-                "image_size": "portrait_4_3",
+                "image_size": "portrait_16_9",
                 "safety_tolerance": 5,
                 "seed": random.randint(0, 999999),
             },
@@ -1366,6 +1368,42 @@ def kling_avatar_label(tier: str = "standard") -> str:
     return KLING_AVATAR_TIERS[tier]["label"]
 
 
+def prepare_kling_actor_image(image_path: str, output_path: str) -> str:
+    """Prepare a native 9:16 actor image before sending it to Kling Avatar."""
+    if (
+        os.path.exists(output_path)
+        and os.path.getsize(output_path) > 0
+        and os.path.getmtime(output_path) >= os.path.getmtime(image_path)
+    ):
+        return output_path
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    for stale_path in (output_path, f"{output_path}.fal_url.txt"):
+        try:
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        except OSError:
+            pass
+
+    # Use cover-crop instead of padding so Kling receives a true vertical
+    # portrait, not a horizontal photo embedded inside a vertical canvas.
+    vf = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
+        "setsar=1,format=rgb24"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", image_path,
+        "-vf", vf,
+        "-frames:v", "1",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    print(f"[SaaSShorts] ✅ Kling 9:16 actor image: {output_path}")
+    return output_path
+
+
 def generate_talking_head(
     image_path: str,
     audio_path: str,
@@ -1377,8 +1415,13 @@ def generate_talking_head(
     tier = (tier or "standard").strip().lower()
     print(f"[SaaSShorts] 🗣️ Generating talking head ({kling_avatar_label(tier)})...")
 
-    # Upload image and audio to fal.ai CDN
-    image_url = _fal_upload_file(image_path, fal_key)
+    # Upload a native 9:16 image to Kling so the model generates for Reels
+    # framing instead of producing a wide frame that we crop later.
+    kling_image_path = output_path.replace(".mp4", "_actor_9x16.png")
+    image_url = _fal_upload_file(
+        prepare_kling_actor_image(image_path, kling_image_path),
+        fal_key,
+    )
     audio_url = _fal_upload_file(audio_path, fal_key)
 
     prompt = (
@@ -2365,6 +2408,8 @@ def generate_full_video(
 
     def _write_talking_head_meta(meta: dict = None):
         payload = {"video_mode": video_mode, "head_source": "generated"}
+        if not use_reusable_head and video_mode in ("standard", "premium"):
+            payload["kling_input"] = "vertical_9x16_v1"
         if meta:
             payload.update(meta)
         with open(talking_head_meta_path, "w", encoding="utf-8") as f:
@@ -2375,6 +2420,7 @@ def generate_full_video(
         "head_source": "template" if use_reusable_head else "generated",
         "reusable_head_path": reusable_head_path or "",
         "reusable_lipsync_model": reusable_lipsync_model if use_reusable_head else "",
+        "kling_input": "vertical_9x16_v1" if (not use_reusable_head and video_mode in ("standard", "premium")) else "",
     }
     current_head_meta = _read_talking_head_meta()
     if _exists(talking_head) and (
@@ -2382,6 +2428,7 @@ def generate_full_video(
         or current_head_meta.get("head_source") != expected_head_meta["head_source"]
         or current_head_meta.get("reusable_head_path", "") != expected_head_meta["reusable_head_path"]
         or current_head_meta.get("reusable_lipsync_model", "") != expected_head_meta["reusable_lipsync_model"]
+        or current_head_meta.get("kling_input", "") != expected_head_meta["kling_input"]
     ):
         log("[3/6] Talking-head source changed; regenerating voice-driven talking head.")
         for stale_path in (
