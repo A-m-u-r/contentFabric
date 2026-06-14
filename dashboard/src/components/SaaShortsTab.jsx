@@ -211,14 +211,17 @@ function estimateSpeechSeconds(text) {
   return Math.max(12, Math.min(75, Math.round(words / 2.5)));
 }
 
-function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor }) {
+function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3' }) {
   const seconds = estimateSpeechSeconds(text);
   const ttsRate = ttsProvider === 'fal_minimax' ? 0.0001 : 0.00003;
   const voiceCost = (text || '').length * ttsRate;
-  const actorCost = hasSelectedActor ? 0 : 0.05;
+  const actorCost = (hasSelectedActor || hasReusableHead) ? 0 : 0.05;
   let videoCost = 0;
 
-  if (videoMode === 'lowcost') {
+  if (hasReusableHead) {
+    const option = LIPSYNC_MODEL_OPTIONS.find((item) => item.id === lipsyncModel) || LIPSYNC_MODEL_OPTIONS[0];
+    videoCost = (seconds / 60) * option.pricePerMinute;
+  } else if (videoMode === 'lowcost') {
     videoCost = 0.19 + 0.20;
   } else if (videoMode === 'premium') {
     videoCost = seconds * 0.115;
@@ -314,6 +317,11 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
+  const [headTemplates, setHeadTemplates] = useState([]);
+  const [loadingHeadTemplates, setLoadingHeadTemplates] = useState(false);
+  const [selectedHeadTemplate, setSelectedHeadTemplate] = useState('');
+  const [savingHeadTemplate, setSavingHeadTemplate] = useState(false);
+  const [headTemplateStatus, setHeadTemplateStatus] = useState('');
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
   const [actorUploadStatus, setActorUploadStatus] = useState('');
   const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
@@ -354,6 +362,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       .then(data => setActorGallery(data.images || []))
       .catch(() => {})
       .finally(() => setLoadingGallery(false));
+  }, []);
+
+  useEffect(() => {
+    refreshHeadTemplates();
   }, []);
 
   // Fetch voices on mount
@@ -565,6 +577,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           selected_actor_url: selectedActor || undefined,
           video_mode: videoMode,
           broll_mode: brollMode,
+          reusable_head_template_id: selectedHeadTemplate || undefined,
+          reusable_lipsync_model: lipSyncModel,
         }),
       });
 
@@ -618,6 +632,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
           retry_job_id: jobId,
           video_mode: videoMode,
           broll_mode: brollMode,
+          reusable_head_template_id: selectedHeadTemplate || undefined,
+          reusable_lipsync_model: lipSyncModel,
         }),
       });
 
@@ -689,6 +705,53 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       }
     } catch (e) {
       console.error('Actor gallery refresh failed:', e);
+    }
+  };
+
+  const refreshHeadTemplates = async () => {
+    setLoadingHeadTemplates(true);
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/head-templates'));
+      if (res.ok) {
+        const data = await res.json();
+        setHeadTemplates(data.templates || []);
+      }
+    } catch (e) {
+      console.error('Head templates refresh failed:', e);
+    } finally {
+      setLoadingHeadTemplates(false);
+    }
+  };
+
+  const handleSaveHeadTemplate = async () => {
+    if (!jobId) {
+      setHeadTemplateStatus('Нет job_id для сохранения talking-head.');
+      return;
+    }
+    setSavingHeadTemplate(true);
+    setHeadTemplateStatus('Сохраняю talking-head шаблон...');
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/head-templates'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          job_id: jobId,
+          label: genResult?.script?.title || 'Talking head template',
+        }),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось сохранить talking-head шаблон';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      await refreshHeadTemplates();
+      setSelectedHeadTemplate(data.template?.template_id || '');
+      setHeadTemplateStatus('Talking-head шаблон сохранен. Его можно выбрать в следующем ролике.');
+    } catch (e) {
+      setHeadTemplateStatus(e.message || 'Не удалось сохранить talking-head шаблон');
+    } finally {
+      setSavingHeadTemplate(false);
     }
   };
 
@@ -1560,8 +1623,101 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 </p>
               </div>
 
+              {/* Talking-head source */}
+              <div className="p-4 rounded-xl border border-white/10 bg-white/5 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-zinc-300 flex items-center gap-2">
+                      <User size={14} /> Источник говорящей головы
+                    </label>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      Можно один раз сгенерировать дорогой talking-head, сохранить его и дальше менять только озвучку через lipsync.
+                    </p>
+                  </div>
+                  {loadingHeadTemplates && <Loader2 size={14} className="animate-spin text-zinc-500 shrink-0" />}
+                </div>
+
+                <div className="grid sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedHeadTemplate('')}
+                    className={`p-3 rounded-xl border text-left transition-all ${
+                      !selectedHeadTemplate
+                        ? 'border-blue-500/50 bg-blue-500/10 text-blue-200'
+                        : 'border-white/10 bg-black/20 text-zinc-400 hover:bg-white/10'
+                    }`}
+                  >
+                    <div className="text-sm font-semibold">Создать новую</div>
+                    <div className="text-[10px] text-zinc-500 mt-1">Kling/Hailuo генерирует новый talking-head под эту озвучку.</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (headTemplates[0]) setSelectedHeadTemplate(headTemplates[0].template_id);
+                    }}
+                    disabled={headTemplates.length === 0}
+                    className={`p-3 rounded-xl border text-left transition-all ${
+                      selectedHeadTemplate
+                        ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                        : 'border-white/10 bg-black/20 text-zinc-400 hover:bg-white/10 disabled:opacity-40'
+                    }`}
+                  >
+                    <div className="text-sm font-semibold">Использовать сохранённую</div>
+                    <div className="text-[10px] text-zinc-500 mt-1">
+                      {headTemplates.length > 0 ? 'Дешевле: новая озвучка + Sync Lipsync.' : 'Сначала сохрани talking-head из готового ролика.'}
+                    </div>
+                  </button>
+                </div>
+
+                {headTemplates.length > 0 && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                    {headTemplates.map((tpl) => (
+                      <button
+                        key={tpl.template_id}
+                        type="button"
+                        onClick={() => setSelectedHeadTemplate(tpl.template_id)}
+                        className={`overflow-hidden rounded-xl border text-left transition-all ${
+                          selectedHeadTemplate === tpl.template_id
+                            ? 'border-violet-500 ring-2 ring-violet-500/25 bg-violet-500/10'
+                            : 'border-white/10 bg-black/20 hover:border-white/25'
+                        }`}
+                      >
+                        <div className="aspect-[9/16] bg-black">
+                          {tpl.poster_url ? (
+                            <img src={tpl.poster_url} alt={tpl.label} className="h-full w-full object-cover" />
+                          ) : (
+                            <video src={tpl.video_url} muted playsInline preload="metadata" className="h-full w-full object-cover" />
+                          )}
+                        </div>
+                        <div className="p-2">
+                          <div className="text-[11px] font-semibold text-zinc-200 truncate">{tpl.label || 'Talking head'}</div>
+                          <div className="text-[9px] text-zinc-500 truncate">{tpl.language || 'template'} · lipsync only</div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {selectedHeadTemplate && (
+                  <div className="rounded-lg border border-violet-500/20 bg-violet-500/10 p-3 space-y-2">
+                    <p className="text-xs text-violet-200">
+                      Выбран сохранённый talking-head. Аватар ниже не нужен: приложение возьмёт видео-шаблон и пересинхронизирует губы под текущую озвучку.
+                    </p>
+                    <OptionPicker
+                      value={lipSyncModel}
+                      onChange={setLipSyncModel}
+                      options={LIPSYNC_MODEL_OPTIONS.map((option) => ({
+                        value: option.id,
+                        label: `${option.label} - $${option.pricePerMinute}/min`,
+                        ...option,
+                      }))}
+                    />
+                  </div>
+                )}
+              </div>
+
               {/* Actor Selection: Gallery + Generate New */}
-              <div>
+              <div className={selectedHeadTemplate ? 'opacity-50 pointer-events-none' : ''}>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
                   <User size={14} /> AI Actor
                 </label>
@@ -1882,9 +2038,13 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   ttsProvider,
                   brollMode,
                   hasSelectedActor: Boolean(selectedActor),
+                  hasReusableHead: Boolean(selectedHeadTemplate),
+                  lipsyncModel: lipSyncModel,
                 });
                 const costDetails =
-                  videoMode === 'lowcost'
+                  selectedHeadTemplate
+                    ? 'Saved talking head + new voiceover + Sync Lipsync. Faster and cheaper than regenerating Kling/Hailuo.'
+                    : videoMode === 'lowcost'
                     ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешевый черновой режим, качество может плыть.'
                     : videoMode === 'premium'
                       ? 'Озвучка + Kling Avatar v2 Pro. Лучший вариант для публикации.'
@@ -1934,15 +2094,17 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               </button>
               <button
                 onClick={handleGenerate}
-                disabled={!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey) || !selectedActor || generating}
+                disabled={!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey) || (!selectedActor && !selectedHeadTemplate) || generating}
                 className="btn-primary px-6 py-2 text-sm flex items-center gap-2 disabled:opacity-50"
               >
                 {generating ? (
                   <><Loader2 size={14} className="animate-spin" /> Generating...</>
-                ) : !selectedActor ? (
+                ) : (!selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Select an actor first</>
+                ) : selectedHeadTemplate ? (
+                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel }).total)})</>
                 ) : (
-                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor) }).total)})</>
+                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel }).total)})</>
                 )}
               </button>
             </div>
@@ -2194,6 +2356,32 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     >
                       <RefreshCw size={14} /> New Video
                     </button>
+                  </div>
+
+                  <div className="p-4 bg-blue-500/5 rounded-xl border border-blue-500/20 space-y-2">
+                    <h3 className="text-sm font-semibold text-zinc-300 flex items-center gap-2">
+                      <User size={14} /> Reuse this talking head
+                    </h3>
+                    <p className="text-xs text-zinc-500">
+                      Save the cached talking-head source. Next time you can generate a new voiceover and only run lipsync against this head.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleSaveHeadTemplate}
+                      disabled={savingHeadTemplate || !jobId}
+                      className="btn-secondary px-4 py-2 text-sm flex items-center gap-2 disabled:opacity-50"
+                    >
+                      {savingHeadTemplate ? (
+                        <><Loader2 size={14} className="animate-spin" /> Saving...</>
+                      ) : (
+                        <><Check size={14} /> Save talking-head template</>
+                      )}
+                    </button>
+                    {headTemplateStatus && (
+                      <p className={`text-[11px] ${headTemplateStatus.toLowerCase().includes('не удалось') ? 'text-red-300' : 'text-blue-200'}`}>
+                        {headTemplateStatus}
+                      </p>
+                    )}
                   </div>
 
                   {/* Standalone Lip-sync */}

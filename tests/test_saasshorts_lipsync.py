@@ -2,11 +2,13 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from saasshorts import (
     build_kling_avatar_request,
     build_sync_lipsync_request,
     estimate_sync_lipsync_cost,
+    generate_full_video,
     kling_avatar_cost_per_second,
     resolve_saas_lipsync_assets,
 )
@@ -99,6 +101,72 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(os.path.basename(assets["broll_clips"][0]["path"]), "__broll_mockup_0.mp4")
             self.assertEqual(assets["broll_clips"][0]["start"], 3)
             self.assertEqual(assets["broll_clips"][0]["end"], 6)
+
+    def test_reuses_saved_talking_head_template_via_lipsync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reusable_head = os.path.join(tmp, "template_head.mp4")
+            reusable_poster = os.path.join(tmp, "template_actor.png")
+            with open(reusable_head, "wb") as f:
+                f.write(b"old-head")
+            with open(reusable_poster, "wb") as f:
+                f.write(b"poster")
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "Russian_AmbitiousWoman"}
+
+            def fake_lipsync(video_path, audio_path, fal_key, output_path, model="sync-3", sync_mode="cut_off"):
+                self.assertEqual(video_path, reusable_head)
+                self.assertEqual(model, "lipsync-2-pro")
+                with open(output_path, "wb") as f:
+                    f.write(b"new-lipsynced-head")
+                return output_path
+
+            def fake_subs(audio_path, output_path, max_words=2):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            script = {
+                "title": "Reuse head",
+                "full_narration": "Новый текст для той же говорящей головы.",
+                "hook_text": "Новый хук",
+                "segments": [],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "actor_gender": "female",
+                "reusable_head_path": reusable_head,
+                "reusable_head_poster_path": reusable_poster,
+                "reusable_head_template_id": "tpl_123",
+                "reusable_lipsync_model": "lipsync-2-pro",
+                "broll_mode": "off",
+            }
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.generate_sync_lipsync_video", side_effect=fake_lipsync) as lipsync_mock, \
+                 patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
+                 patch("saasshorts.composite_video", side_effect=fake_composite), \
+                 patch("saasshorts._get_media_duration", return_value=18), \
+                 patch("saasshorts.generate_talking_head", side_effect=AssertionError("should not generate Kling head")), \
+                 patch("saasshorts.generate_talking_head_lowcost", side_effect=AssertionError("should not generate Hailuo head")), \
+                 patch("saasshorts.generate_actor_image", side_effect=AssertionError("should not generate actor image")):
+                result = generate_full_video(script, config, tmp)
+
+            self.assertEqual(lipsync_mock.call_count, 1)
+            self.assertEqual(result["head_source"], "template")
+            self.assertEqual(result["head_template_id"], "tpl_123")
+            self.assertEqual(result["lipsync_model"], "lipsync-2-pro")
+            self.assertEqual(result["cost_estimate"]["talking_head_reuse_lipsync"], 1.5)
+            self.assertEqual(result["cost_estimate"]["actor_image_reused"], 0)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ export default function UGCGallery({ falKey }) {
   const [copied, setCopied] = useState('');
   const [lipSyncModel, setLipSyncModel] = useState('sync-3');
   const [lipSyncJobs, setLipSyncJobs] = useState({});
+  const [headTemplateJobs, setHeadTemplateJobs] = useState({});
   const [selectedVideo, setSelectedVideo] = useState(null);
   const [avatarPrompt, setAvatarPrompt] = useState('');
   const [avatarGenerating, setAvatarGenerating] = useState(false);
@@ -270,6 +271,37 @@ export default function UGCGallery({ falKey }) {
       setLipSyncJobs((prev) => ({
         ...prev,
         [video.video_id]: { status: 'failed', message: e.message },
+      }));
+    }
+  };
+
+  const handleSaveHeadTemplate = async (video) => {
+    setHeadTemplateJobs((prev) => ({
+      ...prev,
+      [video.video_id]: { status: 'processing', message: 'Сохраняю talking-head шаблон...' },
+    }));
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/head-templates'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          video_url: video.video_url,
+          label: video.title || 'Talking head template',
+        }),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось сохранить шаблон';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      setHeadTemplateJobs((prev) => ({
+        ...prev,
+        [video.video_id]: { status: 'completed', message: 'Сохранено как reusable talking-head' },
+      }));
+    } catch (e) {
+      setHeadTemplateJobs((prev) => ({
+        ...prev,
+        [video.video_id]: { status: 'failed', message: e.message || 'Не удалось сохранить шаблон' },
       }));
     }
   };
@@ -516,10 +548,12 @@ export default function UGCGallery({ falKey }) {
           falKey={falKey}
           lipSyncModel={lipSyncModel}
           lipSyncJob={lipSyncJobs[selectedVideo.video_id]}
+          headTemplateJob={headTemplateJobs[selectedVideo.video_id]}
           onClose={() => setSelectedVideo(null)}
           onCopy={handleCopy}
           onModelChange={setLipSyncModel}
           onLipSync={handleLipSync}
+          onSaveHeadTemplate={handleSaveHeadTemplate}
         />
       )}
     </div>
@@ -643,14 +677,17 @@ function VideoActionModal({
   falKey,
   lipSyncModel,
   lipSyncJob,
+  headTemplateJob,
   onClose,
   onCopy,
   onModelChange,
   onLipSync,
+  onSaveHeadTemplate,
 }) {
   const caption = video.caption || '';
   const hashtags = (video.hashtags || []).join(' ');
   const isProcessing = lipSyncJob?.status === 'processing';
+  const isSavingHeadTemplate = headTemplateJob?.status === 'processing';
   const isLocalSaasVideo = typeof video.video_url === 'string' && video.video_url.includes('/videos/saas_');
   const selectedModel = LIPSYNC_MODEL_OPTIONS.find((option) => option.id === lipSyncModel) || LIPSYNC_MODEL_OPTIONS[0];
 
@@ -703,6 +740,40 @@ function VideoActionModal({
                 <ExternalLink size={15} /> Открыть
               </a>
             </div>
+            <button
+              type="button"
+              onClick={() => onSaveHeadTemplate(video)}
+              disabled={!isLocalSaasVideo || isSavingHeadTemplate}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm font-semibold text-emerald-200 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+            >
+              {isSavingHeadTemplate ? (
+                <>
+                  <Loader2 size={15} className="animate-spin" /> Сохраняю шаблон...
+                </>
+              ) : headTemplateJob?.status === 'completed' ? (
+                <>
+                  <Check size={15} /> Talking-head сохранен
+                </>
+              ) : (
+                <>
+                  <User size={15} /> Сохранить talking-head
+                </>
+              )}
+            </button>
+            {!isLocalSaasVideo && (
+              <p className="text-xs text-zinc-500">
+                Сохранение шаблона доступно для роликов, созданных в AI Shorts.
+              </p>
+            )}
+            {headTemplateJob?.message && (
+              <p className={`rounded-lg px-3 py-2 text-xs ${
+                headTemplateJob.status === 'failed'
+                  ? 'border border-red-500/20 bg-red-500/10 text-red-200'
+                  : 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
+              }`}>
+                {headTemplateJob.message}
+              </p>
+            )}
           </div>
 
           <div className="space-y-5">

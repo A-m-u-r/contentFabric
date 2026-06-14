@@ -2233,6 +2233,11 @@ def generate_full_video(
         config.get("minimax_voice_id"),
     )
     actor_desc = config.get("actor_description") or script.get("actor_description", "a young professional in their late 20s, wearing a casual modern outfit, clean background")
+    reusable_head_path = config.get("reusable_head_path")
+    reusable_head_poster_path = config.get("reusable_head_poster_path")
+    reusable_head_template_id = config.get("reusable_head_template_id")
+    reusable_lipsync_model = config.get("reusable_lipsync_model") or "sync-3"
+    use_reusable_head = bool(reusable_head_path)
 
     title_slug = re.sub(r"[^a-z0-9]+", "_", script.get("title", "video").lower())[:30]
 
@@ -2284,10 +2289,15 @@ def generate_full_video(
 
     tts_provider_used = tts_metadata.get("provider") or tts_provider
 
+    if use_reusable_head and reusable_head_poster_path and os.path.exists(reusable_head_poster_path) and not _exists(actor_img):
+        import shutil
+        shutil.copy2(reusable_head_poster_path, actor_img)
+        log("[1/6] Using poster from saved talking-head template.")
+
     # ── Step 1 & 2: Generate actor image + voiceover in parallel ──
     # If user pre-selected an actor image, copy it
     selected_actor = config.get("selected_actor_path")
-    if selected_actor and os.path.exists(selected_actor) and not _exists(actor_img):
+    if not use_reusable_head and selected_actor and os.path.exists(selected_actor) and not _exists(actor_img):
         import shutil
         shutil.copy2(selected_actor, actor_img)
         log("[1/6] Using pre-selected actor image.")
@@ -2343,22 +2353,37 @@ def generate_full_video(
 
     talking_head_meta_path = f"{talking_head}.meta.json"
 
-    def _read_talking_head_mode():
+    def _read_talking_head_meta():
         try:
             with open(talking_head_meta_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("video_mode")
+                return json.load(f)
         except Exception:
             hailuo_cache = talking_head.replace(".mp4", "_hailuo_cache.mp4")
             if _exists(hailuo_cache):
-                return "lowcost"
-            return "standard"
+                return {"video_mode": "lowcost", "head_source": "generated"}
+            return {"video_mode": "standard", "head_source": "generated"}
 
-    def _write_talking_head_mode():
+    def _write_talking_head_meta(meta: dict = None):
+        payload = {"video_mode": video_mode, "head_source": "generated"}
+        if meta:
+            payload.update(meta)
         with open(talking_head_meta_path, "w", encoding="utf-8") as f:
-            json.dump({"video_mode": video_mode}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    if _exists(talking_head) and _read_talking_head_mode() != video_mode:
-        log("[3/6] Video mode changed; regenerating voice-driven talking head.")
+    expected_head_meta = {
+        "video_mode": "reused_head" if use_reusable_head else video_mode,
+        "head_source": "template" if use_reusable_head else "generated",
+        "reusable_head_path": reusable_head_path or "",
+        "reusable_lipsync_model": reusable_lipsync_model if use_reusable_head else "",
+    }
+    current_head_meta = _read_talking_head_meta()
+    if _exists(talking_head) and (
+        current_head_meta.get("video_mode") != expected_head_meta["video_mode"]
+        or current_head_meta.get("head_source") != expected_head_meta["head_source"]
+        or current_head_meta.get("reusable_head_path", "") != expected_head_meta["reusable_head_path"]
+        or current_head_meta.get("reusable_lipsync_model", "") != expected_head_meta["reusable_lipsync_model"]
+    ):
+        log("[3/6] Talking-head source changed; regenerating voice-driven talking head.")
         for stale_path in (
             talking_head,
             f"{talking_head}.fal_url.txt",
@@ -2368,17 +2393,32 @@ def generate_full_video(
         ):
             _remove_if_exists(stale_path)
     if not _exists(talking_head):
-        if video_mode == "lowcost":
+        if use_reusable_head:
+            if not os.path.exists(reusable_head_path):
+                raise FileNotFoundError(f"Reusable talking-head template not found: {reusable_head_path}")
+            log(f"[3/6] Reusing saved talking-head template via {reusable_lipsync_model} lipsync...")
+            talking_head = generate_sync_lipsync_video(
+                reusable_head_path,
+                audio_path,
+                fal_key,
+                talking_head,
+                model=reusable_lipsync_model,
+                sync_mode="cut_off",
+            )
+            _write_talking_head_meta(expected_head_meta)
+        elif video_mode == "lowcost":
             log("[3/6] Generating talking head (Low Cost: Hailuo + VEED Lipsync)... This can take 2-20 minutes.")
             talking_head = generate_talking_head_lowcost(actor_img, audio_path, fal_key, talking_head)
+            _write_talking_head_meta()
         elif video_mode == "premium":
             log("[3/6] Generating talking head video (Kling Avatar v2 Pro)... This can take 2-20 minutes.")
             talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head, tier="pro")
+            _write_talking_head_meta()
         else:
             video_mode = "standard"
             log("[3/6] Generating talking head video (Kling Avatar v2 Standard)... This can take 2-15 minutes.")
             talking_head = generate_talking_head(actor_img, audio_path, fal_key, talking_head, tier="standard")
-        _write_talking_head_mode()
+            _write_talking_head_meta()
         log("[3/6] Talking head ready.")
     else:
         log("[3/6] ✅ Talking head cached, skipping.")
@@ -2463,10 +2503,17 @@ def generate_full_video(
     tts_cost_key = "voiceover_fal_minimax" if tts_provider_used == "fal_minimax" else "voiceover_elevenlabs"
     tts_cost = round(len(full_narration) * (0.0001 if tts_provider_used == "fal_minimax" else 0.00003), 3)
 
-    actor_cost_key = "actor_image_reused" if selected_actor else "actor_image_flux"
-    actor_cost = 0.00 if selected_actor else 0.05
+    actor_cost_key = "actor_image_reused" if (selected_actor or use_reusable_head) else "actor_image_flux"
+    actor_cost = 0.00 if (selected_actor or use_reusable_head) else 0.05
 
-    if video_mode == "lowcost":
+    if use_reusable_head:
+        cost = {
+            actor_cost_key: actor_cost,
+            tts_cost_key: tts_cost,
+            "talking_head_reuse_lipsync": estimate_sync_lipsync_cost(reusable_lipsync_model, audio_duration) or 0.00,
+            "ffmpeg_compositing": 0.00,
+        }
+    elif video_mode == "lowcost":
         cost = {
             actor_cost_key: actor_cost,
             tts_cost_key: tts_cost,
@@ -2499,4 +2546,7 @@ def generate_full_video(
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
         "broll_mode": broll_mode,
+        "head_source": "template" if use_reusable_head else "generated",
+        "head_template_id": reusable_head_template_id,
+        "lipsync_model": reusable_lipsync_model if use_reusable_head else None,
     }

@@ -329,6 +329,130 @@ def list_combined_video_gallery(limit: int = 50) -> List[dict]:
     combined.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return combined[:limit] if limit else combined
 
+
+def _head_templates_dir() -> str:
+    return os.path.join(OUTPUT_DIR, "head_templates")
+
+
+def _safe_head_template_id(value: str) -> Optional[str]:
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) >= 3 and parts[0] == "videos" and parts[1] == "head_templates":
+        return parts[2]
+    if "/" in value or "\\" in value or ".." in value:
+        return None
+    return value
+
+
+def _head_template_url(template_id: str, filename: str) -> str:
+    return f"/videos/head_templates/{template_id}/{filename}"
+
+
+def _read_head_template_metadata(template_dir: str) -> Optional[dict]:
+    meta_path = os.path.join(template_dir, "metadata.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def resolve_head_template_path(template_id_or_url: str) -> dict:
+    template_id = _safe_head_template_id(template_id_or_url)
+    if not template_id:
+        raise FileNotFoundError("Invalid talking-head template id")
+
+    template_dir = os.path.abspath(os.path.join(_head_templates_dir(), template_id))
+    root_dir = os.path.abspath(_head_templates_dir())
+    if not template_dir.startswith(root_dir):
+        raise FileNotFoundError("Invalid talking-head template path")
+
+    head_path = os.path.join(template_dir, "head.mp4")
+    if not os.path.exists(head_path):
+        raise FileNotFoundError("Talking-head template video not found")
+
+    poster_path = os.path.join(template_dir, "actor.png")
+    metadata = _read_head_template_metadata(template_dir) or {}
+    return {
+        "template_id": template_id,
+        "head_path": head_path,
+        "poster_path": poster_path if os.path.exists(poster_path) else "",
+        "metadata": metadata,
+    }
+
+
+def list_local_head_templates() -> List[dict]:
+    templates = []
+    root = _head_templates_dir()
+    if not os.path.isdir(root):
+        return templates
+
+    for template_dir in glob.glob(os.path.join(root, "*")):
+        if not os.path.isdir(template_dir):
+            continue
+        metadata = _read_head_template_metadata(template_dir)
+        if metadata and metadata.get("video_url"):
+            templates.append(metadata)
+
+    templates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return templates
+
+
+def save_local_head_template(job_id: str, label: Optional[str] = None) -> dict:
+    job_dir = os.path.join(OUTPUT_DIR, f"saas_{job_id}")
+    if not os.path.isdir(job_dir):
+        raise FileNotFoundError("AI Shorts job output not found")
+
+    head_candidates = [
+        path for path in glob.glob(os.path.join(job_dir, "*_head.mp4"))
+        if "_head_lipsync_" not in os.path.basename(path) and os.path.getsize(path) > 0
+    ]
+    head_candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    head_path = head_candidates[0] if head_candidates else ""
+    if not head_path:
+        raise FileNotFoundError("Talking-head source video not found")
+
+    metadata = _read_local_gallery_meta(job_dir) or {}
+    actor_candidates = []
+    for pattern in ("*_actor.png", "selected_actor.png", "__actor.png"):
+        actor_candidates.extend(glob.glob(os.path.join(job_dir, pattern)))
+    actor_candidates = [path for path in actor_candidates if os.path.getsize(path) > 0]
+    actor_candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+
+    template_id = f"head_{uuid.uuid4().hex[:10]}"
+    template_dir = os.path.join(_head_templates_dir(), template_id)
+    os.makedirs(template_dir, exist_ok=True)
+
+    target_head = os.path.join(template_dir, "head.mp4")
+    shutil.copy2(head_path, target_head)
+
+    target_actor = os.path.join(template_dir, "actor.png")
+    actor_path = actor_candidates[0] if actor_candidates else ""
+    if actor_path and os.path.exists(actor_path):
+        shutil.copy2(actor_path, target_actor)
+
+    entry = {
+        "template_id": template_id,
+        "label": label or metadata.get("title") or f"Talking head {template_id[-4:]}",
+        "source_job_id": job_id,
+        "video_url": _head_template_url(template_id, "head.mp4"),
+        "poster_url": _head_template_url(template_id, "actor.png") if os.path.exists(target_actor) else "",
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "duration": metadata.get("duration", 0),
+        "language": metadata.get("language", ""),
+        "actor_description": metadata.get("actor_description", ""),
+        "source_title": metadata.get("title", ""),
+    }
+    with open(os.path.join(template_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(entry, f, ensure_ascii=False, indent=2)
+    return entry
+
 class ProcessRequest(BaseModel):
     url: str
 
@@ -1795,6 +1919,7 @@ from saasshorts import (
     GeminiTemporaryError,
     generate_full_video,
     apply_lipsync_to_saas_job,
+    resolve_saas_lipsync_assets,
     generate_actor_images,
     get_elevenlabs_voices,
     DEFAULT_VOICES,
@@ -2366,6 +2491,8 @@ class SaaSGenerateRequest(BaseModel):
     retry_job_id: Optional[str] = None
     video_mode: str = "standard"  # "lowcost", "standard", or "premium"
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
+    reusable_head_template_id: Optional[str] = None
+    reusable_lipsync_model: str = "sync-3"
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -2373,6 +2500,38 @@ class SaaSLipSyncRequest(BaseModel):
     video_url: Optional[str] = None
     model: str = "sync-3"  # "sync-3", "lipsync-2-pro", or "lipsync-2"
     sync_mode: str = "cut_off"
+
+
+class SaaSHeadTemplateSaveRequest(BaseModel):
+    job_id: Optional[str] = None
+    video_url: Optional[str] = None
+    label: Optional[str] = None
+
+
+@app.get("/api/saasshorts/head-templates")
+async def saasshorts_head_templates():
+    """List reusable talking-head templates saved locally."""
+    try:
+        loop = asyncio.get_running_loop()
+        templates = await loop.run_in_executor(None, list_local_head_templates)
+        return {"templates": templates, "total": len(templates)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/saasshorts/head-templates")
+async def saasshorts_save_head_template(req: SaaSHeadTemplateSaveRequest):
+    """Save the cached talking-head video from an AI Shorts job as a reusable template."""
+    job_id = req.job_id or _job_id_from_saas_video_url(req.video_url or "")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Provide job_id or a local AI Shorts video_url")
+    try:
+        template = save_local_head_template(job_id, label=req.label)
+        return {"template": template}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/saasshorts/generate")
@@ -2446,6 +2605,13 @@ async def saasshorts_generate(
             if os.path.exists(src):
                 selected_actor_path = src
 
+    reusable_head = None
+    if req.reusable_head_template_id:
+        try:
+            reusable_head = resolve_head_template_path(req.reusable_head_template_id)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
     config = {
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
@@ -2458,6 +2624,10 @@ async def saasshorts_generate(
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
         "broll_mode": req.broll_mode or "mockup",
+        "reusable_head_template_id": reusable_head.get("template_id") if reusable_head else None,
+        "reusable_head_path": reusable_head.get("head_path") if reusable_head else None,
+        "reusable_head_poster_path": reusable_head.get("poster_path") if reusable_head else None,
+        "reusable_lipsync_model": req.reusable_lipsync_model or "sync-3",
     }
 
     async def run_generation():
@@ -2485,6 +2655,9 @@ async def saasshorts_generate(
                     "cost_estimate": result.get("cost_estimate", {}),
                     "tts_provider": result.get("tts_provider", req.tts_provider),
                     "broll_mode": result.get("broll_mode", req.broll_mode),
+                    "head_source": result.get("head_source", "generated"),
+                    "head_template_id": result.get("head_template_id"),
+                    "lipsync_model": result.get("lipsync_model"),
                     "script": req.script,
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
@@ -2504,6 +2677,9 @@ async def saasshorts_generate(
                         "video_mode": req.video_mode,
                         "tts_provider": result.get("tts_provider", req.tts_provider),
                         "broll_mode": result.get("broll_mode", req.broll_mode),
+                        "head_source": result.get("head_source", "generated"),
+                        "head_template_id": result.get("head_template_id"),
+                        "lipsync_model": result.get("lipsync_model"),
                         "product_name": req.script.get("_product_name", ""),
                         "product_url": req.script.get("_product_url", ""),
                         "segments": req.script.get("segments", []),
