@@ -9,8 +9,11 @@ from saasshorts import (
     build_sync_lipsync_request,
     estimate_sync_lipsync_cost,
     generate_full_video,
+    generate_talking_head,
+    inspect_talking_head_quality,
     kling_avatar_cost_per_second,
     resolve_saas_lipsync_assets,
+    select_best_talking_head_attempt,
 )
 
 
@@ -67,6 +70,129 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertEqual(estimate_sync_lipsync_cost("lipsync-2", 30), 1.5)
         self.assertEqual(estimate_sync_lipsync_cost("lipsync-2-pro", 30), 2.5)
         self.assertEqual(estimate_sync_lipsync_cost("sync-3", 30), 4.0)
+
+    def test_talking_head_quality_flags_extra_video_tail(self):
+        with patch("saasshorts._get_media_duration", return_value=10.21), \
+             patch("saasshorts._get_media_stream_duration", side_effect=[12.27, 10.21]):
+            report = inspect_talking_head_quality("head.mp4", "voice.mp3", threshold=0.3)
+
+        self.assertEqual(report["status"], "needs_review")
+        self.assertAlmostEqual(report["reference_audio_duration"], 10.21, places=2)
+        self.assertAlmostEqual(report["video_stream_duration"], 12.27, places=2)
+        self.assertAlmostEqual(report["video_reference_delta"], 2.06, places=2)
+        self.assertGreater(report["abs_video_reference_delta"], 0.3)
+        self.assertTrue(report["warnings"])
+
+    def test_selects_best_talking_head_attempt_without_trimming(self):
+        attempts = [
+            {
+                "name": "base",
+                "output_path": "base.mp4",
+                "quality": {
+                    "status": "needs_review",
+                    "abs_video_reference_delta": 2.06,
+                },
+            },
+            {
+                "name": "tail_silence",
+                "output_path": "tail.mp4",
+                "quality": {
+                    "status": "needs_review",
+                    "abs_video_reference_delta": 0.42,
+                },
+            },
+        ]
+
+        selected = select_best_talking_head_attempt(attempts)
+
+        self.assertEqual(selected["name"], "tail_silence")
+        self.assertEqual(selected["output_path"], "tail.mp4")
+
+    def test_talking_head_retries_with_tail_silence_and_saves_audit_metadata(self):
+        class FakeResponse:
+            content = b"video-bytes"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = os.path.join(tmp, "actor.png")
+            audio_path = os.path.join(tmp, "voice.mp3")
+            output_path = os.path.join(tmp, "head.mp4")
+            for path in (image_path, audio_path):
+                with open(path, "wb") as f:
+                    f.write(b"x")
+
+            def fake_upload(path, fal_key):
+                return f"https://cdn.example/{os.path.basename(path)}"
+
+            def fake_tail_audio(source, output, tail_silence=0.45):
+                with open(output, "wb") as f:
+                    f.write(b"tail")
+                return output
+
+            run_results = [
+                {
+                    "video": {"url": "https://cdn.example/base.mp4"},
+                    "_fal_request": {"request_id": "req-base", "model_id": "model"},
+                },
+                {
+                    "video": {"url": "https://cdn.example/tail.mp4"},
+                    "_fal_request": {"request_id": "req-tail", "model_id": "model"},
+                },
+            ]
+            quality_results = [
+                {
+                    "status": "needs_review",
+                    "warnings": ["Kling returned video 2.00s longer than the reference voiceover."],
+                    "abs_video_reference_delta": 2.0,
+                },
+                {
+                    "status": "ok",
+                    "warnings": [],
+                    "abs_video_reference_delta": 0.05,
+                },
+            ]
+
+            with patch("saasshorts.prepare_kling_actor_image", return_value=image_path), \
+                 patch("saasshorts._fal_upload_file", side_effect=fake_upload), \
+                 patch("saasshorts._fal_run", side_effect=run_results) as fal_run_mock, \
+                 patch("saasshorts.httpx.Client", FakeClient), \
+                 patch("saasshorts.create_kling_tail_padded_audio", side_effect=fake_tail_audio) as tail_audio_mock, \
+                 patch("saasshorts.inspect_talking_head_quality", side_effect=quality_results):
+                result_path = generate_talking_head(image_path, audio_path, "fal-test", output_path, tier="pro")
+
+            self.assertEqual(result_path, output_path)
+            self.assertEqual(fal_run_mock.call_count, 2)
+            self.assertEqual(tail_audio_mock.call_count, 1)
+            with open(output_path, "rb") as f:
+                self.assertEqual(f.read(), b"video-bytes")
+
+            quality_path = output_path.replace(".mp4", "_quality.json")
+            with open(quality_path, "r", encoding="utf-8") as f:
+                quality = json.load(f)
+
+            self.assertEqual(quality["status"], "ok")
+            self.assertEqual(quality["selected_attempt"], "tail_silence")
+            self.assertEqual(quality["paid_attempts"], 2)
+
+            base_meta_path = output_path.replace(".mp4", "_base_fal.json")
+            with open(base_meta_path, "r", encoding="utf-8") as f:
+                base_meta = json.load(f)
+            self.assertEqual(base_meta["fal_request"]["request_id"], "req-base")
 
     def test_resolves_russian_empty_slug_job_assets_and_broll(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +293,81 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(result["lipsync_model"], "lipsync-2-pro")
             self.assertEqual(result["cost_estimate"]["talking_head_reuse_lipsync"], 1.5)
             self.assertEqual(result["cost_estimate"]["actor_image_reused"], 0)
+
+    def test_generation_keeps_final_video_when_talking_head_needs_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_actor_image(description, fal_key, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"actor")
+                return output_path
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "Russian_AmbitiousWoman"}
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
+                with open(output_path, "wb") as f:
+                    f.write(b"head")
+                quality_path = output_path.replace(".mp4", "_quality.json")
+                with open(quality_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "status": "needs_review",
+                            "warnings": ["Kling returned video 1.20s longer than voiceover."],
+                            "selected_attempt": "base",
+                            "attempts": [
+                                {
+                                    "name": "base",
+                                    "quality": {
+                                        "status": "needs_review",
+                                        "abs_video_reference_delta": 1.2,
+                                    },
+                                }
+                            ],
+                        },
+                        f,
+                    )
+                return output_path
+
+            def fake_subs(audio_path, output_path, max_words=2):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            script = {
+                "title": "Needs review",
+                "full_narration": "Short voiceover for mismatch review.",
+                "hook_text": "Hook",
+                "segments": [],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "actor_gender": "female",
+                "video_mode": "premium",
+                "broll_mode": "off",
+            }
+
+            with patch("saasshorts.generate_actor_image", side_effect=fake_actor_image), \
+                 patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts.generate_talking_head_lowcost", side_effect=AssertionError("should use Kling")), \
+                 patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
+                 patch("saasshorts.composite_video", side_effect=fake_composite) as composite_mock, \
+                 patch("saasshorts._get_media_duration", return_value=10):
+                result = generate_full_video(script, config, tmp)
+
+            self.assertEqual(composite_mock.call_count, 1)
+            self.assertEqual(result["quality_status"], "needs_review")
+            self.assertEqual(result["quality_warnings"], ["Kling returned video 1.20s longer than voiceover."])
+            self.assertTrue(os.path.exists(result["video_path"]))
 
 
 if __name__ == "__main__":

@@ -2314,6 +2314,20 @@ export default function SaaShortsTab({
                     <p className="text-xs text-zinc-500">{genResult.duration?.toFixed(1)}s &middot; 9:16 vertical</p>
                   </div>
 
+                  {genResult.quality_warnings?.length > 0 && (
+                    <div className="p-3 bg-amber-500/10 rounded-lg border border-amber-500/25 space-y-2">
+                      <div className="flex items-center gap-2 text-xs font-semibold text-amber-200">
+                        <AlertCircle size={14} />
+                        Проверь синхронизацию talking-head
+                      </div>
+                      <div className="space-y-1">
+                        {genResult.quality_warnings.map((warning, i) => (
+                          <p key={i} className="text-xs text-amber-100/80">{warning}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Cost breakdown */}
                   {genResult.cost_estimate && (
                     <div className="p-3 bg-white/5 rounded-lg border border-white/10 space-y-1">

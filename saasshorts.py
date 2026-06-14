@@ -21,7 +21,7 @@ import subprocess
 import httpx
 import textwrap
 from urllib.parse import urljoin
-from typing import Optional, List, Dict, Callable
+from typing import Optional, List, Dict, Callable, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -791,6 +791,17 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
     Submit a job to fal.ai queue, poll for completion, return result.
     Uses the URLs returned by the submit response (as per fal.ai docs).
     """
+
+    def _with_request_meta(result: Any, request_id: Optional[str], status_url: str = "", response_url: str = "") -> dict:
+        payload = dict(result) if isinstance(result, dict) else {"result": result}
+        payload["_fal_request"] = {
+            "model_id": model_id,
+            "request_id": request_id,
+            "status_url": status_url,
+            "response_url": response_url,
+        }
+        return payload
+
     headers = {
         "Authorization": f"Key {fal_key}",
         "Content-Type": "application/json",
@@ -818,7 +829,7 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
     request_id = submit_data.get("request_id")
     if not request_id:
         # Synchronous result (no queue)
-        return submit_data
+        return _with_request_meta(submit_data, None)
 
     # Use the URLs from the submit response (guaranteed correct per docs)
     status_url = submit_data.get("status_url", f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status")
@@ -850,7 +861,7 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
                 with httpx.Client(timeout=120.0) as client:
                     result_resp = client.get(response_url, headers=poll_headers)
                     result_resp.raise_for_status()
-                    return result_resp.json()
+                    return _with_request_meta(result_resp.json(), request_id, status_url, response_url)
             except httpx.RequestError as e:
                 raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
             except httpx.HTTPStatusError as e:
@@ -878,7 +889,7 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
                 with httpx.Client(timeout=120.0) as client:
                     result_resp = client.get(response_url, headers=poll_headers)
                     result_resp.raise_for_status()
-                    return result_resp.json()
+                    return _with_request_meta(result_resp.json(), request_id, status_url, response_url)
             except httpx.RequestError as e:
                 raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
             except httpx.HTTPStatusError as e:
@@ -1412,6 +1423,8 @@ def generate_talking_head(
     tier: str = "standard",
 ) -> str:
     """Generate talking head video using Kling Avatar v2 Standard/Pro on fal.ai."""
+    import shutil
+
     tier = (tier or "standard").strip().lower()
     print(f"[SaaSShorts] 🗣️ Generating talking head ({kling_avatar_label(tier)})...")
 
@@ -1422,24 +1435,135 @@ def generate_talking_head(
         prepare_kling_actor_image(image_path, kling_image_path),
         fal_key,
     )
-    audio_url = _fal_upload_file(audio_path, fal_key)
-
-    prompt = (
-        "Natural UGC creator talking to camera. Expressive and energetic. "
-        "Subtle hand gestures to emphasize points. Slight head movements and nods. "
-        "Occasional leaning forward for emphasis. Relaxed shoulders, casual vibe. "
-        "Maintain eye contact with camera. Natural blinking and micro-expressions."
+    base_prompt = (
+        "Natural UGC creator talking to camera in a steady close-up. "
+        "Keep body movement minimal and controlled. Use only subtle head movement, "
+        "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
+        "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
+        "keep lips closed and hold a calm neutral expression."
     )
-    model_id, payload = build_kling_avatar_request(image_url, audio_url, prompt, tier=tier)
-    result = _fal_run(model_id, payload, fal_key, timeout=1200)
+    retry_prompt = (
+        base_prompt
+        + " Avoid exaggerated gestures, looping motion, repeated smiles, or speaking after the audio has ended."
+    )
+    attempts_config = [
+        {"name": "base", "audio_path": audio_path, "prompt": base_prompt},
+    ]
+    attempts = []
+    selected_attempt = None
+    retry_scheduled = False
+    model_id = ""
 
-    video_url = result["video"]["url"]
+    def _schedule_tail_silence_retry() -> None:
+        nonlocal retry_scheduled
+        if retry_scheduled:
+            return
+        retry_scheduled = True
+        padded_audio_path = output_path.replace(".mp4", "_voice_tail_silence.mp3")
+        try:
+            create_kling_tail_padded_audio(audio_path, padded_audio_path, tail_silence=0.45)
+            attempts_config.append({
+                "name": "tail_silence",
+                "audio_path": padded_audio_path,
+                "prompt": retry_prompt,
+            })
+        except Exception as e:
+            attempts.append({
+                "name": "tail_silence_setup",
+                "error": f"Could not prepare retry audio: {e}",
+            })
 
-    # Download video
-    with httpx.Client(timeout=180.0) as client:
-        vid_resp = client.get(video_url)
-        with open(output_path, "wb") as f:
-            f.write(vid_resp.content)
+    for index, attempt_config in enumerate(attempts_config, start=1):
+        attempt_name = attempt_config["name"]
+        attempt_audio_path = attempt_config["audio_path"]
+        attempt_output = output_path.replace(".mp4", f"_{attempt_name}.mp4")
+        attempt_meta_path = output_path.replace(".mp4", f"_{attempt_name}_fal.json")
+        audio_url = _fal_upload_file(attempt_audio_path, fal_key)
+        model_id, payload = build_kling_avatar_request(
+            image_url,
+            audio_url,
+            attempt_config["prompt"],
+            tier=tier,
+        )
+        attempt_record = {
+            "name": attempt_name,
+            "output_path": attempt_output,
+            "audio_path": attempt_audio_path,
+            "model_id": model_id,
+            "payload": payload,
+        }
+
+        try:
+            result = _fal_run(model_id, payload, fal_key, timeout=1200)
+            video = result.get("video")
+            video_url = video.get("url") if isinstance(video, dict) else video
+            if not video_url:
+                raise Exception(f"No video URL in Kling result: {result}")
+            with httpx.Client(timeout=180.0) as client:
+                vid_resp = client.get(video_url)
+                vid_resp.raise_for_status()
+                with open(attempt_output, "wb") as f:
+                    f.write(vid_resp.content)
+
+            quality = inspect_talking_head_quality(attempt_output, attempt_audio_path)
+            attempt_record.update({
+                "video_url": video_url,
+                "fal_request": result.get("_fal_request", {}),
+                "quality": quality,
+            })
+            _write_json_file(attempt_meta_path, {
+                "attempt": attempt_name,
+                "tier": tier,
+                "model_id": model_id,
+                "payload": payload,
+                "fal_request": result.get("_fal_request", {}),
+                "result": result,
+                "quality": quality,
+            })
+            attempts.append(attempt_record)
+
+            if quality.get("status") == "ok":
+                selected_attempt = attempt_record
+                break
+
+            if index == 1:
+                _schedule_tail_silence_retry()
+        except Exception as e:
+            attempt_record["error"] = str(e)
+            attempts.append(attempt_record)
+            _write_json_file(attempt_meta_path, {
+                "attempt": attempt_name,
+                "tier": tier,
+                "model_id": model_id,
+                "payload": payload,
+                "error": str(e),
+            })
+            if index == 1:
+                _schedule_tail_silence_retry()
+
+    if not selected_attempt:
+        selected_attempt = select_best_talking_head_attempt(attempts)
+
+    shutil.copy2(selected_attempt["output_path"], output_path)
+    selected_quality = selected_attempt.get("quality") or inspect_talking_head_quality(
+        output_path,
+        selected_attempt.get("audio_path") or audio_path,
+    )
+    warnings = []
+    for attempt in attempts:
+        warnings.extend(attempt.get("quality", {}).get("warnings", []))
+        if attempt.get("error"):
+            warnings.append(f"Kling attempt {attempt.get('name')} failed: {attempt['error']}")
+    warnings = list(dict.fromkeys(warnings))
+    quality_report = {
+        "status": selected_quality.get("status", "needs_review"),
+        "selected_attempt": selected_attempt.get("name"),
+        "selected_audio_path": selected_attempt.get("audio_path"),
+        "paid_attempts": len([attempt for attempt in attempts if not attempt.get("error")]),
+        "attempts": attempts,
+        "warnings": warnings if selected_quality.get("status") != "ok" else [],
+    }
+    _write_json_file(talking_head_quality_path(output_path), quality_report)
 
     print(f"[SaaSShorts] ✅ Talking head: {output_path}")
     return output_path
@@ -1975,6 +2099,141 @@ def _get_media_duration(path: str) -> float:
     return 30.0  # Fallback to 30s estimate
 
 
+def _get_media_stream_duration(path: str, stream_type: str) -> float:
+    """Get the first audio/video stream duration without using container fallback."""
+    selector = "v:0" if stream_type == "video" else "a:0"
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", selector,
+        "-show_entries", "stream=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            value = line.strip()
+            if value and value.upper() != "N/A":
+                return float(value)
+    except Exception as e:
+        print(f"[SaaSShorts] ffprobe stream duration failed for {path}: {e}")
+    return 0.0
+
+
+def talking_head_quality_path(video_path: str) -> str:
+    """Sidecar path for quality diagnostics tied to a generated talking head."""
+    if video_path.lower().endswith(".mp4"):
+        return video_path[:-4] + "_quality.json"
+    return f"{video_path}.quality.json"
+
+
+def _write_json_file(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _read_json_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def inspect_talking_head_quality(
+    talking_head_path: str,
+    reference_audio_path: str,
+    threshold: float = 0.3,
+) -> dict:
+    """
+    Compare generated talking-head stream lengths with the reference audio.
+
+    This is deliberately diagnostic only: it does not trim, stretch, or retime
+    the generated video.
+    """
+    reference_audio_duration = _get_media_duration(reference_audio_path)
+    video_stream_duration = _get_media_stream_duration(talking_head_path, "video")
+    embedded_audio_duration = _get_media_stream_duration(talking_head_path, "audio")
+
+    video_reference_delta = video_stream_duration - reference_audio_duration
+    embedded_reference_delta = embedded_audio_duration - reference_audio_duration if embedded_audio_duration else None
+
+    warnings = []
+    if video_stream_duration <= 0:
+        warnings.append("Could not read talking-head video stream duration.")
+    elif abs(video_reference_delta) > threshold:
+        direction = "longer" if video_reference_delta > 0 else "shorter"
+        warnings.append(
+            f"Kling returned video {abs(video_reference_delta):.2f}s {direction} than the reference voiceover."
+        )
+
+    if embedded_audio_duration <= 0:
+        warnings.append("Generated talking head has no readable embedded audio stream.")
+    elif embedded_reference_delta is not None and abs(embedded_reference_delta) > threshold:
+        direction = "longer" if embedded_reference_delta > 0 else "shorter"
+        warnings.append(
+            f"Embedded talking-head audio is {abs(embedded_reference_delta):.2f}s {direction} than the reference voiceover."
+        )
+
+    status = "needs_review" if warnings else "ok"
+    return {
+        "status": status,
+        "threshold": threshold,
+        "reference_audio_duration": round(reference_audio_duration, 3),
+        "video_stream_duration": round(video_stream_duration, 3),
+        "embedded_audio_duration": round(embedded_audio_duration, 3),
+        "video_reference_delta": round(video_reference_delta, 3),
+        "embedded_reference_delta": round(embedded_reference_delta, 3) if embedded_reference_delta is not None else None,
+        "abs_video_reference_delta": round(abs(video_reference_delta), 3),
+        "abs_embedded_reference_delta": round(abs(embedded_reference_delta), 3) if embedded_reference_delta is not None else None,
+        "warnings": warnings,
+    }
+
+
+def select_best_talking_head_attempt(attempts: list) -> dict:
+    """Pick the first passing attempt, otherwise the attempt closest to audio length."""
+    completed = [attempt for attempt in attempts if attempt.get("output_path") and not attempt.get("error")]
+    if not completed:
+        raise Exception("No completed talking-head attempts")
+
+    for attempt in completed:
+        if attempt.get("quality", {}).get("status") == "ok":
+            return attempt
+
+    return min(
+        completed,
+        key=lambda attempt: attempt.get("quality", {}).get("abs_video_reference_delta", float("inf")),
+    )
+
+
+def create_kling_tail_padded_audio(audio_path: str, output_path: str, tail_silence: float = 0.45) -> str:
+    """Create a retry-only audio file with a short silent tail for Kling."""
+    if (
+        os.path.exists(output_path)
+        and os.path.getsize(output_path) > 0
+        and os.path.getmtime(output_path) >= os.path.getmtime(audio_path)
+    ):
+        return output_path
+
+    for stale_path in (output_path, f"{output_path}.fal_url.txt"):
+        try:
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        except OSError:
+            pass
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", audio_path,
+        "-af", f"apad=pad_dur={tail_silence}",
+        "-c:a", "libmp3lame", "-b:a", "128k",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
 def _format_ass_time(seconds: float) -> str:
     """Format time for ASS subtitle format: H:MM:SS.cc"""
     h = int(seconds // 3600)
@@ -2324,6 +2583,7 @@ def generate_full_video(
             f"{audio_path}.fal_url.txt",
             talking_head,
             f"{talking_head}.fal_url.txt",
+            talking_head_quality_path(talking_head),
             srt_path,
             final_path,
         ):
@@ -2435,6 +2695,7 @@ def generate_full_video(
             talking_head,
             f"{talking_head}.fal_url.txt",
             talking_head_meta_path,
+            talking_head_quality_path(talking_head),
             srt_path,
             final_path,
         ):
@@ -2471,6 +2732,18 @@ def generate_full_video(
         log("[3/6] ✅ Talking head cached, skipping.")
 
     # ── Step 4: Generate b-roll clips ──
+    talking_head_quality = _read_json_file(talking_head_quality_path(talking_head))
+    if not talking_head_quality:
+        talking_head_quality = inspect_talking_head_quality(talking_head, audio_path)
+        _write_json_file(talking_head_quality_path(talking_head), talking_head_quality)
+
+    quality_warnings = talking_head_quality.get("warnings") or []
+    if talking_head_quality.get("status") != "ok":
+        if not quality_warnings:
+            quality_warnings = ["Talking-head stream durations need manual review before publishing."]
+        for warning in quality_warnings:
+            log(f"[3/6] Quality warning: {warning}")
+
     broll_mode = (config.get("broll_mode") or "mockup").lower()
     if broll_mode not in ("off", "mockup", "ai"):
         broll_mode = "mockup"
@@ -2570,10 +2843,14 @@ def generate_full_video(
         }
     else:
         kling_tier = "pro" if video_mode == "premium" else "standard"
+        kling_attempts = max(1, int(talking_head_quality.get("paid_attempts") or 1))
         cost = {
             actor_cost_key: actor_cost,
             tts_cost_key: tts_cost,
-            f"talking_head_kling_{kling_tier}": round(audio_duration * kling_avatar_cost_per_second(kling_tier), 2),
+            f"talking_head_kling_{kling_tier}": round(
+                audio_duration * kling_avatar_cost_per_second(kling_tier) * kling_attempts,
+                2,
+            ),
             "ffmpeg_compositing": 0.00,
         }
     if broll_mode == "ai":
@@ -2596,4 +2873,7 @@ def generate_full_video(
         "head_source": "template" if use_reusable_head else "generated",
         "head_template_id": reusable_head_template_id,
         "lipsync_model": reusable_lipsync_model if use_reusable_head else None,
+        "quality_status": talking_head_quality.get("status", "unknown"),
+        "quality_warnings": quality_warnings,
+        "talking_head_quality": talking_head_quality,
     }
