@@ -152,9 +152,6 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
           <h1 className="text-2xl font-bold text-white">
             {isRegister ? 'Создать аккаунт' : 'Войти в аккаунт'}
           </h1>
-          <p className="text-sm text-zinc-500">
-            Аккаунт нужен, чтобы хранить API-ключи, аватары, talking-head шаблоны и будущую подписку.
-          </p>
         </div>
 
         <div className="space-y-3">
@@ -215,6 +212,7 @@ function App() {
   const [authError, setAuthError] = useState('');
   const [apiKeyStatus, setApiKeyStatus] = useState({});
   const [usePlatformKeys, setUsePlatformKeys] = useState(() => localStorage.getItem(USE_PLATFORM_KEYS_KEY) === '1');
+  const [legacyClaimStatus, setLegacyClaimStatus] = useState('');
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || import.meta.env.VITE_GEMINI_API_KEY || '');
   // Social API State - Load encrypted or plain
@@ -364,6 +362,26 @@ function App() {
     }
     const data = await res.json();
     setApiKeyStatus(data.api_keys || {});
+  };
+
+  const handleClaimLegacyAssets = async () => {
+    setLegacyClaimStatus('Переношу старые данные...');
+    try {
+      const res = await fetch(getApiUrl('/api/user/claim-legacy-assets'), {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось перенести старые данные';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      const c = data.claimed || {};
+      setLegacyClaimStatus(`Перенесено: видео ${c.videos || 0}, talking-head ${c.head_templates || 0}, аватары ${c.actors || 0}.`);
+    } catch (e) {
+      setLegacyClaimStatus(e.message || 'Не удалось перенести старые данные');
+    }
   };
 
   // Session Recovery: Restore on mount
@@ -812,6 +830,22 @@ function App() {
                   <p className="text-xs text-amber-300">
                     Platform keys будут доступны после активации подписки. Сейчас можно использовать только свои сохранённые ключи.
                   </p>
+                )}
+                <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-zinc-200">Старые локальные данные</p>
+                    <p className="text-xs text-zinc-500">Перенести legacy-видео, аватары и talking-head шаблоны в текущий аккаунт.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleClaimLegacyAssets}
+                    className="btn-secondary px-3 py-2 text-xs"
+                  >
+                    Забрать старые данные
+                  </button>
+                </div>
+                {legacyClaimStatus && (
+                  <p className="text-xs text-zinc-400">{legacyClaimStatus}</p>
                 )}
               </div>
               <KeyInput

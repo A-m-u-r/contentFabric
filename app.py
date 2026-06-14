@@ -200,6 +200,7 @@ def create_user(email: str, password: str, name: Optional[str] = None) -> dict:
         raise ValueError("Valid email is required")
     if not password or len(password) < 8:
         raise ValueError("Password must be at least 8 characters")
+    is_first_user = _user_count() == 0
     user_id = str(uuid.uuid4())
     with _auth_db() as conn:
         conn.execute(
@@ -210,6 +211,8 @@ def create_user(email: str, password: str, name: Optional[str] = None) -> dict:
             (user_id, email, (name or email.split("@")[0]).strip() or "User", _hash_password(password), _utc_now()),
         )
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if is_first_user:
+        claim_legacy_assets_for_user(user_id)
     return _public_user(row)
 
 
@@ -322,6 +325,59 @@ def list_user_api_key_status(user_id: str) -> dict:
         if row["provider"] in status:
             status[row["provider"]] = {"has_key": True, "updated_at": row["updated_at"]}
     return status
+
+
+def _metadata_json_paths_for_legacy_claim() -> List[str]:
+    paths = []
+    paths.extend(glob.glob(os.path.join(OUTPUT_DIR, "saas_*", "gallery_metadata.json")))
+    paths.extend(glob.glob(os.path.join(OUTPUT_DIR, "head_templates", "*", "metadata.json")))
+
+    for path in glob.glob(os.path.join(OUTPUT_DIR, "**", "*.json"), recursive=True):
+        normalized = path.replace("\\", "/")
+        if normalized.endswith("/gallery_metadata.json") or normalized.endswith("/metadata.json"):
+            continue
+        paths.append(path)
+
+    return paths
+
+
+def claim_legacy_assets_for_user(user_id: str) -> dict:
+    """Attach local legacy assets without owner_user_id to the given user."""
+    counts = {"videos": 0, "head_templates": 0, "actors": 0}
+    for path in _metadata_json_paths_for_legacy_claim():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        if data.get("owner_user_id"):
+            continue
+
+        kind = None
+        normalized = path.replace("\\", "/")
+        if normalized.endswith("/gallery_metadata.json"):
+            kind = "videos"
+        elif normalized.endswith("/metadata.json") and "/head_templates/" in normalized:
+            kind = "head_templates"
+        elif "url" in data and "storage" in data:
+            kind = "actors"
+
+        if not kind:
+            continue
+
+        data["owner_user_id"] = user_id
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        counts[kind] += 1
+
+    return counts
+
+
+def _user_count() -> int:
+    with _auth_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def _platform_api_key(provider: str) -> Optional[str]:
@@ -577,6 +633,12 @@ async def user_save_api_key(
 async def user_api_keys(authorization: Optional[str] = Header(None, alias="Authorization")):
     user = require_user_from_authorization(authorization)
     return {"api_keys": list_user_api_key_status(user["id"])}
+
+
+@app.post("/api/user/claim-legacy-assets")
+async def user_claim_legacy_assets(authorization: Optional[str] = Header(None, alias="Authorization")):
+    user = require_user_from_authorization(authorization)
+    return {"claimed": claim_legacy_assets_for_user(user["id"])}
 
 
 @app.post("/api/admin/subscription")

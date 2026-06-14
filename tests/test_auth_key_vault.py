@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -64,6 +65,32 @@ class AuthKeyVaultTests(unittest.TestCase):
                 os.environ.pop("FAL_KEY", None)
             else:
                 os.environ["FAL_KEY"] = old_fal
+
+    def test_first_user_claims_legacy_assets(self):
+        video_dir = os.path.join(self.tmp.name, "saas_legacy-job")
+        os.makedirs(video_dir)
+        with open(os.path.join(video_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({"title": "Legacy video"}, f)
+
+        head_dir = os.path.join(self.tmp.name, "head_templates", "head_legacy")
+        os.makedirs(head_dir)
+        with open(os.path.join(head_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({"label": "Legacy head"}, f)
+
+        actor_dir = os.path.join(self.tmp.name, "actor_uploads")
+        os.makedirs(actor_dir)
+        actor_meta_path = os.path.join(actor_dir, "custom_legacy.json")
+        with open(actor_meta_path, "w", encoding="utf-8") as f:
+            json.dump({"url": "/videos/actor_uploads/custom_legacy.png", "storage": "local"}, f)
+
+        user = app.create_user("owner@example.com", "secret123", "Owner")
+
+        with open(os.path.join(video_dir, "gallery_metadata.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["owner_user_id"], user["id"])
+        with open(os.path.join(head_dir, "metadata.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["owner_user_id"], user["id"])
+        with open(actor_meta_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["owner_user_id"], user["id"])
 
 
 if __name__ == "__main__":

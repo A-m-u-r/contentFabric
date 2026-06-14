@@ -9,7 +9,7 @@ function Root() {
   const resolveView = () => {
     const hash = window.location.hash;
     if (hash === '#legal') return 'legal';
-    if (hash === '#app' || localStorage.getItem('openshorts_skip_landing') === '1') return 'app';
+    if (hash === '#app') return 'app';
     return 'landing';
   };
 
@@ -22,7 +22,6 @@ function Root() {
   }, []);
 
   const handleLaunchApp = () => {
-    localStorage.setItem('openshorts_skip_landing', '1');
     window.location.hash = '#app';
     setView('app');
   };
