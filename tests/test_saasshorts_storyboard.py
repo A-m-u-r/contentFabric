@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import saasshorts
 from saasshorts import (
     build_custom_script,
     build_kling_v3_storyboard_request,
@@ -17,6 +18,33 @@ from saasshorts import (
 
 
 class SaaSStoryboardTests(unittest.TestCase):
+    def test_power_text_model_resolves_to_gemini_31_pro_with_flash_fallback(self):
+        resolver = getattr(saasshorts, "resolve_gemini_text_model", None)
+        chain_builder = getattr(saasshorts, "gemini_text_model_chain", None)
+
+        self.assertIsNotNone(resolver)
+        self.assertIsNotNone(chain_builder)
+        with patch.object(saasshorts, "GEMINI_MODEL", "gemini-3-flash-preview"), \
+             patch.object(saasshorts, "GEMINI_FALLBACK_MODELS", ["gemini-2.5-flash"]):
+            self.assertEqual(resolver("pro"), "gemini-3.1-pro-preview")
+            self.assertEqual(resolver("quality"), "gemini-3.1-pro-preview")
+            self.assertEqual(
+                chain_builder("pro")[:3],
+                ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
+            )
+
+    def test_default_free_text_model_is_gemini_35_flash(self):
+        self.assertEqual(saasshorts.DEFAULT_FREE_GEMINI_MODEL, "gemini-3.5-flash")
+        with patch.object(saasshorts, "GEMINI_MODEL", saasshorts.DEFAULT_FREE_GEMINI_MODEL):
+            self.assertEqual(saasshorts.resolve_gemini_text_model("fast"), "gemini-3.5-flash")
+            self.assertEqual(saasshorts.gemini_text_model_chain("fast")[0], "gemini-3.5-flash")
+
+    def test_free_grounding_model_uses_model_with_free_search_grounding(self):
+        self.assertEqual(saasshorts.DEFAULT_FREE_GEMINI_GROUNDING_MODEL, "gemini-2.5-flash")
+        with patch.object(saasshorts, "GEMINI_FREE_GROUNDING_MODEL", "gemini-2.5-flash"):
+            self.assertEqual(saasshorts.resolve_gemini_grounding_model("fast"), "gemini-2.5-flash")
+            self.assertEqual(saasshorts.gemini_grounding_model_chain("fast"), ["gemini-2.5-flash"])
+
     def test_normalizes_storyboard_action_transition_and_prompt_contract(self):
         shots = normalize_storyboard_shots({
             "shots": [

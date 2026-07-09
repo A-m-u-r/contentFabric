@@ -32,6 +32,7 @@ class BusinessProfileTests(unittest.TestCase):
             "style": "ugc",
             "language": "ru",
             "actor_gender": "female",
+            "text_model": "pro",
         })
 
         profiles = app.list_business_profiles(user["id"])
@@ -40,6 +41,7 @@ class BusinessProfileTests(unittest.TestCase):
         self.assertEqual(profiles[0]["id"], saved["id"])
         self.assertEqual(profiles[0]["name"], "Неделя без срывов")
         self.assertEqual(profiles[0]["script_format"], "storyboard_v3")
+        self.assertEqual(profiles[0].get("text_model"), "pro")
 
 
 if __name__ == "__main__":

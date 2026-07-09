@@ -39,21 +39,49 @@ DEFAULT_VOICES = {
 }
 
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+DEFAULT_FREE_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_FREE_GEMINI_GROUNDING_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS = "gemini-3-flash-preview,gemini-2.5-flash"
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", DEFAULT_FREE_GEMINI_MODEL)
+GEMINI_FREE_GROUNDING_MODEL = os.environ.get(
+    "GEMINI_FREE_GROUNDING_MODEL",
+    DEFAULT_FREE_GEMINI_GROUNDING_MODEL,
+)
 GEMINI_FALLBACK_MODELS = [
     model.strip()
-    for model in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",")
+    for model in os.environ.get("GEMINI_FALLBACK_MODELS", DEFAULT_GEMINI_FALLBACK_MODELS).split(",")
     if model.strip()
 ]
+GEMINI_PRO_MODEL = os.environ.get("GEMINI_PRO_MODEL", "gemini-3.1-pro-preview")
 GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "2"))
+
+GEMINI_FAST_TEXT_MODEL_KEYS = {"fast", "flash", "default"}
+GEMINI_PRO_TEXT_MODEL_KEYS = {"pro", "quality", "power"}
 
 
 class GeminiTemporaryError(Exception):
     """Raised when Gemini is temporarily unavailable after retry/fallback attempts."""
 
 
-def _gemini_model_chain() -> list:
-    models = [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]
+def resolve_gemini_text_model(text_model: Optional[str] = None) -> str:
+    """Resolve a UI/API text-model preset to a Gemini model id."""
+    key = (text_model or "fast").strip().lower()
+    if key in GEMINI_FAST_TEXT_MODEL_KEYS:
+        return GEMINI_MODEL
+    if key in GEMINI_PRO_TEXT_MODEL_KEYS:
+        return GEMINI_PRO_MODEL
+    if key.startswith("gemini-"):
+        return key
+    return GEMINI_MODEL
+
+
+def gemini_text_model_chain(text_model: Optional[str] = None) -> list:
+    preferred = resolve_gemini_text_model(text_model)
+    models = [preferred]
+    if preferred != GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
+    models.extend(GEMINI_FALLBACK_MODELS)
     seen = set()
     chain = []
     for model in models:
@@ -61,6 +89,32 @@ def _gemini_model_chain() -> list:
             chain.append(model)
             seen.add(model)
     return chain
+
+
+def resolve_gemini_grounding_model(text_model: Optional[str] = None) -> str:
+    """Resolve model for Google Search grounding without routing free mode to paid-only grounding."""
+    key = (text_model or "fast").strip().lower()
+    if key in GEMINI_FAST_TEXT_MODEL_KEYS:
+        return GEMINI_FREE_GROUNDING_MODEL
+    return resolve_gemini_text_model(text_model)
+
+
+def gemini_grounding_model_chain(text_model: Optional[str] = None) -> list:
+    preferred = resolve_gemini_grounding_model(text_model)
+    models = [preferred]
+    if preferred != GEMINI_FREE_GROUNDING_MODEL:
+        models.append(GEMINI_FREE_GROUNDING_MODEL)
+    seen = set()
+    chain = []
+    for model in models:
+        if model and model not in seen:
+            chain.append(model)
+            seen.add(model)
+    return chain
+
+
+def _gemini_model_chain() -> list:
+    return gemini_text_model_chain()
 
 
 def _is_retryable_gemini_error(error: Exception) -> bool:
@@ -86,9 +140,16 @@ def _is_retryable_gemini_error(error: Exception) -> bool:
     )
 
 
-def _generate_gemini_content(client, *, contents, config=None):
+def _generate_gemini_content(
+    client,
+    *,
+    contents,
+    config=None,
+    text_model: Optional[str] = None,
+    model_chain: Optional[list] = None,
+):
     last_error = None
-    models = _gemini_model_chain()
+    models = model_chain or gemini_text_model_chain(text_model)
 
     for model_index, model in enumerate(models):
         for attempt in range(GEMINI_MAX_RETRIES + 1):
@@ -126,7 +187,7 @@ def _generate_gemini_content(client, *, contents, config=None):
 # Phase 1: Website Scraping, Web Research & Analysis
 # ═══════════════════════════════════════════════════════════════════════
 
-def research_saas_online(url: str, gemini_key: str) -> dict:
+def research_saas_online(url: str, gemini_key: str, text_model: Optional[str] = None) -> dict:
     """
     Use Gemini with Google Search grounding to deeply research a product or business
     across the internet: reviews, Reddit threads, Twitter, competitor comparisons,
@@ -188,6 +249,7 @@ Be thorough. Use REAL data from your search results, not made-up information."""
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
+        model_chain=gemini_grounding_model_chain(text_model),
     )
 
     # Extract grounding sources
@@ -318,7 +380,12 @@ def scrape_website(url: str) -> dict:
     return result
 
 
-def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None) -> dict:
+def analyze_saas(
+    scraped_data: dict,
+    gemini_key: str,
+    web_research: dict = None,
+    text_model: Optional[str] = None,
+) -> dict:
     """
     Deep analysis of a product or business combining website scraping + web research.
     Uses Gemini 3 Flash for synthesis.
@@ -418,6 +485,7 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
         client,
         contents=[prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
+        text_model=text_model,
     )
 
     raw = response.text
@@ -456,6 +524,7 @@ def generate_scripts(
     actor_gender: str = "female",
     topic: str = None,
     script_format: str = "ugc",
+    text_model: Optional[str] = None,
 ) -> list:
     """Generate video scripts based on product/business analysis."""
     from google import genai
@@ -575,6 +644,7 @@ RULES:
                 response_mime_type="application/json",
                 max_output_tokens=8192,
             ),
+            text_model=text_model,
         )
 
         raw = response.text
@@ -723,6 +793,7 @@ RULES:
             response_mime_type="application/json",
             max_output_tokens=8192,
         ),
+        text_model=text_model,
     )
 
     raw = response.text

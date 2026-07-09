@@ -136,6 +136,7 @@ def init_auth_db() -> None:
                 topic TEXT NOT NULL DEFAULT '',
                 script_mode TEXT NOT NULL DEFAULT 'ai',
                 script_format TEXT NOT NULL DEFAULT 'ugc',
+                text_model TEXT NOT NULL DEFAULT 'fast',
                 style TEXT NOT NULL DEFAULT 'ugc',
                 language TEXT NOT NULL DEFAULT 'ru',
                 actor_gender TEXT NOT NULL DEFAULT 'female',
@@ -145,6 +146,11 @@ def init_auth_db() -> None:
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE business_profiles ADD COLUMN text_model TEXT NOT NULL DEFAULT 'fast'")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def _normalize_email(email: str) -> str:
@@ -368,6 +374,7 @@ def _public_business_profile(row) -> Optional[dict]:
         "topic": row["topic"],
         "script_mode": row["script_mode"],
         "script_format": row["script_format"],
+        "text_model": row["text_model"] if "text_model" in row.keys() else "fast",
         "style": row["style"],
         "language": row["language"],
         "actor_gender": row["actor_gender"],
@@ -395,16 +402,17 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
         conn.execute(
             """
             INSERT INTO business_profiles (
-                id, user_id, name, description, topic, script_mode, script_format,
+                id, user_id, name, description, topic, script_mode, script_format, text_model,
                 style, language, actor_gender, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
                 topic = excluded.topic,
                 script_mode = excluded.script_mode,
                 script_format = excluded.script_format,
+                text_model = excluded.text_model,
                 style = excluded.style,
                 language = excluded.language,
                 actor_gender = excluded.actor_gender,
@@ -418,6 +426,7 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
                 (profile.get("topic") or "").strip(),
                 profile.get("script_mode") or "ai",
                 profile.get("script_format") or "ugc",
+                profile.get("text_model") or "fast",
                 profile.get("style") or "ugc",
                 profile.get("language") or "ru",
                 profile.get("actor_gender") or "female",
@@ -707,6 +716,7 @@ class BusinessProfileRequest(BaseModel):
     topic: str = ""
     script_mode: str = "ai"
     script_format: str = "ugc"
+    text_model: str = "fast"
     style: str = "ugc"
     language: str = "ru"
     actor_gender: str = "female"
@@ -2938,6 +2948,7 @@ class SaaSAnalyzeRequest(BaseModel):
     topic: Optional[str] = None
     script_mode: str = "ai"  # "ai" or "custom"
     script_format: str = "ugc"  # "ugc" or "storyboard_v3"
+    text_model: str = "fast"  # "fast" or "pro"
     custom_script: Optional[str] = None
     num_scripts: int = 3
     style: str = "ugc"
@@ -3002,8 +3013,8 @@ async def saasshorts_analyze(
             elif req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
-                web_research = research_saas_online(req.url, gemini_key)
-                analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
+                web_research = research_saas_online(req.url, gemini_key, text_model=req.text_model)
+                analysis = analyze_saas(scraped, gemini_key, web_research=web_research, text_model=req.text_model)
                 if req.topic:
                     analysis["topic"] = req.topic
                 scripts = generate_scripts(
@@ -3015,6 +3026,7 @@ async def saasshorts_analyze(
                     req.actor_gender,
                     topic=req.topic,
                     script_format=req.script_format,
+                    text_model=req.text_model,
                 )
             else:
                 # Manual description: build analysis from description
@@ -3037,6 +3049,7 @@ async def saasshorts_analyze(
                     req.actor_gender,
                     topic=req.topic,
                     script_format=req.script_format,
+                    text_model=req.text_model,
                 )
             return {
                 "analysis": analysis,

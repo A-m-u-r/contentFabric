@@ -15,6 +15,11 @@ const SCRIPT_FORMAT_OPTIONS = [
   { id: 'storyboard_v3', label: 'Раскадровка V3', desc: 'ИИ сделает кадры, действия, текст и промпты' },
 ];
 
+const TEXT_MODEL_OPTIONS = [
+  { id: 'fast', label: 'Gemini 3.5 Flash', desc: 'Максимальная бесплатная модель для генерации текста и сценариев' },
+  { id: 'pro', label: 'Gemini 3.1 Pro', desc: 'Платный режим для оффера, раскадровки и сложной логики' },
+];
+
 const TTS_PROVIDER_OPTIONS = [
   { id: 'auto', label: 'Auto fallback', desc: 'ElevenLabs first, fal MiniMax if needed' },
   { id: 'elevenlabs', label: 'ElevenLabs', desc: 'Best voice quality, may need paid plan' },
@@ -451,6 +456,7 @@ export default function SaaShortsTab({
   const [businessProfileStatus, setBusinessProfileStatus] = useState('');
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
   const [scriptFormat, setScriptFormat] = useState(() => loadCache()?.scriptFormat || 'ugc');
+  const [textModel, setTextModel] = useState(() => loadCache()?.textModel || 'fast');
   const [customScript, setCustomScript] = useState(() => loadCache()?.customScript || '');
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('ru');
@@ -660,6 +666,8 @@ export default function SaaShortsTab({
       script_mode: scriptMode,
       scriptFormat,
       script_format: scriptFormat,
+      textModel,
+      text_model: textModel,
       style,
       language,
       actorGender,
@@ -687,6 +695,7 @@ export default function SaaShortsTab({
             topic: topic.trim(),
             script_mode: scriptMode,
             script_format: scriptFormat,
+            text_model: textModel,
             style,
             language,
             actor_gender: actorGender,
@@ -715,6 +724,7 @@ export default function SaaShortsTab({
     setTopic(profile.topic || '');
     if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
     if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
+    if (profile.textModel || profile.text_model) setTextModel(profile.textModel || profile.text_model);
     if (profile.style) setStyle(profile.style);
     if (profile.language) setLanguage(profile.language);
     if (profile.actorGender || profile.actor_gender) setActorGender(profile.actorGender || profile.actor_gender);
@@ -747,6 +757,7 @@ export default function SaaShortsTab({
           topic: topic.trim() || undefined,
           script_mode: scriptMode,
           script_format: scriptFormat,
+          text_model: textModel,
           custom_script: isCustom ? customScript.trim() : undefined,
           num_scripts: numScripts,
           style,
@@ -778,6 +789,7 @@ export default function SaaShortsTab({
         topic: topic.trim(),
         scriptMode,
         scriptFormat,
+        textModel,
         customScript: isCustom ? customScript.trim() : '',
       }, data.analysis, data.web_research, data.scripts);
 
@@ -813,6 +825,7 @@ export default function SaaShortsTab({
       topic: topic.trim(),
       scriptMode,
       scriptFormat,
+      textModel,
       customScript: scriptMode === 'custom' ? customScript.trim() : '',
     }, analysis, webResearch, nextScripts);
   };
@@ -1427,6 +1440,36 @@ export default function SaaShortsTab({
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div data-section="text-model-section">
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Модель текста</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {TEXT_MODEL_OPTIONS.map((model) => (
+                    <button
+                      key={model.id}
+                      onClick={() => setTextModel(model.id)}
+                      className={`p-3 rounded-xl border text-left transition-all ${
+                        textModel === model.id
+                          ? model.id === 'pro'
+                            ? 'border-amber-500/50 bg-amber-500/10 text-amber-200'
+                            : 'border-blue-500/50 bg-blue-500/10 text-blue-200'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold">{model.label}</span>
+                        {model.id === 'pro' && (
+                          <span className="text-[10px] rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-300">paid</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">{model.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-zinc-600 mt-1">
+                  Pro дороже и медленнее, но лучше подходит для сильного оффера, точной раскадровки и русского текста.
+                </p>
               </div>
 
               <div data-section="script-format-section">
