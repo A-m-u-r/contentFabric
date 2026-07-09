@@ -452,7 +452,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
   };
 
   return (
-    <div className="h-full overflow-y-auto p-6 md:p-8 animate-[fadeIn_0.3s_ease-out]">
+    <div className="h-full overflow-y-auto p-6 pb-28 md:p-8 md:pb-8 animate-[fadeIn_0.3s_ease-out]">
       <div className="max-w-5xl mx-auto">
         {/* Header */}
         <div className="flex items-center justify-between mb-2">

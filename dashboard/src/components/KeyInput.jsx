@@ -31,6 +31,7 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                 <div className="relative flex-1">
                     <input
                         type={isVisible ? "text" : "password"}
+                        aria-label="Gemini API key"
                         value={key}
                         onChange={(e) => {
                             setKey(e.target.value);
@@ -40,13 +41,16 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                         className="input-field pr-12 font-mono"
                     />
                     <button
+                        type="button"
+                        aria-label={isVisible ? 'Скрыть API-ключ' : 'Показать API-ключ'}
                         onClick={() => setIsVisible(!isVisible)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-white transition-colors"
+                        className="absolute right-1 top-1/2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
                     >
-                        {isVisible ? <EyeOff size={18} /> : <Eye size={18} />}
+                        {isVisible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
                     </button>
                 </div>
                 <button
+                    type="button"
                     onClick={handleSave}
                     disabled={!key || isSaved}
                     className={`px-6 rounded-xl font-medium transition-all flex items-center gap-2 ${isSaved
@@ -64,7 +68,7 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                     href="https://aistudio.google.com/app/apikey"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-primary hover:underline mt-1 inline-block"
+                    className="mt-1 inline-flex py-2 text-primary hover:underline"
                 >
                     Get your free Gemini API Key here →
                 </a>

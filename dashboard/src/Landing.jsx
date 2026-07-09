@@ -5,22 +5,21 @@ import {
   Bot,
   Check,
   ChevronDown,
-  Cpu,
   FileVideo,
   Gauge,
   Globe2,
   Instagram,
   KeyRound,
-  Languages,
   Megaphone,
+  Moon,
   Play,
   Repeat2,
   Send,
   Sparkles,
   Subtitles,
+  Sun,
   UserRound,
   Youtube,
-  Zap,
 } from 'lucide-react';
 
 const TikTokIcon = ({ size = 18, className = '' }) => (
@@ -29,202 +28,333 @@ const TikTokIcon = ({ size = 18, className = '' }) => (
   </svg>
 );
 
+const BRAND_NAME = 'OpenShorts';
+const BRAND_ICON = '/favicon-192.png';
+
 const LANDING_COPY = {
   ru: {
     nav: {
-      product: 'Возможности',
-      pipeline: 'Пайплайн',
+      product: 'Что собирает',
+      pipeline: 'Петля',
       pricing: 'Доступ',
       faq: 'FAQ',
-      login: 'Войти',
+      login: 'Собрать серию',
+      legal: 'Документы',
     },
     hero: {
-      eyebrow: 'ИИ content factory для коротких видео',
-      title: 'От идеи до Reels, Shorts и заявок в одном пайплайне',
+      eyebrow: 'OpenShorts / series engine',
+      title: '10 AI-роликов из одного оффера — за один запуск',
       description:
-        'Платформа полного цикла для ежедневного производства коротких роликов: идея, сценарий, AI-актер, озвучка, lip-sync, субтитры, публикация, аналитика и новые гипотезы.',
-      primary: 'Открыть платформу',
-      secondary: 'Посмотреть процесс',
-      note: 'Подписка дает доступ к платформенным лимитам. При желании можно подключить свои API для Gemini, fal.ai, ElevenLabs и публикации.',
+        'Задайте продукт, нишу или URL. OpenShorts разложит оффер на hooks, соберет сценарии, AI-аватара, голос, субтитры, публикацию и сигналы для следующей серии.',
+      primary: 'Собрать тестовую серию',
+      secondary: 'Забрать карту hooks',
+      note: 'Первый шаг - не один идеальный ролик, а пачка гипотез на 7-10 видео. Свои API можно подключить для контроля себестоимости генерации.',
     },
-    stats: [
-      { value: '30+', label: 'роликов в месяц на одну нишу' },
-      { value: '3', label: 'канала: TikTok, Instagram, YouTube' },
-      { value: 'BYOK', label: 'режим со своими API-ключами' },
+    heroMockup: {
+      lineLabel: 'Пульт серии',
+      campaign: 'Оффер: консультация по питанию',
+      status: 'новая версия',
+      idea: '1 оффер',
+      script: '25 hooks + 10 сценариев',
+      avatar: 'UGC-аватар + голос + lip-sync',
+      output: 'Reels / Shorts / TikTok',
+      queue: 'Очередь на 3 площадки',
+      analytics: 'удержание',
+      leads: 'DM / заявки',
+      hypothesis: 'следующая связка',
+      hooks: ['Боль в первые 2 секунды', 'До / после без обещаний', 'Оффер через личную историю'],
+      signals: ['42% удержание', '5 DM', '2 заявки'],
+    },
+    capabilities: [
+      { icon: Sparkles, label: 'Оффер' },
+      { icon: Bot, label: 'Hooks' },
+      { icon: UserRound, label: 'AI-аватар' },
+      { icon: Megaphone, label: 'Голос' },
+      { icon: Subtitles, label: 'Субтитры' },
+      { icon: Send, label: 'Публикация' },
     ],
+    proofPoints: [
+      { title: '10 роликов', text: 'пакет под одну гипотезу' },
+      { title: '1 запуск', text: 'оффер, hooks, аватар, публикация' },
+      { title: '3 канала', text: 'Reels, Shorts и TikTok' },
+    ],
+    leadMagnet: {
+      eyebrow: 'Лид-магнит для холодного трафика',
+      title: 'Карта из 25 hooks для первой серии',
+      text:
+        'Быстрый вход без брифа: выберите нишу, боль аудитории и получите стартовые углы подачи для Reels, Shorts и TikTok.',
+      items: ['5 типов боли для первых секунд', 'формулы hooks без кликбейта', 'мини-бриф для первой серии', 'CTA под DM, заявку или переход'],
+      inputLabel: 'Email для карты hooks',
+      placeholder: 'email@company.ru',
+      button: 'Получить карту hooks',
+      note: 'Форма готова под подключение рассылки. Сейчас кнопка ведет в сборку серии.',
+    },
     productCards: [
       {
-        icon: Bot,
-        title: 'AI Shorts',
-        text: 'Генерация UGC-роликов с AI-актером, голосом, lip-sync, hooks, captions и субтитрами.',
-        points: ['AI-актеры и свои аватары', 'Kling/Hailuo/lip-sync режимы', 'Русская озвучка и субтитры'],
+        icon: Sparkles,
+        title: 'Разбор оффера',
+        text: 'Система превращает продукт, услугу или URL в набор углов подачи для коротких видео.',
+        points: ['боли и желания аудитории', 'hooks для первых секунд', 'варианты CTA под лиды или заявки'],
       },
       {
         icon: FileVideo,
-        title: 'Clip Factory',
-        text: 'Пересборка длинных видео в короткие вертикальные клипы для Reels, Shorts и TikTok.',
-        points: ['поиск сильных моментов', '9:16 кадрирование', 'автосубтитры и hook overlays'],
+        title: 'Производство серии',
+        text: 'Из выбранных hooks собираются сценарии, вертикальные ролики, озвучка, lip-sync и субтитры.',
+        points: ['AI-аватар или свой персонаж', 'голос, b-roll и субтитры', 'пакет роликов вместо одиночной генерации'],
       },
       {
-        icon: Youtube,
-        title: 'YouTube Studio',
-        text: 'Вспомогательный блок для названий, описаний, обложек и публикации контента.',
-        points: ['идеи заголовков', 'описания с таймкодами', 'публикация в соцсети'],
+        icon: BarChart3,
+        title: 'Публикация и сигналы',
+        text: 'Ролики уходят в очередь публикаций, а реакции возвращаются в следующую гипотезу.',
+        points: ['очередь TikTok, Reels и Shorts', 'сравнение hooks и CTA', 'идеи для следующей серии'],
       },
     ],
-    pipelineTitle: 'Полный цикл контент-завода',
+    pipelineTitle: 'Петля роста: оффер → серия → сигнал',
     pipelineText:
-      'Система не заканчивается на генерации видео. Она помогает связать производство, публикацию, реакцию аудитории и новые гипотезы.',
+      'Не угадывайте один идеальный ролик. Выпускайте маленькую серию, смотрите удержание, DM и заявки, затем размножайте только те углы, где появился сигнал.',
     pipeline: [
-      'Идея',
-      'Сценарий',
+      'Оффер',
+      'Hooks',
       'AI-актер',
       'Видео',
       'Публикация',
-      'Аналитика',
-      'Лиды',
-      'Новые гипотезы',
+      'Удержание',
+      'DM / лиды',
+      'Новая серия',
     ],
-    channelsTitle: 'Собрано под ежедневный постинг',
+    pipelineGroups: [
+      {
+        key: 'idea',
+        title: 'Оффер',
+        text: 'Формулируем аудиторию, обещание, боль и несколько углов подачи, которые можно быстро проверить.',
+        steps: [0, 1],
+      },
+      {
+        key: 'video',
+        title: 'Серия',
+        text: 'Собираем ролики с аватаром, голосом, субтитрами и выпуском под нужные площадки.',
+        steps: [2, 3, 4],
+      },
+      {
+        key: 'reaction',
+        title: 'Сигнал',
+        text: 'Сравниваем удержание, DM, лиды и сохраняем связки, которые стоит масштабировать.',
+        steps: [5, 6, 7],
+      },
+    ],
+    pipelineConnectorLabels: ['пакет готов', 'серия опубликована'],
+    pipelineReturn: 'Сигналы → новая серия',
+    pipelineReturnText: 'Удержание, DM, клики, заявки и сохранения становятся брифом для следующего выпуска.',
+    pipelineSignals: ['удержание', 'DM', 'клики', 'заявки'],
+    channelsTitle: 'Внутри не генератор, а линия выпуска',
     channelsText:
-      'Один сценарий можно адаптировать под TikTok, Instagram Reels и YouTube Shorts без ручной пересборки каждого ролика.',
+      'Обычно такую серию приходится собирать из ChatGPT, сервиса аватаров, голоса, монтажки и автопостинга. Здесь это один поток: оффер, hooks, ролики, публикация, сигналы.',
     features: [
-      { icon: Sparkles, title: 'Сценарии и hooks', text: 'Генерация сценариев под нишу, оффер, аудиторию и формат ролика.' },
-      { icon: UserRound, title: 'AI-актеры', text: 'Загрузка своих аватаров или генерация новых лиц для UGC-подачи.' },
-      { icon: Subtitles, title: 'Субтитры', text: 'Короткие читаемые субтитры и hook-тексты для удержания внимания.' },
-      { icon: Send, title: 'Публикация', text: 'Экспорт или публикация в TikTok, Instagram и YouTube из одного интерфейса.' },
-      { icon: BarChart3, title: 'Аналитика', text: 'Сравнение тем, hooks и CTA, чтобы наращивать удачные гипотезы.' },
-      { icon: KeyRound, title: 'Свои API', text: 'Можно работать на подписке платформы или подключить свои API-ключи.' },
+      { icon: Sparkles, title: 'Пакет сценариев', text: 'Несколько hooks и сценариев под один оффер, чтобы тестировать не вслепую.' },
+      { icon: UserRound, title: 'AI-аватар', text: 'UGC-подача через AI-персонажа или загруженный образ для узнаваемой серии.' },
+      { icon: Repeat2, title: 'Голос и lip-sync', text: 'Озвучка, синхронизация губ и варианты подачи без ручного сведения.' },
+      { icon: Subtitles, title: 'Субтитры', text: 'Короткие читаемые титры и hook-оверлеи для удержания первых секунд.' },
+      { icon: Send, title: 'Автопостинг', text: 'Очередь публикаций под TikTok, Instagram Reels и YouTube Shorts.' },
+      { icon: KeyRound, title: 'Себестоимость', text: 'Подписка для старта или свои API-ключи, если нужно контролировать расходы.' },
     ],
     access: {
-      title: 'Подписка плюс контроль над API',
+      title: 'Подписка на кабинет + контроль себестоимости',
       text:
-        'Мы продаем доступ к рабочему интерфейсу и пайплайну. Для команд, которые хотят контролировать расходы напрямую, остается режим со своими API.',
-      leftTitle: 'Подписка',
-      leftPoints: ['быстрый старт без сборки инфраструктуры', 'единая галерея роликов и аватаров', 'готовые режимы качества и стоимости'],
-      rightTitle: 'свои API',
-      rightPoints: ['Gemini для анализа и сценариев', 'fal.ai для видео, аватаров и lip-sync', 'ElevenLabs для голоса', 'Upload-Post для публикаций'],
+        'Платформа продает рабочий кабинет для выпуска серий. Если объемы растут, можно подключить свои ключи и видеть, где именно расходуется бюджет.',
+      leftTitle: 'Старт на подписке',
+      leftPoints: ['не нужно собирать инфраструктуру из пяти сервисов', 'в одном месте брифы, сценарии, ролики и очередь', 'понятный путь от оффера до первой серии'],
+      rightTitle: 'Свои API',
+      rightPoints: ['Gemini для анализа оффера и сценариев', 'fal.ai для видео, аватаров и lip-sync', 'ElevenLabs для голоса', 'Upload-Post для публикаций'],
     },
     faq: [
       {
-        question: 'Это генератор роликов или полноценная контент-фабрика?',
+        question: 'Почему серия лучше одного ролика?',
         answer:
-          'Главная идея именно в фабрике полного цикла: не просто сделать видео, а пройти путь от идеи и сценария до публикации, аналитики и следующей гипотезы.',
+          'Один ролик легко промахивается по боли, hook или подаче. Серия из 7-10 роликов быстрее показывает, какие углы цепляют аудиторию и что стоит масштабировать.',
       },
       {
-        question: 'Можно ли использовать русский язык?',
+        question: 'Можно ли делать ролики на русском?',
         answer:
-          'Да. Лендинг по умолчанию показывает русский, а внутри пайплайна поддерживаются русские сценарии, озвучка и субтитры при наличии подходящих ключей и голосов.',
+          'Да. Сценарии, озвучку, титры и подачу можно собирать на русском, если выбранные модели и голоса поддерживают нужный язык.',
       },
       {
         question: 'Зачем нужны свои API, если есть подписка?',
         answer:
-          'Подписка нужна для доступа к продукту и готовому workflow. Свои API полезны, если ты хочешь платить провайдерам напрямую, тестировать другие лимиты или контролировать расходы по каждому сервису.',
+          'Подписка дает кабинет и workflow. Свои API нужны тем, кто делает много роликов, хочет платить провайдерам напрямую и видеть себестоимость по видео, голосу и публикации.',
       },
       {
         question: 'Для кого это подходит?',
         answer:
-          'Для экспертов, малых бизнесов, агентств и проектов, которым нужен стабильный поток коротких роликов, а не разовая генерация ради теста.',
+          'Для экспертов, малого бизнеса, агентств и проектов, где нужно регулярно проверять офферы, лид-магниты, продукты или консультации через короткие видео.',
+      },
+      {
+        question: 'Сколько ручной работы остается?',
+        answer:
+          'Нужно задать нишу, продукт, ограничения и выбрать удачные варианты. Ручная склейка между сценариями, аватаром, голосом, субтитрами и публикацией уходит в пайплайн.',
       },
     ],
     finalCta: {
-      title: 'Запусти первую производственную линию контента',
-      text: 'Начни с одной ниши, одного оффера и 7-10 роликов. Дальше система покажет, какие темы стоит масштабировать.',
-      button: 'Перейти в приложение',
+      title: 'Запустите первую серию, а не один ролик',
+      text: 'Начните с одного оффера и 7-10 коротких видео. Дальше сравните реакции и оставьте только те связки, которые дают сигнал.',
+      button: 'Собрать тестовую серию',
     },
   },
   en: {
     nav: {
-      product: 'Product',
-      pipeline: 'Pipeline',
+      product: 'What it builds',
+      pipeline: 'Loop',
       pricing: 'Access',
       faq: 'FAQ',
-      login: 'Open app',
+      login: 'Build a series',
+      legal: 'Legal',
     },
     hero: {
-      eyebrow: 'AI content factory for short-form video',
-      title: 'From idea to Reels, Shorts and leads in one pipeline',
+      eyebrow: 'OpenShorts / series engine',
+      title: '10 AI videos from one offer in one run',
       description:
-        'A full-cycle platform for daily short-form production: idea, script, AI actor, voiceover, lip-sync, captions, publishing, analytics and the next content hypothesis.',
-      primary: 'Open platform',
-      secondary: 'See workflow',
-      note: 'Subscription access includes platform limits. Teams can also connect their own APIs for Gemini, fal.ai, ElevenLabs and publishing.',
+        'Give OpenShorts a product, niche or URL. It turns the offer into hooks, scripts, an AI avatar, voice, captions, publishing and the signals for the next batch.',
+      primary: 'Build a test series',
+      secondary: 'Get hook map',
+      note: 'Start with a 7-10 video hypothesis batch, not one perfect clip. Connect your own APIs when you need direct cost control.',
     },
-    stats: [
-      { value: '30+', label: 'videos per month per niche' },
-      { value: '3', label: 'channels: TikTok, Instagram, YouTube' },
-      { value: 'BYOK', label: 'bring your own API keys' },
+    heroMockup: {
+      lineLabel: 'Series console',
+      campaign: 'Offer: nutrition consult',
+      status: 'new version',
+      idea: '1 offer',
+      script: '25 hooks + 10 scripts',
+      avatar: 'UGC avatar + voice + lip-sync',
+      output: 'Reels / Shorts / TikTok',
+      queue: 'Queue for 3 channels',
+      analytics: 'retention',
+      leads: 'DM / leads',
+      hypothesis: 'next angle',
+      hooks: ['Pain in first 2 seconds', 'Before / after without hype', 'Offer through a personal story'],
+      signals: ['42% retention', '5 DMs', '2 leads'],
+    },
+    capabilities: [
+      { icon: Sparkles, label: 'Offer' },
+      { icon: Bot, label: 'Hooks' },
+      { icon: UserRound, label: 'AI avatar' },
+      { icon: Megaphone, label: 'Voice' },
+      { icon: Subtitles, label: 'Captions' },
+      { icon: Send, label: 'Publishing' },
     ],
+    proofPoints: [
+      { title: '10 videos', text: 'one hypothesis batch' },
+      { title: '1 run', text: 'offer, hooks, avatar, publishing' },
+      { title: '3 channels', text: 'Reels, Shorts and TikTok' },
+    ],
+    leadMagnet: {
+      eyebrow: 'Lead magnet for cold traffic',
+      title: '25-hook map for the first series',
+      text:
+        'A fast starting point without a long brief: pick a niche and audience pain, then use proven short-form angles for Reels, Shorts and TikTok.',
+      items: ['5 pain types for the first seconds', 'hook formulas without clickbait', 'mini brief for the first batch', 'CTAs for DMs, leads or clicks'],
+      inputLabel: 'Email for the hook map',
+      placeholder: 'email@company.com',
+      button: 'Get the hook map',
+      note: 'The capture form is ready for email integration. For now it opens the series builder.',
+    },
     productCards: [
       {
-        icon: Bot,
-        title: 'AI Shorts',
-        text: 'Generate UGC-style videos with AI actors, voiceover, lip-sync, hooks, captions and subtitles.',
-        points: ['AI actors and custom avatars', 'Kling, Hailuo and lip-sync modes', 'Multilingual voice and captions'],
+        icon: Sparkles,
+        title: 'Offer breakdown',
+        text: 'Turn a product, service or URL into angles for short-form video tests.',
+        points: ['audience pains and desires', 'first-second hooks', 'CTA variants for leads or DMs'],
       },
       {
         icon: FileVideo,
-        title: 'Clip Factory',
-        text: 'Turn long videos into vertical clips for Reels, Shorts and TikTok.',
-        points: ['strong moment detection', '9:16 reframing', 'subtitles and hook overlays'],
+        title: 'Series production',
+        text: 'Build scripts, vertical clips, voice, lip-sync and captions from the selected hooks.',
+        points: ['AI avatar or owned character', 'voice, b-roll and subtitles', 'a batch instead of one-off generation'],
       },
       {
-        icon: Youtube,
-        title: 'YouTube Studio',
-        text: 'Support tools for titles, descriptions, thumbnails and publishing.',
-        points: ['title ideas', 'descriptions with timestamps', 'social publishing'],
+        icon: BarChart3,
+        title: 'Publishing and signals',
+        text: 'Send videos to the publishing queue and bring response back into the next hypothesis.',
+        points: ['TikTok, Reels and Shorts queue', 'hook and CTA comparison', 'ideas for the next batch'],
       },
     ],
-    pipelineTitle: 'The full content-factory cycle',
+    pipelineTitle: 'Growth loop: offer → series → signal',
     pipelineText:
-      'The product does not stop at video generation. It connects production, publishing, audience response and the next set of tests.',
-    pipeline: ['Idea', 'Script', 'AI actor', 'Video', 'Publish', 'Analytics', 'Lead', 'New hypothesis'],
-    channelsTitle: 'Built for daily posting',
+      'Stop guessing the one perfect clip. Publish a small series, read retention, DMs and leads, then scale the angles that show signal.',
+    pipeline: ['Offer', 'Hooks', 'AI actor', 'Video', 'Publish', 'Retention', 'DM / leads', 'New series'],
+    pipelineGroups: [
+      {
+        key: 'idea',
+        title: 'Offer',
+        text: 'Shape the audience, promise, pain and angles that can be tested quickly.',
+        steps: [0, 1],
+      },
+      {
+        key: 'video',
+        title: 'Series',
+        text: 'Assemble videos with avatar, voice, captions and publishing handoff.',
+        steps: [2, 3, 4],
+      },
+      {
+        key: 'reaction',
+        title: 'Signal',
+        text: 'Compare retention, DMs and leads, then keep the angles worth scaling.',
+        steps: [5, 6, 7],
+      },
+    ],
+    pipelineConnectorLabels: ['batch ready', 'series published'],
+    pipelineReturn: 'Signals → new series',
+    pipelineReturnText: 'Retention, DMs, clicks, leads and saves become the brief for the next release.',
+    pipelineSignals: ['retention', 'DMs', 'clicks', 'leads'],
+    channelsTitle: 'Not a generator. A release line.',
     channelsText:
-      'One script can be adapted for TikTok, Instagram Reels and YouTube Shorts without manually rebuilding every video.',
+      'A real series usually means ChatGPT, avatar tools, voice, editing and autoposting. OpenShorts puts the whole flow in one line: offer, hooks, videos, publishing, signals.',
     features: [
-      { icon: Sparkles, title: 'Scripts and hooks', text: 'Generate scripts for a niche, offer, audience and short-form format.' },
-      { icon: UserRound, title: 'AI actors', text: 'Upload your own avatars or generate new faces for UGC-style delivery.' },
-      { icon: Subtitles, title: 'Captions', text: 'Readable subtitles and hook overlays for retention.' },
-      { icon: Send, title: 'Publishing', text: 'Export or publish to TikTok, Instagram and YouTube from one interface.' },
-      { icon: BarChart3, title: 'Analytics', text: 'Compare topics, hooks and CTAs to scale stronger hypotheses.' },
-      { icon: KeyRound, title: 'Your APIs', text: 'Use platform subscription limits or connect your own API keys.' },
+      { icon: Sparkles, title: 'Script batch', text: 'Multiple hooks and scripts for one offer, so testing is not random.' },
+      { icon: UserRound, title: 'AI avatar', text: 'UGC-style delivery through an AI character or uploaded likeness.' },
+      { icon: Repeat2, title: 'Voice and lip-sync', text: 'Voiceover, lip-sync and delivery variants without manual assembly.' },
+      { icon: Subtitles, title: 'Captions', text: 'Readable captions and hook overlays for the first seconds.' },
+      { icon: Send, title: 'Autoposting', text: 'Publishing queue for TikTok, Instagram Reels and YouTube Shorts.' },
+      { icon: KeyRound, title: 'Unit economics', text: 'Start on subscription or connect your own APIs to control cost.' },
     ],
     access: {
-      title: 'Subscription plus API control',
+      title: 'Product access plus cost control',
       text:
-        'We sell access to the working interface and pipeline. Teams that want direct cost control can connect their own provider accounts.',
-      leftTitle: 'Subscription',
-      leftPoints: ['start without building infrastructure', 'one gallery for videos and avatars', 'ready cost and quality modes'],
-      rightTitle: 'your APIs',
-      rightPoints: ['Gemini for analysis and scripts', 'fal.ai for video, avatars and lip-sync', 'ElevenLabs for voice', 'Upload-Post for publishing'],
+        'The subscription gives you the release workspace. If production volume grows, bring your own keys and see where generation budget goes.',
+      leftTitle: 'Start on subscription',
+      leftPoints: ['no five-tool infrastructure setup', 'briefs, scripts, videos and queue in one place', 'a clear path from offer to first batch'],
+      rightTitle: 'Your APIs',
+      rightPoints: ['Gemini for offer analysis and scripts', 'fal.ai for video, avatars and lip-sync', 'ElevenLabs for voice', 'Upload-Post for publishing'],
     },
     faq: [
       {
-        question: 'Is this a video generator or a full content factory?',
+        question: 'Why is a series better than one video?',
         answer:
-          'The core idea is the full factory: move from idea and script to publishing, analytics and the next hypothesis, not just one video export.',
+          'One video can miss the pain, hook or delivery. A 7-10 video batch shows which angles get attention and deserve another round.',
       },
       {
-        question: 'Does it support Russian?',
+        question: 'Can it create Russian videos?',
         answer:
-          'Yes. Russian is the default landing language, and the production pipeline can use Russian scripts, voices and subtitles when the right keys and voices are configured.',
+          'Yes. Scripts, voices, captions and delivery can be created in Russian when the selected models and voices support it.',
       },
       {
         question: 'Why connect my own APIs if I have a subscription?',
         answer:
-          'Subscription gives access to the product and workflow. Your own APIs are useful when you want to pay providers directly, test different limits or control spend per service.',
+          'Subscription gives you the workspace and workflow. Your own APIs matter when you publish at volume and want direct cost control by provider.',
       },
       {
         question: 'Who is it for?',
         answer:
-          'Experts, small businesses, agencies and projects that need a steady stream of short-form content rather than a one-off generation test.',
+          'Experts, small businesses, agencies and projects that need to test offers, products, lead magnets or consultations through short videos.',
+      },
+      {
+        question: 'How much manual work remains?',
+        answer:
+          'You still define the niche, offer and constraints, then approve the best variants. The handoff between scripts, avatar, voice, captions and publishing moves into the pipeline.',
       },
     ],
     finalCta: {
-      title: 'Launch your first content production line',
-      text: 'Start with one niche, one offer and 7-10 videos. Then scale the topics that show traction.',
-      button: 'Open the app',
+      title: 'Launch the first series, not just one clip',
+      text: 'Start with one offer and 7-10 short videos. Compare response, then keep only the angles that show signal.',
+      button: 'Build a test series',
     },
   },
 };
@@ -234,11 +364,32 @@ const getInitialLanguage = () => {
   return navigator.language?.toLowerCase().startsWith('en') ? 'en' : 'ru';
 };
 
+const THEME_KEY = 'openshorts_landing_theme_v2';
+const THEME_LIGHT_CLASS = 'theme-light';
+const THEME_DARK_CLASS = 'theme-dark';
+
+const getInitialTheme = () => {
+  if (typeof window === 'undefined') return 'dark';
+  const saved = window.localStorage.getItem(THEME_KEY);
+  if (saved === 'light' || saved === 'dark') return saved;
+  return 'dark';
+};
+
+const scrollToSection = (event, sectionId) => {
+  event.preventDefault();
+  const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  document.getElementById(sectionId)?.scrollIntoView({
+    behavior: prefersReducedMotion ? 'auto' : 'smooth',
+    block: 'start',
+  });
+  window.history.replaceState(null, '', `#${sectionId}`);
+};
+
 const SectionHeading = ({ eyebrow, title, text }) => (
   <div className="mb-10 max-w-3xl">
     {eyebrow && <p className="mb-3 text-sm font-semibold text-cyan-300">{eyebrow}</p>}
-    <h2 className="text-3xl font-bold tracking-tight text-white md:text-4xl">{title}</h2>
-    {text && <p className="mt-4 text-base leading-7 text-zinc-400">{text}</p>}
+    <h2 className="text-balance text-3xl font-bold text-white md:text-4xl">{title}</h2>
+    {text && <p className="text-pretty mt-4 text-base leading-7 text-zinc-400">{text}</p>}
   </div>
 );
 
@@ -250,7 +401,7 @@ const ServiceBadge = ({ icon: Icon, label, tone = 'cyan' }) => {
     blue: 'border-blue-300/25 bg-blue-300/10 text-blue-100',
   };
   return (
-    <div className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${tones[tone]}`}>
+    <div className={`inline-flex min-h-10 items-center gap-2 rounded-lg border px-3 py-2 text-sm ${tones[tone]}`}>
       <Icon size={17} />
       <span>{label}</span>
     </div>
@@ -258,13 +409,13 @@ const ServiceBadge = ({ icon: Icon, label, tone = 'cyan' }) => {
 };
 
 const ProductCard = ({ icon: Icon, title, text, points }) => (
-  <article className="rounded-xl border border-white/10 bg-zinc-950/55 p-6 shadow-[0_18px_80px_rgba(0,0,0,0.22)] backdrop-blur">
+  <article className="landing-product-card flex h-full flex-col rounded-xl border border-white/10 bg-zinc-950/55 p-6 backdrop-blur">
     <div className="mb-6 flex h-11 w-11 items-center justify-center rounded-lg bg-white/10">
       <Icon size={22} className="text-cyan-200" />
     </div>
     <h3 className="text-xl font-bold text-white">{title}</h3>
-    <p className="mt-3 text-sm leading-6 text-zinc-400">{text}</p>
-    <ul className="mt-5 space-y-2">
+    <p className="text-pretty mt-3 text-sm leading-6 text-zinc-400">{text}</p>
+    <ul className="mt-auto space-y-2 pt-5">
       {points.map((point) => (
         <li key={point} className="flex gap-2 text-sm text-zinc-300">
           <Check size={15} className="mt-0.5 shrink-0 text-emerald-300" />
@@ -282,98 +433,328 @@ const FeatureRow = ({ icon: Icon, title, text }) => (
     </div>
     <div>
       <h3 className="font-semibold text-white">{title}</h3>
-      <p className="mt-1 text-sm leading-6 text-zinc-400">{text}</p>
+      <p className="text-pretty mt-1 text-sm leading-6 text-zinc-400">{text}</p>
     </div>
   </div>
 );
 
-const FAQItem = ({ question, answer, isOpen, onClick }) => (
+const LeadMagnetSection = ({ copy, onLaunchApp }) => {
+  const lead = copy.leadMagnet;
+
+  return (
+    <section id="lead-magnet" className="scroll-mt-24 px-5 py-14 md:py-20">
+      <div className="lead-magnet-panel mx-auto grid max-w-7xl gap-8 rounded-2xl border border-white/10 bg-zinc-950/70 p-5 md:grid-cols-[1fr_0.9fr] md:p-8 lg:p-10">
+        <div>
+          <div className="mb-4 inline-flex items-center gap-2 rounded-lg border border-lime-300/20 bg-lime-300/10 px-3 py-2 text-sm font-semibold text-lime-100">
+            <Sparkles size={16} />
+            {lead.eyebrow}
+          </div>
+          <h2 className="text-balance text-3xl font-bold text-white md:text-5xl">{lead.title}</h2>
+          <p className="text-pretty mt-5 max-w-2xl text-base leading-7 text-zinc-300">{lead.text}</p>
+          <div className="mt-7 grid gap-3 sm:grid-cols-2">
+            {lead.items.map((item) => (
+              <div key={item} className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.035] p-4 text-sm leading-6 text-zinc-300">
+                <Check size={16} className="mt-1 shrink-0 text-lime-200" />
+                <span>{item}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <form
+          className="lead-form-card flex flex-col justify-between rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onLaunchApp();
+          }}
+        >
+          <div>
+            <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-xl bg-cyan-300 text-zinc-950">
+              <FileVideo size={22} />
+            </div>
+            <label htmlFor="lead-email" className="text-sm font-semibold text-cyan-100">
+              {lead.inputLabel}
+            </label>
+            <input
+              id="lead-email"
+              type="email"
+              placeholder={lead.placeholder}
+              className="mt-3 w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-white outline-none transition placeholder:text-zinc-500 focus:border-cyan-200"
+            />
+          </div>
+          <div className="mt-6">
+            <button
+              type="submit"
+              className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-lime-300 px-5 py-3 font-semibold text-zinc-950 transition hover:bg-lime-200"
+            >
+              {lead.button}
+              <ArrowRight size={18} />
+            </button>
+            <p className="mt-4 text-pretty text-xs leading-5 text-cyan-100/70">{lead.note}</p>
+          </div>
+        </form>
+      </div>
+    </section>
+  );
+};
+
+const FAQItem = ({ id, question, answer, isOpen, onClick }) => (
   <div className="rounded-xl border border-white/10 bg-zinc-950/45">
     <button
       type="button"
       onClick={onClick}
+      aria-expanded={isOpen}
+      aria-controls={`${id}-panel`}
       className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left text-white"
     >
       <span className="font-medium">{question}</span>
       <ChevronDown size={18} className={`shrink-0 text-zinc-500 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
     </button>
-    {isOpen && <p className="px-5 pb-5 text-sm leading-6 text-zinc-400">{answer}</p>}
+    <p id={`${id}-panel`} hidden={!isOpen} className="px-5 pb-5 text-sm leading-6 text-zinc-400">
+      {answer}
+    </p>
   </div>
 );
 
-function FactoryPreview({ copy }) {
+function HeroFactoryMockup({ copy, className = '' }) {
+  const mockup = copy.heroMockup;
+  const hooks = mockup.hooks || [mockup.script];
+  const signals = mockup.signals || [mockup.analytics, mockup.leads, mockup.hypothesis];
+
   return (
-    <div className="pointer-events-none absolute inset-x-4 bottom-0 hidden translate-y-[42%] md:block">
-      <div className="mx-auto max-w-5xl rounded-xl border border-white/10 bg-zinc-950/75 p-4 shadow-[0_30px_120px_rgba(0,0,0,0.45)] backdrop-blur-xl">
-        <div className="grid gap-3 lg:grid-cols-[1.1fr_0.9fr]">
-          <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
-            <div className="mb-3 flex items-center justify-between">
-              <div>
-                <p className="text-xs text-zinc-500">Content line</p>
-                <p className="font-semibold text-white">START 7 / Reels sprint</p>
+    <aside className={`hero-factory-mockup relative mx-auto w-full max-w-xl lg:ml-auto ${className}`} aria-label={mockup.lineLabel}>
+      <div className="factory-halo absolute -inset-8 -z-10 rounded-[2rem]" />
+      <div className="landing-mockup-shell factory-console rounded-2xl border border-white/10 bg-zinc-950/70 p-4 shadow-[0_10px_48px_rgba(0,0,0,0.28)] backdrop-blur-xl">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase text-cyan-200">{mockup.lineLabel}</p>
+            <p className="mt-1 text-lg font-bold text-white">{mockup.campaign}</p>
+          </div>
+          <div className="factory-live-badge rounded-full border border-emerald-300/25 bg-emerald-300/10 px-3 py-1 text-xs font-semibold text-emerald-200">
+            {mockup.status}
+          </div>
+        </div>
+
+        <div className="factory-flow-strip mb-3" aria-hidden="true">
+          {[mockup.idea, mockup.script, mockup.queue, mockup.hypothesis].map((label) => (
+            <span key={label}>{label}</span>
+          ))}
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-[0.92fr_1.08fr]">
+          <div className="space-y-3">
+            <div className="factory-step-card rounded-xl border border-white/10 bg-white/[0.035] p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-cyan-300/10 text-cyan-200">
+                  <Sparkles size={18} />
+                </div>
+                <span className="text-xs text-zinc-500">01</span>
               </div>
-              <div className="rounded-md border border-emerald-300/25 bg-emerald-300/10 px-2 py-1 text-xs text-emerald-200">ready</div>
+              <p className="font-semibold text-white">{mockup.idea}</p>
+              <p className="mt-1 text-sm text-zinc-400">{mockup.script}</p>
+              <div className="mt-4 space-y-2">
+                {hooks.map((hook, index) => (
+                  <div key={hook} className="factory-hook-row flex items-start gap-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs leading-5 text-zinc-300">
+                    <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-cyan-200" />
+                    <span>{String(index + 1).padStart(2, '0')} / {hook}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div className="grid grid-cols-4 gap-2 text-xs text-zinc-300">
-              {copy.pipeline.slice(0, 4).map((step, index) => (
-                <div key={step} className="rounded-md border border-white/10 bg-zinc-900/80 p-3">
-                  <span className="mb-2 block text-zinc-500">0{index + 1}</span>
-                  {step}
+
+            <div className="factory-step-card rounded-xl border border-white/10 bg-white/[0.035] p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-pink-300/10 text-pink-100">
+                  <UserRound size={18} />
+                </div>
+                <span className="text-xs text-zinc-500">02</span>
+              </div>
+              <p className="font-semibold text-white">{mockup.avatar}</p>
+              <div className="factory-progress-track mt-4 h-2 overflow-hidden rounded-full bg-white/10">
+                <div className="factory-progress-bar h-full rounded-full bg-gradient-to-r from-cyan-300 via-fuchsia-300 to-amber-200" />
+              </div>
+            </div>
+          </div>
+
+          <div className="factory-video-panel rounded-xl border border-white/10 bg-white/[0.035] p-4">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-xs text-zinc-500">{mockup.output}</p>
+                <p className="font-semibold text-white">{mockup.queue}</p>
+              </div>
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-amber-200/10 text-amber-100">
+                <Play size={18} />
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-black/35 p-3">
+              <div className="factory-video-card mx-auto aspect-[9/16] max-h-52 rounded-xl border border-white/10 bg-gradient-to-br from-zinc-800 via-zinc-950 to-cyan-950 p-3">
+                <div className="mb-3 h-2 w-16 rounded-full bg-white/30" />
+                <div className="mt-16 space-y-2">
+                  <div className="h-2 w-24 rounded-full bg-white/45" />
+                  <div className="h-2 w-16 rounded-full bg-white/25" />
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
+              {[
+                { icon: TikTokIcon, label: 'TikTok' },
+                { icon: Instagram, label: 'Reels' },
+                { icon: Youtube, label: 'Shorts' },
+              ].map((channel) => (
+                <div key={channel.label} className="factory-channel-card rounded-lg border border-white/10 bg-white/[0.035] p-2 text-center text-zinc-300">
+                  <channel.icon size={15} className="mx-auto mb-1 text-cyan-200" />
+                  {channel.label}
                 </div>
               ))}
             </div>
           </div>
-          <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
-            <div className="mb-4 flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-300/20 to-pink-300/20">
-                <Play size={20} className="text-white" />
+        </div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+          {[
+            { icon: BarChart3, value: signals[0], label: mockup.analytics },
+            { icon: Send, value: signals[1], label: mockup.leads },
+            { icon: Repeat2, value: signals[2], label: mockup.hypothesis },
+          ].map((item) => (
+            <div key={item.label} className="factory-signal-card rounded-xl border border-white/10 bg-white/[0.035] p-3">
+              <div className="mb-3 flex items-center justify-between">
+                <item.icon size={17} className="text-cyan-200" />
+                <span className="text-xs font-semibold text-cyan-100">{item.value}</span>
               </div>
-              <div>
-                <p className="font-semibold text-white">Reel batch</p>
-                <p className="text-xs text-zinc-500">TikTok / Instagram / YouTube</p>
-              </div>
+              <p className="text-sm font-semibold text-white">{item.label}</p>
             </div>
-            <div className="h-2 overflow-hidden rounded-full bg-white/10">
-              <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-cyan-300 via-fuchsia-300 to-amber-200" />
+          ))}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+const PipelineDiagram = ({ copy }) => {
+  const stageIcons = [Sparkles, Play, BarChart3];
+  const connectorLabels = copy.pipelineConnectorLabels || [];
+
+  return (
+    <div className="pipeline-diagram content-loop-map rounded-2xl border border-white/10 bg-zinc-950/55 p-4 backdrop-blur md:p-6">
+      <div className="content-loop-main">
+        {copy.pipelineGroups.map((group, groupIndex) => {
+          const Icon = stageIcons[groupIndex] || Repeat2;
+          return (
+            <React.Fragment key={group.key}>
+              <article className={`content-loop-card pipeline-group pipeline-group-${group.key} rounded-xl border border-white/10 bg-black/25 p-5`}>
+                <div className="mb-7 flex items-start justify-between gap-4">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-cyan-300/10 text-cyan-100">
+                    <Icon size={20} />
+                  </div>
+                  <span className="rounded-full border border-white/10 bg-white/[0.035] px-2.5 py-1 text-xs font-semibold text-zinc-500">
+                    {String(groupIndex + 1).padStart(2, '0')}
+                  </span>
+                </div>
+                <h3 className="text-2xl font-bold text-white">{group.title}</h3>
+                <p className="text-pretty mt-3 min-h-14 text-sm leading-6 text-zinc-400">{group.text}</p>
+                <div className="mt-6 flex flex-wrap gap-2">
+                  {group.steps.map((stepIndex) => (
+                    <span key={copy.pipeline[stepIndex]} className="pipeline-node-pill rounded-full border border-white/10 bg-white/[0.045] px-3 py-1.5 text-xs font-semibold text-zinc-300">
+                      {copy.pipeline[stepIndex]}
+                    </span>
+                  ))}
+                </div>
+              </article>
+              {groupIndex < copy.pipelineGroups.length - 1 && (
+                <div className="content-loop-connector" aria-hidden="true">
+                  <span>{connectorLabels[groupIndex]}</span>
+                  <ArrowRight size={18} />
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
+      </div>
+
+      <div className="content-loop-return-lane mt-4 rounded-xl border border-cyan-300/20 bg-cyan-300/10 p-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-cyan-300/15 text-cyan-100">
+              <Repeat2 size={18} />
+            </span>
+            <div>
+              <p className="font-semibold text-cyan-50">{copy.pipelineReturn}</p>
+              <p className="mt-1 text-sm leading-6 text-cyan-100/75">{copy.pipelineReturnText}</p>
             </div>
           </div>
+          <div className="flex flex-wrap gap-2">
+            {copy.pipelineSignals.map((signal) => (
+              <span key={signal} className="rounded-full border border-cyan-200/20 bg-black/20 px-3 py-1.5 text-xs font-semibold text-cyan-50">
+                {signal}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="content-loop-return-line" aria-hidden="true">
+          <span />
         </div>
       </div>
     </div>
   );
-}
+};
 
 export default function Landing({ onLaunchApp }) {
   const [language, setLanguage] = React.useState(getInitialLanguage);
   const [openFaq, setOpenFaq] = React.useState(0);
+  const [theme, setTheme] = React.useState(getInitialTheme);
   const copy = LANDING_COPY[language] || LANDING_COPY.ru;
+  const isLight = theme === 'light';
+
+  React.useEffect(() => {
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
 
   return (
-    <div className="min-h-screen overflow-hidden bg-[#07080d] text-white">
+    <div className={`landing-page ${isLight ? THEME_LIGHT_CLASS : THEME_DARK_CLASS} min-h-screen overflow-hidden text-white`}>
       <div className="pointer-events-none fixed inset-0 -z-10 aurora-mesh" />
 
-      <nav className="fixed inset-x-0 top-0 z-50 border-b border-white/10 bg-[#07080d]/78 backdrop-blur-xl">
+      <nav className="landing-nav fixed inset-x-0 top-0 z-50 border-b border-white/10 backdrop-blur-xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4">
-          <a href="#" className="flex items-center gap-3">
-            <img src="/logo-openshorts.png" alt="Content Factory logo" className="h-8 w-8" />
-            <span className="font-bold tracking-tight">AI Content Factory</span>
+          <a href="#" className="flex min-h-11 items-center gap-3">
+            <img src={BRAND_ICON} alt="" className="h-8 w-8 rounded-lg" />
+            <span className="whitespace-nowrap text-sm font-bold sm:text-base">{BRAND_NAME}</span>
           </a>
-          <div className="hidden items-center gap-7 text-sm text-zinc-400 md:flex">
-            <a href="#product" className="hover:text-white">{copy.nav.product}</a>
-            <a href="#pipeline" className="hover:text-white">{copy.nav.pipeline}</a>
-            <a href="#access" className="hover:text-white">{copy.nav.pricing}</a>
-            <a href="#faq" className="hover:text-white">{copy.nav.faq}</a>
+          <div className="hidden items-center gap-5 text-sm text-zinc-400 md:flex">
+            <a href="#product" className="inline-flex min-h-11 min-w-11 items-center justify-center py-2 hover:text-white">{copy.nav.product}</a>
+            <a href="#pipeline" onClick={(event) => scrollToSection(event, 'pipeline')} className="inline-flex min-h-11 min-w-11 items-center justify-center py-2 hover:text-white">{copy.nav.pipeline}</a>
+            <a href="#access" className="inline-flex min-h-11 min-w-11 items-center justify-center py-2 hover:text-white">{copy.nav.pricing}</a>
+            <a href="#faq" className="inline-flex min-h-11 min-w-11 items-center justify-center py-2 hover:text-white">{copy.nav.faq}</a>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setTheme(isLight ? 'dark' : 'light')}
+              className="theme-toggle inline-flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-300 transition hover:text-white"
+              aria-label={
+                language === 'ru'
+                  ? isLight ? 'Включить темную тему' : 'Включить светлую тему'
+                  : isLight ? 'Switch to dark theme' : 'Switch to light theme'
+              }
+              title={
+                language === 'ru'
+                  ? isLight ? 'Темная тема' : 'Светлая тема'
+                  : isLight ? 'Dark theme' : 'Light theme'
+              }
+            >
+              {isLight ? <Moon size={16} /> : <Sun size={16} />}
+            </button>
             <div className="hidden rounded-lg border border-white/10 bg-white/5 p-1 sm:flex">
               {['ru', 'en'].map((lang) => (
                 <button
                   key={lang}
                   type="button"
                   onClick={() => setLanguage(lang)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-semibold transition ${
+                  className={`flex h-11 min-w-11 items-center justify-center rounded-md px-2.5 text-xs font-semibold transition ${
                     language === lang ? 'bg-white text-zinc-950' : 'text-zinc-400 hover:text-white'
                   }`}
+                  aria-pressed={language === lang}
                 >
                   {lang.toUpperCase()}
                 </button>
@@ -382,7 +763,7 @@ export default function Landing({ onLaunchApp }) {
             <button
               type="button"
               onClick={onLaunchApp}
-              className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:-translate-y-0.5 hover:bg-cyan-100"
+              className="min-h-11 whitespace-nowrap rounded-lg bg-white px-3 py-2 text-xs font-semibold text-zinc-950 transition hover:-translate-y-0.5 hover:bg-cyan-100 sm:px-4 sm:text-sm"
             >
               {copy.nav.login}
             </button>
@@ -390,89 +771,104 @@ export default function Landing({ onLaunchApp }) {
         </div>
       </nav>
 
-      <header className="relative min-h-[100dvh] px-5 pb-40 pt-32 md:pb-52">
+      <header className="landing-hero relative px-5 pb-20 pt-32 md:pb-24 lg:min-h-[100dvh] lg:pt-36">
         <div className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_50%_0%,rgba(0,128,255,0.22),transparent_34%),linear-gradient(180deg,rgba(7,8,13,0.05),#07080d_88%)]" />
-        <div className="mx-auto max-w-7xl">
+        <div className="mx-auto grid max-w-7xl gap-12 lg:grid-cols-[0.92fr_1.08fr] lg:items-center">
           <div className="max-w-4xl">
-            <div className="mb-7 inline-flex items-center gap-2 rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-3 py-2 text-sm text-cyan-100">
+            <div className="mb-7 inline-flex items-center gap-2 rounded-lg border border-lime-300/25 bg-lime-300/10 px-3 py-2 text-sm font-semibold text-lime-100">
               <Sparkles size={16} />
               <span>{copy.hero.eyebrow}</span>
             </div>
-            <h1 className="max-w-5xl text-4xl font-bold tracking-tight text-white md:text-6xl lg:text-7xl">
+            <h1 className="text-balance max-w-5xl text-4xl font-bold text-white md:text-6xl lg:text-7xl">
               {copy.hero.title}
             </h1>
-            <p className="hero-description mt-7 max-w-3xl text-lg leading-8 text-zinc-300 md:text-xl">
+            <p className="hero-description text-pretty mt-7 max-w-3xl text-lg leading-8 text-zinc-300 md:text-xl">
               {copy.hero.description}
             </p>
+            <div className="hero-billboard mt-7 grid max-w-2xl grid-cols-[0.86fr_1fr] overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04]">
+              <div className="border-r border-white/10 p-5">
+                <p className="text-sm font-semibold text-lime-100">{language === 'ru' ? 'Один запуск' : 'One run'}</p>
+                <div className="mt-2 flex items-end gap-2">
+                  <span className="tabular-nums text-6xl font-bold leading-none text-white md:text-7xl">10</span>
+                  <span className="pb-2 text-sm font-semibold text-zinc-400">{language === 'ru' ? 'роликов' : 'videos'}</span>
+                </div>
+              </div>
+              <div className="grid grid-rows-2">
+                <div className="border-b border-white/10 p-4">
+                  <p className="text-xs font-semibold text-zinc-500">{language === 'ru' ? 'Вход' : 'Input'}</p>
+                  <p className="mt-1 font-semibold text-white">{language === 'ru' ? 'оффер или URL' : 'offer or URL'}</p>
+                </div>
+                <div className="p-4">
+                  <p className="text-xs font-semibold text-zinc-500">{language === 'ru' ? 'Выход' : 'Output'}</p>
+                  <p className="mt-1 font-semibold text-white">Reels / Shorts / TikTok</p>
+                </div>
+              </div>
+            </div>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
               <button
                 type="button"
                 onClick={onLaunchApp}
-                className="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-300 to-amber-200 px-6 py-3.5 font-semibold text-zinc-950 transition hover:-translate-y-0.5"
+                className="inline-flex items-center justify-center gap-2 rounded-xl bg-lime-300 px-6 py-3.5 font-semibold text-zinc-950 transition hover:bg-lime-200"
               >
                 {copy.hero.primary}
                 <ArrowRight size={19} />
               </button>
               <a
-                href="#pipeline"
+                href="#lead-magnet"
+                onClick={(event) => scrollToSection(event, 'lead-magnet')}
                 className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/15 bg-white/5 px-6 py-3.5 font-semibold text-white transition hover:bg-white/10"
               >
-                <Gauge size={18} />
+                <FileVideo size={18} />
                 {copy.hero.secondary}
               </a>
             </div>
-            <p className="mt-5 max-w-3xl text-sm leading-6 text-zinc-500">{copy.hero.note}</p>
+            <p className="text-pretty mt-5 max-w-3xl text-sm leading-6 text-zinc-500">{copy.hero.note}</p>
           </div>
 
-          <div className="mt-12 flex flex-wrap gap-3">
-            <ServiceBadge icon={Cpu} label="Gemini" tone="blue" />
-            <ServiceBadge icon={Zap} label="fal.ai" tone="amber" />
-            <ServiceBadge icon={Languages} label="ElevenLabs" tone="pink" />
-            <ServiceBadge icon={TikTokIcon} label="TikTok" tone="cyan" />
-            <ServiceBadge icon={Instagram} label="Instagram" tone="pink" />
-            <ServiceBadge icon={Youtube} label="YouTube" tone="amber" />
-          </div>
+          <HeroFactoryMockup copy={copy} className="lg:col-start-2 lg:row-span-2 lg:row-start-1" />
 
-          <div className="mt-12 grid max-w-4xl gap-3 sm:grid-cols-3">
-            {copy.stats.map((stat) => (
-              <div key={stat.label} className="rounded-xl border border-white/10 bg-white/[0.045] p-4 backdrop-blur">
-                <p className="text-2xl font-bold text-white">{stat.value}</p>
-                <p className="mt-1 text-sm text-zinc-400">{stat.label}</p>
-              </div>
-            ))}
+          <div className="lg:col-start-1">
+            <div className="mt-10 flex flex-wrap gap-3">
+              {copy.capabilities.map((item, index) => (
+                <ServiceBadge
+                  key={item.label}
+                  icon={item.icon}
+                  label={item.label}
+                  tone={['cyan', 'pink', 'amber', 'blue'][index % 4]}
+                />
+              ))}
+            </div>
+
+            <div className="mt-6 grid max-w-4xl grid-cols-3 gap-2 sm:mt-10 sm:gap-3">
+              {copy.proofPoints.map((point) => (
+                <div key={point.title} className="hero-proof-card rounded-xl border border-white/10 bg-white/[0.045] p-3 backdrop-blur sm:p-4">
+                  <p className="text-sm font-bold text-white">{point.title}</p>
+                  <p className="mt-2 text-sm leading-5 text-zinc-400">{point.text}</p>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
-        <FactoryPreview copy={copy} />
       </header>
 
       <main>
-        <section id="product" className="px-5 py-20 md:pt-28">
+        <LeadMagnetSection copy={copy} onLaunchApp={onLaunchApp} />
+
+        <section id="product" className="scroll-mt-24 px-5 py-20 md:pt-28">
           <div className="mx-auto max-w-7xl">
             <SectionHeading title={copy.channelsTitle} text={copy.channelsText} />
-            <div className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
-              <div className="grid gap-5 md:grid-cols-2">
-                {copy.productCards.slice(0, 2).map((card) => (
-                  <ProductCard key={card.title} {...card} />
-                ))}
-              </div>
-              <ProductCard {...copy.productCards[2]} />
+            <div className="grid gap-5 md:grid-cols-3">
+              {copy.productCards.map((card) => (
+                <ProductCard key={card.title} {...card} />
+              ))}
             </div>
           </div>
         </section>
 
-        <section id="pipeline" className="px-5 py-20">
+        <section id="pipeline" className="scroll-mt-24 px-5 py-20">
           <div className="mx-auto max-w-7xl">
             <SectionHeading title={copy.pipelineTitle} text={copy.pipelineText} />
-            <div className="rounded-xl border border-white/10 bg-zinc-950/55 p-5 backdrop-blur">
-              <div className="grid gap-3 md:grid-cols-4">
-                {copy.pipeline.map((step, index) => (
-                  <div key={step} className="relative rounded-lg border border-white/10 bg-white/[0.035] p-4">
-                    <span className="mb-6 block text-xs font-semibold text-zinc-500">{String(index + 1).padStart(2, '0')}</span>
-                    <p className="font-semibold text-white">{step}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <PipelineDiagram copy={copy} />
           </div>
         </section>
 
@@ -480,18 +876,32 @@ export default function Landing({ onLaunchApp }) {
           <div className="mx-auto grid max-w-7xl gap-10 lg:grid-cols-[0.85fr_1.15fr] lg:items-start">
             <div>
               <SectionHeading
-                eyebrow="Workflow"
-                title={language === 'ru' ? 'Один интерфейс вместо набора разрозненных сервисов' : 'One interface instead of scattered tools'}
+                eyebrow={language === 'ru' ? 'Рабочий процесс' : 'Workflow'}
+                title={language === 'ru' ? 'Одна линия вместо ChatGPT, аватаров, голоса, монтажки и автопостинга' : 'One release line instead of scripts, avatars, voice, editing and autoposting tabs'}
                 text={
                   language === 'ru'
-                    ? 'Пользователь видит не набор API, а понятные производственные этапы: сценарий, видео, озвучка, публикация, результат.'
-                    : 'Users see a production workflow rather than a pile of provider APIs: script, video, voice, publishing and result.'
+                    ? 'Вы работаете не с набором чужих интерфейсов, а с этапами выпуска: оффер, hooks, ролики, публикация, сигналы и следующая серия.'
+                    : 'Work with release stages, not vendor tabs: offer, hooks, videos, publishing, signals and the next batch.'
                 }
               />
-              <div className="mt-6 rounded-xl border border-cyan-300/20 bg-cyan-300/10 p-5 text-sm leading-6 text-cyan-50">
-                {language === 'ru'
-                  ? 'Главная ценность не в одной генерации, а в повторяемости: каждый день выпускать ролики, сравнивать результаты и быстро менять гипотезы.'
-                  : 'The core value is repeatability: publish videos every day, compare results and change hypotheses quickly.'}
+              <div className="workflow-ledger mt-6 rounded-xl border border-white/10 bg-zinc-950/55 p-4">
+                {(language === 'ru'
+                  ? [
+                      ['01', 'Гипотеза', 'задаем нишу, оффер, аудиторию и ограничения для серии'],
+                      ['02', 'Выпуск', 'собираем ролики из сценариев, аватара, голоса и субтитров'],
+                      ['03', 'Повтор', 'берем реакцию аудитории и запускаем следующую связку'],
+                    ]
+                  : [
+                      ['01', 'Hypothesis', 'set the niche, offer, audience and constraints'],
+                      ['02', 'Release', 'build videos from scripts, avatar, voice and captions'],
+                      ['03', 'Repeat', 'turn audience response into the next angle'],
+                    ]).map(([number, title, text]) => (
+                  <div key={number} className="workflow-ledger-row">
+                    <span>{number}</span>
+                    <strong>{title}</strong>
+                    <p>{text}</p>
+                  </div>
+                ))}
               </div>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
@@ -502,7 +912,7 @@ export default function Landing({ onLaunchApp }) {
           </div>
         </section>
 
-        <section id="access" className="px-5 py-20">
+        <section id="access" className="scroll-mt-24 px-5 py-20">
           <div className="mx-auto max-w-7xl">
             <SectionHeading title={copy.access.title} text={copy.access.text} />
             <div className="grid gap-5 lg:grid-cols-2">
@@ -544,22 +954,22 @@ export default function Landing({ onLaunchApp }) {
               <div>
                 <div className="mb-4 inline-flex items-center gap-2 rounded-lg border border-pink-300/20 bg-pink-300/10 px-3 py-2 text-sm text-pink-100">
                   <Repeat2 size={16} />
-                  {language === 'ru' ? 'Цикл гипотез' : 'Hypothesis loop'}
+                  {language === 'ru' ? 'Цикл тестов' : 'Testing loop'}
                 </div>
-                <h2 className="text-3xl font-bold tracking-tight text-white md:text-4xl">
-                  {language === 'ru' ? 'Контент должен улучшаться после публикации' : 'Content should improve after publishing'}
+                <h2 className="text-3xl font-bold text-white md:text-4xl">
+                  {language === 'ru' ? 'Ролики должны приносить сигналы, а не просто лежать в галерее' : 'Videos should create signals, not just sit in a gallery'}
                 </h2>
                 <p className="mt-4 text-base leading-7 text-zinc-400">
                   {language === 'ru'
-                    ? 'Смысл фабрики в том, чтобы темы, hooks, аватары, CTA и форматы не угадывались один раз, а постоянно уточнялись по реакции аудитории.'
-                    : 'The point of the factory is to keep improving topics, hooks, actors, CTAs and formats based on audience response.'}
+                    ? 'Смысл OpenShorts в том, чтобы темы, hooks, аватары, CTA и форматы уточнялись по реакции аудитории. Вы не спорите о вкусах, а смотрите, что дало удержание, DM или заявку.'
+                    : 'OpenShorts keeps topics, hooks, avatars, CTAs and formats improving from audience response. Instead of debating taste, you look for retention, DMs and leads.'}
                 </p>
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
                 {[
-                  { icon: Play, label: language === 'ru' ? 'ролики' : 'videos' },
+                  { icon: Play, label: language === 'ru' ? 'серия' : 'series' },
                   { icon: BarChart3, label: language === 'ru' ? 'сигналы' : 'signals' },
-                  { icon: Sparkles, label: language === 'ru' ? 'новые идеи' : 'new ideas' },
+                  { icon: Sparkles, label: language === 'ru' ? 'следующая связка' : 'next angle' },
                 ].map((item) => (
                   <div key={item.label} className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
                     <item.icon size={22} className="mb-8 text-cyan-200" />
@@ -571,12 +981,13 @@ export default function Landing({ onLaunchApp }) {
           </div>
         </section>
 
-        <section id="faq" className="px-5 py-20">
+        <section id="faq" className="scroll-mt-24 px-5 py-20">
           <div className="mx-auto max-w-3xl">
-            <SectionHeading title={copy.nav.faq} text={language === 'ru' ? 'Коротко о том, как это позиционировать и использовать.' : 'Short answers on positioning and usage.'} />
+            <SectionHeading title={copy.nav.faq} text={language === 'ru' ? 'Коротко о запуске серии, API и каналах.' : 'Short answers on batches, APIs and channels.'} />
             <div className="space-y-3">
               {copy.faq.map((faq, index) => (
                 <FAQItem
+                  id={`landing-faq-${index}`}
                   key={faq.question}
                   question={faq.question}
                   answer={faq.answer}
@@ -593,7 +1004,7 @@ export default function Landing({ onLaunchApp }) {
             <div className="mx-auto mb-6 flex h-14 w-14 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-300/20 to-amber-200/20">
               <Globe2 size={24} className="text-cyan-100" />
             </div>
-            <h2 className="text-3xl font-bold tracking-tight text-white md:text-5xl">{copy.finalCta.title}</h2>
+            <h2 className="text-3xl font-bold text-white md:text-5xl">{copy.finalCta.title}</h2>
             <p className="mx-auto mt-5 max-w-2xl text-base leading-7 text-zinc-400">{copy.finalCta.text}</p>
             <button
               type="button"
@@ -609,15 +1020,15 @@ export default function Landing({ onLaunchApp }) {
 
       <footer className="border-t border-white/10 px-5 py-8">
         <div className="mx-auto flex max-w-7xl flex-col gap-4 text-sm text-zinc-500 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
-            <img src="/logo-openshorts.png" alt="AI Content Factory" className="h-6 w-6" />
-            <span>AI Content Factory</span>
+          <div className="flex min-h-11 items-center gap-3">
+            <img src={BRAND_ICON} alt="" className="h-6 w-6 rounded-md" />
+            <span>{BRAND_NAME}</span>
           </div>
-          <div className="flex flex-wrap gap-5">
-            <a href="#product" className="hover:text-white">{copy.nav.product}</a>
-            <a href="#pipeline" className="hover:text-white">{copy.nav.pipeline}</a>
-            <a href="#access" className="hover:text-white">{copy.nav.pricing}</a>
-            <a href="#legal" className="hover:text-white">Legal</a>
+          <div className="flex flex-wrap gap-x-5 gap-y-1">
+            <a href="#product" className="inline-flex min-h-11 min-w-11 items-center py-2 hover:text-white">{copy.nav.product}</a>
+            <a href="#pipeline" onClick={(event) => scrollToSection(event, 'pipeline')} className="inline-flex min-h-11 min-w-11 items-center py-2 hover:text-white">{copy.nav.pipeline}</a>
+            <a href="#access" className="inline-flex min-h-11 min-w-11 items-center py-2 hover:text-white">{copy.nav.pricing}</a>
+            <a href="#legal" className="inline-flex min-h-11 min-w-11 items-center py-2 hover:text-white">{copy.nav.legal}</a>
           </div>
         </div>
       </footer>

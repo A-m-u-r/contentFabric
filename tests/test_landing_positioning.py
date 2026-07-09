@@ -9,7 +9,7 @@ INDEX = ROOT / "dashboard" / "index.html"
 
 
 class LandingPositioningTests(unittest.TestCase):
-    def test_landing_positions_product_as_subscription_content_factory(self):
+    def test_landing_positions_product_as_subscription_series_engine(self):
         landing = LANDING.read_text(encoding="utf-8")
         index = INDEX.read_text(encoding="utf-8")
         combined = f"{landing}\n{index}".lower()
@@ -17,9 +17,10 @@ class LandingPositioningTests(unittest.TestCase):
         for banned in ("github", "open source", "self-hosted", "free open source"):
             self.assertNotIn(banned, combined)
 
-        self.assertIn("ИИ content factory", landing)
+        self.assertIn("OpenShorts / series engine", landing)
+        self.assertIn("OpenShorts", landing)
         self.assertIn("Подписка", landing)
-        self.assertIn("свои API", landing)
+        self.assertIn("свои API-ключи", landing)
         self.assertIn("TikTok", landing)
         self.assertIn("Instagram", landing)
         self.assertIn("YouTube", landing)

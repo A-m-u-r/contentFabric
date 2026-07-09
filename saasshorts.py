@@ -455,6 +455,7 @@ def generate_scripts(
     language: str = "en",
     actor_gender: str = "female",
     topic: str = None,
+    script_format: str = "ugc",
 ) -> list:
     """Generate video scripts based on product/business analysis."""
     from google import genai
@@ -485,6 +486,14 @@ Examples of Spanish UGC hooks: "Tío, no me puedo creer que nadie me haya dicho 
 LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in RUSSIAN.
 Use natural casual Russian like a real person would speak in Reels/TikTok. Keep it punchy, direct, and conversational.
 Examples of Russian UGC hooks: "Ты срываешься вечером не потому, что слабая", "Хватит начинать заново каждый понедельник", "Вот что съесть в 17:00, чтобы вечером не снести холодильник".
+
+SPEECH STYLE (critical — the speech/narration text goes straight to TTS and must sound like LIVE spoken Russian, not written copy):
+- The very first spoken line MUST open with a 1-3 word pattern-interrupt before the main hook: "Стоп-стоп-стоп.", "Так, слушай.", "Всё, хватит.".
+- Short punchy sentences. Fragments are fine ("Это не работает. Вообще.").
+- Mark natural pauses and hesitations with ellipses "…" and dashes "—": "а сладкое… ну, это самый быстрый путь".
+- Ask the viewer rhetorical questions: "Знакомо?", "Когда? Где?".
+- Write ALL numbers in words: "двадцать минут", never "20 минут".
+- You MAY add up to 2-3 ElevenLabs audio tags per script inside speech/narration, in English square brackets: [sighs], [excited], [whispers]. They are acting directions and are never spoken. NEVER put a tag as the last token of a line, and NEVER put tags in overlay_text, captions, or hashtags.
 """
     else:
         lang_instructions = """
@@ -501,6 +510,99 @@ CURRENT VIDEO TOPIC:
 
 Every generated script MUST focus on this exact topic. Do not drift into generic product promotion.
 """
+
+    if script_format == "storyboard_v3":
+        prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
+Generate {num_scripts} storyboard-based video scripts for this product/business.
+{lang_instructions}
+{topic_instructions}
+PRODUCT ANALYSIS:
+{json.dumps(analysis, indent=2)}
+
+STYLE: {style_guide.get(style, style_guide['ugc'])}
+
+Return a JSON array. Each script MUST be a storyboard for Kling V3 video generation:
+[
+  {{
+    "title": "Short internal title",
+    "format": "storyboard_v3",
+    "style": "{style}",
+    "duration_seconds": 18,
+    "target_platform": "instagram",
+    "hook_text": "2-6 word overlay hook",
+    "shots": [
+      {{
+        "shot_number": 1,
+        "start": 0,
+        "end": 3,
+        "role": "hook",
+        "scene": "Close-up face, front camera, looks into lens",
+        "camera": "tight close-up, steady handheld",
+        "actor_action": "speaks directly to camera with raised eyebrows",
+        "transition": "cut",
+        "speech": "Exact line the actor says",
+        "overlay_text": "Short text on screen",
+        "visual_type": "talking",
+        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same woman, scene, action, camera, lighting, no text in image"
+      }}
+    ],
+    "full_narration": "All shot speech joined exactly",
+    "actor_description": "English physical description only",
+    "hashtags": ["#reels"],
+    "caption": "Suggested caption"
+  }}
+]
+
+RULES:
+- Generate 5-6 shots, total 15-22 seconds.
+- shot durations should be 3-5 seconds.
+- Use visual variety: close-up, kitchen/lifestyle, exercise/home, product/checklist/tracker, final CTA.
+- Do NOT rely only on talking head. Use the actor as a consistent character across shots.
+- Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
+- role must be one of: hook, problem, explanation, solution, proof, cta.
+- transition should be "cut" or "smooth_0.3s".
+- speech and overlay_text must be in {lang_name}.
+- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark.
+- Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
+- Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
+- Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
+- Avoid laptops, monitors, headset, microphones, studio AI background unless the product explicitly needs them.
+"""
+        response = _generate_gemini_content(
+            client,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=8192,
+            ),
+        )
+
+        raw = response.text
+        if not raw:
+            raise Exception("Gemini returned empty response for storyboard script generation")
+
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1:
+            text = text[start : end + 1]
+
+        try:
+            scripts = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise Exception(f"Failed to parse storyboard scripts JSON: {e}\nRaw: {text[:500]}")
+
+        for script in scripts:
+            script["format"] = "storyboard_v3"
+            script["shots"] = normalize_storyboard_shots(script)
+            if not script.get("full_narration"):
+                script["full_narration"] = " ".join(shot.get("speech", "") for shot in script["shots"]).strip()
+        print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
+        return scripts
 
     prompt = f"""You are a viral short-form video scriptwriter for TikTok/Instagram Reels.
 Generate {num_scripts} video scripts to promote this product/business.
@@ -587,7 +689,7 @@ Return a JSON array:
                 "subtitle_text": "Link in bio"
             }}
         ],
-        "full_narration": "All narration text joined (only actor_talking segments)",
+        "full_narration": "ALL segment narration joined in timeline order",
         "actor_description": "Specific person description: age, gender, ethnicity, hair style, clothing. Casual everyday look.",
         "hashtags": ["#reels", "#product", "#ugc"],
         "caption": "Suggested Instagram/TikTok caption"
@@ -597,7 +699,7 @@ Return a JSON array:
 RULES:
 - EXACTLY 5 segments in order: actor, broll, actor, broll, actor
 - EXACTLY 2 broll segments with detailed broll_prompt (NOT null)
-- full_narration = ALL narration text (both actor and broll voiceover segments joined)
+- full_narration = ALL segment narration joined in timeline order, including b-roll voiceover lines.
 - Total duration MUST be 18-22 seconds, never more
 - Keep narrations punchy, conversational, with contractions
 - Actor descriptions: casual, real-person look (NOT model/influencer)
@@ -666,7 +768,72 @@ def _split_text_for_segments(text: str, parts: int = 5) -> list:
     return chunks
 
 
-def build_custom_script(
+def _parse_timecode_seconds(value: str) -> float:
+    value = (value or "").strip()
+    match = re.match(r"(?:(\d+):)?(\d{1,2})(?:[.,](\d{1,3}))?$", value)
+    if not match:
+        return 0.0
+    minutes = int(match.group(1) or 0)
+    seconds = int(match.group(2) or 0)
+    millis = match.group(3) or ""
+    fraction = float(f"0.{millis}") if millis else 0.0
+    return minutes * 60 + seconds + fraction
+
+
+def _extract_labeled_line(block: str, labels: list) -> str:
+    for label in labels:
+        pattern = rf"{label}\s*[:：]\s*(.+)"
+        match = re.search(pattern, block, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip("«»\"")
+    return ""
+
+
+def _extract_storyboard_field(block: str, labels: list) -> str:
+    for label in labels:
+        pattern = rf"{label}\s*[:：]\s*(.*)"
+        match = re.search(pattern, block, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if not value:
+            for line in block[match.end():].splitlines():
+                value = line.strip().lstrip(">").strip()
+                if value:
+                    break
+        return value.strip().strip("«»\"“”*")
+    return ""
+
+
+def _storyboard_role_from_text(text: str, fallback: str = "") -> str:
+    value = (text or "").strip().lower()
+    role_map = [
+        ("hook", ("hook", "хук")),
+        ("problem", ("problem", "проблем")),
+        ("explanation", ("explanation", "объяснен", "объяснени")),
+        ("solution", ("solution", "решени")),
+        ("proof", ("proof", "доказательств")),
+        ("cta", ("cta", "призыв")),
+        ("demo", ("demo", "демо")),
+    ]
+    for role, markers in role_map:
+        if any(marker in value for marker in markers):
+            return role
+    return fallback or "shot"
+
+
+def _storyboard_transition_from_text(text: str) -> str:
+    value = (text or "").strip().lower()
+    if not value:
+        return "cut"
+    if "плав" in value or "smooth" in value or "fade" in value:
+        return "smooth_0.3s"
+    if "резк" in value or "cut" in value or "склей" in value:
+        return "cut"
+    return value
+
+
+def build_custom_storyboard_script(
     custom_script: str,
     analysis: dict,
     style: str = "ugc",
@@ -674,7 +841,132 @@ def build_custom_script(
     actor_gender: str = "female",
     topic: str = None,
 ) -> dict:
+    """Convert a user-provided storyboard into shots without rewriting copy."""
+    text = custom_script.strip()
+    title_base = (topic or analysis.get("product_name") or "Storyboard").strip()
+    title = title_base[:80] or "Storyboard"
+    matches = list(re.finditer(r"(?im)^\s*(?:#+\s*)?(?:КАДР|РљРђР”Р |SHOT)\s*(\d+)[^\n]*", text))
+    blocks = []
+    if matches:
+        for idx, match in enumerate(matches):
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            blocks.append(text[start:end].strip())
+
+    shots = []
+    if blocks:
+        transition_map = {}
+        for match in re.finditer(r"\|\s*(\d+)\s*(?:→|->|в†’)\s*\d+\s*\|[^|]*\|\s*([^|]+)\|", text):
+            try:
+                transition_map[int(match.group(1))] = _storyboard_transition_from_text(match.group(2))
+            except ValueError:
+                pass
+
+        cursor = 0.0
+        for idx, block in enumerate(blocks, start=1):
+            header_line = block.splitlines()[0] if block.splitlines() else ""
+            time_match = re.search(r"(\d{1,2}:\d{2}(?:[.,]\d+)?)\s*(?:–|—|-|вЂ“|вЂ”)\s*(\d{1,2}:\d{2}(?:[.,]\d+)?)", block)
+            if time_match:
+                start = _parse_timecode_seconds(time_match.group(1))
+                end = _parse_timecode_seconds(time_match.group(2))
+            else:
+                start = cursor
+                end = cursor + 3
+            if end <= start:
+                end = start + 3
+            cursor = end
+
+            role = _storyboard_role_from_text(header_line, f"shot_{idx}")
+            actor_action = _extract_storyboard_field(block, ["Что делает", "Действие", "Action", "Actor action"])
+            scene = _extract_storyboard_field(block, ["Сцена", "Scene", "Локация", "Location"]) or actor_action or header_line
+            camera = _extract_storyboard_field(block, ["Камера", "Camera"])
+            speech = _extract_storyboard_field(block, ["Она говорит", "Он говорит", "Говорит", "Speech", "Line"])
+            overlay_text = _extract_storyboard_field(block, ["Текст на экране", "Текст", "Text", "Overlay"])
+            transition = _storyboard_transition_from_text(
+                _extract_storyboard_field(block, ["Переход", "Transition"]) or transition_map.get(idx, "cut")
+            )
+            prompt_bits = [
+                "vertical 9:16 realistic UGC ad",
+                "same actor/character",
+                scene,
+                actor_action,
+                camera,
+                "natural light",
+                "no burned-in text, no watermark",
+            ]
+            shots.append({
+                "shot_number": idx,
+                "start": start,
+                "end": end,
+                "role": role,
+                "scene": scene,
+                "camera": camera,
+                "action": actor_action,
+                "actor_action": actor_action,
+                "speech": speech,
+                "overlay_text": overlay_text,
+                "transition": transition,
+                "visual_type": "talking" if speech else "broll",
+                "generation_prompt": ", ".join(bit for bit in prompt_bits if bit),
+            })
+    else:
+        duration = _estimate_speech_duration(text)
+        chunks = [chunk for chunk in _split_text_for_segments(text, 6) if chunk]
+        cursor = 0
+        shot_duration = max(3, min(5, round(duration / max(1, len(chunks)))))
+        for idx, chunk in enumerate(chunks, start=1):
+            role = "hook" if idx == 1 else ("cta" if idx == len(chunks) else "body")
+            shots.append({
+                "shot_number": idx,
+                "start": cursor,
+                "end": cursor + shot_duration,
+                "role": role,
+                "scene": "Actor in a realistic social video scene",
+                "camera": "vertical handheld social video",
+                "action": "speaks directly to camera",
+                "actor_action": "speaks directly to camera",
+                "speech": chunk,
+                "overlay_text": chunk[:50],
+                "transition": "cut",
+                "visual_type": "talking",
+                "generation_prompt": "vertical 9:16 realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark",
+            })
+            cursor += shot_duration
+
+    shots = normalize_storyboard_shots({"shots": shots})
+    full_narration = " ".join(shot.get("speech", "") for shot in shots if shot.get("speech")).strip()
+    actor_noun = "woman" if actor_gender == "female" else "man"
+    return {
+        "title": title,
+        "format": "storyboard_v3",
+        "style": style,
+        "duration_seconds": int(max((shot.get("end", 0) for shot in shots), default=0)),
+        "target_platform": "instagram",
+        "hook_text": (shots[0].get("overlay_text") or shots[0].get("speech", "")[:50]) if shots else title,
+        "shots": shots,
+        "full_narration": full_narration or text,
+        "actor_description": (
+            f"a 30 year old natural looking european {actor_noun}, casual premium wellness outfit, "
+            "friendly trustworthy face, minimal styling, authentic UGC look"
+        ),
+        "hashtags": ["#reels", "#shorts", "#ugc"] if language != "ru" else ["#рилс", "#привычки", "#питание"],
+        "caption": topic or analysis.get("description") or title,
+        "custom_script": True,
+    }
+
+def build_custom_script(
+    custom_script: str,
+    analysis: dict,
+    style: str = "ugc",
+    language: str = "en",
+    actor_gender: str = "female",
+    topic: str = None,
+    script_format: str = "ugc",
+) -> dict:
     """Create an AI Shorts script object without rewriting user narration."""
+    if script_format == "storyboard_v3":
+        return build_custom_storyboard_script(custom_script, analysis, style, language, actor_gender, topic=topic)
+
     narration = custom_script.strip()
     if not narration:
         raise ValueError("Custom script is empty")
@@ -1089,14 +1381,29 @@ def generate_actor_image(
     return output_path
 
 
+_AUDIO_TAG_RE = re.compile(r"\[[A-Za-z][^\]\n]*\]")
+
+
+def _strip_audio_tags(text: str) -> str:
+    """Remove ElevenLabs v3 audio tags ([sighs], [excited]...) for TTS engines that would read them aloud."""
+    return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub(" ", text or "")).strip()
+
+
 def generate_voiceover(
     text: str,
     elevenlabs_key: str,
     output_path: str,
     voice_id: str = "21m00Tcm4TlvDq8ikWAM",
+    model_id: str = "eleven_v3",
 ) -> str:
-    """Generate voiceover audio using ElevenLabs TTS."""
-    print(f"[SaaSShorts] 🎙️ Generating voiceover ({len(text)} chars)...")
+    """Generate voiceover audio using ElevenLabs TTS.
+
+    Defaults to eleven_v3 in Creative mode (stability 0.0): lively human
+    delivery that honors [sighs]/[excited]-style audio tags in the text.
+    Falls back to multilingual_v2 with the legacy settings when the account
+    has no v3 access; tags are stripped there since v2 would voice them.
+    """
+    print(f"[SaaSShorts] 🎙️ Generating voiceover ({len(text)} chars, {model_id})...")
 
     url = f"{ELEVENLABS_API_BASE}/text-to-speech/{voice_id}"
 
@@ -1105,19 +1412,29 @@ def generate_voiceover(
         "Content-Type": "application/json",
     }
 
-    body = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-            "style": 0.4,
-            "use_speaker_boost": True,
-        },
-    }
+    def request_body(model: str) -> dict:
+        if model == "eleven_v3":
+            return {
+                "text": text,
+                "model_id": model,
+                "voice_settings": {"stability": 0.0},
+            }
+        return {
+            "text": _strip_audio_tags(text),
+            "model_id": model,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "style": 0.4,
+                "use_speaker_boost": True,
+            },
+        }
 
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(url, headers=headers, json=body)
+    with httpx.Client(timeout=180.0) as client:
+        resp = client.post(url, headers=headers, json=request_body(model_id))
+        if resp.status_code != 200 and model_id == "eleven_v3":
+            print(f"[SaaSShorts] ⚠️ eleven_v3 failed ({resp.status_code}), retrying with multilingual_v2...")
+            resp = client.post(url, headers=headers, json=request_body("eleven_multilingual_v2"))
         if resp.status_code != 200:
             raise Exception(f"ElevenLabs TTS error ({resp.status_code}): {resp.text}")
 
@@ -1136,6 +1453,7 @@ def generate_voiceover_minimax(
     language: str = "en",
 ) -> str:
     """Generate voiceover audio using fal.ai MiniMax Speech-02 HD."""
+    text = _strip_audio_tags(text)
     print(f"[SaaSShorts] Generating fal MiniMax voiceover ({len(text)} chars, {voice_id})...")
 
     language_boost = {
@@ -1379,6 +1697,311 @@ def kling_avatar_label(tier: str = "standard") -> str:
     return KLING_AVATAR_TIERS[tier]["label"]
 
 
+KLING_V3_STORYBOARD_TIERS = {
+    "standard": {
+        "family": "kling_v3",
+        "text_model_id": "fal-ai/kling-video/v3/standard/text-to-video",
+        "image_model_id": "fal-ai/kling-video/v3/standard/image-to-video",
+        "cost_per_second": 0.084,
+        "label": "Kling V3 Standard",
+    },
+    "pro": {
+        "family": "kling_v3",
+        "text_model_id": "fal-ai/kling-video/v3/pro/text-to-video",
+        "image_model_id": "fal-ai/kling-video/v3/pro/image-to-video",
+        "cost_per_second": 0.112,
+        "label": "Kling V3 Pro",
+    },
+}
+
+STORYBOARD_VIDEO_TIERS = {
+    **KLING_V3_STORYBOARD_TIERS,
+    "veo31_quality": {
+        "family": "veo31",
+        "text_model_id": "fal-ai/veo3.1",
+        "image_model_id": "fal-ai/veo3.1/image-to-video",
+        "cost_per_second": 0.20,
+        "label": "Veo 3.1 Quality",
+        "resolution": "1080p",
+    },
+}
+
+STORYBOARD_VIDEO_MODE_TIERS = {
+    "storyboard_v3_standard": "standard",
+    "storyboard_v3_pro": "pro",
+    "storyboard_veo31_quality": "veo31_quality",
+}
+
+STORYBOARD_VIDEO_MODES = set(STORYBOARD_VIDEO_MODE_TIERS)
+
+
+def is_storyboard_script(script: dict) -> bool:
+    """Return true when a script should use the Kling V3 storyboard pipeline."""
+    fmt = (script or {}).get("format") or (script or {}).get("script_format")
+    return fmt == "storyboard_v3" or bool((script or {}).get("shots"))
+
+
+def storyboard_tier_from_video_mode(video_mode: str) -> str:
+    mode = (video_mode or "").strip().lower()
+    if mode in STORYBOARD_VIDEO_MODE_TIERS:
+        return STORYBOARD_VIDEO_MODE_TIERS[mode]
+    return "pro" if mode.endswith("_pro") else "standard"
+
+
+def kling_v3_cost_per_second(tier: str = "standard") -> float:
+    tier = (tier or "standard").strip().lower()
+    if tier not in KLING_V3_STORYBOARD_TIERS:
+        raise ValueError(f"Unsupported Kling V3 tier: {tier}")
+    return KLING_V3_STORYBOARD_TIERS[tier]["cost_per_second"]
+
+
+def storyboard_video_cost_per_second(tier: str = "standard") -> float:
+    tier = (tier or "standard").strip().lower()
+    if tier not in STORYBOARD_VIDEO_TIERS:
+        raise ValueError(f"Unsupported storyboard video tier: {tier}")
+    return STORYBOARD_VIDEO_TIERS[tier]["cost_per_second"]
+
+
+def storyboard_video_label(tier: str = "standard") -> str:
+    tier = (tier or "standard").strip().lower()
+    if tier not in STORYBOARD_VIDEO_TIERS:
+        raise ValueError(f"Unsupported storyboard video tier: {tier}")
+    return STORYBOARD_VIDEO_TIERS[tier]["label"]
+
+
+def storyboard_video_family(tier: str = "standard") -> str:
+    tier = (tier or "standard").strip().lower()
+    if tier not in STORYBOARD_VIDEO_TIERS:
+        raise ValueError(f"Unsupported storyboard video tier: {tier}")
+    return STORYBOARD_VIDEO_TIERS[tier].get("family", "kling_v3")
+
+
+def _veo31_duration(seconds: int | float) -> str:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        value = 8
+    if value <= 4:
+        return "4s"
+    if value <= 6:
+        return "6s"
+    return "8s"
+
+
+def _shot_duration(shot: dict) -> int:
+    try:
+        start = float(shot.get("start", 0))
+        end = float(shot.get("end", 0))
+        duration = end - start
+    except (TypeError, ValueError):
+        duration = 0
+    if duration <= 0:
+        duration = float(shot.get("duration", 0) or 0)
+    return max(3, min(15, int(round(duration or 5))))
+
+
+def _build_storyboard_generation_prompt(shot: dict) -> str:
+    existing = (shot.get("generation_prompt") or "").strip()
+    if existing and "vertical 9:16" in existing and "no burned-in text" in existing:
+        return existing
+
+    scene = (shot.get("scene") or shot.get("visual") or "realistic social video scene").strip()
+    actor_action = (shot.get("actor_action") or shot.get("action") or "natural movement").strip()
+    camera = (shot.get("camera") or "vertical 9:16 steady handheld smartphone video").strip()
+    bits = [
+        "vertical 9:16 realistic UGC ad",
+        "same actor/character across shots",
+        scene,
+        actor_action,
+        camera,
+        "natural light",
+        "authentic smartphone footage",
+        "no burned-in text",
+        "no watermark",
+    ]
+    return ", ".join(bit for bit in bits if bit)
+
+
+def normalize_storyboard_shots(script: dict) -> list:
+    """Normalize shot dictionaries for Kling V3 generation and UI edits."""
+    raw_shots = script.get("shots") or []
+    if not raw_shots and script.get("segments"):
+        raw_shots = []
+        for index, segment in enumerate(script.get("segments") or [], start=1):
+            narration = segment.get("narration") or ""
+            raw_shots.append({
+                "shot_number": index,
+                "start": segment.get("start", index - 1),
+                "end": segment.get("end", index),
+                "role": segment.get("type") or f"shot_{index}",
+                "scene": segment.get("broll_prompt") or segment.get("visual") or "",
+                "actor_action": segment.get("action") or "speaks directly to camera",
+                "camera": segment.get("camera") or "vertical 9:16 steady handheld smartphone video",
+                "speech": narration,
+                "overlay_text": segment.get("subtitle_text") or narration[:50],
+                "transition": segment.get("transition") or "cut",
+                "generation_prompt": segment.get("generation_prompt") or segment.get("broll_prompt") or narration,
+            })
+
+    shots = []
+    cursor = 0
+    for index, shot in enumerate(raw_shots, start=1):
+        duration = _shot_duration(shot)
+        start = shot.get("start")
+        end = shot.get("end")
+        try:
+            start = float(start)
+            end = float(end)
+        except (TypeError, ValueError):
+            start = cursor
+            end = cursor + duration
+        if end <= start:
+            end = start + duration
+        cursor = end
+
+        speech = (shot.get("speech") or shot.get("narration") or "").strip()
+        scene = (shot.get("scene") or shot.get("visual") or "").strip()
+        actor_action = (shot.get("actor_action") or shot.get("action") or "").strip()
+        camera = (shot.get("camera") or "vertical 9:16 steady handheld smartphone video").strip()
+        role = _storyboard_role_from_text(shot.get("role") or shot.get("type") or "", f"shot_{index}")
+        overlay_text = (shot.get("overlay_text") or shot.get("subtitle_text") or "").strip()
+        transition = _storyboard_transition_from_text(shot.get("transition") or "cut")
+        normalized = {
+            **shot,
+            "shot_number": int(shot.get("shot_number") or index),
+            "start": start,
+            "end": end,
+            "duration": int(round(end - start)),
+            "role": role,
+            "scene": scene,
+            "actor_action": actor_action,
+            "action": actor_action,
+            "camera": camera,
+            "speech": speech,
+            "overlay_text": overlay_text,
+            "transition": transition,
+            "visual_type": shot.get("visual_type") or ("talking" if speech else "broll"),
+        }
+        normalized["generation_prompt"] = _build_storyboard_generation_prompt(normalized)
+        shots.append(normalized)
+    return shots
+
+def split_storyboard_shots(shots: list, max_duration: int = 15) -> list:
+    """Split storyboard shots into chunks that fit Kling V3 multi-shot limits."""
+    chunks = []
+    current = []
+    current_duration = 0
+    for shot in normalize_storyboard_shots({"shots": shots}):
+        duration = _shot_duration(shot)
+        if current and current_duration + duration > max_duration:
+            chunks.append(current)
+            current = []
+            current_duration = 0
+        current.append(shot)
+        current_duration += duration
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def build_kling_v3_storyboard_request(
+    shots: list,
+    tier: str = "standard",
+    generation_mode: str = "single_shot",
+    aspect_ratio: str = "9:16",
+    start_image_url: str = "",
+) -> tuple[str, dict]:
+    """Build a fal.ai request for one shot or a multi-shot storyboard."""
+    tier = (tier or "standard").strip().lower()
+    if tier not in STORYBOARD_VIDEO_TIERS:
+        raise ValueError(f"Unsupported storyboard video tier: {tier}")
+
+    normalized = normalize_storyboard_shots({"shots": shots})
+    if not normalized:
+        raise ValueError("Storyboard requires at least one shot")
+
+    if len(normalized) == 1:
+        first_shot = normalized[0]
+        start_image_url = start_image_url or first_shot.get("image_url") or first_shot.get("start_image_url") or ""
+
+    use_image_to_video = bool(start_image_url)
+    model_key = "image_model_id" if use_image_to_video else "text_model_id"
+    tier_config = STORYBOARD_VIDEO_TIERS[tier]
+    model_id = tier_config[model_key]
+
+    if tier_config.get("family") == "veo31":
+        if generation_mode == "multi_shot" and len(normalized) > 1:
+            raise ValueError("Veo 3.1 storyboard mode supports one prompt per fal.ai request")
+        shot = normalized[0]
+        payload = {
+            "prompt": shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot",
+            "aspect_ratio": aspect_ratio,
+            "duration": _veo31_duration(_shot_duration(shot)),
+            "negative_prompt": "blur, distort, low quality, deformed face, extra fingers, wrong text, watermark",
+            "resolution": tier_config.get("resolution", "1080p"),
+            "generate_audio": False,
+            "auto_fix": False,
+            "safety_tolerance": "4",
+        }
+        if use_image_to_video:
+            payload["image_url"] = start_image_url
+        return model_id, payload
+
+    payload = {
+        "duration": str(min(15, sum(_shot_duration(shot) for shot in normalized))),
+        "generate_audio": False,
+        "negative_prompt": "blur, distort, low quality, deformed face, extra fingers, wrong text, watermark",
+    }
+    if use_image_to_video:
+        payload["start_image_url"] = start_image_url
+    else:
+        payload["aspect_ratio"] = aspect_ratio
+
+    if generation_mode == "multi_shot" and len(normalized) > 1:
+        payload["shot_type"] = "customize"
+        payload["multi_prompt"] = [
+            {
+                "duration": str(_shot_duration(shot)),
+                "prompt": shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot",
+            }
+            for shot in normalized
+        ]
+    else:
+        shot = normalized[0]
+        payload["prompt"] = shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot"
+        payload["duration"] = str(_shot_duration(shot))
+
+    return model_id, payload
+
+
+def _resolve_storyboard_start_image_url(shot: dict, fal_key: str) -> str:
+    """Return a public URL for a storyboard reference frame when one is present."""
+    for key in ("image_url", "start_image_url"):
+        value = (shot.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+
+    local_ref = (shot.get("image_path") or shot.get("local_path") or "").strip()
+    if not local_ref:
+        local_url = (shot.get("local_url") or "").strip()
+        if local_url.startswith("/videos/"):
+            local_ref = os.path.join("output", local_url.replace("/videos/", "", 1))
+
+    if not local_ref:
+        return ""
+
+    abs_path = os.path.abspath(local_ref)
+    output_root = os.path.abspath("output")
+    try:
+        is_inside_output = os.path.commonpath([abs_path, output_root]) == output_root
+    except ValueError:
+        is_inside_output = False
+    if not is_inside_output or not os.path.exists(abs_path):
+        return ""
+
+    return _fal_upload_file(abs_path, fal_key)
+
+
 def prepare_kling_actor_image(image_path: str, output_path: str) -> str:
     """Prepare a native 9:16 actor image before sending it to Kling Avatar."""
     if (
@@ -1451,27 +2074,7 @@ def generate_talking_head(
     ]
     attempts = []
     selected_attempt = None
-    retry_scheduled = False
     model_id = ""
-
-    def _schedule_tail_silence_retry() -> None:
-        nonlocal retry_scheduled
-        if retry_scheduled:
-            return
-        retry_scheduled = True
-        padded_audio_path = output_path.replace(".mp4", "_voice_tail_silence.mp3")
-        try:
-            create_kling_tail_padded_audio(audio_path, padded_audio_path, tail_silence=0.45)
-            attempts_config.append({
-                "name": "tail_silence",
-                "audio_path": padded_audio_path,
-                "prompt": retry_prompt,
-            })
-        except Exception as e:
-            attempts.append({
-                "name": "tail_silence_setup",
-                "error": f"Could not prepare retry audio: {e}",
-            })
 
     for index, attempt_config in enumerate(attempts_config, start=1):
         attempt_name = attempt_config["name"]
@@ -1525,9 +2128,6 @@ def generate_talking_head(
             if quality.get("status") == "ok":
                 selected_attempt = attempt_record
                 break
-
-            if index == 1:
-                _schedule_tail_silence_retry()
         except Exception as e:
             attempt_record["error"] = str(e)
             attempts.append(attempt_record)
@@ -1538,8 +2138,6 @@ def generate_talking_head(
                 "payload": payload,
                 "error": str(e),
             })
-            if index == 1:
-                _schedule_tail_silence_retry()
 
     if not selected_attempt:
         selected_attempt = select_best_talking_head_attempt(attempts)
@@ -1839,6 +2437,36 @@ def estimate_sync_lipsync_cost(model: str, duration_seconds: float) -> Optional[
     return None
 
 
+def _video_version_index(version_id: str) -> Optional[int]:
+    match = re.fullmatch(r"v(\d+)", str(version_id or "").strip().lower())
+    return int(match.group(1)) if match else None
+
+
+def _next_lipsync_final_path(output_dir: str, prefix: str, metadata: dict, model: str) -> str:
+    """Create a new final-video path for a lip-sync version without touching the current final."""
+    versions = (metadata.get("versions") if isinstance(metadata, dict) else []) or []
+    indexes = [
+        index
+        for index in (_video_version_index(item.get("id")) for item in versions if isinstance(item, dict))
+        if index is not None
+    ]
+
+    version_pattern = os.path.join(output_dir, f"{prefix}_final_v*.mp4")
+    for path in glob.glob(version_pattern):
+        match = re.search(r"_final_v(\d+)_", os.path.basename(path))
+        if match:
+            indexes.append(int(match.group(1)))
+
+    next_index = max(indexes or [1]) + 1
+    safe_model = re.sub(r"[^a-z0-9]+", "_", (model or "lipsync").lower()).strip("_") or "lipsync"
+
+    while True:
+        candidate = os.path.join(output_dir, f"{prefix}_final_v{next_index:03d}_{safe_model}.mp4")
+        if not os.path.exists(candidate):
+            return candidate
+        next_index += 1
+
+
 def apply_lipsync_to_saas_job(
     output_dir: str,
     fal_key: str,
@@ -1850,11 +2478,15 @@ def apply_lipsync_to_saas_job(
     assets = resolve_saas_lipsync_assets(output_dir)
     safe_model = re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_") or "sync_3"
     lipsynced_head = os.path.join(output_dir, f"{assets['prefix']}_head_lipsync_{safe_model}.mp4")
+    versioned_final = _next_lipsync_final_path(output_dir, assets["prefix"], assets["metadata"], model)
 
     log(f"[LipSync 1/3] Uploading cached talking head and voiceover to fal.ai ({model}).")
+    voiceover_preparation = prepare_voiceover_for_video_generation(assets["audio"], log=log)
+    lipsync_audio = voiceover_preparation["path"]
+
     generate_sync_lipsync_video(
         assets["talking_head"],
-        assets["audio"],
+        lipsync_audio,
         fal_key,
         lipsynced_head,
         model=model,
@@ -1862,26 +2494,33 @@ def apply_lipsync_to_saas_job(
     )
 
     log("[LipSync 2/3] Re-compositing final video with the lip-synced head.")
+    try:
+        spoken_words = transcribe_audio_for_subs(lipsync_audio)
+    except Exception:
+        spoken_words = []
     composite_video(
         lipsynced_head,
         assets["broll_clips"],
         assets["subtitles"],
         assets["hook_text"],
-        assets["final"],
+        versioned_final,
+        jump_cut_words=spoken_words,
     )
 
-    duration = _get_media_duration(assets["audio"])
+    duration = _get_media_duration(lipsync_audio)
     log("[LipSync 3/3] Final video updated.")
 
     return {
-        "video_path": assets["final"],
-        "video_filename": os.path.basename(assets["final"]),
+        "video_path": versioned_final,
+        "video_filename": os.path.basename(versioned_final),
+        "previous_video_path": assets["final"],
         "lipsynced_head": lipsynced_head,
         "actor_image": assets["actor_image"],
         "duration": duration,
         "lipsync_model": model,
         "lipsync_sync_mode": sync_mode,
         "lipsync_cost_estimate": estimate_sync_lipsync_cost(model, duration),
+        "voiceover_preparation": voiceover_preparation,
         "metadata": assets["metadata"],
     }
 
@@ -1974,6 +2613,42 @@ def _wrapped_text(text: str, width: int = 24, max_lines: int = 4) -> str:
     text = " ".join(str(text or "").replace("\n", " ").split())
     lines = textwrap.wrap(text, width=width, max_lines=max_lines, placeholder="...")
     return "\n".join(lines)
+
+
+def _escape_ass_text(text: str) -> str:
+    """Escape user text for ASS while keeping it readable."""
+    return (
+        str(text or "")
+        .replace("\\", "\\\\")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
+        .replace("\n", "\\N")
+    )
+
+
+def _pick_caption_highlight_word(text: str) -> str:
+    words = re.findall(r"[A-ZА-ЯЁ0-9][A-ZА-ЯЁ0-9-]{2,}", text.upper())
+    if not words:
+        return ""
+    priority = {
+        "БЕЗ", "НЕДЕЛЯ", "СРЫВОВ", "СЛАДКОЕ", "ВЕС", "ПЛАН", "СТАРТ",
+        "НЕ", "СЕГОДНЯ", "ПОНЕДЕЛЬНИК", "КОНТРОЛЬ", "СПОКОЙСТВИЕ",
+    }
+    for word in words:
+        if word in priority:
+            return word
+    longest = max(words, key=len)
+    return longest if len(longest) >= 8 else ""
+
+
+def _highlight_ass_caption(text: str, reset_style: str = "Subtitle") -> str:
+    safe_text = _escape_ass_text(text.upper())
+    target = _pick_caption_highlight_word(text)
+    if not target:
+        return safe_text
+    pattern = re.compile(rf"(?<![A-ZА-ЯЁ0-9-]){re.escape(target)}(?![A-ZА-ЯЁ0-9-])")
+    replacement = r"{\c&H0066D1FF&\bord8}" + target + rf"{{\r{reset_style}}}"
+    return pattern.sub(lambda _: replacement, safe_text, count=1)
 
 
 def generate_product_broll(
@@ -2234,6 +2909,161 @@ def create_kling_tail_padded_audio(audio_path: str, output_path: str, tail_silen
     return output_path
 
 
+def prepared_voiceover_path(audio_path: str) -> str:
+    """Path for the voiceover file cleaned for video/lip-sync generation."""
+    root, ext = os.path.splitext(audio_path)
+    return f"{root}_clean{ext or '.mp3'}"
+
+
+def _parse_audio_silence_events(log_text: str, duration: float) -> dict:
+    """Parse ffmpeg silencedetect output into leading/trailing silence metrics."""
+    starts = [
+        float(match.group(1))
+        for match in re.finditer(r"silence_start:\s*([0-9.]+)", log_text or "")
+    ]
+    ends = [
+        float(match.group(1))
+        for match in re.finditer(r"silence_end:\s*([0-9.]+)", log_text or "")
+    ]
+
+    leading_silence = 0.0
+    if starts and starts[0] <= 0.08 and ends:
+        leading_silence = max(0.0, ends[0])
+
+    trailing_silence = 0.0
+    if starts:
+        last_start = starts[-1]
+        last_end = ends[-1] if ends else duration
+        if duration <= 0 or abs(duration - last_end) <= 0.25 or last_end >= duration - 0.25:
+            trailing_silence = max(0.0, duration - last_start)
+
+    return {
+        "leading_silence": round(leading_silence, 3),
+        "trailing_silence": round(trailing_silence, 3),
+        "silence_events": len(starts),
+    }
+
+
+def inspect_voiceover_silence(
+    audio_path: str,
+    threshold_db: int = -45,
+    min_silence: float = 0.15,
+    duration: float = None,
+) -> dict:
+    """Detect leading/trailing silence in a voiceover file."""
+    duration = _get_media_duration(audio_path) if duration is None else duration
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", audio_path,
+        "-af", f"silencedetect=noise={threshold_db}dB:d={min_silence}",
+        "-f", "null",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if getattr(result, "returncode", 0) not in (0, None):
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg silencedetect failed").strip())
+
+    metrics = _parse_audio_silence_events(
+        f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}",
+        duration,
+    )
+    metrics["duration"] = round(duration, 3)
+    metrics["threshold_db"] = threshold_db
+    metrics["min_silence"] = min_silence
+    return metrics
+
+
+def prepare_voiceover_for_video_generation(
+    audio_path: str,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """
+    Create a clean voiceover file for audio-driven video models.
+
+    Kling Avatar v2 derives output length and lip movement from the submitted
+    audio file, so trailing TTS silence must be removed before upload.
+    """
+    clean_path = prepared_voiceover_path(audio_path)
+    meta_path = f"{clean_path}.meta.json"
+    source_stat = os.stat(audio_path)
+    source_signature = {
+        "source_path": audio_path,
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+    }
+
+    cached = _read_json_file(meta_path)
+    if (
+        cached.get("source_size") == source_signature["source_size"]
+        and cached.get("source_mtime_ns") == source_signature["source_mtime_ns"]
+        and os.path.exists(clean_path)
+        and os.path.getsize(clean_path) > 0
+    ):
+        return cached
+
+    for stale_path in (clean_path, f"{clean_path}.fal_url.txt", meta_path):
+        try:
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        except OSError:
+            pass
+
+    original_duration = _get_media_duration(audio_path)
+    try:
+        silence = inspect_voiceover_silence(audio_path, duration=original_duration)
+        filter_expr = (
+            "silenceremove="
+            "start_periods=1:start_duration=0.05:start_threshold=-45dB:"
+            "stop_periods=1:stop_duration=0.08:stop_threshold=-45dB"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-af", filter_expr,
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            clean_path,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        clean_duration = _get_media_duration(clean_path)
+        trimmed = clean_duration < original_duration - 0.05
+        report = {
+            **source_signature,
+            "path": clean_path,
+            "original_path": audio_path,
+            "original_duration": round(original_duration, 3),
+            "duration": round(clean_duration, 3),
+            "leading_silence": silence.get("leading_silence", 0.0),
+            "trailing_silence": silence.get("trailing_silence", 0.0),
+            "silence_events": silence.get("silence_events", 0),
+            "trimmed": trimmed,
+            "status": "trimmed" if trimmed else "normalized",
+        }
+        _write_json_file(meta_path, report)
+        if report["trailing_silence"] >= 0.2 or trimmed:
+            log(
+                "[2/6] Voiceover cleaned: "
+                f"{report['original_duration']:.2f}s -> {report['duration']:.2f}s "
+                f"(tail silence ~{report['trailing_silence']:.2f}s)."
+            )
+        return report
+    except Exception as error:
+        report = {
+            **source_signature,
+            "path": audio_path,
+            "original_path": audio_path,
+            "original_duration": round(original_duration, 3),
+            "duration": round(original_duration, 3),
+            "leading_silence": 0.0,
+            "trailing_silence": 0.0,
+            "silence_events": 0,
+            "trimmed": False,
+            "status": "fallback_raw_audio",
+            "warning": f"Voiceover cleanup skipped: {error}",
+        }
+        log(f"[2/6] Voiceover cleanup skipped: {error}")
+        return report
+
+
 def _format_ass_time(seconds: float) -> str:
     """Format time for ASS subtitle format: H:MM:SS.cc"""
     h = int(seconds // 3600)
@@ -2268,14 +3098,17 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     return words
 
 
-def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3) -> str:
+def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3, words: Optional[list] = None) -> str:
     """
     Generate TikTok-style ASS subtitles from audio using Whisper transcription.
 
     Style: Big bold centered text, 1-3 words at a time, white with black outline.
     Matches actual spoken words with precise timestamps.
+
+    Pass precomputed `words` to reuse an existing transcription.
     """
-    words = transcribe_audio_for_subs(audio_path)
+    if words is None:
+        words = transcribe_audio_for_subs(audio_path)
     if not words:
         # Fallback: empty subtitle file
         with open(output_path, "w") as f:
@@ -2320,6 +3153,73 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return output_path
 
 
+def generate_storyboard_ass_subtitles(
+    audio_path: str,
+    shots: list,
+    output_path: str,
+    max_words: int = 3,
+    words: Optional[list] = None,
+) -> str:
+    """Generate ASS subtitles with separate storyboard overlay and speech layers.
+
+    Pass precomputed `words` to reuse an existing transcription.
+    """
+    normalized_shots = normalize_storyboard_shots({"shots": shots})
+    if words is None:
+        words = transcribe_audio_for_subs(audio_path)
+    chunks = []
+    for i in range(0, len(words), max_words):
+        group = words[i : i + max_words]
+        if not group:
+            continue
+        chunks.append({
+            "text": " ".join(w["word"] for w in group).upper(),
+            "start": group[0]["start"],
+            "end": group[-1]["end"],
+        })
+
+    ass_content = """[Script Info]
+Title: Storyboard Reels Submagic Preset
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Hook,Arial Black,78,&H00FFFFFF,&H000000FF,&H00000000,&HC0000000,-1,0,0,0,100,100,0,0,3,5,0,8,96,96,150,1
+Style: Overlay,Arial Black,58,&H00FFFFFF,&H000000FF,&H00000000,&HB0000000,-1,0,0,0,100,100,0,0,3,4,0,8,96,96,170,1
+Style: Subtitle,Arial Black,64,&H00FFFFFF,&H000000FF,&H00000000,&HCC000000,-1,0,0,0,100,100,0,0,3,6,0,2,96,96,360,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    for shot in normalized_shots:
+        overlay = (shot.get("overlay_text") or "").strip()
+        if not overlay:
+            continue
+        start = _format_ass_time(float(shot.get("start") or 0))
+        end = _format_ass_time(float(shot.get("end") or 0))
+        style_name = "Hook" if (shot.get("role") or "").lower() == "hook" else "Overlay"
+        wrap_width = 16 if style_name == "Hook" else 20
+        text = _escape_ass_text(_wrapped_text(overlay.upper(), width=wrap_width, max_lines=2))
+        ass_content += f"Dialogue: 0,{start},{end},{style_name},,0,0,0,,{text}\n"
+
+    for chunk in chunks:
+        start = _format_ass_time(chunk["start"])
+        end = _format_ass_time(chunk["end"])
+        text = _highlight_ass_caption(chunk["text"], reset_style="Subtitle")
+        ass_content += f"Dialogue: 1,{start},{end},Subtitle,,0,0,0,,{text}\n"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    print(f"[SaaSShorts] Storyboard ASS: {len(normalized_shots)} overlays, {len(chunks)} captions")
+    return output_path
+
+
 def generate_srt_from_script(segments: list, output_path: str) -> str:
     """Fallback: generate basic SRT from script segments (used if no audio available)."""
     srt_content = ""
@@ -2347,17 +3247,84 @@ def generate_srt_from_script(segments: list, output_path: str) -> str:
     return output_path
 
 
+def _select_jump_cut_points(
+    words: list,
+    duration: float,
+    min_gap: float = 2.2,
+    max_gap: float = 3.8,
+) -> list:
+    """
+    Pick jump-cut timestamps for talking-head footage.
+
+    Within each pacing window prefers the word boundary with the longest pause
+    after it, so cuts land between phrases instead of mid-word. Falls back to
+    a fixed grid when no transcription is available.
+    """
+    if duration <= min_gap + 1.2:
+        return []
+
+    tail_guard = duration - 1.2
+
+    boundaries = []
+    for i, w in enumerate(words or []):
+        try:
+            end = float(w["end"])
+            nxt = float(words[i + 1]["start"]) if i + 1 < len(words) else end
+        except (KeyError, TypeError, ValueError):
+            continue
+        boundaries.append({"t": end, "pause": max(0.0, nxt - end)})
+
+    cuts = []
+    if not boundaries:
+        step = (min_gap + max_gap) / 2
+        t = step
+        while t < tail_guard:
+            cuts.append(round(t, 3))
+            t += step
+        return cuts
+
+    last_cut = 0.0
+    while True:
+        window = [b for b in boundaries if last_cut + min_gap <= b["t"] <= last_cut + max_gap]
+        if window:
+            cut_t = max(window, key=lambda b: b["pause"])["t"]
+        else:
+            later = [b for b in boundaries if b["t"] > last_cut + max_gap]
+            if not later:
+                break
+            cut_t = min(b["t"] for b in later)
+        if cut_t >= tail_guard:
+            break
+        cuts.append(round(cut_t, 3))
+        last_cut = cut_t
+    return cuts
+
+
+def _punch_in_subsegments(start: float, end: float, cuts: list, edge_guard: float = 0.6) -> list:
+    """Split [start, end] at the cut points that fall safely inside it."""
+    points = sorted(c for c in cuts if start + edge_guard < c < end - edge_guard)
+    times = [start] + points + [end]
+    return [(times[i], times[i + 1]) for i in range(len(times) - 1)]
+
+
 def composite_video(
     talking_head_path: str,
     broll_clips: List[Dict],
     srt_path: str,
     hook_text: str,
     output_path: str,
+    jump_cut_words: Optional[List[Dict]] = None,
+    punch_in: bool = True,
 ) -> str:
     """
     Composite talking head + b-roll inserts + subtitles into final video.
 
     broll_clips: [{"path": "/path/to/clip.mp4", "start": 12, "end": 17}]
+
+    Talking-head stretches are split into jump-cut shots with an alternating
+    punch-in zoom so the final edit reads like manual cutting instead of one
+    static avatar take. Cuts are video-only: audio is mapped straight from
+    the talking head as one continuous track.
     """
     print(f"[SaaSShorts] 🎞️ Compositing final video...")
 
@@ -2374,13 +3341,50 @@ def composite_video(
         )
         sub_filter = f"subtitles='{safe_sub}':force_style='{sub_style}'"
 
-    if not broll_clips:
-        # Simple: talking head + subtitles only
-        norm = (
-            "scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
-            "fps=30,setsar=1"
-        )
+    # Normalize all segments to vertical cover. This avoids the old landscape
+    # letterbox look where the avatar was tiny inside a 9:16 black frame.
+    norm = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
+        "fps=30,setsar=1"
+    )
+    # ~15% zoom after norm, biased above center so the face keeps headroom
+    punch_zoom = "crop=938:1668:(iw-ow)/2:(ih-oh)*0.3,scale=1080:1920,setsar=1"
+
+    th_duration = _get_media_duration(talking_head_path)
+    cuts = _select_jump_cut_points(jump_cut_words or [], th_duration) if punch_in else []
+
+    # Build the segment timeline: talking-head stretches interleaved with b-roll,
+    # b-roll segments limited to the actual clip duration.
+    segments = []
+    sorted_broll = sorted(broll_clips, key=lambda x: x["start"]) if broll_clips else []
+    if sorted_broll:
+        prev_end = 0.0
+        for i, clip in enumerate(sorted_broll):
+            actual_dur = _get_media_duration(clip["path"])
+            print(f"[SaaSShorts] B-roll {i} actual duration: {actual_dur:.1f}s")
+            bstart = clip["start"]
+            bend = min(clip["end"], bstart + actual_dur)
+            if prev_end < bstart:
+                segments.append({"type": "th", "start": prev_end, "end": bstart})
+            segments.append({"type": "broll", "index": i, "start": bstart, "end": bend})
+            prev_end = bend
+        if prev_end < th_duration:
+            segments.append({"type": "th", "start": prev_end, "end": th_duration})
+    else:
+        segments.append({"type": "th", "start": 0.0, "end": th_duration})
+
+    # Expand talking-head segments into jump-cut shots
+    shots = []
+    for seg in segments:
+        if seg["type"] == "th":
+            for s, e in _punch_in_subsegments(seg["start"], seg["end"], cuts):
+                shots.append({"type": "th", "start": s, "end": e})
+        else:
+            shots.append(seg)
+
+    if len(shots) == 1 and shots[0]["type"] == "th":
+        # Single continuous take: no filter_complex needed
         cmd = [
             "ffmpeg", "-y",
             "-i", talking_head_path,
@@ -2393,106 +3397,589 @@ def composite_video(
         print(f"[SaaSShorts] ✅ Final video (simple): {output_path}")
         return output_path
 
-    # Complex: talking head with b-roll inserts
-    th_duration = _get_media_duration(talking_head_path)
-    sorted_broll = sorted(broll_clips, key=lambda x: x["start"])
-
-    # Get actual b-roll durations and limit segment lengths
-    broll_durations = {}
-    for i, clip in enumerate(sorted_broll):
-        broll_durations[i] = _get_media_duration(clip["path"])
-        print(f"[SaaSShorts] B-roll {i} actual duration: {broll_durations[i]:.1f}s")
-
-    # Build segment list — limit b-roll segments to actual clip duration
-    segments = []
-    prev_end = 0.0
-
-    for i, clip in enumerate(sorted_broll):
-        bstart = clip["start"]
-        actual_dur = broll_durations[i]
-        # B-roll segment can't be longer than the actual clip
-        bend = min(clip["end"], bstart + actual_dur)
-
-        if prev_end < bstart:
-            segments.append({"type": "th", "start": prev_end, "end": bstart})
-
-        segments.append({
-            "type": "broll",
-            "index": i,
-            "start": bstart,
-            "end": bend,
-            "duration": bend - bstart,
-        })
-        prev_end = bend
-
-    if prev_end < th_duration:
-        segments.append({"type": "th", "start": prev_end, "end": th_duration})
-
-    # Build FFmpeg filter_complex
     inputs = ["-i", talking_head_path]
     for clip in sorted_broll:
         inputs.extend(["-i", clip["path"]])
 
     filter_parts = []
     concat_parts = []
-
-    # Normalize all segments to vertical cover. This avoids the old landscape
-    # letterbox look where the avatar was tiny inside a 9:16 black frame.
-    norm = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
-        "fps=30,setsar=1"
-    )
-
-    for j, seg in enumerate(segments):
-        if seg["type"] == "th":
+    for j, shot in enumerate(shots):
+        if shot["type"] == "th":
+            vf = norm if j % 2 == 0 else f"{norm},{punch_zoom}"
             filter_parts.append(
-                f"[0:v]trim=start={seg['start']:.3f}:end={seg['end']:.3f},setpts=PTS-STARTPTS,{norm}[tv{j}]"
+                f"[0:v]trim=start={shot['start']:.3f}:end={shot['end']:.3f},setpts=PTS-STARTPTS,{vf}[v{j}]"
             )
-            filter_parts.append(
-                f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},asetpts=PTS-STARTPTS[ta{j}]"
-            )
-            concat_parts.append(f"[tv{j}][ta{j}]")
         else:
-            idx = seg["index"] + 1
-            dur = seg["duration"]
+            idx = shot["index"] + 1
+            dur = shot["end"] - shot["start"]
             filter_parts.append(
-                f"[{idx}:v]trim=start=0:end={dur:.3f},setpts=PTS-STARTPTS,{norm}[bv{j}]"
+                f"[{idx}:v]trim=start=0:end={dur:.3f},setpts=PTS-STARTPTS,{norm}[v{j}]"
             )
-            filter_parts.append(
-                f"[0:a]atrim=start={seg['start']:.3f}:end={seg['end']:.3f},asetpts=PTS-STARTPTS[ba{j}]"
-            )
-            concat_parts.append(f"[bv{j}][ba{j}]")
+        concat_parts.append(f"[v{j}]")
 
-    n = len(segments)
-    filter_parts.append(
-        f"{''.join(concat_parts)}concat=n={n}:v=1:a=1[outv][outa]"
-    )
-    filter_parts.append(
-        f"[outv]{sub_filter}[finalv]"
-    )
-
-    filter_str = ";".join(filter_parts)
+    filter_parts.append(f"{''.join(concat_parts)}concat=n={len(shots)}:v=1:a=0[outv]")
+    filter_parts.append(f"[outv]{sub_filter}[finalv]")
 
     cmd = [
         "ffmpeg", "-y",
         *inputs,
-        "-filter_complex", filter_str,
+        "-filter_complex", ";".join(filter_parts),
         "-map", "[finalv]",
-        "-map", "[outa]",
+        "-map", "0:a",
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
         output_path,
     ]
 
     subprocess.run(cmd, check=True)
-    print(f"[SaaSShorts] ✅ Final video (composite): {output_path}")
+    print(f"[SaaSShorts] ✅ Final video ({len(shots)} shots): {output_path}")
     return output_path
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Orchestrator: Full Pipeline
 # ═══════════════════════════════════════════════════════════════════════
+
+def _video_url_from_fal_result(result: dict) -> str:
+    video = result.get("video")
+    if isinstance(video, dict) and video.get("url"):
+        return video["url"]
+    if isinstance(video, str):
+        return video
+    videos = result.get("videos")
+    if isinstance(videos, list) and videos:
+        first = videos[0]
+        if isinstance(first, dict) and first.get("url"):
+            return first["url"]
+        if isinstance(first, str):
+            return first
+    for key in ("video_url", "output"):
+        value = result.get(key)
+        if isinstance(value, dict) and value.get("url"):
+            return value["url"]
+        if isinstance(value, str):
+            return value
+    raise Exception(f"No video URL in fal result: {result}")
+
+
+def generate_storyboard_shot_clip(
+    shot: dict,
+    fal_key: str,
+    output_path: str,
+    tier: str = "standard",
+    aspect_ratio: str = "9:16",
+) -> str:
+    """Generate one storyboard shot with Kling V3 and no native audio."""
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return output_path
+
+    start_image_url = _resolve_storyboard_start_image_url(shot, fal_key)
+    model_id, payload = build_kling_v3_storyboard_request(
+        [shot],
+        tier=tier,
+        generation_mode="single_shot",
+        aspect_ratio=aspect_ratio,
+        start_image_url=start_image_url,
+    )
+    result = _fal_run(model_id, payload, fal_key, timeout=1800)
+    video_url = _video_url_from_fal_result(result)
+    with httpx.Client(timeout=300.0) as client:
+        vid_resp = client.get(video_url)
+        vid_resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(vid_resp.content)
+
+    _write_json_file(f"{output_path}.meta.json", {
+        "shot": shot,
+        "tier": tier,
+        "model_id": model_id,
+        "payload": payload,
+        "fal_request": result.get("_fal_request", {}),
+        "video_url": video_url,
+    })
+    return output_path
+
+
+def generate_storyboard_chunk_clip(
+    shots: list,
+    fal_key: str,
+    output_path: str,
+    tier: str = "standard",
+) -> str:
+    """Generate a <=15s multi-shot Kling V3 storyboard chunk."""
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return output_path
+
+    model_id, payload = build_kling_v3_storyboard_request(
+        shots,
+        tier=tier,
+        generation_mode="multi_shot",
+        aspect_ratio="9:16",
+    )
+    result = _fal_run(model_id, payload, fal_key, timeout=1800)
+    video_url = _video_url_from_fal_result(result)
+    with httpx.Client(timeout=300.0) as client:
+        vid_resp = client.get(video_url)
+        vid_resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(vid_resp.content)
+
+    _write_json_file(f"{output_path}.meta.json", {
+        "shots": shots,
+        "tier": tier,
+        "model_id": model_id,
+        "payload": payload,
+        "fal_request": result.get("_fal_request", {}),
+        "video_url": video_url,
+    })
+    return output_path
+
+
+def composite_storyboard_video(
+    clips: list,
+    audio_path: str,
+    srt_path: str,
+    output_path: str,
+) -> str:
+    """Concatenate Kling V3 storyboard clips and lay the voiceover/subtitles on top."""
+    if not clips:
+        raise ValueError("Storyboard composite requires at least one clip")
+
+    safe_sub = srt_path.replace("\\", "/").replace(":", "\\:")
+    sub_filter = f"ass='{safe_sub}'" if srt_path.endswith(".ass") else f"subtitles='{safe_sub}'"
+    inputs = []
+    for clip in clips:
+        inputs.extend(["-i", clip["path"]])
+    inputs.extend(["-i", audio_path])
+
+    norm = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
+        "fps=30,setsar=1"
+    )
+    filter_parts = []
+    concat_parts = []
+    for index, clip in enumerate(clips):
+        actual = _get_media_duration(clip["path"])
+        duration = max(0.1, float(clip.get("duration") or actual))
+        chain = f"[{index}:v]trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS,{norm}"
+        # If the generated clip came back shorter than its slot, freeze the
+        # last frame instead of silently shifting every later shot off-sync.
+        deficit = duration - actual
+        if actual > 0 and deficit > 0.05:
+            chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
+        filter_parts.append(chain + f"[v{index}]")
+        concat_parts.append(f"[v{index}]")
+    filter_parts.append(f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0[vout]")
+    filter_parts.append(f"[vout]{sub_filter}[finalv]")
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[finalv]",
+        "-map", f"{len(clips)}:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
+    return output_path
+
+
+def _normalize_align_token(token: str) -> str:
+    return re.sub(r"[\W_]+", "", (token or "").lower(), flags=re.UNICODE)
+
+
+def _align_shots_to_voiceover(shots: list, words: list, audio_duration: float) -> tuple:
+    """
+    Assign each speech shot a contiguous [start, end] slice of one master voiceover.
+
+    Boundaries are placed proportionally to each shot's word count, then snapped
+    to an inter-word pause: a pause right after the shot's last scripted word
+    wins outright; otherwise the pause score is penalized by distance from the
+    proportional target, so a marginally longer pause one phrase away cannot
+    steal the boundary. Returns (slices, skipped_shots) where slices tile
+    [0, audio_duration] exactly.
+    """
+    speech_shots = [s for s in shots if (s.get("speech") or "").strip()]
+    skipped = [s for s in shots if not (s.get("speech") or "").strip()]
+    if not speech_shots:
+        return [], skipped
+
+    # Audio tags ([sighs]...) are acting directions, not spoken words —
+    # exclude them from proportional weights and boundary word matching.
+    spoken_texts = [_strip_audio_tags(s.get("speech") or "") for s in speech_shots]
+    weights = [max(1, len(t.split())) for t in spoken_texts]
+    total_weight = sum(weights)
+
+    boundaries = [0.0]
+    n = len(words or [])
+    cum = 0
+    for shot_index, w_count in enumerate(weights[:-1]):
+        cum += w_count
+        if n > 1:
+            target_idx = min(max(round(n * cum / total_weight), 1), n - 1)
+            lo = max(1, target_idx - 4)
+            hi = min(n - 1, target_idx + 4)
+            shot_tokens = spoken_texts[shot_index].split()
+            last_token = _normalize_align_token(shot_tokens[-1]) if shot_tokens else ""
+            text_matches = [
+                k for k in range(lo, hi + 1)
+                if last_token and _normalize_align_token(words[k - 1].get("word", "")) == last_token
+            ]
+            if text_matches:
+                best = min(text_matches, key=lambda k: abs(k - target_idx))
+            else:
+                best = max(
+                    range(lo, hi + 1),
+                    key=lambda k: (
+                        float(words[k]["start"]) - float(words[k - 1]["end"])
+                        - 0.06 * abs(k - target_idx)
+                    ),
+                )
+            boundary = (float(words[best - 1]["end"]) + float(words[best]["start"])) / 2
+        else:
+            boundary = audio_duration * cum / total_weight
+        boundaries.append(boundary)
+    boundaries.append(audio_duration)
+
+    # Enforce monotonic boundaries with a minimum slice length
+    min_len = 0.4
+    for i in range(1, len(boundaries)):
+        boundaries[i] = min(max(boundaries[i], boundaries[i - 1] + min_len), audio_duration)
+    boundaries[-1] = audio_duration
+
+    slices = []
+    for i, shot in enumerate(speech_shots):
+        start, end = boundaries[i], boundaries[i + 1]
+        if end - start < 0.2:
+            raise ValueError(
+                f"Voiceover too short to fit shot {shot.get('shot_number', i + 1)}: "
+                f"slice {start:.2f}-{end:.2f}s"
+            )
+        slices.append({"shot": shot, "start": round(start, 3), "end": round(end, 3)})
+    return slices, skipped
+
+
+def _slice_voiceover_segment(audio_path: str, start: float, end: float, output_path: str) -> str:
+    """Extract [start, end] of the master voiceover with decode-accurate seeking."""
+    if _nonempty(output_path):
+        return output_path
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", audio_path,
+        "-ss", f"{start:.3f}",
+        "-to", f"{end:.3f}",
+        "-c:a", "libmp3lame", "-b:a", "192k",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) -> str:
+    """Return a local path to the shot's reference frame, downloading remote URLs."""
+    local_ref = (shot.get("image_path") or shot.get("local_path") or "").strip()
+    if not local_ref:
+        local_url = (shot.get("local_url") or "").strip()
+        if local_url.startswith("/videos/"):
+            local_ref = os.path.join("output", local_url.replace("/videos/", "", 1))
+    if local_ref and os.path.exists(local_ref):
+        return local_ref
+
+    for key in ("image_url", "start_image_url"):
+        url = (shot.get(key) or "").strip()
+        if url.startswith(("http://", "https://")):
+            ext = os.path.splitext(url.split("?")[0])[1] or ".png"
+            ref_path = os.path.join(output_dir, f"avatar_ref_{index:02d}{ext}")
+            if _nonempty(ref_path):
+                return ref_path
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                with open(ref_path, "wb") as f:
+                    f.write(resp.content)
+            return ref_path
+    return ""
+
+
+def generate_sliced_avatar_clips(
+    shots: list,
+    audio_path: str,
+    words: list,
+    fal_key: str,
+    output_dir: str,
+    title_slug: str,
+    tier: str = "standard",
+    actor_description: str = "",
+    selected_actor_path: str = "",
+    log: Callable[[str], None] = print,
+) -> list:
+    """
+    Slice one master voiceover at phrase boundaries and generate a Kling Avatar
+    clip per shot from its own reference frame. The slices tile the voiceover,
+    so at assembly the master track plays uncut while video changes per shot.
+    """
+    audio_duration = _get_media_duration(audio_path)
+    slices, skipped = _align_shots_to_voiceover(shots, words, audio_duration)
+    for shot in skipped:
+        log(
+            f"  ⚠️ Shot {shot.get('shot_number', '?')} has no speech — skipped: "
+            "the sliced-avatar timeline is driven by the voiceover."
+        )
+    if not slices:
+        raise ValueError("Sliced-avatar mode requires at least one shot with speech")
+
+    fallback_actor_img = ""
+
+    def _resolve_image(sl, index):
+        nonlocal fallback_actor_img
+        ref = _storyboard_avatar_reference_image(sl["shot"], output_dir, index)
+        if ref:
+            return ref
+        if selected_actor_path and os.path.exists(selected_actor_path):
+            return selected_actor_path
+        if not fallback_actor_img:
+            fallback_actor_img = os.path.join(output_dir, f"{title_slug}_actor.png")
+            if not _nonempty(fallback_actor_img):
+                desc = actor_description or (
+                    "a young professional in their late 20s, wearing a casual modern outfit, clean background"
+                )
+                generate_actor_image(desc, fal_key, fallback_actor_img)
+        return fallback_actor_img
+
+    jobs = []
+    for index, sl in enumerate(slices, start=1):
+        slice_audio = os.path.join(output_dir, f"{title_slug}_slice_{index:02d}.mp3")
+        _slice_voiceover_segment(audio_path, sl["start"], sl["end"], slice_audio)
+        clip_path = os.path.join(output_dir, f"{title_slug}_avatar_{index:02d}.mp4")
+        image_path = _resolve_image(sl, index)
+        jobs.append({
+            "index": index,
+            "slice": sl,
+            "audio": slice_audio,
+            "image": image_path,
+            "clip_path": clip_path,
+        })
+        # Keep overlay/subtitle timing aligned with the real audio timeline
+        sl["shot"]["start"] = sl["start"]
+        sl["shot"]["end"] = sl["end"]
+
+    def _gen_clip(job):
+        if _nonempty(job["clip_path"]):
+            log(f"  Avatar shot {job['index']} cached.")
+            return job["clip_path"]
+        log(
+            f"  Generating avatar shot {job['index']}/{len(jobs)} "
+            f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
+        )
+        return generate_talking_head(job["image"], job["audio"], fal_key, job["clip_path"], tier=tier)
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_gen_clip, job): job for job in jobs}
+        for future in as_completed(futures):
+            job = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(f"shot {job['index']}: {e}")
+    if errors:
+        raise Exception("Sliced-avatar generation failed for " + "; ".join(errors))
+
+    return [
+        {
+            "path": job["clip_path"],
+            "duration": job["slice"]["end"] - job["slice"]["start"],
+            "shot": job["slice"]["shot"],
+            "audio_slice": job["audio"],
+            "start": job["slice"]["start"],
+            "end": job["slice"]["end"],
+        }
+        for job in jobs
+    ]
+
+
+def generate_storyboard_video(
+    script: dict,
+    config: dict,
+    output_dir: str,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Generate a storyboard-first short: Kling V3 shots + external voiceover."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    fal_key = config["fal_key"]
+    video_mode = (config.get("video_mode") or "storyboard_v3_standard").lower()
+    tier = storyboard_tier_from_video_mode(video_mode)
+    storyboard_label = storyboard_video_label(tier)
+    storyboard_family = storyboard_video_family(tier)
+    language = config.get("language") or script.get("language", "ru")
+    actor_gender = config.get("actor_gender", "female")
+    tts_provider = config.get("tts_provider", "auto")
+    elevenlabs_key = config.get("elevenlabs_key")
+    voice_id = config.get("voice_id", "21m00Tcm4TlvDq8ikWAM")
+    minimax_voice_id = _minimax_voice_for(
+        language,
+        actor_gender,
+        config.get("minimax_voice_id"),
+    )
+
+    title_slug = re.sub(r"[^a-z0-9]+", "_", script.get("title", "storyboard").lower())[:30] or "storyboard"
+    shots = normalize_storyboard_shots(script)
+    if not shots:
+        raise ValueError("Storyboard script has no shots")
+
+    full_narration = script.get("full_narration") or " ".join(
+        (shot.get("speech") or "").strip() for shot in shots if shot.get("speech")
+    )
+    if not full_narration.strip():
+        full_narration = " ".join((shot.get("overlay_text") or shot.get("scene") or "").strip() for shot in shots)
+
+    audio_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
+    srt_path = os.path.join(output_dir, f"{title_slug}_subs.ass")
+    final_path = os.path.join(output_dir, f"{title_slug}_storyboard_final.mp4")
+
+    log("[1/5] Generating voiceover for storyboard...")
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        voice_result = generate_voiceover_with_fallback(
+            full_narration,
+            audio_path,
+            provider=tts_provider,
+            fal_key=fal_key,
+            elevenlabs_key=elevenlabs_key,
+            elevenlabs_voice_id=voice_id,
+            minimax_voice_id=minimax_voice_id,
+            language=language,
+            actor_gender=actor_gender,
+            log=log,
+        )
+        tts_provider_used = voice_result["provider"]
+        _write_tts_metadata(audio_path, {
+            "signature": _tts_signature(full_narration, tts_provider, voice_id, minimax_voice_id, language, actor_gender),
+            "provider": voice_result["provider"],
+            "voice_id": voice_result["voice_id"],
+        })
+    else:
+        tts_provider_used = (_read_tts_metadata(audio_path) or {}).get("provider") or tts_provider
+        log("[1/5] Voiceover cached, skipping.")
+
+    voiceover_preparation = prepare_voiceover_for_video_generation(audio_path, log=log)
+    audio_path = voiceover_preparation["path"]
+
+    generation_mode = (config.get("storyboard_generation_mode") or "per_shot").lower()
+    if generation_mode not in ("per_shot", "multi_shot", "sliced_avatar"):
+        generation_mode = "per_shot"
+    if generation_mode == "multi_shot" and any(
+        shot.get("image_url") or shot.get("start_image_url") or shot.get("image_path") or shot.get("local_url")
+        for shot in shots
+    ):
+        generation_mode = "per_shot"
+        log("[2/5] Reference frames detected, using per-shot generation for frame control.")
+    if generation_mode == "multi_shot" and storyboard_family != "kling_v3":
+        generation_mode = "per_shot"
+        log(f"[2/5] {storyboard_label} does not support multi-shot payloads here, using per-shot generation.")
+
+    spoken_words = []
+    clips = []
+    if generation_mode == "sliced_avatar":
+        avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
+        if avatar_tier != tier:
+            log(f"[2/5] Sliced-avatar uses Kling Avatar, switching {storyboard_label} to Kling Avatar v2 Pro.")
+        log(f"[2/5] Generating sliced-avatar shots (Kling Avatar v2 {avatar_tier}, one master voiceover)...")
+        try:
+            spoken_words = transcribe_audio_for_subs(audio_path)
+        except Exception as e:
+            log(f"  ⚠️ Transcription failed, slicing voiceover proportionally: {e}")
+        clips = generate_sliced_avatar_clips(
+            shots,
+            audio_path,
+            spoken_words,
+            fal_key,
+            output_dir,
+            title_slug,
+            tier=avatar_tier,
+            actor_description=config.get("actor_description") or script.get("actor_description") or "",
+            selected_actor_path=config.get("selected_actor_path") or "",
+            log=log,
+        )
+    elif generation_mode == "multi_shot":
+        log(f"[2/5] Generating storyboard with {storyboard_label} ({generation_mode})...")
+        shot_chunks = split_storyboard_shots(shots, max_duration=15)
+        for index, chunk in enumerate(shot_chunks, start=1):
+            clip_path = os.path.join(output_dir, f"{title_slug}_chunk_{index:02d}.mp4")
+            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                log(f"  Chunk {index} cached.")
+            else:
+                log(f"  Generating chunk {index}/{len(shot_chunks)} ({len(chunk)} shots)...")
+                generate_storyboard_chunk_clip(chunk, fal_key, clip_path, tier=tier)
+            clips.append({
+                "path": clip_path,
+                "duration": sum(_shot_duration(shot) for shot in chunk),
+                "shots": chunk,
+            })
+    else:
+        log(f"[2/5] Generating storyboard with {storyboard_label} ({generation_mode})...")
+        for index, shot in enumerate(shots, start=1):
+            clip_path = os.path.join(output_dir, f"{title_slug}_shot_{index:02d}.mp4")
+            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                log(f"  Shot {index} cached.")
+            else:
+                log(f"  Generating shot {index}/{len(shots)}...")
+                generate_storyboard_shot_clip(shot, fal_key, clip_path, tier=tier)
+            clips.append({"path": clip_path, "duration": _shot_duration(shot), "shot": shot})
+
+    log("[3/5] Transcribing voiceover and generating subtitles...")
+    generate_storyboard_ass_subtitles(
+        audio_path, shots, srt_path, max_words=2, words=spoken_words or None
+    )
+
+    log("[4/5] Assembling storyboard edit...")
+    composite_storyboard_video(clips, audio_path, srt_path, final_path)
+
+    log("[5/5] Storyboard video complete.")
+
+    audio_duration = _get_media_duration(audio_path)
+    tts_cost_key = "voiceover_fal_minimax" if tts_provider_used == "fal_minimax" else "voiceover_elevenlabs"
+    tts_cost = round(len(full_narration) * (0.0001 if tts_provider_used == "fal_minimax" else 0.00003), 3)
+    if generation_mode == "sliced_avatar":
+        avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
+        video_cost_key = f"sliced_avatar_kling_{avatar_tier}"
+        video_cost = round(audio_duration * kling_avatar_cost_per_second(avatar_tier), 2)
+    else:
+        video_seconds = sum(_shot_duration(shot) for shot in shots)
+        video_cost_key = f"storyboard_{storyboard_family}_{tier}"
+        video_cost = round(video_seconds * storyboard_video_cost_per_second(tier), 2)
+    cost = {
+        tts_cost_key: tts_cost,
+        video_cost_key: video_cost,
+        "ffmpeg_compositing": 0.00,
+    }
+    cost["total"] = round(sum(cost.values()), 2)
+
+    return {
+        "video_path": final_path,
+        "video_filename": os.path.basename(final_path),
+        "srt_path": srt_path,
+        "actor_image": "",
+        "duration": audio_duration,
+        "cost_estimate": cost,
+        "tts_provider": tts_provider_used,
+        "broll_mode": "storyboard",
+        "head_source": "storyboard",
+        "head_template_id": None,
+        "lipsync_model": None,
+        "quality_status": "storyboard",
+        "quality_warnings": [],
+        "talking_head_quality": {},
+        "storyboard_shots": shots,
+        "storyboard_generation_mode": generation_mode,
+        "voiceover_preparation": voiceover_preparation,
+    }
+
 
 def generate_full_video(
     script: dict,
@@ -2522,6 +4009,9 @@ def generate_full_video(
         {"video_path": str, "srt_path": str, "actor_image": str, "cost_estimate": dict}
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    if is_storyboard_script(script) or (config.get("video_mode") or "").lower() in STORYBOARD_VIDEO_MODES:
+        return generate_storyboard_video(script, config, output_dir, log)
 
     fal_key = config["fal_key"]
     elevenlabs_key = config.get("elevenlabs_key")
@@ -2581,6 +4071,9 @@ def generate_full_video(
             audio_path,
             f"{audio_path}.meta.json",
             f"{audio_path}.fal_url.txt",
+            prepared_voiceover_path(audio_path),
+            f"{prepared_voiceover_path(audio_path)}.meta.json",
+            f"{prepared_voiceover_path(audio_path)}.fal_url.txt",
             talking_head,
             f"{talking_head}.fal_url.txt",
             talking_head_quality_path(talking_head),
@@ -2650,6 +4143,10 @@ def generate_full_video(
         log("[2/6] ✅ Using cached assets.")
 
     # ── Step 3: Generate talking head ──
+    voiceover_preparation = prepare_voiceover_for_video_generation(audio_path, log=log)
+    source_audio_path = audio_path
+    audio_path = voiceover_preparation["path"]
+
     video_mode = (config.get("video_mode") or "standard").lower()
     if video_mode not in ("lowcost", "standard", "premium"):
         video_mode = "standard"
@@ -2670,6 +4167,9 @@ def generate_full_video(
         payload = {"video_mode": video_mode, "head_source": "generated"}
         if not use_reusable_head and video_mode in ("standard", "premium"):
             payload["kling_input"] = "vertical_9x16_v1"
+        payload["voiceover_audio_path"] = audio_path
+        payload["source_audio_path"] = source_audio_path
+        payload["voiceover_preparation_status"] = voiceover_preparation.get("status", "")
         if meta:
             payload.update(meta)
         with open(talking_head_meta_path, "w", encoding="utf-8") as f:
@@ -2681,6 +4181,9 @@ def generate_full_video(
         "reusable_head_path": reusable_head_path or "",
         "reusable_lipsync_model": reusable_lipsync_model if use_reusable_head else "",
         "kling_input": "vertical_9x16_v1" if (not use_reusable_head and video_mode in ("standard", "premium")) else "",
+        "voiceover_audio_path": audio_path,
+        "source_audio_path": source_audio_path,
+        "voiceover_preparation_status": voiceover_preparation.get("status", ""),
     }
     current_head_meta = _read_talking_head_meta()
     if _exists(talking_head) and (
@@ -2689,6 +4192,9 @@ def generate_full_video(
         or current_head_meta.get("reusable_head_path", "") != expected_head_meta["reusable_head_path"]
         or current_head_meta.get("reusable_lipsync_model", "") != expected_head_meta["reusable_lipsync_model"]
         or current_head_meta.get("kling_input", "") != expected_head_meta["kling_input"]
+        or current_head_meta.get("voiceover_audio_path", "") != expected_head_meta["voiceover_audio_path"]
+        or current_head_meta.get("source_audio_path", "") != expected_head_meta["source_audio_path"]
+        or current_head_meta.get("voiceover_preparation_status", "") != expected_head_meta["voiceover_preparation_status"]
     ):
         log("[3/6] Talking-head source changed; regenerating voice-driven talking head.")
         for stale_path in (
@@ -2809,12 +4315,26 @@ def generate_full_video(
 
     # ── Step 5: Generate subtitles (from actual audio, not script text) ──
     log("[5/6] Transcribing audio and generating TikTok-style subtitles...")
-    generate_tiktok_subs(audio_path, srt_path, max_words=2)
+    try:
+        spoken_words = transcribe_audio_for_subs(audio_path)
+    except Exception as e:
+        log(f"  ⚠️ Transcription failed, subtitles empty and jump-cuts fall back to fixed grid: {e}")
+        spoken_words = []
+    generate_tiktok_subs(audio_path, srt_path, max_words=2, words=spoken_words)
 
     # ── Step 6: Composite final video ──
     log("[6/6] Compositing final video with FFmpeg...")
     hook_text = script.get("hook_text", "")
-    composite_video(talking_head, broll_clips, srt_path, hook_text, final_path)
+    punch_in_cuts = bool(config.get("punch_in_cuts", True))
+    composite_video(
+        talking_head,
+        broll_clips,
+        srt_path,
+        hook_text,
+        final_path,
+        jump_cut_words=spoken_words,
+        punch_in=punch_in_cuts,
+    )
 
     log("🎉 Video generation complete!")
 
@@ -2876,4 +4396,5 @@ def generate_full_video(
         "quality_status": talking_head_quality.get("status", "unknown"),
         "quality_warnings": quality_warnings,
         "talking_head_quality": talking_head_quality,
+        "voiceover_preparation": voiceover_preparation,
     }

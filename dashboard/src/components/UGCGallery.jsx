@@ -22,6 +22,7 @@ const LIPSYNC_MODEL_OPTIONS = [
     label: 'Sync 3',
     quality: 'Лучшее качество',
     price: '~$8 / мин',
+    pricePerMinute: 8,
     description: 'Для финального ролика, когда губы заметно не попадают в озвучку.',
   },
   {
@@ -29,6 +30,7 @@ const LIPSYNC_MODEL_OPTIONS = [
     label: 'Lipsync 2 Pro',
     quality: 'Высокое качество',
     price: '~$5 / мин',
+    pricePerMinute: 5,
     description: 'Понятный баланс качества и стоимости для важных тестов.',
   },
   {
@@ -36,9 +38,12 @@ const LIPSYNC_MODEL_OPTIONS = [
     label: 'Lipsync 2',
     quality: 'Тестовый вариант',
     price: '~$3 / мин',
+    pricePerMinute: 3,
     description: 'Дешевле, подходит для быстрых проверок перед финальной версией.',
   },
 ];
+
+const mediaUrl = (url) => getApiUrl(url || '');
 
 export default function UGCGallery({ falKey, authToken, usePlatformKeys = false }) {
   const [tab, setTab] = useState('videos');
@@ -211,19 +216,18 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
 
         if (data.status === 'completed') {
           clearInterval(interval);
-          setLipSyncJobs((prev) => ({ ...prev, [cardId]: { status: 'completed', message: 'Updated' } }));
+          setLipSyncJobs((prev) => ({
+            ...prev,
+            [cardId]: {
+              status: 'completed',
+              message: 'Новая версия сохранена. Предыдущая версия осталась в истории.',
+            },
+          }));
           const gallery = await loadGallery({ showLoading: false });
           setSelectedVideo((prev) => {
             if (!prev || prev.video_id !== cardId) return prev;
             return gallery.videos.find((video) => video.video_id === cardId) || prev;
           });
-          setTimeout(() => {
-            setLipSyncJobs((prev) => {
-              const next = { ...prev };
-              delete next[cardId];
-              return next;
-            });
-          }, 2500);
         } else if (data.status === 'failed') {
           clearInterval(interval);
           setLipSyncJobs((prev) => ({ ...prev, [cardId]: { status: 'failed', message: lastLog || 'Failed' } }));
@@ -326,7 +330,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
   return (
     <div className="w-full max-w-full space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-lg font-bold text-zinc-200">UGC-галерея</h2>
           <p className="text-xs text-zinc-500">{videos.length} видео · {avatars.length} аватаров</p>
@@ -335,17 +339,17 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
           href={getApiUrl('/gallery')}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-xs text-violet-400 hover:text-violet-300 flex items-center gap-1"
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-2 text-xs text-violet-400 transition-colors hover:bg-violet-500/10 hover:text-violet-300"
         >
           <ExternalLink size={12} /> Публичная галерея
         </a>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 bg-white/5 p-1 rounded-lg w-fit">
+      <div className="flex w-full gap-1 rounded-lg bg-white/5 p-1 sm:w-fit">
         <button
           onClick={() => setTab('videos')}
-          className={`px-4 py-1.5 rounded-md text-xs font-medium transition-all ${
+          className={`flex-1 rounded-md px-4 py-2.5 text-xs font-medium transition-all sm:flex-none ${
             tab === 'videos' ? 'bg-violet-500/20 text-violet-300' : 'text-zinc-400 hover:text-white'
           }`}
         >
@@ -353,7 +357,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
         </button>
         <button
           onClick={() => setTab('avatars')}
-          className={`px-4 py-1.5 rounded-md text-xs font-medium transition-all ${
+          className={`flex-1 rounded-md px-4 py-2.5 text-xs font-medium transition-all sm:flex-none ${
             tab === 'avatars' ? 'bg-violet-500/20 text-violet-300' : 'text-zinc-400 hover:text-white'
           }`}
         >
@@ -369,7 +373,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
             <p className="text-sm text-zinc-500">Пока нет роликов. Сгенерируй первый в AI Shorts.</p>
           </div>
         ) : (
-          <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
             {videos.map((video) => (
               <VideoCard
                 key={video.video_id}
@@ -393,7 +397,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
               </p>
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(420px,1.1fr)]">
+            <div className="grid gap-4 lg:grid-cols-[minmax(280px,0.9fr)_minmax(320px,1.1fr)]">
               <div className="rounded-2xl border border-white/10 bg-white/5 p-5 space-y-4">
                 <div className="flex items-start gap-3">
                   <div className="mt-0.5 rounded-lg bg-blue-500/15 p-2 text-blue-300">
@@ -501,12 +505,14 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
                     <><User size={16} /> Сгенерировать 3 аватара (~$0.06)</>
                   )}
                 </button>
+                {!falKey && (
+                  <p className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                    Генерация требует fal.ai API-ключ. Загрузка фото работает без него.
+                  </p>
+                )}
               </div>
             </div>
 
-            {!falKey && (
-              <p className="text-xs text-red-300">Для генерации нужен fal.ai API-ключ в настройках. Загрузка фото работает без него.</p>
-            )}
             {avatarStatus && (
               <p className="rounded-lg border border-green-500/20 bg-green-500/10 px-3 py-2 text-xs text-green-200">{avatarStatus}</p>
             )}
@@ -518,7 +524,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
           {newAvatarUrls.length > 0 && (
             <section className="space-y-2">
               <h3 className="text-xs font-semibold uppercase tracking-wide text-violet-300">Новые аватары</h3>
-              <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-3">
                 {newAvatarUrls.map((url, i) => (
                   <AvatarCard
                     key={`${url}-${i}`}
@@ -539,7 +545,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
           ) : (
             <section className="space-y-2">
               <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Сохраненные аватары</h3>
-              <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-3">
                 {avatars.map((avatar, i) => (
                   <AvatarCard key={avatar.key || i} avatar={avatar} copied={copied} onCopy={handleCopy} />
                 ))}
@@ -572,16 +578,18 @@ function AvatarCard({ avatar, copied, onCopy }) {
   return (
     <div className="group rounded-xl overflow-hidden border border-white/10 bg-white/5 hover:border-white/20 transition-all">
       <div className="aspect-[3/4] bg-black">
-        <img src={avatar.url} alt="Аватар" className="w-full h-full object-cover" />
+        <img src={mediaUrl(avatar.url)} alt="Аватар" className="w-full h-full object-cover" />
       </div>
       <div className="p-2 space-y-1">
         {avatar.description ? (
           <div className="relative pr-4">
             <p className="text-[9px] text-zinc-400 line-clamp-2">{avatar.description}</p>
             <button
+              type="button"
               onClick={() => onCopy(avatar.description, `avatar-${avatar.key}`)}
               className="absolute top-0 right-0 p-0.5 text-zinc-600 hover:text-zinc-300"
               title="Скопировать prompt"
+              aria-label="Скопировать prompt аватара"
             >
               {copied === `avatar-${avatar.key}` ? <Check size={9} /> : <Copy size={9} />}
             </button>
@@ -590,7 +598,7 @@ function AvatarCard({ avatar, copied, onCopy }) {
           <p className="text-[9px] text-zinc-600 italic">Нет описания</p>
         )}
         <a
-          href={avatar.url}
+          href={mediaUrl(avatar.url)}
           download
           className="block text-center text-[9px] bg-white/5 hover:bg-white/10 text-zinc-400 py-1 rounded-md transition-colors"
         >
@@ -635,8 +643,8 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
       >
         <video
           ref={videoRef}
-          src={video.video_url}
-          poster={video.actor_url}
+          src={mediaUrl(video.video_url)}
+          poster={mediaUrl(video.actor_url)}
           muted
           playsInline
           preload="metadata"
@@ -698,10 +706,22 @@ function VideoActionModal({
   const isSavingHeadTemplate = headTemplateJob?.status === 'processing';
   const isLocalSaasVideo = typeof video.video_url === 'string' && video.video_url.includes('/videos/saas_');
   const selectedModel = LIPSYNC_MODEL_OPTIONS.find((option) => option.id === lipSyncModel) || LIPSYNC_MODEL_OPTIONS[0];
+  const selectedLipSyncEstimate = ((Number(video.duration) || 0) / 60) * selectedModel.pricePerMinute;
+  const versions = Array.isArray(video.versions) ? video.versions.filter((item) => item?.video_url) : [];
+  const formatVersionDate = (value) => {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('ru-RU', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
 
   return (
     <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm p-4 flex items-center justify-center">
-      <div className="w-full max-w-6xl max-h-[92vh] overflow-hidden rounded-2xl border border-white/10 bg-zinc-950 shadow-2xl">
+      <div className="flex w-full max-w-5xl max-h-[92vh] flex-col overflow-hidden rounded-2xl border border-white/10 bg-zinc-950 shadow-2xl">
         <div className="flex items-start justify-between gap-4 border-b border-white/10 px-5 py-4">
           <div>
             <p className="text-[11px] uppercase tracking-wide text-violet-300">Готовый ролик</p>
@@ -713,19 +733,19 @@ function VideoActionModal({
           <button
             type="button"
             onClick={onClose}
-            className="p-2 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-white/10 transition-colors"
+            className="flex h-10 w-10 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
             aria-label="Close"
           >
             <X size={18} />
           </button>
         </div>
 
-        <div className="grid gap-5 p-5 lg:grid-cols-[minmax(260px,360px),1fr] overflow-y-auto max-h-[calc(92vh-82px)]">
+        <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto custom-scrollbar p-4 sm:p-5 lg:grid-cols-[minmax(260px,340px),1fr]">
           <div className="space-y-3">
             <div className="rounded-2xl overflow-hidden bg-black border border-white/10">
               <video
-                src={video.video_url}
-                poster={video.actor_url}
+                src={mediaUrl(video.video_url)}
+                poster={mediaUrl(video.actor_url)}
                 controls
                 playsInline
                 className="w-full aspect-[9/16] object-contain bg-black"
@@ -733,7 +753,7 @@ function VideoActionModal({
             </div>
             <div className="grid grid-cols-2 gap-2">
               <a
-                href={video.video_url}
+                href={mediaUrl(video.video_url)}
                 download
                 className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-400 transition-colors"
               >
@@ -748,6 +768,60 @@ function VideoActionModal({
                 <ExternalLink size={15} /> Открыть
               </a>
             </div>
+            {versions.length > 0 && (
+              <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-semibold text-zinc-200">Версии видео</h4>
+                  <span className="text-[10px] text-zinc-500">{versions.length}</span>
+                </div>
+                <div className="space-y-2">
+                  {versions.map((version, index) => (
+                    <div
+                      key={`${version.id || index}-${version.video_url}`}
+                      className={`rounded-xl border px-3 py-2 ${
+                        version.current
+                          ? 'border-emerald-500/30 bg-emerald-500/10'
+                          : 'border-white/10 bg-black/20'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-semibold text-zinc-100">
+                            {version.id || `v${index + 1}`} · {version.label || 'Версия'}
+                          </p>
+                          <p className="mt-0.5 text-[10px] text-zinc-500">
+                            {formatVersionDate(version.created_at)}
+                            {version.lipsync_cost_estimate != null ? ` · ~$${Number(version.lipsync_cost_estimate).toFixed(2)}` : ''}
+                          </p>
+                        </div>
+                        {version.current && (
+                          <span className="shrink-0 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[9px] font-semibold text-emerald-200">
+                            Текущая
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <a
+                          href={mediaUrl(version.video_url)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center justify-center gap-1 rounded-lg bg-white/5 px-2 py-2.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10"
+                        >
+                          <ExternalLink size={11} /> Смотреть
+                        </a>
+                        <a
+                          href={mediaUrl(version.video_url)}
+                          download
+                          className="inline-flex items-center justify-center gap-1 rounded-lg bg-white/5 px-2 py-2.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10"
+                        >
+                          <Download size={11} /> Скачать
+                        </a>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
             <button
               type="button"
               onClick={() => onSaveHeadTemplate(video)}
@@ -792,7 +866,7 @@ function VideoActionModal({
                   <button
                     type="button"
                     onClick={() => onCopy(`${caption}\n${hashtags}`, `modal-caption-${video.video_id}`)}
-                    className="inline-flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-200"
+                    className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-xs text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200"
                   >
                     {copied === `modal-caption-${video.video_id}` ? <Check size={13} /> : <Copy size={13} />}
                     Копировать
@@ -807,7 +881,7 @@ function VideoActionModal({
               )}
             </section>
 
-            <section className="space-y-3 rounded-2xl border border-violet-500/20 bg-violet-500/5 p-4">
+            <section className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.035] p-4">
               <div className="flex items-start gap-3">
                 <div className="mt-0.5 rounded-lg bg-violet-500/20 p-2 text-violet-300">
                   <Wand2 size={17} />
@@ -821,8 +895,13 @@ function VideoActionModal({
               </div>
 
               <div className="space-y-2">
-                <p className="text-xs font-semibold text-zinc-400">Повторная синхронизация губ</p>
-                <div className="grid gap-2">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                  <p className="text-xs font-semibold text-zinc-400">Повторная синхронизация губ</p>
+                  <p className="text-[11px] text-zinc-500">
+                    Примерно ${selectedLipSyncEstimate.toFixed(2)} для этого ролика · {selectedModel.price}
+                  </p>
+                </div>
+                <div className="grid gap-2 md:grid-cols-3">
                   {LIPSYNC_MODEL_OPTIONS.map((option) => (
                     <button
                       key={option.id}
@@ -873,7 +952,9 @@ function VideoActionModal({
               </button>
 
               {!falKey && (
-                <p className="text-xs text-red-300">Нужен fal.ai API key в настройках приложения.</p>
+                <p className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  Нужен fal.ai API key в настройках приложения.
+                </p>
               )}
               {lipSyncJob?.status === 'processing' && lipSyncJob.message && (
                 <p className="text-xs text-violet-200">{lipSyncJob.message}</p>

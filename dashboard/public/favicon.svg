@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">ИИ Фабрика</title>
+  <desc id="desc">Минимальный знак коротких видео: playhead и одна линия-конвейер.</desc>
+  <rect width="64" height="64" rx="14" fill="#0b1220"/>
+  <path class="playhead" d="M26 18 46 32 26 46V18Z" fill="#f8fafc"/>
+  <path class="conveyor" d="M18 50h28" fill="none" stroke="#22d3ee" stroke-width="5" stroke-linecap="round"/>
+</svg>

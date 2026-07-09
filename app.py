@@ -11,8 +11,11 @@ import datetime
 import base64
 import hashlib
 import hmac
+import io
 import secrets
 import sqlite3
+import tempfile
+import zipfile
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
@@ -20,7 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
@@ -32,6 +35,7 @@ OUTPUT_DIR = "output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 AUTH_DB_PATH = os.environ.get("OPENSHORTS_DB_PATH", os.path.join(OUTPUT_DIR, "openshorts.db"))
+ENV_PATH = os.environ.get("OPENSHORTS_ENV_PATH", ".env")
 KEY_VAULT_SECRET = os.environ.get("OPENSHORTS_KEY_VAULT_SECRET") or os.environ.get("SECRET_KEY") or "openshorts-dev-key-vault-secret"
 
 # Configuration
@@ -70,9 +74,17 @@ def _utc_now() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _auth_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(AUTH_DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn = sqlite3.connect(AUTH_DB_PATH, factory=ClosingSQLiteConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -110,6 +122,25 @@ def init_auth_db() -> None:
                 encrypted_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, provider),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_profiles (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                topic TEXT NOT NULL DEFAULT '',
+                script_mode TEXT NOT NULL DEFAULT 'ai',
+                script_format TEXT NOT NULL DEFAULT 'ugc',
+                style TEXT NOT NULL DEFAULT 'ugc',
+                language TEXT NOT NULL DEFAULT 'ru',
+                actor_gender TEXT NOT NULL DEFAULT 'female',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
@@ -325,6 +356,93 @@ def list_user_api_key_status(user_id: str) -> dict:
         if row["provider"] in status:
             status[row["provider"]] = {"has_key": True, "updated_at": row["updated_at"]}
     return status
+
+
+def _public_business_profile(row) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "topic": row["topic"],
+        "script_mode": row["script_mode"],
+        "script_format": row["script_format"],
+        "style": row["style"],
+        "language": row["language"],
+        "actor_gender": row["actor_gender"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def upsert_business_profile(user_id: str, profile: dict) -> dict:
+    name = (profile.get("name") or "").strip()
+    description = (profile.get("description") or "").strip()
+    if not name:
+        raise ValueError("Business name is required")
+    if not description:
+        raise ValueError("Business description is required")
+
+    profile_id = (profile.get("id") or "").strip() or str(uuid.uuid4())
+    now = _utc_now()
+    with _auth_db() as conn:
+        existing = conn.execute(
+            "SELECT created_at FROM business_profiles WHERE id = ? AND user_id = ?",
+            (profile_id, user_id),
+        ).fetchone()
+        created_at = existing["created_at"] if existing else now
+        conn.execute(
+            """
+            INSERT INTO business_profiles (
+                id, user_id, name, description, topic, script_mode, script_format,
+                style, language, actor_gender, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                topic = excluded.topic,
+                script_mode = excluded.script_mode,
+                script_format = excluded.script_format,
+                style = excluded.style,
+                language = excluded.language,
+                actor_gender = excluded.actor_gender,
+                updated_at = excluded.updated_at
+            """,
+            (
+                profile_id,
+                user_id,
+                name,
+                description,
+                (profile.get("topic") or "").strip(),
+                profile.get("script_mode") or "ai",
+                profile.get("script_format") or "ugc",
+                profile.get("style") or "ugc",
+                profile.get("language") or "ru",
+                profile.get("actor_gender") or "female",
+                created_at,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM business_profiles WHERE id = ? AND user_id = ?",
+            (profile_id, user_id),
+        ).fetchone()
+    return _public_business_profile(row)
+
+
+def list_business_profiles(user_id: str) -> List[dict]:
+    with _auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM business_profiles
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [_public_business_profile(row) for row in rows]
 
 
 def _metadata_json_paths_for_legacy_claim() -> List[str]:
@@ -582,9 +700,228 @@ class ApiKeySaveRequest(BaseModel):
     api_key: str
 
 
+class BusinessProfileRequest(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: str
+    topic: str = ""
+    script_mode: str = "ai"
+    script_format: str = "ugc"
+    style: str = "ugc"
+    language: str = "ru"
+    actor_gender: str = "female"
+
+
 class AdminSubscriptionRequest(BaseModel):
     user_id: str
     status: str
+
+
+BACKUP_FORMAT = "openshorts-backup"
+BACKUP_VERSION = 1
+BACKUP_ALLOWED_ROOTS = {"output", "uploads", "auth", ".env", "openshorts-backup.json"}
+
+
+def _is_path_inside(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(parent)]) == os.path.abspath(parent)
+    except ValueError:
+        return False
+
+
+def _checkpoint_auth_db() -> None:
+    if not os.path.exists(AUTH_DB_PATH):
+        return
+    conn = _auth_db()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+
+def _write_tree_to_zip(zf: zipfile.ZipFile, source_dir: str, archive_root: str) -> int:
+    if not os.path.isdir(source_dir):
+        return 0
+
+    written = 0
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if d not in {"__pycache__", ".git"}]
+        for filename in files:
+            src = os.path.join(root, filename)
+            rel = os.path.relpath(src, source_dir).replace(os.sep, "/")
+            zf.write(src, f"{archive_root}/{rel}")
+            written += 1
+    return written
+
+
+def _backup_env_contents() -> str:
+    env_path = ENV_PATH
+    content = ""
+    if os.path.isfile(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    has_vault_secret = "OPENSHORTS_KEY_VAULT_SECRET=" in content or "SECRET_KEY=" in content
+    if not has_vault_secret:
+        separator = "" if not content or content.endswith("\n") else "\n"
+        content = f"{content}{separator}OPENSHORTS_KEY_VAULT_SECRET={KEY_VAULT_SECRET}\n"
+    return content
+
+
+def create_backup_archive(user_id: str) -> bytes:
+    _checkpoint_auth_db()
+
+    buf = io.BytesIO()
+    included = []
+    file_count = 0
+
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        output_count = _write_tree_to_zip(zf, OUTPUT_DIR, "output")
+        if output_count:
+            included.append("output")
+            file_count += output_count
+
+        upload_count = _write_tree_to_zip(zf, UPLOAD_DIR, "uploads")
+        if upload_count:
+            included.append("uploads")
+            file_count += upload_count
+
+        auth_db_abs = os.path.abspath(AUTH_DB_PATH)
+        output_abs = os.path.abspath(OUTPUT_DIR)
+        if os.path.isfile(auth_db_abs) and not _is_path_inside(auth_db_abs, output_abs):
+            zf.write(auth_db_abs, "auth/openshorts.db")
+            included.append("auth")
+            file_count += 1
+
+        zf.writestr(".env", _backup_env_contents())
+        included.append(".env")
+        file_count += 1
+
+        manifest = {
+            "format": BACKUP_FORMAT,
+            "version": BACKUP_VERSION,
+            "created_at": _utc_now(),
+            "owner_user_id": user_id,
+            "included_roots": sorted(set(included)),
+            "file_count": file_count,
+            "contains_sensitive_data": True,
+            "note": "Archive contains local videos, avatars, encrypted API keys and the vault secret needed to decrypt them.",
+        }
+        zf.writestr("openshorts-backup.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    return buf.getvalue()
+
+
+def _validate_backup_member_name(name: str) -> str:
+    normalized = (name or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    if not parts:
+        raise ValueError("Backup archive contains an empty path")
+    if normalized.startswith("/") or ".." in parts or ":" in parts[0]:
+        raise ValueError(f"Unsafe backup path: {name}")
+
+    top = parts[0]
+    if top not in BACKUP_ALLOWED_ROOTS:
+        raise ValueError(f"Unsupported backup path: {name}")
+    if top in {".env", "openshorts-backup.json"} and len(parts) != 1:
+        raise ValueError(f"Unsupported nested backup path: {name}")
+    return "/".join(parts)
+
+
+def _copy_file_atomic(src: str, dst: str) -> None:
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    tmp_dst = f"{dst}.importing-{uuid.uuid4().hex}"
+    shutil.copy2(src, tmp_dst)
+    os.replace(tmp_dst, dst)
+
+
+def _merge_tree(src_dir: str, dst_dir: str) -> int:
+    if not os.path.isdir(src_dir):
+        return 0
+
+    copied = 0
+    for root, dirs, files in os.walk(src_dir):
+        rel_root = os.path.relpath(root, src_dir)
+        target_root = dst_dir if rel_root == "." else os.path.join(dst_dir, rel_root)
+        os.makedirs(target_root, exist_ok=True)
+        for dirname in dirs:
+            os.makedirs(os.path.join(target_root, dirname), exist_ok=True)
+        for filename in files:
+            _copy_file_atomic(os.path.join(root, filename), os.path.join(target_root, filename))
+            copied += 1
+    return copied
+
+
+def restore_backup_archive(archive_bytes: bytes) -> dict:
+    restored_roots = set()
+    restored_files = 0
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(archive_bytes), "r")
+    except zipfile.BadZipFile as e:
+        raise ValueError("Backup archive is not a valid ZIP file") from e
+
+    with zf:
+        names = zf.namelist()
+        if "openshorts-backup.json" not in names:
+            raise ValueError("Backup manifest is missing")
+
+        try:
+            manifest = json.loads(zf.read("openshorts-backup.json").decode("utf-8"))
+        except Exception as e:
+            raise ValueError("Backup manifest is invalid") from e
+        if manifest.get("format") != BACKUP_FORMAT:
+            raise ValueError("Unsupported backup format")
+
+        for info in zf.infolist():
+            _validate_backup_member_name(info.filename)
+
+        with tempfile.TemporaryDirectory(prefix="openshorts-import-") as tmp_dir:
+            for info in zf.infolist():
+                safe_name = _validate_backup_member_name(info.filename)
+                if info.is_dir() or safe_name == "openshorts-backup.json":
+                    continue
+
+                dst = os.path.join(tmp_dir, *safe_name.split("/"))
+                os.makedirs(os.path.dirname(dst) or tmp_dir, exist_ok=True)
+                with zf.open(info, "r") as src, open(dst, "wb") as out:
+                    shutil.copyfileobj(src, out)
+
+            output_count = _merge_tree(os.path.join(tmp_dir, "output"), OUTPUT_DIR)
+            if output_count:
+                restored_roots.add("output")
+                restored_files += output_count
+
+            upload_count = _merge_tree(os.path.join(tmp_dir, "uploads"), UPLOAD_DIR)
+            if upload_count:
+                restored_roots.add("uploads")
+                restored_files += upload_count
+
+            env_src = os.path.join(tmp_dir, ".env")
+            if os.path.isfile(env_src):
+                if os.path.exists(ENV_PATH):
+                    backup_name = f"{ENV_PATH}.before-import-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                    _copy_file_atomic(ENV_PATH, backup_name)
+                _copy_file_atomic(env_src, ENV_PATH)
+                restored_roots.add(".env")
+                restored_files += 1
+
+            auth_db_src = os.path.join(tmp_dir, "auth", "openshorts.db")
+            if os.path.isfile(auth_db_src):
+                _copy_file_atomic(auth_db_src, AUTH_DB_PATH)
+                restored_roots.add("auth")
+                restored_files += 1
+
+    init_auth_db()
+    return {
+        "restored_roots": sorted(restored_roots),
+        "restored_files": restored_files,
+        "requires_restart": ".env" in restored_roots,
+        "message": "Backup restored. Restart the backend if API keys do not decrypt until the vault secret is reloaded.",
+    }
 
 
 @app.post("/api/auth/register")
@@ -635,10 +972,55 @@ async def user_api_keys(authorization: Optional[str] = Header(None, alias="Autho
     return {"api_keys": list_user_api_key_status(user["id"])}
 
 
+@app.get("/api/user/business-profiles")
+async def user_business_profiles(authorization: Optional[str] = Header(None, alias="Authorization")):
+    user = require_user_from_authorization(authorization)
+    return {"profiles": list_business_profiles(user["id"])}
+
+
+@app.post("/api/user/business-profiles")
+async def user_save_business_profile(
+    req: BusinessProfileRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    try:
+        profile = upsert_business_profile(user["id"], req.dict())
+        return {"profile": profile, "profiles": list_business_profiles(user["id"])}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/api/user/claim-legacy-assets")
 async def user_claim_legacy_assets(authorization: Optional[str] = Header(None, alias="Authorization")):
     user = require_user_from_authorization(authorization)
     return {"claimed": claim_legacy_assets_for_user(user["id"])}
+
+
+@app.get("/api/backup/export")
+async def export_backup(authorization: Optional[str] = Header(None, alias="Authorization")):
+    user = require_user_from_authorization(authorization)
+    archive = create_backup_archive(user["id"])
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"openshorts-backup-{stamp}.zip"
+    return Response(
+        content=archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/backup/import")
+async def import_backup(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    require_user_from_authorization(authorization)
+    archive = await file.read()
+    try:
+        return restore_backup_archive(archive)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/admin/subscription")
@@ -666,6 +1048,111 @@ def _local_video_url(job_dir_name: str, file_path: str) -> str:
     return f"/videos/{job_dir_name}/{os.path.basename(file_path)}"
 
 
+def _strip_url_cache_bust(video_url: str) -> str:
+    return urlparse(video_url or "").path or video_url or ""
+
+
+def _video_version_index(version_id: str) -> Optional[int]:
+    text = str(version_id or "").strip().lower()
+    if len(text) < 2 or not text.startswith("v") or not text[1:].isdigit():
+        return None
+    return int(text[1:])
+
+
+def _lipsync_version_label(model: str) -> str:
+    labels = {
+        "sync-3": "Sync 3",
+        "lipsync-2-pro": "Lipsync 2 Pro",
+        "lipsync-2": "Lipsync 2",
+    }
+    return labels.get(model or "", model or "Lip-sync")
+
+
+def _with_default_saas_video_versions(meta: Optional[dict]) -> Optional[dict]:
+    if not meta or meta.get("versions") or not meta.get("video_url"):
+        return meta
+    next_meta = dict(meta)
+    next_meta["versions"] = [{
+        "id": "v001",
+        "label": "Original" if not next_meta.get("lipsync_model") else _lipsync_version_label(next_meta.get("lipsync_model")),
+        "video_url": _strip_url_cache_bust(next_meta.get("video_url", "")),
+        "created_at": next_meta.get("created_at") or _utc_now(),
+        "current": True,
+        "lipsync_model": next_meta.get("lipsync_model", ""),
+        "lipsync_sync_mode": next_meta.get("lipsync_sync_mode", ""),
+    }]
+    return next_meta
+
+
+def _build_saas_video_versions(
+    previous_meta: dict,
+    new_video_url: str,
+    lipsync_model: str,
+    sync_mode: str,
+    lipsync_cost: Optional[float],
+    created_at: Optional[str] = None,
+) -> List[dict]:
+    created_at = created_at or _utc_now()
+    previous_meta = previous_meta or {}
+    versions = []
+
+    for item in previous_meta.get("versions") or []:
+        if not isinstance(item, dict) or not item.get("video_url"):
+            continue
+        version = dict(item)
+        version["video_url"] = _strip_url_cache_bust(version["video_url"])
+        version["current"] = False
+        versions.append(version)
+
+    previous_current_url = _strip_url_cache_bust(previous_meta.get("video_url", ""))
+    if previous_current_url and not any(v.get("video_url") == previous_current_url for v in versions):
+        versions.append({
+            "id": "v001",
+            "label": "Original" if not previous_meta.get("lipsync_model") else _lipsync_version_label(previous_meta.get("lipsync_model")),
+            "video_url": previous_current_url,
+            "created_at": previous_meta.get("created_at") or created_at,
+            "current": False,
+            "lipsync_model": previous_meta.get("lipsync_model", ""),
+            "lipsync_sync_mode": previous_meta.get("lipsync_sync_mode", ""),
+        })
+
+    indexes = [
+        index
+        for index in (_video_version_index(item.get("id")) for item in versions)
+        if index is not None
+    ]
+    next_index = max(indexes or [len(versions)]) + 1
+    new_version = {
+        "id": f"v{next_index:03d}",
+        "label": _lipsync_version_label(lipsync_model),
+        "video_url": _strip_url_cache_bust(new_video_url),
+        "created_at": created_at,
+        "current": True,
+        "lipsync_model": lipsync_model,
+        "lipsync_sync_mode": sync_mode,
+    }
+    if lipsync_cost is not None:
+        new_version["lipsync_cost_estimate"] = lipsync_cost
+    versions.append(new_version)
+    return versions
+
+
+def _add_saas_lipsync_cost(previous_cost: dict, model: str, lipsync_cost: Optional[float], version_id: str) -> dict:
+    cost = dict(previous_cost) if isinstance(previous_cost, dict) else {}
+    if lipsync_cost is None:
+        return cost
+
+    safe_model = "".join(ch if ch.isalnum() else "_" for ch in (model or "lipsync").lower()).strip("_") or "lipsync"
+    safe_version = "".join(ch if ch.isalnum() else "_" for ch in (version_id or "").lower()).strip("_")
+    cost_key = f"lipsync_{safe_version}_{safe_model}" if safe_version else f"lipsync_{safe_model}"
+    cost[cost_key] = lipsync_cost
+    cost["total"] = round(
+        sum(v for k, v in cost.items() if k != "total" and isinstance(v, (int, float))),
+        2,
+    )
+    return cost
+
+
 def _job_id_from_saas_video_url(video_url: str) -> Optional[str]:
     if not video_url:
         return None
@@ -690,7 +1177,7 @@ def _read_local_gallery_meta(job_dir: str) -> Optional[dict]:
         return None
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _with_default_saas_video_versions(json.load(f))
     except Exception:
         return None
 
@@ -2450,6 +2937,7 @@ class SaaSAnalyzeRequest(BaseModel):
     description: Optional[str] = None  # Manual product/business description
     topic: Optional[str] = None
     script_mode: str = "ai"  # "ai" or "custom"
+    script_format: str = "ugc"  # "ugc" or "storyboard_v3"
     custom_script: Optional[str] = None
     num_scripts: int = 3
     style: str = "ugc"
@@ -2508,6 +2996,7 @@ async def saasshorts_analyze(
                         req.language,
                         req.actor_gender,
                         topic=req.topic,
+                        script_format=req.script_format,
                     )
                 ]
             elif req.url and req.url.strip():
@@ -2525,6 +3014,7 @@ async def saasshorts_analyze(
                     req.language,
                     req.actor_gender,
                     topic=req.topic,
+                    script_format=req.script_format,
                 )
             else:
                 # Manual description: build analysis from description
@@ -2546,6 +3036,7 @@ async def saasshorts_analyze(
                     req.language,
                     req.actor_gender,
                     topic=req.topic,
+                    script_format=req.script_format,
                 )
             return {
                 "analysis": analysis,
@@ -2570,6 +3061,7 @@ class SaaSActorRequest(BaseModel):
 
 
 ACTOR_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+STORYBOARD_FRAME_EXTENSIONS = ACTOR_IMAGE_EXTENSIONS
 
 
 def _output_file_url(file_path: str) -> str:
@@ -2693,6 +3185,65 @@ async def saasshorts_actor_upload(
             "local_url": local_url,
             "saved": True,
             "storage": storage,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/saasshorts/storyboard-frame-upload")
+async def saasshorts_storyboard_frame_upload(
+    file: UploadFile = File(...),
+    shot_number: int = Form(0),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Upload a storyboard reference frame for Kling V3 image-to-video shots."""
+    user = get_user_from_authorization(authorization)
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        content = await file.read()
+        if len(content) < 1000:
+            raise HTTPException(status_code=400, detail="File too small to be a valid image")
+
+        original_ext = os.path.splitext(file.filename or "")[1].lower()
+        content_ext = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+        }.get(file.content_type, "")
+        ext = original_ext if original_ext in STORYBOARD_FRAME_EXTENSIONS else content_ext or ".png"
+        upload_id = uuid.uuid4().hex[:8]
+        upload_dir = os.path.join(OUTPUT_DIR, "storyboard_frames")
+        os.makedirs(upload_dir, exist_ok=True)
+        filename = f"shot_{max(0, int(shot_number or 0)):02d}_{upload_id}{ext}"
+        file_path = os.path.join(upload_dir, filename)
+
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        local_url = _output_file_url(file_path)
+        meta = {
+            "url": local_url,
+            "local_url": local_url,
+            "image_path": file_path,
+            "key": os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"),
+            "shot_number": shot_number,
+            "created_at": _utc_now(),
+            "storage": "local",
+            "owner_user_id": user.get("id") if user else "",
+        }
+        with open(os.path.splitext(file_path)[0] + ".json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        return {
+            **meta,
+            "image_url": local_url,
+            "saved": True,
+            "note": "Local frame saved. The generator uploads it to fal.ai before Kling V3 image-to-video.",
         }
 
     except HTTPException:
@@ -3080,6 +3631,8 @@ class SaaSGenerateRequest(BaseModel):
     retry_job_id: Optional[str] = None
     video_mode: str = "standard"  # "lowcost", "standard", or "premium"
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
+    punch_in_cuts: bool = True  # jump-cut talking head with alternating punch-in zoom
+    storyboard_generation_mode: str = "per_shot"  # "per_shot", "multi_shot", or "sliced_avatar"
     reusable_head_template_id: Optional[str] = None
     reusable_lipsync_model: str = "sync-3"
     use_platform_keys: bool = False
@@ -3243,6 +3796,8 @@ async def saasshorts_generate(
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
         "broll_mode": req.broll_mode or "mockup",
+        "punch_in_cuts": req.punch_in_cuts,
+        "storyboard_generation_mode": req.storyboard_generation_mode or "per_shot",
         "reusable_head_template_id": reusable_head.get("template_id") if reusable_head else None,
         "reusable_head_path": reusable_head.get("head_path") if reusable_head else None,
         "reusable_head_poster_path": reusable_head.get("poster_path") if reusable_head else None,
@@ -3283,6 +3838,12 @@ async def saasshorts_generate(
                     "talking_head_quality": result.get("talking_head_quality", {}),
                     "language": resolved_language,
                     "script": req.script,
+                    "script_format": req.script.get("format") or req.script.get("script_format") or "ugc",
+                    "shots": result.get("storyboard_shots") or req.script.get("shots", []),
+                    "storyboard_generation_mode": result.get("storyboard_generation_mode"),
+                    "business_name": req.script.get("_business_name", ""),
+                    "business_description": req.script.get("_business_description", ""),
+                    "video_topic": req.script.get("_video_topic", ""),
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
 
@@ -3309,7 +3870,13 @@ async def saasshorts_generate(
                         "talking_head_quality": result.get("talking_head_quality", {}),
                         "product_name": req.script.get("_product_name", ""),
                         "product_url": req.script.get("_product_url", ""),
+                        "business_name": req.script.get("_business_name", ""),
+                        "business_description": req.script.get("_business_description", ""),
+                        "video_topic": req.script.get("_video_topic", ""),
                         "segments": req.script.get("segments", []),
+                        "script_format": req.script.get("format") or req.script.get("script_format") or "ugc",
+                        "shots": result.get("storyboard_shots") or req.script.get("shots", []),
+                        "storyboard_generation_mode": result.get("storyboard_generation_mode"),
                         "cost_estimate": result.get("cost_estimate", {}),
                         "owner_user_id": owner_user_id or "",
                     }
@@ -3420,17 +3987,10 @@ async def saasshorts_lipsync(
 
             result = await loop.run_in_executor(None, run)
 
-            cost = dict(previous_cost) if isinstance(previous_cost, dict) else {}
             lip_cost = result.get("lipsync_cost_estimate")
-            if lip_cost is not None:
-                cost_key = f"lipsync_{req.model.replace('-', '_')}"
-                cost[cost_key] = lip_cost
-                cost["total"] = round(
-                    sum(v for k, v in cost.items() if k != "total" and isinstance(v, (int, float))),
-                    2,
-                )
 
             meta = dict(previous_meta)
+            completed_at = _utc_now()
             script = previous_result.get("script") or {
                 "title": meta.get("title", ""),
                 "caption": meta.get("caption", ""),
@@ -3439,16 +3999,27 @@ async def saasshorts_lipsync(
             }
 
             video_filename = result["video_filename"]
-            cache_bust = int(time.time())
+            new_video_url = f"/videos/saas_{job_id}/{video_filename}"
+            versions = _build_saas_video_versions(
+                meta,
+                new_video_url,
+                req.model,
+                req.sync_mode,
+                lip_cost,
+                created_at=completed_at,
+            )
+            current_version_id = versions[-1].get("id", "") if versions else ""
+            cost = _add_saas_lipsync_cost(previous_cost, req.model, lip_cost, current_version_id)
             completed_result = {
                 **previous_result,
-                "video_url": f"/videos/saas_{job_id}/{video_filename}?v={cache_bust}",
+                "video_url": new_video_url,
                 "video_filename": video_filename,
                 "duration": result.get("duration", previous_result.get("duration", 0)),
                 "cost_estimate": cost,
                 "script": script,
                 "lipsync_model": req.model,
                 "lipsync_sync_mode": req.sync_mode,
+                "versions": versions,
             }
 
             if job_id in saas_jobs:
@@ -3474,6 +4045,7 @@ async def saasshorts_lipsync(
                 "cost_estimate": cost,
                 "lipsync_model": req.model,
                 "lipsync_sync_mode": req.sync_mode,
+                "versions": versions,
             }
             write_local_saas_gallery_entry(
                 job_id,

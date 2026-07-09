@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import saasshorts
 from saasshorts import (
+    apply_lipsync_to_saas_job,
     build_kling_avatar_request,
     build_sync_lipsync_request,
     estimate_sync_lipsync_cost,
@@ -108,7 +110,122 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertEqual(selected["name"], "tail_silence")
         self.assertEqual(selected["output_path"], "tail.mp4")
 
-    def test_talking_head_retries_with_tail_silence_and_saves_audit_metadata(self):
+    def test_prepare_voiceover_trims_tail_silence_and_writes_audit(self):
+        class FakeRunResult:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = os.path.join(tmp, "voice.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(b"raw-audio")
+
+            def fake_run(cmd, *args, **kwargs):
+                command = " ".join(str(part) for part in cmd)
+                if "silencedetect" in command:
+                    return FakeRunResult(stderr="silence_start: 3.12\nsilence_end: 4.21 | silence_duration: 1.09\n")
+                if "silenceremove" in command:
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"clean-audio")
+                    return FakeRunResult()
+                raise AssertionError(f"Unexpected command: {command}")
+
+            with patch("saasshorts._get_media_duration", side_effect=[4.21, 3.12]), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                report = saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
+
+            self.assertNotEqual(report["path"], audio_path)
+            self.assertTrue(report["trimmed"])
+            self.assertAlmostEqual(report["original_duration"], 4.21)
+            self.assertAlmostEqual(report["duration"], 3.12)
+            self.assertAlmostEqual(report["trailing_silence"], 1.09)
+            self.assertTrue(os.path.exists(report["path"]))
+            self.assertTrue(os.path.exists(f"{report['path']}.meta.json"))
+
+    def test_full_video_uses_prepared_voiceover_for_kling_subtitles_and_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared_audio_holder = {}
+
+            def fake_actor_image(description, fal_key, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"actor")
+                return output_path
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"raw-voice-with-tail")
+                return {"path": output_path, "provider": "elevenlabs", "voice_id": "voice_ru"}
+
+            def fake_prepare(audio_path, log=print):
+                clean_path = audio_path.replace(".mp3", "_clean.mp3")
+                with open(clean_path, "wb") as f:
+                    f.write(b"clean-voice")
+                prepared_audio_holder["path"] = clean_path
+                return {
+                    "path": clean_path,
+                    "original_path": audio_path,
+                    "original_duration": 10.2,
+                    "duration": 9.1,
+                    "trailing_silence": 1.1,
+                    "leading_silence": 0.0,
+                    "trimmed": True,
+                    "status": "trimmed",
+                }
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
+                self.assertEqual(audio_path, prepared_audio_holder["path"])
+                with open(output_path, "wb") as f:
+                    f.write(b"head")
+                return output_path
+
+            def fake_subs(audio_path, output_path, max_words=2, **kwargs):
+                self.assertEqual(audio_path, prepared_audio_holder["path"])
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            script = {
+                "title": "Clean audio",
+                "full_narration": "Вся система в гайде. Ссылка в профиле.",
+                "hook_text": "Система",
+                "segments": [],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "elevenlabs_key": "eleven-test",
+                "voice_id": "voice_ru",
+                "tts_provider": "elevenlabs",
+                "language": "ru",
+                "actor_gender": "female",
+                "video_mode": "standard",
+                "broll_mode": "off",
+            }
+
+            with patch("saasshorts.generate_actor_image", side_effect=fake_actor_image), \
+                 patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=fake_prepare), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts.generate_talking_head_lowcost", side_effect=AssertionError("should use Kling")), \
+                 patch("saasshorts.inspect_talking_head_quality", return_value={"status": "ok", "warnings": [], "paid_attempts": 1}), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
+                 patch("saasshorts.composite_video", side_effect=fake_composite), \
+                 patch("saasshorts._get_media_duration", return_value=9.1):
+                result = generate_full_video(script, config, tmp)
+
+            self.assertEqual(result["duration"], 9.1)
+            self.assertEqual(result["voiceover_preparation"]["path"], prepared_audio_holder["path"])
+            self.assertTrue(result["voiceover_preparation"]["trimmed"])
+            self.assertGreater(result["voiceover_preparation"]["trailing_silence"], 1.0)
+
+    def test_talking_head_does_not_retry_by_adding_tail_silence_by_default(self):
         class FakeResponse:
             content = b"video-bytes"
 
@@ -148,23 +265,14 @@ class SaaSLipSyncTests(unittest.TestCase):
                 {
                     "video": {"url": "https://cdn.example/base.mp4"},
                     "_fal_request": {"request_id": "req-base", "model_id": "model"},
-                },
-                {
-                    "video": {"url": "https://cdn.example/tail.mp4"},
-                    "_fal_request": {"request_id": "req-tail", "model_id": "model"},
-                },
+                }
             ]
             quality_results = [
                 {
                     "status": "needs_review",
                     "warnings": ["Kling returned video 2.00s longer than the reference voiceover."],
                     "abs_video_reference_delta": 2.0,
-                },
-                {
-                    "status": "ok",
-                    "warnings": [],
-                    "abs_video_reference_delta": 0.05,
-                },
+                }
             ]
 
             with patch("saasshorts.prepare_kling_actor_image", return_value=image_path), \
@@ -176,8 +284,8 @@ class SaaSLipSyncTests(unittest.TestCase):
                 result_path = generate_talking_head(image_path, audio_path, "fal-test", output_path, tier="pro")
 
             self.assertEqual(result_path, output_path)
-            self.assertEqual(fal_run_mock.call_count, 2)
-            self.assertEqual(tail_audio_mock.call_count, 1)
+            self.assertEqual(fal_run_mock.call_count, 1)
+            self.assertEqual(tail_audio_mock.call_count, 0)
             with open(output_path, "rb") as f:
                 self.assertEqual(f.read(), b"video-bytes")
 
@@ -185,9 +293,10 @@ class SaaSLipSyncTests(unittest.TestCase):
             with open(quality_path, "r", encoding="utf-8") as f:
                 quality = json.load(f)
 
-            self.assertEqual(quality["status"], "ok")
-            self.assertEqual(quality["selected_attempt"], "tail_silence")
-            self.assertEqual(quality["paid_attempts"], 2)
+            self.assertEqual(quality["status"], "needs_review")
+            self.assertEqual(quality["selected_attempt"], "base")
+            self.assertEqual(quality["paid_attempts"], 1)
+            self.assertTrue(quality["warnings"])
 
             base_meta_path = output_path.replace(".mp4", "_base_fal.json")
             with open(base_meta_path, "r", encoding="utf-8") as f:
@@ -228,6 +337,41 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(assets["broll_clips"][0]["start"], 3)
             self.assertEqual(assets["broll_clips"][0]["end"], 6)
 
+    def test_lipsync_postprocess_creates_versioned_final_without_overwriting_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("__head.mp4", "__voice.mp3", "__subs.ass"):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(b"x")
+            final_path = os.path.join(tmp, "__final.mp4")
+            with open(final_path, "wb") as f:
+                f.write(b"original-final")
+
+            with open(os.path.join(tmp, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+                json.dump({"hook_text": "hook", "segments": []}, f)
+
+            def fake_lipsync(video_path, audio_path, fal_key, output_path, model="sync-3", sync_mode="cut_off"):
+                with open(output_path, "wb") as f:
+                    f.write(b"head")
+                return output_path
+
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"versioned-final")
+                return output_path
+
+            with patch("saasshorts.generate_sync_lipsync_video", side_effect=fake_lipsync), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts.composite_video", side_effect=fake_composite), \
+                 patch("saasshorts._get_media_duration", return_value=12):
+                result = apply_lipsync_to_saas_job(tmp, "fal-test", model="lipsync-2")
+
+            self.assertEqual(os.path.basename(result["video_path"]), "__final_v002_lipsync_2.mp4")
+            self.assertEqual(result["video_filename"], "__final_v002_lipsync_2.mp4")
+            with open(final_path, "rb") as f:
+                self.assertEqual(f.read(), b"original-final")
+            with open(result["video_path"], "rb") as f:
+                self.assertEqual(f.read(), b"versioned-final")
+
     def test_reuses_saved_talking_head_template_via_lipsync(self):
         with tempfile.TemporaryDirectory() as tmp:
             reusable_head = os.path.join(tmp, "template_head.mp4")
@@ -249,12 +393,12 @@ class SaaSLipSyncTests(unittest.TestCase):
                     f.write(b"new-lipsynced-head")
                 return output_path
 
-            def fake_subs(audio_path, output_path, max_words=2):
+            def fake_subs(audio_path, output_path, max_words=2, **kwargs):
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write("[Script Info]\n")
                 return output_path
 
-            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path):
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
                 return output_path
@@ -279,6 +423,7 @@ class SaaSLipSyncTests(unittest.TestCase):
 
             with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
                  patch("saasshorts.generate_sync_lipsync_video", side_effect=fake_lipsync) as lipsync_mock, \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
                  patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
                  patch("saasshorts.composite_video", side_effect=fake_composite), \
                  patch("saasshorts._get_media_duration", return_value=18), \
@@ -330,12 +475,12 @@ class SaaSLipSyncTests(unittest.TestCase):
                     )
                 return output_path
 
-            def fake_subs(audio_path, output_path, max_words=2):
+            def fake_subs(audio_path, output_path, max_words=2, **kwargs):
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write("[Script Info]\n")
                 return output_path
 
-            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path):
+            def fake_composite(talking_head_path, broll_clips, subtitles_path, hook_text, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
                 return output_path
@@ -359,6 +504,7 @@ class SaaSLipSyncTests(unittest.TestCase):
                  patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
                  patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
                  patch("saasshorts.generate_talking_head_lowcost", side_effect=AssertionError("should use Kling")), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
                  patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
                  patch("saasshorts.composite_video", side_effect=fake_composite) as composite_mock, \
                  patch("saasshorts._get_media_duration", return_value=10):
@@ -368,6 +514,259 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(result["quality_status"], "needs_review")
             self.assertEqual(result["quality_warnings"], ["Kling returned video 1.20s longer than voiceover."])
             self.assertTrue(os.path.exists(result["video_path"]))
+
+
+class JumpCutTests(unittest.TestCase):
+    def test_selects_cut_points_at_longest_pause_in_window(self):
+        # Words 0-3s continuous, big pause at 2.9-3.4s, then 3.4-6s continuous
+        words = []
+        t = 0.0
+        while t < 2.9:
+            words.append({"word": "a", "start": t, "end": t + 0.28})
+            t += 0.3
+        t = 3.4
+        while t < 6.0:
+            words.append({"word": "b", "start": t, "end": t + 0.28})
+            t += 0.3
+
+        cuts = saasshorts._select_jump_cut_points(words, duration=6.0, min_gap=2.2, max_gap=3.8)
+
+        self.assertTrue(cuts, "expected at least one cut")
+        # The first cut should land on the phrase boundary (word ending at ~2.98)
+        self.assertAlmostEqual(cuts[0], 2.98, delta=0.05)
+
+    def test_falls_back_to_fixed_grid_without_words(self):
+        cuts = saasshorts._select_jump_cut_points([], duration=12.0)
+        self.assertTrue(cuts)
+        for a, b in zip(cuts, cuts[1:]):
+            self.assertGreater(b - a, 1.5)
+        self.assertLess(cuts[-1], 12.0 - 1.0)
+
+    def test_no_cuts_for_very_short_video(self):
+        self.assertEqual(saasshorts._select_jump_cut_points([], duration=3.0), [])
+
+    def test_subsegments_ignore_cuts_near_edges(self):
+        subs = saasshorts._punch_in_subsegments(0.0, 10.0, [0.3, 3.0, 6.0, 9.8])
+        self.assertEqual(subs, [(0.0, 3.0), (3.0, 6.0), (6.0, 10.0)])
+
+    def test_composite_builds_alternating_punch_in_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head = os.path.join(tmp, "head.mp4")
+            with open(head, "wb") as f:
+                f.write(b"head")
+            subs_path = os.path.join(tmp, "subs.ass")
+            final = os.path.join(tmp, "final.mp4")
+            captured = {}
+
+            def fake_run(cmd, check=True, **kwargs):
+                captured["cmd"] = cmd
+
+            words = [
+                {"word": "w", "start": s / 10, "end": s / 10 + 0.08}
+                for s in range(0, 100, 3)
+            ]
+
+            with patch("saasshorts._get_media_duration", return_value=10.0), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                saasshorts.composite_video(head, [], subs_path, "hook", final, jump_cut_words=words)
+
+            cmd = captured["cmd"]
+            filter_idx = cmd.index("-filter_complex") + 1
+            filter_str = cmd[filter_idx]
+
+            # Even shots are full frame, odd shots are punched in
+            self.assertIn("crop=938:1668", filter_str)
+            self.assertIn("[v0]", filter_str)
+            self.assertIn("[v1]", filter_str)
+            v0 = [p for p in filter_str.split(";") if p.endswith("[v0]")][0]
+            v1 = [p for p in filter_str.split(";") if p.endswith("[v1]")][0]
+            self.assertNotIn("crop=938:1668", v0)
+            self.assertIn("crop=938:1668", v1)
+
+            # Audio must come straight from the talking head, uncut
+            audio_map = cmd[cmd.index("-map", cmd.index("-map") + 1) + 1]
+            self.assertEqual(audio_map, "0:a")
+
+    def test_composite_without_punch_in_keeps_single_take(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head = os.path.join(tmp, "head.mp4")
+            with open(head, "wb") as f:
+                f.write(b"head")
+            final = os.path.join(tmp, "final.mp4")
+            captured = {}
+
+            def fake_run(cmd, check=True, **kwargs):
+                captured["cmd"] = cmd
+
+            with patch("saasshorts._get_media_duration", return_value=10.0), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                saasshorts.composite_video(
+                    head, [], os.path.join(tmp, "subs.ass"), "hook", final, punch_in=False
+                )
+
+            self.assertNotIn("-filter_complex", captured["cmd"])
+
+
+class SlicedAvatarTests(unittest.TestCase):
+    def _words(self, phrases):
+        """Build word timestamps: phrases = [(word_count, start, end), ...] evenly spaced."""
+        words = []
+        for count, start, end in phrases:
+            step = (end - start) / count
+            for k in range(count):
+                words.append({
+                    "word": "w",
+                    "start": start + k * step,
+                    "end": start + k * step + step * 0.8,
+                })
+        return words
+
+    def test_align_snaps_boundary_to_pause(self):
+        # Two phrases: 10 words 0-3s, big pause, 10 words 3.6-6.6s
+        words = self._words([(10, 0.0, 3.0), (10, 3.6, 6.6)])
+        shots = [
+            {"shot_number": 1, "speech": "один два три четыре пять шесть семь восемь девять десять"},
+            {"shot_number": 2, "speech": "раз два три четыре пять шесть семь восемь девять десять"},
+        ]
+
+        slices, skipped = saasshorts._align_shots_to_voiceover(shots, words, 6.6)
+
+        self.assertEqual(len(slices), 2)
+        self.assertEqual(skipped, [])
+        # Boundary should land inside the 3.0-3.6s pause
+        boundary = slices[0]["end"]
+        self.assertEqual(boundary, slices[1]["start"])
+        self.assertGreater(boundary, 2.9)
+        self.assertLess(boundary, 3.7)
+        self.assertEqual(slices[0]["start"], 0.0)
+        self.assertEqual(slices[1]["end"], 6.6)
+
+    def test_align_prefers_scripted_last_word_over_longer_earlier_pause(self):
+        # Real-world case: the pause after "сахара" (decoy) is longer than the
+        # pause after the shot's true last word "срываешься" — the boundary
+        # must still follow the scripted phrase end.
+        words = []
+        t = 0.0
+        tokens = ["w"] * 8 + ["сахара."] + ["w"] * 3 + ["срываешься."] + ["w"] * 7
+        for tok in tokens:
+            words.append({"word": tok, "start": t, "end": t + 0.3})
+            t += 0.35
+            if tok == "сахара.":
+                t += 0.5
+            elif tok == "срываешься.":
+                t += 0.4
+        shots = [
+            {"shot_number": 1, "speech": "a b c d e f g h сахара а к вечеру срываешься"},
+            {"shot_number": 2, "speech": "j k l m n o p"},
+        ]
+
+        slices, _ = saasshorts._align_shots_to_voiceover(shots, words, t)
+
+        self.assertGreater(slices[0]["end"], words[12]["end"])
+        self.assertLess(slices[0]["end"], words[13]["start"])
+
+    def test_align_proportional_without_words(self):
+        shots = [
+            {"shot_number": 1, "speech": "a b c d e"},
+            {"shot_number": 2, "speech": "f g h i j k l m n o"},
+        ]
+        slices, _ = saasshorts._align_shots_to_voiceover(shots, [], 15.0)
+        self.assertEqual(len(slices), 2)
+        self.assertAlmostEqual(slices[0]["end"], 5.0, delta=0.01)
+
+    def test_align_skips_shots_without_speech(self):
+        shots = [
+            {"shot_number": 1, "speech": "hello there my friend"},
+            {"shot_number": 2, "speech": ""},
+        ]
+        slices, skipped = saasshorts._align_shots_to_voiceover(shots, [], 8.0)
+        self.assertEqual(len(slices), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["shot_number"], 2)
+
+    def test_storyboard_sliced_avatar_mode_generates_lipsynced_shots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref1 = os.path.join(tmp, "ref1.png")
+            ref2 = os.path.join(tmp, "ref2.png")
+            for p in (ref1, ref2):
+                with open(p, "wb") as f:
+                    f.write(b"img")
+
+            head_calls = []
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+
+            def fake_prepare(audio_path, log=print):
+                return {"path": audio_path, "status": "ok", "trimmed": False}
+
+            def fake_slice(audio_path, start, end, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"slice")
+                return output_path
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
+                head_calls.append({"image": image_path, "audio": audio_path, "tier": tier})
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_composite(clips, audio_path, srt_path, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            def fake_subs(audio_path, shots, output_path, max_words=2, words=None):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            script = {
+                "title": "Sliced avatar",
+                "format": "storyboard_v3",
+                "language": "ru",
+                "full_narration": "Первая фраза кадра. Вторая фраза кадра.",
+                "shots": [
+                    {"shot_number": 1, "role": "hook", "start": 0, "end": 4,
+                     "speech": "Первая фраза кадра.", "image_path": ref1,
+                     "scene": "close-up", "overlay_text": "", "transition": "cut"},
+                    {"shot_number": 2, "role": "cta", "start": 4, "end": 8,
+                     "speech": "Вторая фраза кадра.", "image_path": ref2,
+                     "scene": "medium", "overlay_text": "", "transition": "cut"},
+                ],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "video_mode": "storyboard_v3_standard",
+                "storyboard_generation_mode": "sliced_avatar",
+            }
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=fake_prepare), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=AssertionError("should not use Kling V3")), \
+                 patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
+                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite) as composite_mock, \
+                 patch("saasshorts.generate_actor_image", side_effect=AssertionError("reference frames should be used")), \
+                 patch("saasshorts._get_media_duration", return_value=8.0):
+                result = saasshorts.generate_storyboard_video(script, config, tmp)
+
+            self.assertEqual(len(head_calls), 2)
+            self.assertEqual({c["image"] for c in head_calls}, {ref1, ref2})
+            self.assertEqual({c["tier"] for c in head_calls}, {"standard"})
+
+            clips = composite_mock.call_args[0][0]
+            self.assertEqual(len(clips), 2)
+            self.assertAlmostEqual(sum(c["duration"] for c in clips), 8.0, delta=0.01)
+
+            self.assertEqual(result["storyboard_generation_mode"], "sliced_avatar")
+            self.assertIn("sliced_avatar_kling_standard", result["cost_estimate"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
+import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -158,6 +158,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
           {isRegister && (
             <input
               className="input-field"
+              aria-label="Имя"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Имя"
@@ -166,6 +167,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
           <input
             className="input-field"
             type="email"
+            aria-label="Email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             placeholder="email@example.com"
@@ -173,6 +175,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
           <input
             className="input-field"
             type="password"
+            aria-label="Пароль"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="Пароль, минимум 8 символов"
@@ -192,12 +195,125 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
         </div>
 
         <button
-          className="text-sm text-zinc-400 hover:text-white"
+          type="button"
+          className="inline-flex rounded-lg px-2 py-2 text-sm text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
           onClick={() => setMode(isRegister ? 'login' : 'register')}
         >
           {isRegister ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Зарегистрироваться'}
         </button>
       </div>
+    </div>
+  );
+};
+
+const ProviderKeyInput = ({
+  title,
+  description,
+  value,
+  onChange,
+  placeholder,
+  hasAccountKey,
+  onSave,
+  actionLabel = 'Сохранить',
+  savedLabel = 'Сохранено в аккаунте',
+  help,
+  links = [],
+}) => {
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState('');
+  const hasDraftKey = Boolean(value?.trim()) && value !== '__saved__' && value !== '__platform__';
+
+  const handleSave = async () => {
+    setMessage('');
+    if (!hasDraftKey) {
+      setMessage(hasAccountKey ? 'Вставь новый ключ, чтобы заменить текущий.' : 'Вставь API-ключ перед сохранением.');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await onSave(value.trim());
+      setMessage(savedLabel);
+    } catch (e) {
+      setMessage(e.message || 'Не удалось сохранить ключ.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 space-y-1">
+          <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
+          <p className="text-xs leading-relaxed text-zinc-500">{description}</p>
+        </div>
+        <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+          hasAccountKey
+            ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-200'
+            : 'border-amber-500/25 bg-amber-500/10 text-amber-200'
+        }`}>
+          {hasAccountKey ? <CheckCircle2 size={13} /> : <KeyRound size={13} />}
+          {hasAccountKey ? savedLabel : 'Не сохранено'}
+        </span>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr),auto]">
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => {
+            onChange(e.target.value);
+            setMessage('');
+          }}
+          className="input-field"
+          placeholder={hasAccountKey ? 'Ключ скрыт. Вставь новый, чтобы заменить.' : placeholder}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="btn-primary whitespace-nowrap px-4 py-3 text-sm"
+        >
+          {saving ? 'Сохраняю...' : hasAccountKey ? 'Заменить' : actionLabel}
+        </button>
+      </div>
+
+      {message && (
+        <p className={`rounded-lg border px-3 py-2 text-xs ${
+          message === savedLabel
+            ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
+            : 'border-amber-500/20 bg-amber-500/10 text-amber-200'
+        }`}>
+          {message}
+        </p>
+      )}
+
+      {(help || links.length > 0) && (
+        <div className="space-y-3 text-xs leading-relaxed text-zinc-500">
+          {help && <p>{help}</p>}
+          {links.length > 0 && (
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {links.map((link) => (
+                <a
+                  key={link.href}
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="rounded-xl border border-white/10 bg-black/20 p-3 transition-colors hover:border-white/20 hover:bg-white/[0.04]"
+                >
+                  <span className="flex items-center gap-2 font-medium text-zinc-300">
+                    {link.label}
+                    <ExternalLink size={12} className="text-zinc-500" />
+                  </span>
+                  {link.caption && <span className="mt-1 block text-[11px] text-zinc-600">{link.caption}</span>}
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };
@@ -213,6 +329,8 @@ function App() {
   const [apiKeyStatus, setApiKeyStatus] = useState({});
   const [usePlatformKeys, setUsePlatformKeys] = useState(() => localStorage.getItem(USE_PLATFORM_KEYS_KEY) === '1');
   const [legacyClaimStatus, setLegacyClaimStatus] = useState('');
+  const [backupStatus, setBackupStatus] = useState('');
+  const [backupImporting, setBackupImporting] = useState(false);
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || import.meta.env.VITE_GEMINI_API_KEY || '');
   // Social API State - Load encrypted or plain
@@ -362,6 +480,7 @@ function App() {
     }
     const data = await res.json();
     setApiKeyStatus(data.api_keys || {});
+    return data.api_keys || {};
   };
 
   const handleClaimLegacyAssets = async () => {
@@ -381,6 +500,63 @@ function App() {
       setLegacyClaimStatus(`Перенесено: видео ${c.videos || 0}, talking-head ${c.head_templates || 0}, аватары ${c.actors || 0}.`);
     } catch (e) {
       setLegacyClaimStatus(e.message || 'Не удалось перенести старые данные');
+    }
+  };
+
+  const handleExportBackup = async () => {
+    setBackupStatus('Готовлю архив переноса...');
+    try {
+      const res = await fetch(getApiUrl('/api/backup/export'), {
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось скачать backup';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+
+      const blob = await res.blob();
+      const disposition = res.headers.get('content-disposition') || '';
+      const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+      const filename = filenameMatch?.[1] || `content-factory-backup-${new Date().toISOString().slice(0, 10)}.zip`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setBackupStatus('Архив скачан. Перенеси ZIP на другой компьютер и импортируй его в настройках.');
+    } catch (e) {
+      setBackupStatus(e.message || 'Не удалось скачать backup');
+    }
+  };
+
+  const handleImportBackup = async (file) => {
+    if (!file) return;
+    setBackupImporting(true);
+    setBackupStatus('Импортирую backup...');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch(getApiUrl('/api/backup/import'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось импортировать backup';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      setBackupStatus(`Backup восстановлен: файлов ${data.restored_files || 0}. Если ключи не видны, перезапусти backend и войди заново.`);
+      await loadMe();
+    } catch (e) {
+      setBackupStatus(e.message || 'Не удалось импортировать backup');
+    } finally {
+      setBackupImporting(false);
     }
   };
 
@@ -578,54 +754,75 @@ function App() {
 
   // --- UI Components ---
 
+  const navItems = [
+    { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard, activeClass: 'bg-primary/10 text-primary' },
+    { id: 'saasshorts', label: 'AI Shorts', shortLabel: 'Shorts', icon: Sparkles, activeClass: 'bg-violet-500/10 text-violet-400' },
+    { id: 'ai-agent', label: 'AI-агент', shortLabel: 'Агент', icon: Bot, activeClass: 'bg-emerald-500/10 text-emerald-400' },
+    { id: 'ugc-gallery', label: 'UGC-галерея', shortLabel: 'UGC', icon: LayoutGrid, activeClass: 'bg-violet-500/10 text-violet-400' },
+    { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image, activeClass: 'bg-primary/10 text-primary' },
+    { id: 'settings', label: 'Настройки', shortLabel: 'Ключи', icon: Settings, activeClass: 'bg-primary/10 text-primary' },
+  ];
+  const activeNavItem = navItems.find((item) => item.id === activeTab) || navItems[0];
+  const ActiveHeaderIcon = activeNavItem.icon;
+
   const Sidebar = () => (
-    <div className="relative z-20 w-20 lg:w-64 bg-surface border-r border-white/5 flex flex-col h-full shrink-0 transition-all duration-300">
+    <div className="relative z-20 hidden w-20 shrink-0 flex-col border-r border-white/5 bg-surface transition-all duration-300 md:flex xl:w-64">
       <div className="p-6 flex items-center gap-3">
         <div className="w-8 h-8 bg-white/5 rounded-lg flex items-center justify-center shrink-0 overflow-hidden border border-white/5">
-          <img src="/logo-openshorts.png" alt="Logo" className="w-full h-full object-cover" />
+          <img src="/favicon.svg" alt="" className="w-full h-full object-cover" />
         </div>
-        <span className="font-bold text-lg text-white hidden lg:block tracking-tight">OpenShorts</span>
+        <span className="font-bold text-lg text-white hidden xl:block tracking-tight">Контентфабрика</span>
       </div>
 
       <nav className="flex-1 px-4 py-4 space-y-2">
         <button
+          type="button"
+          aria-label="Генератор клипов"
           onClick={() => setActiveTab('dashboard')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'dashboard' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <LayoutDashboard size={20} />
-          <span className="font-medium hidden lg:block">Clip Generator</span>
+          <span className="font-medium hidden xl:block">Генератор клипов</span>
         </button>
 
         <button
+          type="button"
+          aria-label="AI Shorts"
           onClick={() => setActiveTab('saasshorts')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'saasshorts' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <Sparkles size={20} />
-          <span className="font-medium hidden lg:block">AI Shorts</span>
+          <span className="font-medium hidden xl:block">AI Shorts</span>
         </button>
 
         <button
+          type="button"
+          aria-label="AI-агент"
           onClick={() => setActiveTab('ai-agent')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ai-agent' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <Bot size={20} />
-          <span className="font-medium hidden lg:block">AI Agent</span>
+          <span className="font-medium hidden xl:block">AI-агент</span>
         </button>
 
         <button
+          type="button"
+          aria-label="UGC-галерея"
           onClick={() => setActiveTab('ugc-gallery')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ugc-gallery' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <LayoutGrid size={20} />
-          <span className="font-medium hidden lg:block">UGC Gallery</span>
+          <span className="font-medium hidden xl:block">UGC-галерея</span>
         </button>
 
         <button
+          type="button"
+          aria-label="YouTube-студия"
           onClick={() => setActiveTab('thumbnails')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'thumbnails' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <Image size={20} />
-          <span className="font-medium hidden lg:block">YouTube Studio</span>
+          <span className="font-medium hidden xl:block">YouTube-студия</span>
         </button>
 
         {/* <button
@@ -637,15 +834,17 @@ function App() {
         </button> */}
 
         <button
+          type="button"
+          aria-label="Настройки"
           onClick={() => setActiveTab('settings')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'settings' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <Settings size={20} />
-          <span className="font-medium hidden lg:block">Settings</span>
+          <span className="font-medium hidden xl:block">Настройки</span>
         </button>
       </nav>
 
-      <div className="p-4 border-t border-white/5 space-y-2">
+      <div className="p-4 border-t border-white/5">
         <a
           href="#"
           onClick={(e) => { e.preventDefault(); localStorage.removeItem('openshorts_skip_landing'); window.location.hash = ''; window.location.reload(); }}
@@ -654,27 +853,46 @@ function App() {
           <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
             <Globe size={16} />
           </div>
-          <div className="hidden lg:block overflow-hidden">
-            <p className="text-sm font-bold text-white leading-none mb-0.5">Landing Page</p>
-            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">View website</p>
+          <div className="hidden xl:block overflow-hidden">
+            <p className="text-sm font-bold text-white leading-none mb-0.5">Лендинг</p>
+            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">Открыть сайт</p>
           </div>
         </a>
-        <a
-          href="https://github.com/mutonby/openshorts"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors group"
-        >
-          <div className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center shrink-0">
+        {/*
             <svg height="20" viewBox="0 0 16 16" version="1.1" width="20" aria-hidden="true"><path fillRule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
           </div>
-          <div className="hidden lg:block overflow-hidden">
-            <p className="text-sm font-bold text-white leading-none mb-0.5">Open Source</p>
-            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">Free & Community Driven</p>
+          <div className="hidden xl:block overflow-hidden">
+            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">Открытый код</p>
           </div>
         </a>
+        */}
       </div>
     </div>
+  );
+
+  const MobileTabBar = () => (
+    <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
+      <div className="grid grid-cols-6 gap-1">
+        {navItems.map((item) => {
+          const Icon = item.icon;
+          const isActive = activeTab === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setActiveTab(item.id)}
+              className={`flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-1 text-[10px] font-semibold transition-colors ${
+                isActive ? item.activeClass : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+              }`}
+              aria-label={item.label}
+            >
+              <Icon size={18} />
+              <span className="max-w-full truncate">{item.shortLabel}</span>
+            </button>
+          );
+        })}
+      </div>
+    </nav>
   );
 
   if (authLoading && !authUser) {
@@ -698,25 +916,32 @@ function App() {
   }
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
+    <div className="flex h-dvh bg-background overflow-hidden selection:bg-primary/30">
       <Sidebar />
 
-      <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden relative">
+      <main className="relative mb-20 flex min-w-0 flex-1 flex-col overflow-hidden md:mb-0">
         {/* Background Gradients */}
         <div className="absolute inset-0 overflow-hidden -z-10 pointer-events-none">
           <div className="absolute -top-[10%] -right-[10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
         </div>
 
         {/* Top Header */}
-        <header className="h-16 border-b border-white/5 bg-background/50 backdrop-blur-md flex items-center justify-between px-6 shrink-0 z-10">
+        <header className="h-16 border-b border-white/5 bg-background/50 backdrop-blur-md flex items-center justify-between px-4 md:px-6 shrink-0 z-10">
           <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 md:hidden">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/5 text-violet-300">
+                <ActiveHeaderIcon size={17} />
+              </div>
+              <span className="text-sm font-semibold text-zinc-100">{activeNavItem.label}</span>
+            </div>
             {status !== 'idle' && (
               <button
+                type="button"
                 onClick={handleReset}
-                className="flex items-center gap-2 text-sm text-zinc-400 hover:text-white transition-colors"
+                className="hidden sm:flex items-center gap-2 rounded-lg px-2 py-2 text-sm text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
               >
                 <PlusCircle size={16} />
-                <span className="hidden sm:inline">New Project</span>
+                <span>Новый проект</span>
               </button>
             )}
           </div>
@@ -734,8 +959,9 @@ function App() {
               </span>
             </div>
             <button
+              type="button"
               onClick={handleLogout}
-              className="text-xs text-zinc-500 hover:text-white flex items-center gap-1.5"
+              className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-xs text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
             >
               <LogOut size={14} /> Выйти
             </button>
@@ -769,15 +995,16 @@ function App() {
               <div>
                 <span className="font-semibold">Required API key missing.</span>{' '}
                 <span className="text-amber-200/80">
-                  Set your Gemini API key to use OpenShorts.
+                  Укажи API-ключ Gemini, чтобы пользоваться Контентфабрикой.
                 </span>
               </div>
             </div>
             <button
+              type="button"
               onClick={() => setActiveTab('settings')}
-              className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black transition-colors"
+              className="shrink-0 rounded-lg bg-amber-500 px-3 py-2 text-xs font-medium text-black transition-colors hover:bg-amber-400"
             >
-              Go to Settings
+              Настройки
             </button>
           </div>
         )}
@@ -790,8 +1017,13 @@ function App() {
               <span className="font-medium">Session recovered</span>
               <span className="text-zinc-400 text-xs">Your previous work has been restored.</span>
             </div>
-            <button onClick={() => setSessionRecovered(false)} className="text-zinc-500 hover:text-white transition-colors">
-              <X size={14} />
+            <button
+              type="button"
+              aria-label="Скрыть сообщение восстановления"
+              onClick={() => setSessionRecovered(false)}
+              className="rounded-lg p-2 text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
+            >
+              <X size={14} aria-hidden="true" />
             </button>
           </div>
         )}
@@ -801,7 +1033,7 @@ function App() {
 
           {/* View: Settings */}
           {activeTab === 'settings' && (
-            <div className="h-full overflow-y-auto p-8 max-w-2xl mx-auto animate-[fadeIn_0.3s_ease-out]">
+            <div className="h-full overflow-y-auto p-6 pb-28 md:p-8 md:pb-8 max-w-2xl mx-auto animate-[fadeIn_0.3s_ease-out]">
               <div className="flex items-center justify-between mb-8">
                 <h1 className="text-2xl font-bold">Settings</h1>
                 <div className="px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[10px] text-green-400 font-medium flex items-center gap-2">
@@ -847,6 +1079,51 @@ function App() {
                 {legacyClaimStatus && (
                   <p className="text-xs text-zinc-400">{legacyClaimStatus}</p>
                 )}
+                <div className="rounded-xl border border-sky-500/20 bg-sky-500/[0.06] p-4">
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div className="flex min-w-0 gap-3">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-500/10 text-sky-300">
+                        <Archive size={18} />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-zinc-100">Перенос на другой компьютер</p>
+                        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                          ZIP включает аккаунты, сохранённые API-ключи, видео, аватары, шаблоны talking-head, uploads и секрет расшифровки.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                      <button
+                        type="button"
+                        onClick={handleExportBackup}
+                        className="btn-primary inline-flex items-center justify-center gap-2 px-3 py-2 text-xs"
+                      >
+                        <Download size={14} />
+                        Скачать backup
+                      </button>
+                      <label className={`btn-secondary inline-flex cursor-pointer items-center justify-center gap-2 px-3 py-2 text-xs ${backupImporting ? 'pointer-events-none opacity-60' : ''}`}>
+                        <Upload size={14} />
+                        {backupImporting ? 'Импортирую...' : 'Импортировать'}
+                        <input
+                          type="file"
+                          accept=".zip,application/zip"
+                          className="sr-only"
+                          disabled={backupImporting}
+                          onChange={(e) => {
+                            handleImportBackup(e.target.files?.[0]);
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-[11px] leading-relaxed text-sky-100/70">
+                    Архив содержит чувствительные данные. Храни его как пароль: не отправляй в публичные чаты и не загружай в чужие облака.
+                  </p>
+                  {backupStatus && (
+                    <p className="mt-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-zinc-300">{backupStatus}</p>
+                  )}
+                </div>
               </div>
               <KeyInput
                 onKeySet={setApiKey}
@@ -856,161 +1133,73 @@ function App() {
               />
 
               <div className="glass-panel p-6 mt-8">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-lg font-semibold">Social Integration</h2>
-                  <span className="text-[10px] bg-white/5 border border-white/10 px-2 py-0.5 rounded text-zinc-400 uppercase tracking-wider">Optional</span>
-                </div>
-                <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
-                  Needed only if you want one-click publishing to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
-                  Includes a <strong>free tier</strong> (no credit card required).
-                </p>
-                <div className="space-y-4">
-                  <label className="block text-sm text-zinc-400">Upload-Post API Key</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={uploadPostKey}
-                      onChange={(e) => setUploadPostKey(e.target.value)}
-                      className="input-field"
-                      placeholder="ey..."
-                    />
-                    <button
-                      onClick={async () => {
-                        if (uploadPostKey && !['__saved__', '__platform__'].includes(uploadPostKey)) {
-                          await handleSaveApiKey('upload_post', uploadPostKey);
-                        }
-                        await fetchUserProfiles();
-                      }}
-                      className="btn-primary py-2 px-4 text-sm"
-                    >
-                      Connect
-                    </button>
+                <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h2 className="text-lg font-semibold">Интеграции и API-ключи</h2>
+                    <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                      Секреты хранятся в backend vault текущего аккаунта. Мы показываем только статус, сам ключ обратно не раскрываем.
+                    </p>
                   </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
-                    Connect your Upload-Post account to enable one-click publishing.
-                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">1. Login</span>
-                        <span className="text-[10px] text-zinc-600">Register account</span>
-                      </a>
-                      <a href="https://app.upload-post.com/manage-users" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">2. Profiles</span>
-                        <span className="text-[10px] text-zinc-600">Create & Connect</span>
-                      </a>
-                      <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">3. API Key</span>
-                        <span className="text-[10px] text-zinc-600">Generate key</span>
-                      </a>
-                    </div>
-                    <br />
-                    <span className="text-zinc-600 italic">
-                      Ключ сохраняется в backend vault текущего аккаунта.
-                    </span>
-                  </p>
+                  <span className="w-fit rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
+                    Account vault
+                  </span>
                 </div>
-              </div>
 
-              <div className="glass-panel p-6 mt-8">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-lg font-semibold">Video Translation</h2>
-                  <span className="text-[10px] bg-white/5 border border-white/5 px-2 py-0.5 rounded text-zinc-500 uppercase tracking-wider">Optional</span>
-                </div>
-                <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
-                  Translate your clips to different languages using <strong>ElevenLabs</strong> AI dubbing.
-                  Automatically translates speech while preserving the original voice characteristics.
-                </p>
                 <div className="space-y-4">
-                  <label className="block text-sm text-zinc-400">ElevenLabs API Key</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={elevenLabsKey}
-                      onChange={(e) => setElevenLabsKey(e.target.value)}
-                      className="input-field"
-                      placeholder="sk_..."
-                    />
-                    <button
-                      onClick={async () => {
-                        if (elevenLabsKey) {
-                          localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
-                          await handleSaveApiKey('elevenlabs', elevenLabsKey);
-                          alert('ElevenLabs API Key saved to account!');
-                        }
-                      }}
-                      className="btn-primary py-2 px-4 text-sm"
-                    >
-                      Save
-                    </button>
-                  </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
-                    Get your API key from ElevenLabs to enable video translation.
-                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <a href="https://elevenlabs.io/sign-up" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">1. Sign Up</span>
-                        <span className="text-[10px] text-zinc-600">Create account</span>
-                      </a>
-                      <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">2. API Key</span>
-                        <span className="text-[10px] text-zinc-600">Generate key</span>
-                      </a>
-                    </div>
-                    <br />
-                    <span className="text-zinc-600 italic">
-                      Ключ сохраняется в backend vault текущего аккаунта.
-                    </span>
-                  </p>
-                </div>
-              </div>
+                  <ProviderKeyInput
+                    title="Upload-Post"
+                    description="Публикация готовых роликов в TikTok, Instagram Reels и YouTube Shorts."
+                    value={uploadPostKey}
+                    onChange={setUploadPostKey}
+                    placeholder="ey..."
+                    hasAccountKey={hasSavedKey('upload_post')}
+                    actionLabel="Подключить"
+                    onSave={async (key) => {
+                      localStorage.setItem('uploadPostKey_v3', encrypt(key));
+                      await handleSaveApiKey('upload_post', key);
+                      await fetchUserProfiles();
+                    }}
+                    help="Нужен только для публикации из приложения. Генерация роликов работает без него."
+                    links={[
+                      { label: 'Войти в Upload-Post', caption: 'Создать аккаунт', href: 'https://app.upload-post.com/login' },
+                      { label: 'Профили', caption: 'Подключить соцсети', href: 'https://app.upload-post.com/manage-users' },
+                      { label: 'API Key', caption: 'Создать ключ', href: 'https://app.upload-post.com/api-keys' },
+                    ]}
+                  />
 
-              <div className="glass-panel p-6 mt-8">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-lg font-semibold">AI Shorts (UGC Videos)</h2>
-                  <span className="text-[10px] bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded text-violet-400 uppercase tracking-wider">New</span>
-                </div>
-                <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
-                  Generate UGC-style videos with AI actors for any product or business using <strong>fal.ai</strong>.
-                  Just describe your product or paste a URL. Requires fal.ai + ElevenLabs API keys.
-                </p>
-                <div className="space-y-4">
-                  <label className="block text-sm text-zinc-400">fal.ai API Key</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={falKey}
-                      onChange={(e) => setFalKey(e.target.value)}
-                      className="input-field"
-                      placeholder="fal_..."
-                    />
-                    <button
-                      onClick={async () => {
-                        if (falKey) {
-                          localStorage.setItem('falKey_v1', encrypt(falKey));
-                          await handleSaveApiKey('fal', falKey);
-                          alert('fal.ai API Key saved to account!');
-                        }
-                      }}
-                      className="btn-primary py-2 px-4 text-sm"
-                    >
-                      Save
-                    </button>
-                  </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
-                    Get your API key from fal.ai to enable AI actor video generation.
-                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">1. Sign Up</span>
-                        <span className="text-[10px] text-zinc-600">Create fal.ai account</span>
-                      </a>
-                      <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
-                        <span className="text-zinc-400 font-medium">2. API Key</span>
-                        <span className="text-[10px] text-zinc-600">Generate key</span>
-                      </a>
-                    </div>
-                    <br />
-                    <span className="text-zinc-600 italic">
-                      Ключ сохраняется в backend vault текущего аккаунта.
-                    </span>
-                  </p>
+                  <ProviderKeyInput
+                    title="ElevenLabs"
+                    description="Озвучка и русские голоса для AI Shorts. Библиотечные голоса могут требовать платный план ElevenLabs."
+                    value={elevenLabsKey}
+                    onChange={setElevenLabsKey}
+                    placeholder="sk_..."
+                    hasAccountKey={hasSavedKey('elevenlabs')}
+                    onSave={async (key) => {
+                      localStorage.setItem('elevenLabsKey_v1', encrypt(key));
+                      await handleSaveApiKey('elevenlabs', key);
+                    }}
+                    links={[
+                      { label: 'ElevenLabs', caption: 'Открыть кабинет', href: 'https://elevenlabs.io/app' },
+                      { label: 'API Keys', caption: 'Создать ключ', href: 'https://elevenlabs.io/app/settings/api-keys' },
+                    ]}
+                  />
+
+                  <ProviderKeyInput
+                    title="fal.ai"
+                    description="Генерация аватаров, talking-head видео, b-roll и повторный lip-sync."
+                    value={falKey}
+                    onChange={setFalKey}
+                    placeholder="fal_..."
+                    hasAccountKey={hasSavedKey('fal')}
+                    onSave={async (key) => {
+                      localStorage.setItem('falKey_v1', encrypt(key));
+                      await handleSaveApiKey('fal', key);
+                    }}
+                    links={[
+                      { label: 'fal.ai Dashboard', caption: 'Создать аккаунт', href: 'https://fal.ai/dashboard' },
+                      { label: 'API Keys', caption: 'Создать ключ', href: 'https://fal.ai/dashboard/keys' },
+                    ]}
+                  />
                 </div>
               </div>
             </div>
@@ -1031,7 +1220,7 @@ function App() {
 
           {/* View: AI Agent */}
           {activeTab === 'ai-agent' && (
-            <div className="h-full overflow-y-auto custom-scrollbar p-6 md:p-10 animate-[fadeIn_0.3s_ease-out]">
+            <div className="h-full overflow-y-auto custom-scrollbar p-6 pb-28 md:p-10 md:pb-10 animate-[fadeIn_0.3s_ease-out]">
               <div className="max-w-4xl mx-auto space-y-8">
 
                 {/* Header */}
@@ -1113,8 +1302,10 @@ function App() {
                   <div className="bg-[#0c0c0e] border border-white/10 rounded-lg p-4 font-mono text-xs text-zinc-300 flex items-center justify-between gap-3">
                     <span className="truncate">git clone https://github.com/mutonby/skill-autoshorts</span>
                     <button
+                      type="button"
+                      aria-label="Скопировать команду установки"
                       onClick={() => navigator.clipboard.writeText('git clone https://github.com/mutonby/skill-autoshorts')}
-                      className="text-zinc-500 hover:text-white transition-colors shrink-0"
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
                       title="Copy"
                     >
                       <Copy size={14} />
@@ -1147,7 +1338,7 @@ function App() {
 
           {/* View: UGC Gallery */}
           {activeTab === 'ugc-gallery' && (
-            <div className="h-full overflow-y-auto custom-scrollbar p-6 md:p-8">
+            <div className="h-full overflow-y-auto custom-scrollbar p-6 pb-28 md:p-8 md:pb-8">
               <UGCGallery falKey={effectiveFalKey} authToken={authToken} usePlatformKeys={usingPlatformKeys} />
             </div>
           )}
@@ -1191,7 +1382,7 @@ function App() {
             <div className="h-full flex flex-col md:flex-row animate-[fadeIn_0.3s_ease-out]">
 
               {/* Left Panel: Preview & Status */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} h-full flex flex-col border-r border-white/5 bg-black/20 p-6 overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
+              <div className={`${status === 'complete' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} h-full flex flex-col border-r border-white/5 bg-black/20 p-6 pb-28 md:pb-6 overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
                 <div className="mb-6 flex items-center justify-between">
                   <h2 className="text-lg font-semibold flex items-center gap-2">
                     <Activity className={`text-primary ${status === 'processing' ? 'animate-pulse' : ''}`} size={20} />
@@ -1243,7 +1434,7 @@ function App() {
               </div>
 
               {/* Right Panel: Results Grid */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 transition-all duration-700 ease-in-out`}>
+              <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 pb-28 md:pb-6 transition-all duration-700 ease-in-out`}>
                 <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                   <Sparkles className="text-yellow-400" size={20} />
                   Generated Shorts
@@ -1309,6 +1500,7 @@ function App() {
         </div>
 
       </main>
+      <MobileTabBar />
 
       {/* Missing API Key Modal */}
       {showKeyModal && (
@@ -1316,7 +1508,7 @@ function App() {
           <div className="bg-[#18181b] border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-lg font-bold text-white">Gemini API Key Required</h2>
             <p className="text-sm text-zinc-400">
-              OpenShorts needs a <strong className="text-zinc-200">Gemini</strong> API key for analysis and script generation. Upload-Post is optional and only needed for publishing.
+              Контентфабрике нужен API-ключ <strong className="text-zinc-200">Gemini</strong> для анализа и генерации сценариев. Upload-Post опционален и нужен только для публикации.
             </p>
 
             {/* Gemini block */}

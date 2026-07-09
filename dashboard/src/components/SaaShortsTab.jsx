@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload } from 'lucide-react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X } from 'lucide-react';
 import { getApiUrl } from '../config';
 
 const STYLE_OPTIONS = [
@@ -8,6 +8,11 @@ const STYLE_OPTIONS = [
   { id: 'shock', label: 'Shock/Discovery', desc: 'Surprising opener' },
   { id: 'story', label: 'Storytelling', desc: 'Mini narrative arc' },
   { id: 'comparison', label: 'Before/After', desc: 'Comparison style' },
+];
+
+const SCRIPT_FORMAT_OPTIONS = [
+  { id: 'ugc', label: 'UGC 5 частей', desc: 'ИИ сделает сценарий для talking-head + вставок' },
+  { id: 'storyboard_v3', label: 'Раскадровка V3', desc: 'ИИ сделает кадры, действия, текст и промпты' },
 ];
 
 const TTS_PROVIDER_OPTIONS = [
@@ -22,27 +27,54 @@ const BROLL_MODE_OPTIONS = [
   { id: 'ai', label: 'AI b-roll', desc: 'Flux image inserts, can look synthetic' },
 ];
 
+const STORYBOARD_GENERATION_OPTIONS = [
+  { id: 'per_shot', label: '6 отдельных кадров', desc: 'Лучше чинить и перегенерировать один кадр' },
+  { id: 'multi_shot', label: 'Multi-shot draft', desc: 'Меньше запросов, но сложнее заменить один плохой кадр' },
+  { id: 'sliced_avatar', label: 'Говорящие кадры (1 озвучка)', desc: 'Один войсовер режется по фразам, каждый кадр — Kling Avatar с липсинком' },
+];
+
 const VIDEO_MODE_OPTIONS = [
   {
     id: 'lowcost',
-    label: 'Супер дешёвый',
+    label: 'AI-slop черновик',
     price: 'from ~$0.45',
     accent: 'green',
-    desc: 'Draft mode: Hailuo + VEED lipsync. Cheap, but can loop or drift.',
+    desc: 'Угарный дешёвый режим для черновика: может петлять, дрейфовать и выглядеть как нейрослоп.',
   },
   {
     id: 'standard',
-    label: 'Средний',
+    label: 'Standard',
     price: 'from ~$0.75',
     accent: 'blue',
-    desc: 'Kling Avatar v2 Standard. Good baseline for tests and daily volume.',
+    desc: 'Kling Avatar v2 Standard. Основной режим для коротких UGC: хорошее качество при нормальной цене.',
   },
   {
     id: 'premium',
-    label: 'Премиум',
+    label: 'Pro',
     price: 'from ~$1.45',
     accent: 'violet',
-    desc: 'Kling Avatar v2 Pro. Best choice when the video is going to publish.',
+    desc: 'Kling Avatar v2 Pro: дороже; использовать, когда нужен более аккуратный финальный дубль.',
+  },
+  {
+    id: 'storyboard_v3_standard',
+    label: 'V3 Standard',
+    price: 'from ~$1.30',
+    accent: 'blue',
+    desc: 'Kling V3 по кадрам. Рабочий режим для раскадровок и разнообразных роликов.',
+  },
+  {
+    id: 'storyboard_v3_pro',
+    label: 'V3 Pro',
+    price: 'from ~$1.75',
+    accent: 'violet',
+    desc: 'Kling V3 Pro по кадрам: дороже; включай для более аккуратного финального визуала.',
+  },
+  {
+    id: 'storyboard_veo31_quality',
+    label: 'Veo 3.1 Quality',
+    price: 'from ~$3.20',
+    accent: 'amber',
+    desc: 'Google Veo 3.1 через fal.ai: самый дорогой режим для финального визуала, без нативного аудио.',
   },
 ];
 
@@ -80,6 +112,7 @@ function defaultMiniMaxVoice(language, actorGender) {
 }
 
 const CACHE_KEY = 'saasshorts_cache';
+const BUSINESS_PROFILES_KEY = 'saasshorts_business_profiles';
 const CACHE_VERSION = 2;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -211,16 +244,47 @@ function estimateSpeechSeconds(text) {
   return Math.max(12, Math.min(75, Math.round(words / 2.5)));
 }
 
-function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3' }) {
+function isStoryboardScript(script) {
+  return script?.format === 'storyboard_v3' || Array.isArray(script?.shots);
+}
+
+function activeVideoModeOptions(scriptFormat) {
+  if (scriptFormat === 'storyboard_v3') {
+    return VIDEO_MODE_OPTIONS.filter((option) => option.id.startsWith('storyboard_'));
+  }
+  return VIDEO_MODE_OPTIONS.filter((option) => !option.id.startsWith('storyboard_'));
+}
+
+function estimateStoryboardSeconds(script, fallbackText) {
+  if (Array.isArray(script?.shots) && script.shots.length > 0) {
+    return Math.max(3, Math.round(script.shots.reduce((sum, shot) => {
+      const start = Number(shot.start || 0);
+      const end = Number(shot.end || 0);
+      const duration = Number(shot.duration || 0);
+      return sum + Math.max(3, end > start ? end - start : duration || 3);
+    }, 0)));
+  }
+  return estimateSpeechSeconds(fallbackText);
+}
+
+function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null }) {
   const seconds = estimateSpeechSeconds(text);
+  const storyboardSeconds = estimateStoryboardSeconds(script, text);
   const ttsRate = ttsProvider === 'fal_minimax' ? 0.0001 : 0.00003;
   const voiceCost = (text || '').length * ttsRate;
-  const actorCost = (hasSelectedActor || hasReusableHead) ? 0 : 0.05;
+  const storyboardMode = videoMode.startsWith('storyboard_');
+  const actorCost = (hasSelectedActor || hasReusableHead || storyboardMode) ? 0 : 0.05;
   let videoCost = 0;
 
   if (hasReusableHead) {
     const option = LIPSYNC_MODEL_OPTIONS.find((item) => item.id === lipsyncModel) || LIPSYNC_MODEL_OPTIONS[0];
     videoCost = (seconds / 60) * option.pricePerMinute;
+  } else if (videoMode === 'storyboard_v3_standard') {
+    videoCost = storyboardSeconds * 0.084;
+  } else if (videoMode === 'storyboard_v3_pro') {
+    videoCost = storyboardSeconds * 0.112;
+  } else if (videoMode === 'storyboard_veo31_quality') {
+    videoCost = storyboardSeconds * 0.20;
   } else if (videoMode === 'lowcost') {
     videoCost = 0.19 + 0.20;
   } else if (videoMode === 'premium') {
@@ -229,10 +293,10 @@ function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSel
     videoCost = seconds * 0.0562;
   }
 
-  const brollCost = brollMode === 'ai' ? 0.10 : 0;
+  const brollCost = storyboardMode ? 0 : (brollMode === 'ai' ? 0.10 : 0);
   const total = actorCost + voiceCost + videoCost + brollCost;
   return {
-    seconds,
+    seconds: storyboardMode ? storyboardSeconds : seconds,
     actorCost,
     voiceCost,
     videoCost,
@@ -275,6 +339,92 @@ function saveCache(input, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
+function loadBusinessProfiles() {
+  try {
+    const raw = localStorage.getItem(BUSINESS_PROFILES_KEY);
+    const profiles = raw ? JSON.parse(raw) : [];
+    return Array.isArray(profiles) ? profiles : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveBusinessProfiles(profiles) {
+  try {
+    localStorage.setItem(BUSINESS_PROFILES_KEY, JSON.stringify(profiles.slice(0, 20)));
+  } catch { /* localStorage full */ }
+}
+
+function buildScriptDraft(script) {
+  return {
+    ...script,
+    title: script?.title || '',
+    hook_text: script?.hook_text || '',
+    caption: script?.caption || '',
+    hashtagsText: (script?.hashtags || []).join(' '),
+    segments: (script?.segments || []).map((segment) => ({ ...segment })),
+    shots: (script?.shots || []).map((shot) => ({ ...shot })),
+  };
+}
+
+function normalizeScriptDraft(draft, fallbackScript = {}) {
+  const { hashtagsText, ...scriptFields } = draft;
+  const segments = (draft.segments || []).map((segment) => ({
+    ...segment,
+    narration: segment.narration || '',
+    subtitle_text: segment.subtitle_text || segment.narration || '',
+  }));
+  const fullNarration = segments
+    .map((segment) => (segment.narration || '').trim())
+    .filter(Boolean)
+    .join(' ');
+  const hashtags = (draft.hashtagsText || '')
+    .split(/\s+/)
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .map((tag) => (tag.startsWith('#') ? tag : `#${tag}`));
+
+  if (draft.format === 'storyboard_v3' || Array.isArray(draft.shots)) {
+    const shots = (draft.shots || []).map((shot, idx) => ({
+      ...shot,
+      shot_number: Number(shot.shot_number || idx + 1),
+      start: Number(shot.start || 0),
+      end: Number(shot.end || Number(shot.start || 0) + 3),
+      role: shot.role || `shot_${idx + 1}`,
+      scene: shot.scene || '',
+      actor_action: shot.actor_action || shot.action || '',
+      action: shot.actor_action || shot.action || '',
+      camera: shot.camera || '',
+      speech: shot.speech || '',
+      overlay_text: shot.overlay_text || '',
+      transition: shot.transition || 'cut',
+      generation_prompt: shot.generation_prompt || shot.scene || shot.speech || '',
+    }));
+    const shotNarration = shots
+      .map((shot) => (shot.speech || '').trim())
+      .filter(Boolean)
+      .join(' ');
+
+    return {
+      ...fallbackScript,
+      ...scriptFields,
+      format: 'storyboard_v3',
+      shots,
+      hashtags,
+      full_narration: shotNarration || draft.full_narration || fallbackScript.full_narration || '',
+      duration_seconds: Math.max(...shots.map((shot) => Number(shot.end || 0)), Number(draft.duration_seconds || 0), 0),
+    };
+  }
+
+  return {
+    ...fallbackScript,
+    ...scriptFields,
+    segments,
+    hashtags,
+    full_narration: fullNarration || draft.full_narration || fallbackScript.full_narration || '',
+  };
+}
+
 export default function SaaShortsTab({
   geminiApiKey,
   elevenLabsKey,
@@ -290,12 +440,17 @@ export default function SaaShortsTab({
     return cache ? 1 : 0;
   });
 
-  // Step 0: URL input
-  const [url, setUrl] = useState(() => loadCache()?.url || '');
+  // Step 0: Business brief
+  const [url] = useState('');
   const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
   const [description, setDescription] = useState(() => loadCache()?.description || '');
   const [topic, setTopic] = useState(() => loadCache()?.topic || '');
+  const [businessName, setBusinessName] = useState(() => loadCache()?.businessName || '');
+  const [businessProfiles, setBusinessProfiles] = useState(() => loadBusinessProfiles());
+  const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => loadCache()?.businessProfileId || '');
+  const [businessProfileStatus, setBusinessProfileStatus] = useState('');
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
+  const [scriptFormat, setScriptFormat] = useState(() => loadCache()?.scriptFormat || 'ugc');
   const [customScript, setCustomScript] = useState(() => loadCache()?.customScript || '');
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('ru');
@@ -310,11 +465,14 @@ export default function SaaShortsTab({
   const [webResearch, setWebResearch] = useState(() => loadCache()?.webResearch || null);
   const [scripts, setScripts] = useState(() => loadCache()?.scripts || []);
   const [selectedScript, setSelectedScript] = useState(0);
+  const [editingScriptIndex, setEditingScriptIndex] = useState(null);
+  const [scriptDraft, setScriptDraft] = useState(null);
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
   const [ttsProvider, setTtsProvider] = useState('auto');
   const [brollMode, setBrollMode] = useState('mockup');
+  const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('per_shot');
   const [selectedVoice, setSelectedVoice] = useState('21m00Tcm4TlvDq8ikWAM');
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
@@ -379,6 +537,19 @@ export default function SaaShortsTab({
     refreshHeadTemplates();
   }, []);
 
+  useEffect(() => {
+    if (!authToken) return;
+    fetch(getApiUrl('/api/user/business-profiles'), { headers: authHeaders() })
+      .then((res) => res.ok ? res.json() : { profiles: [] })
+      .then((data) => {
+        if (Array.isArray(data.profiles) && data.profiles.length > 0) {
+          setBusinessProfiles(data.profiles);
+          saveBusinessProfiles(data.profiles);
+        }
+      })
+      .catch(() => {});
+  }, [authToken]);
+
   // Fetch voices on mount
   useEffect(() => {
     if (elevenLabsKey) {
@@ -411,6 +582,13 @@ export default function SaaShortsTab({
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
   }, [actorGender, language]);
+
+  useEffect(() => {
+    const allowed = activeVideoModeOptions(scriptFormat).map((option) => option.id);
+    if (!allowed.includes(videoMode)) {
+      setVideoMode(scriptFormat === 'storyboard_v3' ? 'storyboard_v3_standard' : 'standard');
+    }
+  }, [scriptFormat, videoMode]);
 
   // Poll generation status
   useEffect(() => {
@@ -466,10 +644,87 @@ export default function SaaShortsTab({
     }
   };
 
+  const handleSaveBusinessProfile = async () => {
+    const brief = description.trim();
+    if (!brief) {
+      setBusinessProfileStatus('Добавь описание бизнеса перед сохранением.');
+      return;
+    }
+    const name = businessName.trim() || brief.split('\n')[0].slice(0, 48) || 'Новый бизнес';
+    const profile = {
+      id: `${Date.now()}`,
+      name,
+      description: brief,
+      topic: topic.trim(),
+      scriptMode,
+      script_mode: scriptMode,
+      scriptFormat,
+      script_format: scriptFormat,
+      style,
+      language,
+      actorGender,
+      actor_gender: actorGender,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextProfiles = [
+      profile,
+      ...businessProfiles.filter((item) => item.name.toLowerCase() !== name.toLowerCase()),
+    ].slice(0, 20);
+    setBusinessProfiles(nextProfiles);
+    saveBusinessProfiles(nextProfiles);
+    setBusinessName(name);
+    setSelectedBusinessProfileId(profile.id);
+    setBusinessProfileStatus('Проект сохранён. Его можно выбрать в следующий раз.');
+
+    if (authToken) {
+      try {
+        const res = await fetch(getApiUrl('/api/user/business-profiles'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({
+            name,
+            description: brief,
+            topic: topic.trim(),
+            script_mode: scriptMode,
+            script_format: scriptFormat,
+            style,
+            language,
+            actor_gender: actorGender,
+          }),
+        });
+        if (!res.ok) throw new Error('account save failed');
+        const data = await res.json();
+        if (Array.isArray(data.profiles)) {
+          setBusinessProfiles(data.profiles);
+          saveBusinessProfiles(data.profiles);
+          const savedProfile = data.profiles.find((item) => item.name === name);
+          if (savedProfile) setSelectedBusinessProfileId(savedProfile.id || savedProfile.name);
+        }
+        setBusinessProfileStatus('Проект сохранён в аккаунте.');
+      } catch {
+        setBusinessProfileStatus('Проект сохранён локально. В аккаунт сейчас не записался.');
+      }
+    }
+  };
+
+  const handleLoadBusinessProfile = (profile) => {
+    if (!profile) return;
+    setSelectedBusinessProfileId(profile.id || profile.name || '');
+    setBusinessName(profile.name || '');
+    setDescription(profile.description || '');
+    setTopic(profile.topic || '');
+    if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
+    if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
+    if (profile.style) setStyle(profile.style);
+    if (profile.language) setLanguage(profile.language);
+    if (profile.actorGender || profile.actor_gender) setActorGender(profile.actorGender || profile.actor_gender);
+    setBusinessProfileStatus(`Загружен проект: ${profile.name}`);
+  };
+
   const handleAnalyze = async () => {
     const isCustom = scriptMode === 'custom';
     if (isCustom && !customScript.trim()) return;
-    if (!isCustom && !url.trim() && !description.trim()) return;
+    if (!isCustom && !description.trim()) return;
     if (!isCustom && !geminiApiKey) {
       setAnalyzeError('Gemini API key required. Set it in Settings.');
       return;
@@ -487,10 +742,11 @@ export default function SaaShortsTab({
           ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
         },
         body: JSON.stringify({
-          url: url.trim() || undefined,
+          url: undefined,
           description: description.trim() || undefined,
           topic: topic.trim() || undefined,
           script_mode: scriptMode,
+          script_format: scriptFormat,
           custom_script: isCustom ? customScript.trim() : undefined,
           num_scripts: numScripts,
           style,
@@ -515,10 +771,13 @@ export default function SaaShortsTab({
 
       // Cache results
       saveCache({
-        url: url.trim(),
+        url: '',
+        businessProfileId: selectedBusinessProfileId,
+        businessName: businessName.trim(),
         description: description.trim(),
         topic: topic.trim(),
         scriptMode,
+        scriptFormat,
         customScript: isCustom ? customScript.trim() : '',
       }, data.analysis, data.web_research, data.scripts);
 
@@ -545,6 +804,137 @@ export default function SaaShortsTab({
     }
   };
 
+  const persistScripts = (nextScripts) => {
+    saveCache({
+      url: '',
+      businessProfileId: selectedBusinessProfileId,
+      businessName: businessName.trim(),
+      description: description.trim(),
+      topic: topic.trim(),
+      scriptMode,
+      scriptFormat,
+      customScript: scriptMode === 'custom' ? customScript.trim() : '',
+    }, analysis, webResearch, nextScripts);
+  };
+
+  const handleStartScriptEdit = (idx, event) => {
+    event?.stopPropagation();
+    if (!scripts[idx]) return;
+    setSelectedScript(idx);
+    setEditingScriptIndex(idx);
+    setScriptDraft(buildScriptDraft(scripts[idx]));
+  };
+
+  const handleCancelScriptEdit = (event) => {
+    event?.stopPropagation();
+    setEditingScriptIndex(null);
+    setScriptDraft(null);
+  };
+
+  const handleScriptDraftField = (field, value) => {
+    setScriptDraft((draft) => ({ ...draft, [field]: value }));
+  };
+
+  const handleScriptDraftSegment = (segmentIndex, value) => {
+    setScriptDraft((draft) => ({
+      ...draft,
+      segments: (draft.segments || []).map((segment, idx) => (
+        idx === segmentIndex
+          ? { ...segment, narration: value, subtitle_text: value.slice(0, 90) }
+          : segment
+      )),
+    }));
+  };
+
+  const handleScriptDraftShot = (shotIndex, field, value) => {
+    setScriptDraft((draft) => ({
+      ...draft,
+      format: 'storyboard_v3',
+      shots: (draft.shots || []).map((shot, idx) => (
+        idx === shotIndex
+          ? { ...shot, [field]: field === 'start' || field === 'end' ? Number(value) : value }
+          : shot
+      )),
+    }));
+  };
+
+  const updateSelectedScriptShot = (shotIndex, patch) => {
+    const nextScripts = scripts.map((script, idx) => {
+      if (idx !== selectedScript) return script;
+      return {
+        ...script,
+        format: 'storyboard_v3',
+        shots: (script.shots || []).map((shot, j) => (
+          j === shotIndex ? { ...shot, ...patch } : shot
+        )),
+      };
+    });
+    setScripts(nextScripts);
+    persistScripts(nextScripts);
+  };
+
+  const handleSelectedScriptShot = (shotIndex, field, value) => {
+    updateSelectedScriptShot(shotIndex, {
+      [field]: field === 'start' || field === 'end' ? Number(value) : value,
+    });
+  };
+
+  const handleStoryboardFrameUpload = async (shotIndex, file) => {
+    if (!file || !scripts[selectedScript]) return;
+    const localPreview = URL.createObjectURL(file);
+    updateSelectedScriptShot(shotIndex, {
+      image_preview: localPreview,
+      frame_status: 'Загружаю кадр...',
+    });
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('shot_number', String((scripts[selectedScript].shots?.[shotIndex]?.shot_number || shotIndex + 1)));
+
+      const res = await fetch(getApiUrl('/api/saasshorts/storyboard-frame-upload'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось загрузить кадр';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+
+      const data = await res.json();
+      updateSelectedScriptShot(shotIndex, {
+        image_url: data.image_url || data.url || data.local_url,
+        local_url: data.local_url || data.url,
+        image_path: data.image_path,
+        image_key: data.key,
+        image_preview: data.local_url ? getApiUrl(data.local_url) : localPreview,
+        frame_status: 'Кадр сохранён',
+      });
+    } catch (err) {
+      updateSelectedScriptShot(shotIndex, {
+        image_preview: localPreview,
+        frame_status: err.message || 'Ошибка загрузки кадра',
+      });
+    }
+  };
+
+  const handleSaveScriptDraft = (event) => {
+    event?.stopPropagation();
+    if (editingScriptIndex == null || !scriptDraft) return;
+    const updatedScript = normalizeScriptDraft(scriptDraft, scripts[editingScriptIndex]);
+    const nextScripts = scripts.map((script, idx) => (
+      idx === editingScriptIndex ? updatedScript : script
+    ));
+    setScripts(nextScripts);
+    setSelectedScript(editingScriptIndex);
+    setEditedNarration(updatedScript.full_narration || '');
+    persistScripts(nextScripts);
+    setEditingScriptIndex(null);
+    setScriptDraft(null);
+  };
+
   const handleGenerate = async () => {
     if (!falKey) {
       alert('fal.ai API key required. Set it in Settings.');
@@ -565,7 +955,10 @@ export default function SaaShortsTab({
       // Update script with edited narration
       const scriptToSend = { ...scripts[selectedScript] };
       scriptToSend._product_name = analysis?.product_name || analysis?.name || '';
-      scriptToSend._product_url = url;
+      scriptToSend._business_name = businessName.trim();
+      scriptToSend._business_description = description.trim();
+      scriptToSend._video_topic = topic.trim();
+      scriptToSend._product_url = '';
       if (editedNarration !== scriptToSend.full_narration) {
         scriptToSend.full_narration = editedNarration;
       }
@@ -590,7 +983,8 @@ export default function SaaShortsTab({
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
           video_mode: videoMode,
-          broll_mode: brollMode,
+          broll_mode: storyboardSelected ? 'off' : brollMode,
+          storyboard_generation_mode: storyboardGenerationMode,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
@@ -622,7 +1016,10 @@ export default function SaaShortsTab({
     try {
       const scriptToSend = { ...scripts[selectedScript] };
       scriptToSend._product_name = analysis?.product_name || analysis?.name || '';
-      scriptToSend._product_url = url;
+      scriptToSend._business_name = businessName.trim();
+      scriptToSend._business_description = description.trim();
+      scriptToSend._video_topic = topic.trim();
+      scriptToSend._product_url = '';
       if (editedNarration !== scriptToSend.full_narration) {
         scriptToSend.full_narration = editedNarration;
       }
@@ -647,7 +1044,8 @@ export default function SaaShortsTab({
           actor_description: actorDescription || undefined,
           retry_job_id: jobId,
           video_mode: videoMode,
-          broll_mode: brollMode,
+          broll_mode: storyboardSelected ? 'off' : brollMode,
+          storyboard_generation_mode: storyboardGenerationMode,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
@@ -848,15 +1246,18 @@ export default function SaaShortsTab({
     ttsProvider,
     brollMode,
     hasSelectedActor: Boolean(selectedActor),
+    script: scripts[selectedScript],
   });
 
   const estimateModePriceLabel = (modeId) => `~${formatUsd(estimateForMode(modeId).total)}`;
+  const currentScript = scripts[selectedScript];
+  const storyboardSelected = isStoryboardScript(currentScript);
 
   // ─── Render Steps ─────────────────────────────────────────────────
 
   return (
     <div className="h-full overflow-y-auto custom-scrollbar">
-      <div className="max-w-5xl mx-auto p-6 lg:p-8">
+      <div className="max-w-5xl mx-auto p-6 pb-28 md:pb-8 lg:p-8">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
@@ -904,24 +1305,176 @@ export default function SaaShortsTab({
         {step === 0 && (
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             <div className="glass-panel p-8 space-y-6">
-              {/* Video Mode Selector */}
+              <section className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Target size={15} className="text-violet-300" />
+                      <h2 className="text-sm font-semibold text-zinc-100">Проект</h2>
+                    </div>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      Сохрани конкретный бизнес один раз, потом выбирай его перед генерацией роликов.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleSaveBusinessProfile}
+                    className="btn-secondary px-4 py-2.5 text-sm flex items-center justify-center gap-2 md:w-auto"
+                  >
+                    <Save size={14} /> Сохранить проект
+                  </button>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.45fr)]">
+                  <label className="space-y-1.5">
+                    <span className="text-xs font-medium text-zinc-400">Название проекта</span>
+                    <input
+                      value={businessName}
+                      onChange={(e) => {
+                        setBusinessName(e.target.value);
+                        setSelectedBusinessProfileId('');
+                      }}
+                      className="input-field"
+                      placeholder="Например: Неделя без срывов"
+                    />
+                  </label>
+                  <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-600">Выбрано</span>
+                    <div className="mt-1 text-sm font-semibold text-zinc-200 truncate">
+                      {businessProfiles.find((profile) => (profile.id || profile.name) === selectedBusinessProfileId)?.name || businessName.trim() || 'Новый проект'}
+                    </div>
+                    <div className="text-[11px] text-zinc-500 truncate">
+                      {selectedBusinessProfileId ? 'Используется сохранённый профиль' : 'Заполни и сохрани профиль'}
+                    </div>
+                  </div>
+                </div>
+
+                {businessProfiles.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-xs font-semibold text-zinc-300">Библиотека проектов</p>
+                      <span className="text-[10px] text-zinc-600">{businessProfiles.length} сохранено</span>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {businessProfiles.slice(0, 6).map((profile) => {
+                        const profileId = profile.id || profile.name;
+                        const active = selectedBusinessProfileId === profileId;
+                        return (
+                          <button
+                            key={profileId}
+                            type="button"
+                            onClick={() => handleLoadBusinessProfile(profile)}
+                            className={`rounded-xl border p-3 text-left transition-all ${
+                              active
+                                ? 'border-violet-500/50 bg-violet-500/10 text-violet-100'
+                                : 'border-white/10 bg-white/[0.04] text-zinc-300 hover:border-violet-400/40 hover:bg-white/[0.07]'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="text-sm font-semibold truncate">{profile.name}</div>
+                                <div className="text-[11px] text-zinc-500 line-clamp-2 mt-1">
+                                  {profile.topic || profile.description || 'Без темы ролика'}
+                                </div>
+                              </div>
+                              {active && <Check size={14} className="text-violet-300 shrink-0 mt-0.5" />}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {businessProfileStatus && (
+                  <p className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-zinc-400">
+                    {businessProfileStatus}
+                  </p>
+                )}
+              </section>
+
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Video Mode</label>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  {VIDEO_MODE_OPTIONS.map((mode) => {
+                <label className="block text-sm font-medium text-zinc-300 mb-2">
+                  Описание бизнеса / продукта <span className="text-zinc-600">(обязательно)</span>
+                </label>
+                <textarea
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  rows={3}
+                  className="input-field resize-none text-sm"
+                  placeholder="Что продаём, кому, какой результат, какие ограничения, тон коммуникации."
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Источник сценария</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {[
+                    { id: 'ai', label: 'Сгенерировать варианты', desc: 'ИИ возьмёт проект, тему и формат как бриф' },
+                    { id: 'custom', label: 'Мой точный текст', desc: 'Не переписывать озвучку перед генерацией' },
+                  ].map((mode) => (
+                    <button
+                      key={mode.id}
+                      onClick={() => setScriptMode(mode.id)}
+                      className={`p-3 rounded-xl border text-left transition-all ${
+                        scriptMode === mode.id
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="text-xs font-semibold">{mode.label}</div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">{mode.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div data-section="script-format-section">
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Формат сценария</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {SCRIPT_FORMAT_OPTIONS.map((format) => (
+                    <button
+                      key={format.id}
+                      onClick={() => setScriptFormat(format.id)}
+                      className={`p-3 rounded-xl border text-left transition-all ${
+                        scriptFormat === format.id
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="text-xs font-semibold">{format.label}</div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">{format.desc}</div>
+                    </button>
+                  ))}
+                </div>
+                {scriptFormat === 'storyboard_v3' && (
+                  <p className="text-[10px] text-zinc-500 mt-2">
+                    ИИ сгенерирует кадры, действия, текст на экране и промпты для выбранной видео-модели.
+                  </p>
+                )}
+              </div>
+
+              {/* Video Mode Selector */}
+              <div data-section="video-mode-section">
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Режим генерации видео</label>
+                <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))' }}>
+                  {activeVideoModeOptions(scriptFormat).map((mode) => {
                     const active = videoMode === mode.id;
                     const activeClass =
                       mode.id === 'lowcost' ? 'border-green-500/50 bg-green-500/10 ring-1 ring-green-500/30' :
-                      mode.id === 'standard' ? 'border-blue-500/50 bg-blue-500/10 ring-1 ring-blue-500/30' :
+                      mode.id === 'storyboard_veo31_quality' ? 'border-amber-500/50 bg-amber-500/10 ring-1 ring-amber-500/30' :
+                      mode.id === 'standard' || mode.id === 'storyboard_v3_standard' ? 'border-blue-500/50 bg-blue-500/10 ring-1 ring-blue-500/30' :
                       'border-violet-500/50 bg-violet-500/10 ring-1 ring-violet-500/30';
                     const textClass =
                       active && mode.id === 'lowcost' ? 'text-green-300' :
-                      active && mode.id === 'standard' ? 'text-blue-300' :
-                      active && mode.id === 'premium' ? 'text-violet-300' :
+                      active && mode.id === 'storyboard_veo31_quality' ? 'text-amber-300' :
+                      active && (mode.id === 'standard' || mode.id === 'storyboard_v3_standard') ? 'text-blue-300' :
+                      active && (mode.id === 'premium' || mode.id === 'storyboard_v3_pro') ? 'text-violet-300' :
                       'text-zinc-300';
                     const priceClass =
                       mode.id === 'lowcost' ? 'text-green-400 bg-green-500/10' :
-                      mode.id === 'standard' ? 'text-blue-400 bg-blue-500/10' :
+                      mode.id === 'storyboard_veo31_quality' ? 'text-amber-400 bg-amber-500/10' :
+                      mode.id === 'standard' || mode.id === 'storyboard_v3_standard' ? 'text-blue-400 bg-blue-500/10' :
                       'text-violet-400 bg-violet-500/10';
 
                     return (
@@ -945,48 +1498,7 @@ export default function SaaShortsTab({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">Website URL <span className="text-zinc-600">(optional)</span></label>
-                <div className="flex gap-3">
-                  <div className="relative flex-1">
-                    <Globe size={18} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500" />
-                    <input
-                      type="url"
-                      value={url}
-                      onChange={(e) => setUrl(e.target.value)}
-                      placeholder="https://your-website.com"
-                      className="input-field !pl-12"
-                      onKeyDown={(e) => e.key === 'Enter' && handleAnalyze()}
-                    />
-                  </div>
-                </div>
-                <p className="text-[10px] text-zinc-600 mt-1">If provided, we'll scrape and research your site automatically</p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Script Input Mode</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {[
-                    { id: 'ai', label: 'AI generate scripts', desc: 'Use product + topic as a brief' },
-                    { id: 'custom', label: 'Use my exact script', desc: 'Keep narration text unchanged' },
-                  ].map((mode) => (
-                    <button
-                      key={mode.id}
-                      onClick={() => setScriptMode(mode.id)}
-                      className={`p-3 rounded-xl border text-left transition-all ${
-                        scriptMode === mode.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{mode.label}</div>
-                      <div className="text-[10px] text-zinc-500 mt-0.5">{mode.desc}</div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div>
+              <div className="hidden">
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   {url.trim() ? 'Extra context' : 'Describe your product/business'} <span className="text-zinc-600">{url.trim() ? '(optional)' : '(required if no URL)'}</span>
                 </label>
@@ -1001,7 +1513,7 @@ export default function SaaShortsTab({
 
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  Current video topic <span className="text-zinc-600">(optional, but recommended)</span>
+                  Тема текущего ролика <span className="text-zinc-600">(необязательно, но лучше заполнить)</span>
                 </label>
                 <textarea
                   value={topic}
@@ -1010,13 +1522,13 @@ export default function SaaShortsTab({
                   className="input-field resize-none text-sm"
                   placeholder="e.g. Почему вечерний срыв начинается утром; What to eat at 5 PM to avoid night cravings..."
                 />
-                <p className="text-[10px] text-zinc-600 mt-1">AI mode will generate scripts around this topic. Custom mode uses it for title, hook overlay, caption and b-roll prompts.</p>
+                <p className="text-[10px] text-zinc-600 mt-1">В AI-режиме варианты сценариев строятся вокруг этой темы. В ручном режиме тема нужна для заголовка, caption и визуальных подсказок.</p>
               </div>
 
               {scriptMode === 'custom' && (
                 <div>
                   <label className="block text-sm font-medium text-zinc-300 mb-2">
-                    Exact narration script <span className="text-zinc-600">(required)</span>
+                    Точный текст озвучки <span className="text-zinc-600">(обязательно)</span>
                   </label>
                   <textarea
                     value={customScript}
@@ -1026,13 +1538,13 @@ export default function SaaShortsTab({
                     placeholder={`Ты срываешься вечером не потому, что слабая.\nЧасто проблема начинается утром: кофе вместо завтрака, маленький обед...\nНапиши "НЕДЕЛЯ" - пришлю чеклист антисрыв-вечера.`}
                   />
                   <p className="text-[10px] text-zinc-600 mt-1">
-                    {customScript.length} chars &middot; ~{Math.max(1, Math.round(customScript.trim().split(/\s+/).filter(Boolean).length / 2.5))}s speech. This text will not be rewritten before video generation.
+                    {customScript.length} символов &middot; ~{Math.max(1, Math.round(customScript.trim().split(/\s+/).filter(Boolean).length / 2.5))} сек озвучки. Этот текст не будет переписан перед генерацией.
                   </p>
                 </div>
               )}
 
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Language</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Язык</label>
                 <div className="flex gap-2 mb-6">
                   {[
                     { id: 'en', label: 'English', flag: '🇺🇸' },
@@ -1054,11 +1566,11 @@ export default function SaaShortsTab({
                   ))}
                 </div>
 
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Actor</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Пол актёра</label>
                 <div className="flex gap-2 mb-6">
                   {[
-                    { id: 'female', label: 'Woman', icon: '👩' },
-                    { id: 'male', label: 'Man', icon: '👨' },
+                    { id: 'female', label: 'Женщина', icon: '👩' },
+                    { id: 'male', label: 'Мужчина', icon: '👨' },
                   ].map((g) => (
                     <button
                       key={g.id}
@@ -1075,7 +1587,7 @@ export default function SaaShortsTab({
                   ))}
                 </div>
 
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Video Style</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-3">Стиль ролика</label>
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                   {STYLE_OPTIONS.map((s) => (
                     <button
@@ -1095,8 +1607,11 @@ export default function SaaShortsTab({
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">Number of Scripts</label>
-                <div className="flex gap-2">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <label className="block text-sm font-medium text-zinc-300">Количество вариантов сценария</label>
+                  <span className="text-[11px] text-zinc-500">Сейчас: {numScripts}</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
                   {[1, 2, 3, 5].map((n) => (
                     <button
                       key={n}
@@ -1107,7 +1622,7 @@ export default function SaaShortsTab({
                           : 'bg-white/5 text-zinc-400 border border-white/10 hover:bg-white/10'
                       }`}
                     >
-                      {n}
+                      {n} {n === 1 ? 'вариант' : n < 5 ? 'варианта' : 'вариантов'}
                     </button>
                   ))}
                 </div>
@@ -1322,53 +1837,268 @@ export default function SaaShortsTab({
                           <span className="text-[10px] text-zinc-500">{script.duration_seconds}s &middot; {script.style} &middot; {script.target_platform}</span>
                         </div>
                       </div>
-                      {selectedScript === i && (
-                        <span className="text-[10px] bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-full">Selected</span>
-                      )}
+                      <div className="flex items-center gap-2">
+                        {selectedScript === i && (
+                          <span className="text-[10px] bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-full">Selected</span>
+                        )}
+                        <button
+                          type="button"
+                          aria-label="Редактировать сценарий"
+                          onClick={(event) => handleStartScriptEdit(i, event)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:border-violet-400/40 hover:bg-violet-500/10 hover:text-violet-100"
+                        >
+                          <Pencil size={12} /> Править
+                        </button>
+                      </div>
                     </div>
 
-                    {/* Segments preview */}
-                    <div className="flex gap-1 mb-3">
-                      {(script.segments || []).map((seg, j) => (
-                        <div
-                          key={j}
-                          className={`h-1.5 rounded-full ${
-                            seg.type === 'hook' ? 'bg-red-400' :
-                            seg.type === 'problem' ? 'bg-yellow-400' :
-                            seg.type === 'solution' ? 'bg-green-400' :
-                            'bg-blue-400'
-                          }`}
-                          style={{ flex: (seg.end - seg.start) }}
-                          title={`${seg.type}: ${seg.start}s-${seg.end}s`}
-                        />
-                      ))}
-                    </div>
-
-                    <div className="space-y-2">
-                      {(script.segments || []).map((seg, j) => (
-                        <div key={j} className="flex gap-3 text-xs">
-                          <span className={`shrink-0 px-1.5 py-0.5 rounded font-mono uppercase tracking-wider ${
-                            seg.type === 'hook' ? 'bg-red-500/20 text-red-300' :
-                            seg.type === 'problem' ? 'bg-yellow-500/20 text-yellow-300' :
-                            seg.type === 'solution' ? 'bg-green-500/20 text-green-300' :
-                            'bg-blue-500/20 text-blue-300'
-                          }`}>
-                            {seg.type}
-                          </span>
-                          <span className="text-zinc-400 leading-relaxed">{seg.narration}</span>
+                    {editingScriptIndex === i && scriptDraft ? (
+                      <div
+                        className="space-y-4 rounded-xl border border-violet-500/20 bg-black/20 p-4"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),minmax(220px,0.45fr)]">
+                          <label className="space-y-1.5 text-xs text-zinc-400">
+                            <span>Заголовок</span>
+                            <input
+                              className="input-field py-2 text-sm"
+                              value={scriptDraft.title || ''}
+                              onChange={(event) => handleScriptDraftField('title', event.target.value)}
+                            />
+                          </label>
+                          <label className="space-y-1.5 text-xs text-zinc-400">
+                            <span>Hook overlay</span>
+                            <input
+                              className="input-field py-2 text-sm"
+                              value={scriptDraft.hook_text || ''}
+                              onChange={(event) => handleScriptDraftField('hook_text', event.target.value)}
+                            />
+                          </label>
                         </div>
-                      ))}
-                    </div>
 
-                    {/* Hook text & hashtags */}
-                    <div className="mt-3 pt-3 border-t border-white/5 flex items-center gap-3 flex-wrap">
-                      <span className="text-[10px] bg-red-500/10 text-red-300 px-2 py-0.5 rounded-full">
-                        Hook: &quot;{script.hook_text}&quot;
-                      </span>
-                      {(script.hashtags || []).slice(0, 4).map((tag, j) => (
-                        <span key={j} className="text-[10px] text-zinc-500">{tag}</span>
-                      ))}
-                    </div>
+                        {scriptDraft.format === 'storyboard_v3' ? (
+                          <div className="space-y-3">
+                            {(scriptDraft.shots || []).map((shot, j) => (
+                              <div key={j} className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <span className="text-xs font-semibold text-violet-200">КАДР {shot.shot_number || j + 1}</span>
+                                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                                    <input
+                                      type="number"
+                                      value={shot.start ?? 0}
+                                      onChange={(event) => handleScriptDraftShot(j, 'start', event.target.value)}
+                                      className="input-field w-16 py-1 text-[11px]"
+                                    />
+                                    <span>–</span>
+                                    <input
+                                      type="number"
+                                      value={shot.end ?? 3}
+                                      onChange={(event) => handleScriptDraftShot(j, 'end', event.target.value)}
+                                      className="input-field w-16 py-1 text-[11px]"
+                                    />
+                                    <span>sec</span>
+                                  </div>
+                                </div>
+                                <div className="grid gap-3 md:grid-cols-3">
+                                  <label className="space-y-1.5 text-xs text-zinc-400">
+                                    <span>Роль кадра</span>
+                                    <input
+                                      className="input-field py-2 text-sm"
+                                      value={shot.role || ''}
+                                      onChange={(event) => handleScriptDraftShot(j, 'role', event.target.value)}
+                                      placeholder="hook / problem / cta"
+                                    />
+                                  </label>
+                                  <label className="space-y-1.5 text-xs text-zinc-400 md:col-span-2">
+                                    <span>Переход после кадра</span>
+                                    <input
+                                      className="input-field py-2 text-sm"
+                                      value={shot.transition || ''}
+                                      onChange={(event) => handleScriptDraftShot(j, 'transition', event.target.value)}
+                                      placeholder="cut / smooth_0.3s"
+                                    />
+                                  </label>
+                                </div>
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Сцена</span>
+                                  <textarea
+                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
+                                    value={shot.scene || ''}
+                                    onChange={(event) => handleScriptDraftShot(j, 'scene', event.target.value)}
+                                  />
+                                </label>
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Действие актера</span>
+                                  <textarea
+                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
+                                    value={shot.actor_action || shot.action || ''}
+                                    onChange={(event) => handleScriptDraftShot(j, 'actor_action', event.target.value)}
+                                  />
+                                </label>
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Камера</span>
+                                  <input
+                                    className="input-field py-2 text-sm"
+                                    value={shot.camera || ''}
+                                    onChange={(event) => handleScriptDraftShot(j, 'camera', event.target.value)}
+                                    placeholder="крупный план, легкая ручная камера"
+                                  />
+                                </label>
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Реплика</span>
+                                  <textarea
+                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
+                                    value={shot.speech || ''}
+                                    onChange={(event) => handleScriptDraftShot(j, 'speech', event.target.value)}
+                                  />
+                                </label>
+                                <div className="grid gap-3 md:grid-cols-2">
+                                  <label className="space-y-1.5 text-xs text-zinc-400">
+                                    <span>Текст на экране</span>
+                                    <input
+                                      className="input-field py-2 text-sm"
+                                      value={shot.overlay_text || ''}
+                                      onChange={(event) => handleScriptDraftShot(j, 'overlay_text', event.target.value)}
+                                    />
+                                  </label>
+                                  <label className="space-y-1.5 text-xs text-zinc-400">
+                                    <span>Kling prompt</span>
+                                    <input
+                                      className="input-field py-2 text-sm"
+                                      value={shot.generation_prompt || ''}
+                                      onChange={(event) => handleScriptDraftShot(j, 'generation_prompt', event.target.value)}
+                                    />
+                                  </label>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            {(scriptDraft.segments || []).map((seg, j) => (
+                              <label key={j} className="grid gap-2 text-xs text-zinc-400 md:grid-cols-[92px,minmax(0,1fr)] md:items-start">
+                                <span className={`w-fit shrink-0 px-1.5 py-1 rounded font-mono uppercase tracking-wider ${
+                                  seg.type === 'hook' ? 'bg-red-500/20 text-red-300' :
+                                  seg.type === 'problem' ? 'bg-yellow-500/20 text-yellow-300' :
+                                  seg.type === 'solution' ? 'bg-green-500/20 text-green-300' :
+                                  'bg-blue-500/20 text-blue-300'
+                                }`}>
+                                  {seg.type}
+                                </span>
+                                <textarea
+                                  className="input-field min-h-[74px] resize-y py-2 text-sm leading-relaxed"
+                                  value={seg.narration || ''}
+                                  onChange={(event) => handleScriptDraftSegment(j, event.target.value)}
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),minmax(220px,0.45fr)]">
+                          <label className="space-y-1.5 text-xs text-zinc-400">
+                            <span>Caption</span>
+                            <textarea
+                              className="input-field min-h-[74px] resize-y py-2 text-sm"
+                              value={scriptDraft.caption || ''}
+                              onChange={(event) => handleScriptDraftField('caption', event.target.value)}
+                            />
+                          </label>
+                          <label className="space-y-1.5 text-xs text-zinc-400">
+                            <span>Hashtags</span>
+                            <textarea
+                              className="input-field min-h-[74px] resize-y py-2 text-sm"
+                              value={scriptDraft.hashtagsText || ''}
+                              onChange={(event) => handleScriptDraftField('hashtagsText', event.target.value)}
+                              placeholder="#reels #ugc"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                          <button
+                            type="button"
+                            onClick={handleCancelScriptEdit}
+                            className="btn-secondary px-4 py-2 text-sm inline-flex items-center justify-center gap-2"
+                          >
+                            <X size={14} /> Отмена
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Сохранить сценарий"
+                            onClick={handleSaveScriptDraft}
+                            className="btn-primary px-4 py-2 text-sm inline-flex items-center justify-center gap-2"
+                          >
+                            <Save size={14} /> Сохранить сценарий
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        {isStoryboardScript(script) ? (
+                          <div className="space-y-2">
+                            {(script.shots || []).map((shot, j) => (
+                              <div key={j} className="grid gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 text-xs md:grid-cols-[82px,minmax(0,1fr)]">
+                                <div className="text-violet-300 font-semibold">
+                                  КАДР {shot.shot_number || j + 1}
+                                  <div className="text-[10px] text-zinc-500 font-normal">{shot.start ?? 0}-{shot.end ?? 0}s</div>
+                                </div>
+                                <div className="min-w-0 space-y-1">
+                                  <p className="text-zinc-300 leading-relaxed">{shot.scene || shot.generation_prompt}</p>
+                                  {shot.speech && <p className="text-zinc-500 leading-relaxed">«{shot.speech}»</p>}
+                                  {shot.overlay_text && <span className="inline-flex text-[10px] bg-violet-500/10 text-violet-300 px-2 py-0.5 rounded-full">{shot.overlay_text}</span>}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <>
+                            {/* Segments preview */}
+                            <div className="flex gap-1 mb-3">
+                              {(script.segments || []).map((seg, j) => (
+                                <div
+                                  key={j}
+                                  className={`h-1.5 rounded-full ${
+                                    seg.type === 'hook' ? 'bg-red-400' :
+                                    seg.type === 'problem' ? 'bg-yellow-400' :
+                                    seg.type === 'solution' ? 'bg-green-400' :
+                                    'bg-blue-400'
+                                  }`}
+                                  style={{ flex: (seg.end - seg.start) }}
+                                  title={`${seg.type}: ${seg.start}s-${seg.end}s`}
+                                />
+                              ))}
+                            </div>
+
+                            <div className="space-y-2">
+                              {(script.segments || []).map((seg, j) => (
+                                <div key={j} className="flex gap-3 text-xs">
+                                  <span className={`shrink-0 px-1.5 py-0.5 rounded font-mono uppercase tracking-wider ${
+                                    seg.type === 'hook' ? 'bg-red-500/20 text-red-300' :
+                                    seg.type === 'problem' ? 'bg-yellow-500/20 text-yellow-300' :
+                                    seg.type === 'solution' ? 'bg-green-500/20 text-green-300' :
+                                    'bg-blue-500/20 text-blue-300'
+                                  }`}>
+                                    {seg.type}
+                                  </span>
+                                  <span className="text-zinc-400 leading-relaxed">{seg.narration}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        )}
+
+                        {/* Hook text & hashtags */}
+                        <div className="mt-3 pt-3 border-t border-white/5 flex items-center gap-3 flex-wrap">
+                          <span className="text-[10px] bg-red-500/10 text-red-300 px-2 py-0.5 rounded-full">
+                            Hook: &quot;{script.hook_text}&quot;
+                          </span>
+                          {(script.hashtags || []).slice(0, 4).map((tag, j) => (
+                            <span key={j} className="text-[10px] text-zinc-500">{tag}</span>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1393,6 +2123,149 @@ export default function SaaShortsTab({
               <p className="text-sm text-zinc-500">
                 Script: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
+
+              {storyboardSelected && (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 space-y-4">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
+                        <Film size={14} /> Кадры раскадровки
+                      </h3>
+                      <p className="text-[11px] text-zinc-500">
+                        Здесь управляешь кадрами перед генерацией: текст, prompt и reference image для Kling V3.
+                      </p>
+                    </div>
+                    <span className="text-[11px] text-zinc-500">
+                      {(scripts[selectedScript].shots || []).length} кадров
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {(scripts[selectedScript].shots || []).map((shot, shotIndex) => {
+                      const previewUrl = shot.image_preview
+                        || (shot.local_url ? getApiUrl(shot.local_url) : '')
+                        || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url);
+                      const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
+
+                      return (
+                        <div key={shotIndex} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                          <div className="grid gap-3 lg:grid-cols-[120px,minmax(0,1fr)]">
+                            <div className="space-y-2">
+                              <div className="aspect-[9/16] overflow-hidden rounded-lg border border-white/10 bg-zinc-950">
+                                {previewUrl ? (
+                                  <img src={previewUrl} alt={`Кадр ${shot.shot_number || shotIndex + 1}`} className="h-full w-full object-cover" />
+                                ) : (
+                                  <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-[10px] text-zinc-600">
+                                    <Upload size={18} />
+                                    Reference frame
+                                  </div>
+                                )}
+                              </div>
+                              <input
+                                id={inputId}
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(event) => {
+                                  const file = event.target.files?.[0];
+                                  if (file) handleStoryboardFrameUpload(shotIndex, file);
+                                  event.target.value = '';
+                                }}
+                              />
+                              <label htmlFor={inputId} className="btn-secondary w-full cursor-pointer px-2 py-2 text-[11px] flex items-center justify-center gap-1.5">
+                                <Upload size={12} /> Загрузить кадр
+                              </label>
+                              {shot.frame_status && (
+                                <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
+                              )}
+                            </div>
+
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between gap-3">
+                                <span className="text-xs font-semibold text-violet-200">КАДР {shot.shot_number || shotIndex + 1}</span>
+                                <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                                  <input
+                                    type="number"
+                                    value={shot.start ?? 0}
+                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'start', event.target.value)}
+                                    className="input-field w-16 py-1 text-[11px]"
+                                  />
+                                  <span>-</span>
+                                  <input
+                                    type="number"
+                                    value={shot.end ?? 3}
+                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'end', event.target.value)}
+                                    className="input-field w-16 py-1 text-[11px]"
+                                  />
+                                  <span>sec</span>
+                                </div>
+                              </div>
+                              <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                <span>Сцена</span>
+                                <textarea
+                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+                                  value={shot.scene || ''}
+                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'scene', event.target.value)}
+                                />
+                              </label>
+                              <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                <span>Реплика</span>
+                                <textarea
+                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+                                  value={shot.speech || ''}
+                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
+                                />
+                              </label>
+                              <div className="grid gap-3 md:grid-cols-2">
+                                <label className="space-y-1.5 text-xs text-zinc-400">
+                                  <span>Текст на экране</span>
+                                  <input
+                                    className="input-field py-2 text-sm"
+                                    value={shot.overlay_text || ''}
+                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'overlay_text', event.target.value)}
+                                  />
+                                </label>
+                                <label className="space-y-1.5 text-xs text-zinc-400">
+                                  <span>Kling prompt</span>
+                                  <input
+                                    className="input-field py-2 text-sm"
+                                    value={shot.generation_prompt || ''}
+                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'generation_prompt', event.target.value)}
+                                  />
+                                </label>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {storyboardSelected && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                    <Film size={14} /> Storyboard generation
+                  </label>
+                  <div className="grid sm:grid-cols-2 gap-2">
+                    {STORYBOARD_GENERATION_OPTIONS.map((option) => (
+                      <button
+                        key={option.id}
+                        onClick={() => setStoryboardGenerationMode(option.id)}
+                        className={`p-3 rounded-lg border text-left transition-all ${
+                          storyboardGenerationMode === option.id
+                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="text-sm font-semibold">{option.label}</div>
+                        <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* TTS Provider */}
               <div>
@@ -1618,6 +2491,7 @@ export default function SaaShortsTab({
               )}
 
               {/* B-roll Mode */}
+              {!storyboardSelected && (
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
                   <Film size={14} /> B-roll
@@ -1642,8 +2516,10 @@ export default function SaaShortsTab({
                   Product mockups are the default for this offer because dramatic AI lifestyle scenes often reduce trust.
                 </p>
               </div>
+              )}
 
               {/* Talking-head source */}
+              {!storyboardSelected && (
               <div className="p-4 rounded-xl border border-white/10 bg-white/5 space-y-3">
                 <div className="flex items-start justify-between gap-3">
                   <div>
@@ -1735,17 +2611,26 @@ export default function SaaShortsTab({
                   </div>
                 )}
               </div>
+              )}
 
               {/* Actor Selection: Gallery + Generate New */}
               <div className={selectedHeadTemplate ? 'opacity-50 pointer-events-none' : ''}>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <User size={14} /> AI Actor
+                  <User size={14} /> Аватар проекта {storyboardSelected && <span className="text-zinc-600">(необязательно)</span>}
                 </label>
+                {storyboardSelected && (
+                  <p className="text-xs text-zinc-500 mb-3">
+                    Для V3-раскадровки аватар не обязателен: кадры строятся по промптам. Но сохранённый аватар пригодится, когда будем делать постоянного персонажа проекта.
+                  </p>
+                )}
+                <p className="text-xs text-zinc-500 mb-3">
+                  Выбери сохранённого аватара из UGC-галереи или загрузи новый. Это постоянный визуальный персонаж проекта.
+                </p>
 
                 <div className="grid grid-cols-2 gap-1 bg-white/5 p-1 rounded-xl mb-3">
                   {[
-                    { id: 'saved', label: 'Saved' },
-                    { id: 'upload', label: 'Upload' },
+                    { id: 'saved', label: 'Сохранённые' },
+                    { id: 'upload', label: 'Загрузить' },
                   ].map((source) => (
                     <button
                       key={source.id}
@@ -1764,9 +2649,21 @@ export default function SaaShortsTab({
 
                 {actorSource === 'saved' && (
                   <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-xs font-semibold text-zinc-300">Сохранённые аватары ({actorGallery.length})</p>
+                      {selectedActor && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedActor(null)}
+                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                        >
+                          Сбросить выбор
+                        </button>
+                      )}
+                    </div>
                     {loadingGallery ? (
                       <p className="text-xs text-zinc-500 flex items-center gap-1">
-                        <Loader2 size={12} className="animate-spin" /> Loading saved avatars...
+                        <Loader2 size={12} className="animate-spin" /> Загружаю сохранённые аватары...
                       </p>
                     ) : actorGallery.length > 0 ? (
                       <div className="grid grid-cols-4 sm:grid-cols-6 gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
@@ -1793,7 +2690,7 @@ export default function SaaShortsTab({
                       </div>
                     ) : (
                       <div className="p-3 rounded-xl border border-dashed border-white/15 bg-white/5 text-xs text-zinc-500">
-                        No saved avatars yet. Create avatars in UGC Gallery / Avatars, or upload a photo here.
+                        В UGC-галерее пока нет аватаров. Загрузи фото здесь или создай аватара во вкладке «Аватары».
                       </div>
                     )}
                   </div>
@@ -1804,7 +2701,7 @@ export default function SaaShortsTab({
                     <div className="flex items-center gap-3">
                       <label className="flex-1 flex items-center justify-center gap-2 text-sm bg-white/5 text-zinc-400 px-4 py-3 rounded-xl border border-dashed border-white/20 hover:bg-white/10 hover:border-white/30 transition-colors cursor-pointer">
                         <Upload size={14} />
-                        <span>Upload and save avatar</span>
+                        <span>Загрузить и сохранить аватар</span>
                         <input
                           type="file"
                           accept="image/*"
@@ -1854,7 +2751,7 @@ export default function SaaShortsTab({
 
                 {!selectedActor && (
                   <p className="text-xs text-amber-400 mt-3 flex items-center gap-1">
-                    <AlertCircle size={12} /> Select or upload an actor to continue
+                    <AlertCircle size={12} /> Выбери или загрузи аватара, чтобы продолжить
                   </p>
                 )}
               </div>
@@ -2037,7 +2934,7 @@ export default function SaaShortsTab({
                   </div>
                 )}
 
-                {!selectedActor && (actorOptions.length > 0 || actorGallery.length > 0) && (
+                {!storyboardSelected && !selectedActor && (actorOptions.length > 0 || actorGallery.length > 0) && (
                   <p className="text-xs text-amber-400 mt-2 flex items-center gap-1"><AlertCircle size={12} /> Select an actor to continue</p>
                 )}
               </div>
@@ -2068,15 +2965,22 @@ export default function SaaShortsTab({
                   hasSelectedActor: Boolean(selectedActor),
                   hasReusableHead: Boolean(selectedHeadTemplate),
                   lipsyncModel: lipSyncModel,
+                  script: scripts[selectedScript],
                 });
                 const costDetails =
                   selectedHeadTemplate
-                    ? 'Saved talking head + new voiceover + Sync Lipsync. Faster and cheaper than regenerating Kling/Hailuo.'
+                    ? 'Сохранённый talking-head + новая озвучка + Sync Lipsync. Быстрее, чем заново генерировать Kling/Hailuo.'
+                    : videoMode === 'storyboard_v3_standard'
+                    ? 'Озвучка + Kling V3 Standard по кадрам. Рабочий режим для раскадровок.'
+                    : videoMode === 'storyboard_v3_pro'
+                    ? 'Озвучка + Kling V3 Pro по кадрам: дороже; включай для более аккуратного финального визуала.'
+                    : videoMode === 'storyboard_veo31_quality'
+                    ? 'Озвучка + Google Veo 3.1 через fal.ai по кадрам. Самый дорогой режим для финального визуала; audio в Veo отключен, используем наш TTS.'
                     : videoMode === 'lowcost'
-                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешевый черновой режим, качество может плыть.'
+                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. AI-slop черновик: дешево, но качество может плыть.'
                     : videoMode === 'premium'
-                      ? 'Озвучка + Kling Avatar v2 Pro. Лучший вариант для публикации.'
-                      : 'Озвучка + Kling Avatar v2 Standard. Баланс цены и качества.';
+                      ? 'Озвучка + Kling Avatar v2 Pro: дороже; использовать для контрольного финального дубля.'
+                      : 'Озвучка + Kling Avatar v2 Standard. Основной UGC-режим: хорошее качество при нормальной цене.';
 
                 return (
                   <div className="max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10">
@@ -2122,17 +3026,19 @@ export default function SaaShortsTab({
               </button>
               <button
                 onClick={handleGenerate}
-                disabled={!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey) || (!selectedActor && !selectedHeadTemplate) || generating}
+                disabled={!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey) || (!storyboardSelected && !selectedActor && !selectedHeadTemplate) || generating}
                 className="btn-primary px-6 py-2 text-sm flex items-center gap-2 disabled:opacity-50"
               >
                 {generating ? (
                   <><Loader2 size={14} className="animate-spin" /> Generating...</>
-                ) : (!selectedActor && !selectedHeadTemplate) ? (
+                ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Select an actor first</>
+                ) : storyboardSelected ? (
+                  <><Film size={14} /> Generate storyboard ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel, script: scripts[selectedScript] }).total)})</>
                 ) : selectedHeadTemplate ? (
-                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel }).total)})</>
+                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel, script: scripts[selectedScript] }).total)})</>
                 ) : (
-                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel }).total)})</>
+                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel, script: scripts[selectedScript] }).total)})</>
                 )}
               </button>
             </div>
@@ -2162,8 +3068,16 @@ export default function SaaShortsTab({
                 {(() => {
                   const logStr = genLogs.join(' ').toLowerCase();
                   const isLipSyncJob = logStr.includes('lip-sync') || logStr.includes('lipsync');
+                  const isStoryboardJob = logStr.includes('storyboard') || logStr.includes('kling v3');
                   const noBroll = !isLipSyncJob && brollMode === 'off';
-                  const labels = isLipSyncJob
+                  const labels = isStoryboardJob
+                    ? [
+                      'Generating Russian voiceover',
+                      'Generating Kling V3 shots',
+                      'Adding subtitles',
+                      'Assembling storyboard edit',
+                    ]
+                    : isLipSyncJob
                     ? [
                       'Finding cached head + voiceover',
                       'Running lip-sync model',
@@ -2207,6 +3121,13 @@ export default function SaaShortsTab({
                         i === 2 ? logStr.includes('[lipsync 3/3]') || genStatus === 'completed' :
                         genStatus === 'completed'
                       )
+                      : isStoryboardJob
+                      ? (
+                        i === 0 ? logStr.includes('[2/5]') || logStr.includes('[3/5]') :
+                        i === 1 ? logStr.includes('[3/5]') || logStr.includes('[4/5]') || genStatus === 'completed' :
+                        i === 2 ? logStr.includes('[4/5]') || genStatus === 'completed' :
+                        genStatus === 'completed'
+                      )
                       : normalStepDone();
                     const stepActive = isLipSyncJob
                       ? (
@@ -2214,6 +3135,13 @@ export default function SaaShortsTab({
                         i === 1 ? logStr.includes('[lipsync 1/3]') && !logStr.includes('[lipsync 2/3]') :
                         i === 2 ? logStr.includes('[lipsync 2/3]') && !logStr.includes('[lipsync 3/3]') :
                         logStr.includes('[lipsync 3/3]') && genStatus !== 'completed'
+                      )
+                      : isStoryboardJob
+                      ? (
+                        i === 0 ? logStr.includes('[1/5]') && !stepDone :
+                        i === 1 ? logStr.includes('[2/5]') && !stepDone :
+                        i === 2 ? logStr.includes('[3/5]') && !stepDone :
+                        logStr.includes('[4/5]') && genStatus !== 'completed'
                       )
                       : normalStepActive();
 

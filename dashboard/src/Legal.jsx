@@ -23,8 +23,9 @@ export default function Legal() {
             <header className="border-b border-white/5 sticky top-0 bg-bg/95 backdrop-blur z-10">
                 <div className="max-w-3xl mx-auto px-6 py-4 flex items-center">
                     <button
+                        type="button"
                         onClick={handleBack}
-                        className="text-zinc-400 hover:text-white flex items-center gap-2 text-sm"
+                        className="inline-flex items-center gap-2 rounded-lg px-2 py-2 text-sm text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
                     >
                         <ArrowLeft size={16} /> Back
                     </button>
