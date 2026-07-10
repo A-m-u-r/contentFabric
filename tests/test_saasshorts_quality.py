@@ -8,6 +8,7 @@ from saasshorts import (
     _broll_reference_image,
     _parse_review_issues,
     composite_storyboard_video,
+    generate_storyboard_shot_clip,
     review_clip_quality,
 )
 
@@ -126,6 +127,81 @@ class BrollReferenceImageTest(unittest.TestCase):
                 result = _broll_reference_image({"generation_prompt": "x"}, "key", out,
                                                 log=lambda *_: None)
         self.assertEqual(result, out)
+
+
+class ClipCacheInvalidationTest(unittest.TestCase):
+    """Editing a shot's Kling prompt must invalidate the cached clip on retry."""
+
+    def _make_cached_clip(self, tmp, prompt):
+        clip = os.path.join(tmp, "shot_01.mp4")
+        with open(clip, "wb") as f:
+            f.write(b"cached-clip")
+        with open(f"{clip}.meta.json", "w", encoding="utf-8") as f:
+            json.dump({"payload": {"prompt": prompt}}, f)
+        with open(f"{clip}.review.json", "w", encoding="utf-8") as f:
+            json.dump({"issues": []}, f)
+        return clip
+
+    def _shot(self, prompt):
+        return {"shot_number": 1, "duration": 5, "scene": "kitchen", "speech": "hi", "generation_prompt": prompt}
+
+    def test_cache_reused_when_prompt_unchanged(self):
+        from saasshorts import _shot_request_prompt
+        with tempfile.TemporaryDirectory() as tmp:
+            # Meta stores the request prompt (normalized form), as real jobs do.
+            cached_prompt = _shot_request_prompt(self._shot("coffee cup close-up"))
+            clip = self._make_cached_clip(tmp, cached_prompt)
+            with patch("saasshorts._fal_run", side_effect=AssertionError("must not call fal")):
+                result = generate_storyboard_shot_clip(self._shot("coffee cup close-up"), "key", clip)
+            self.assertEqual(result, clip)
+            self.assertTrue(os.path.exists(f"{clip}.review.json"))
+
+    def test_user_prompt_respected_with_guardrails_appended(self):
+        from saasshorts import _shot_request_prompt
+        prompt = _shot_request_prompt(self._shot("крупный план кофейной чашки на столе"))
+        self.assertIn("крупный план кофейной чашки", prompt)
+        self.assertIn("vertical 9:16", prompt)
+        self.assertIn("no burned-in text", prompt)
+        # Идемпотентность: повторная нормализация не должна менять промпт,
+        # иначе кэш клипов вечно считал бы его «изменённым».
+        reshot = self._shot("x")
+        reshot["generation_prompt"] = prompt
+        self.assertEqual(_shot_request_prompt(reshot), prompt)
+
+    def test_cache_invalidated_when_prompt_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = self._make_cached_clip(tmp, "old prompt")
+            with patch("saasshorts._fal_run", side_effect=RuntimeError("fal-called")):
+                with self.assertRaisesRegex(RuntimeError, "fal-called"):
+                    generate_storyboard_shot_clip(self._shot("new edited prompt"), "key", clip)
+            # Stale artifacts are gone so the retry regenerates from scratch.
+            self.assertFalse(os.path.exists(clip))
+            self.assertFalse(os.path.exists(f"{clip}.review.json"))
+            self.assertFalse(os.path.exists(f"{clip}.meta.json"))
+
+    def test_legacy_clip_without_meta_is_kept(self):
+        # Old jobs predate meta.json: never surprise the user with a paid regen.
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "shot_01.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"legacy")
+            with patch("saasshorts._fal_run", side_effect=AssertionError("must not call fal")):
+                result = generate_storyboard_shot_clip(self._shot("any prompt"), "key", clip)
+            self.assertEqual(result, clip)
+
+    def test_broll_reference_regenerated_when_prompt_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            with open(ref, "wb") as f:
+                f.write(b"old-frame")
+            with open(f"{ref}.prompt.txt", "w", encoding="utf-8") as f:
+                f.write("stale prompt text")
+            with patch("saasshorts._fal_run", side_effect=RuntimeError("flux-called")) as fal_mock:
+                result = _broll_reference_image({"generation_prompt": "brand new scene"}, "key", ref,
+                                                log=lambda *_: None)
+            fal_mock.assert_called_once()
+            self.assertEqual(result, "")  # failure path: fell back, stale file removed
+            self.assertFalse(os.path.exists(ref))
 
 
 if __name__ == "__main__":

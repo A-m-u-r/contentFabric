@@ -2114,8 +2114,16 @@ def _shot_duration(shot: dict) -> int:
 
 def _build_storyboard_generation_prompt(shot: dict) -> str:
     existing = (shot.get("generation_prompt") or "").strip()
-    if existing and "vertical 9:16" in existing and "no burned-in text" in existing:
-        return existing
+    if existing:
+        # Уважать промпт пользователя (он редактируется в UI): гардрейлы формата
+        # дописываем, а не заменяем ими весь текст. Идемпотентно — повторный
+        # normalize не меняет строку, иначе кэш клипов считал бы её «новым промптом».
+        additions = []
+        if "9:16" not in existing:
+            additions.append("vertical 9:16")
+        if "no burned-in text" not in existing.lower():
+            additions.append("no burned-in text, no watermark")
+        return ", ".join([existing] + additions)
 
     scene = (shot.get("scene") or shot.get("visual") or "realistic social video scene").strip()
     actor_action = (shot.get("actor_action") or shot.get("action") or "natural movement").strip()
@@ -3923,6 +3931,24 @@ def _video_url_from_fal_result(result: dict) -> str:
     raise Exception(f"No video URL in fal result: {result}")
 
 
+def _shot_request_prompt(shot: dict) -> str:
+    """The prompt a single-shot fal request would carry (mirrors build_kling_v3_storyboard_request)."""
+    normalized = normalize_storyboard_shots({"shots": [shot]})
+    source = normalized[0] if normalized else shot
+    return source.get("generation_prompt") or source.get("scene") or source.get("speech") or "vertical social video shot"
+
+
+def _cached_clip_prompt(output_path: str) -> Optional[str]:
+    try:
+        with open(f"{output_path}.meta.json", encoding="utf-8") as f:
+            payload = (json.load(f).get("payload") or {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    if "prompt" in payload:
+        return payload["prompt"]
+    return None
+
+
 def generate_storyboard_shot_clip(
     shot: dict,
     fal_key: str,
@@ -3932,7 +3958,25 @@ def generate_storyboard_shot_clip(
 ) -> str:
     """Generate one storyboard shot with Kling V3 and no native audio."""
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        return output_path
+        # The UI lets the user edit a shot's Kling prompt and retry the job:
+        # the cached clip is only valid while the prompt still matches. Legacy
+        # clips without meta are kept — surprise regeneration is a paid call.
+        cached_prompt = _cached_clip_prompt(output_path)
+        if cached_prompt is None or cached_prompt == _shot_request_prompt(shot):
+            return output_path
+        print(f"[SaaSShorts] Prompt changed for {os.path.basename(output_path)} — regenerating clip.")
+        for stale in (
+            output_path,
+            f"{output_path}.fal_url.txt",
+            f"{output_path}.meta.json",
+            f"{output_path}.review.json",
+            f"{output_path}.review.jpg",
+        ):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
 
     start_image_url = _resolve_storyboard_start_image_url(shot, fal_key)
     model_id, payload = build_kling_v3_storyboard_request(
@@ -4386,14 +4430,28 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
     consistent aesthetic. Returns "" on any failure — the caller falls back to
     plain text-to-video, a worse shot beats a failed job.
     """
-    if _nonempty(output_path):
-        return output_path
     base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
     prompt = (
         f"{base_prompt}. Single photographic frame, vertical 9:16, first frame of a short "
         "product b-roll: realistic close-up of objects, natural light, shallow depth of field, "
         "smartphone realism, no people, no faces, no readable text, no logos, no watermark"
     )
+    prompt_sidecar = f"{output_path}.prompt.txt"
+    if _nonempty(output_path):
+        try:
+            with open(prompt_sidecar, encoding="utf-8") as f:
+                cached_prompt = f.read()
+        except OSError:
+            cached_prompt = None
+        # Референс валиден, пока совпадает промпт кадра (юзер мог его отредактировать).
+        if cached_prompt is None or cached_prompt == prompt:
+            return output_path
+        for stale in (output_path, f"{output_path}.fal_url.txt"):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
     try:
         result = _fal_run(
             "fal-ai/flux-2-pro",
@@ -4410,6 +4468,8 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
             resp.raise_for_status()
             with open(output_path, "wb") as f:
                 f.write(resp.content)
+        with open(prompt_sidecar, "w", encoding="utf-8") as f:
+            f.write(prompt)
         return output_path
     except Exception as e:
         log(f"  ⚠️ B-roll reference frame failed ({e}); falling back to text-to-video")
