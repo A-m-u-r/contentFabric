@@ -12,16 +12,16 @@ import {
 } from '../lib/businessProfiles';
 
 const STYLE_OPTIONS = [
-  { id: 'ugc', label: 'UGC Natural', desc: 'Authentic, talking to camera' },
-  { id: 'educational', label: 'Educational', desc: 'Clear explanations' },
-  { id: 'shock', label: 'Shock/Discovery', desc: 'Surprising opener' },
-  { id: 'story', label: 'Storytelling', desc: 'Mini narrative arc' },
-  { id: 'comparison', label: 'Before/After', desc: 'Comparison style' },
+  { id: 'ugc', label: 'Разговор в камеру', desc: 'Живо и по-человечески, как сторис у знакомой' },
+  { id: 'educational', label: 'Обучающий', desc: 'Проблема → 2-3 конкретных шага → вывод' },
+  { id: 'shock', label: 'Шок-факт', desc: 'Неожиданное заявление первой фразой, потом объяснение' },
+  { id: 'story', label: 'История', desc: 'Мини-сюжет от первого лица: было → перелом → стало' },
+  { id: 'comparison', label: 'До/после', desc: 'Контраст: как было раньше и как стало теперь' },
 ];
 
 const SCRIPT_FORMAT_OPTIONS = [
-  { id: 'ugc', label: 'UGC 5 частей', desc: 'ИИ сделает сценарий для talking-head + вставок' },
-  { id: 'storyboard_v3', label: 'Раскадровка V3', desc: 'ИИ сделает кадры, действия, текст и промпты' },
+  { id: 'ugc', label: 'Простой (5 частей)', desc: 'Актёр говорит в камеру, между репликами — предметные вставки' },
+  { id: 'storyboard_v3', label: 'Раскадровка (рекомендуем)', desc: 'ИИ распишет ролик по кадрам: сцены, реплики, движение камеры' },
 ];
 
 const TEXT_MODEL_OPTIONS = [
@@ -62,45 +62,45 @@ const STORYBOARD_GENERATION_OPTIONS = [
 const VIDEO_MODE_OPTIONS = [
   {
     id: 'lowcost',
-    label: 'AI-slop черновик',
+    label: 'Черновик (дёшево)',
     price: 'from ~$0.45',
     accent: 'green',
-    desc: 'Угарный дешёвый режим для черновика: может петлять, дрейфовать и выглядеть как нейрослоп.',
+    desc: 'Модель Hailuo. Быстро проверить идею ролика — картинка может плыть и глючить, для публикации не годится.',
   },
   {
     id: 'standard',
-    label: 'Standard',
+    label: 'Стандарт',
     price: 'from ~$0.75',
     accent: 'blue',
-    desc: 'Kling Avatar v2 Standard. Основной режим для коротких UGC: хорошее качество при нормальной цене.',
+    desc: 'Модель Kling Avatar v2. Оптимально по цене и качеству — подходит для большинства роликов.',
   },
   {
     id: 'premium',
-    label: 'Pro',
+    label: 'Про',
     price: 'from ~$1.45',
     accent: 'violet',
-    desc: 'Kling Avatar v2 Pro: дороже; использовать, когда нужен более аккуратный финальный дубль.',
+    desc: 'Kling Avatar v2 Pro: та же модель, но чётче лицо и движения. Примерно вдвое дороже Стандарта.',
   },
   {
     id: 'storyboard_v3_standard',
-    label: 'V3 Standard',
+    label: 'Kling V3 — Стандарт',
     price: 'from ~$1.30',
     accent: 'blue',
-    desc: 'Kling V3 по кадрам. Рабочий режим для раскадровок и разнообразных роликов.',
+    desc: 'Оптимально по цене и качеству. Подходит для большинства роликов.',
   },
   {
     id: 'storyboard_v3_pro',
-    label: 'V3 Pro',
+    label: 'Kling V3 — Про',
     price: 'from ~$1.75',
     accent: 'violet',
-    desc: 'Kling V3 Pro по кадрам: дороже; включай для более аккуратного финального визуала.',
+    desc: 'Та же модель, но чётче лица, руки и движения. Дороже примерно на треть.',
   },
   {
     id: 'storyboard_veo31_quality',
-    label: 'Veo 3.1 Quality',
+    label: 'Google Veo 3.1 — Максимум',
     price: 'from ~$3.20',
     accent: 'amber',
-    desc: 'Google Veo 3.1 через fal.ai: самый дорогой режим для финального визуала, без нативного аудио.',
+    desc: 'Максимум качества картинки в покадровых режимах. Говорящие кадры всё равно делает Kling Avatar, озвучка — наша (ElevenLabs).',
   },
 ];
 
@@ -292,24 +292,59 @@ function estimateStoryboardSeconds(script, fallbackText) {
   return estimateSpeechSeconds(fallbackText);
 }
 
-function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null }) {
-  const seconds = estimateSpeechSeconds(text);
-  const storyboardSeconds = estimateStoryboardSeconds(script, text);
+// Тарифы за секунду — зеркало бэкенда (KLING_AVATAR_TIERS / storyboard_video_cost_per_second).
+const AVATAR_RATE = { standard: 0.0562, pro: 0.115 };
+const STORYBOARD_RATE = { storyboard_v3_standard: 0.084, storyboard_v3_pro: 0.112, storyboard_veo31_quality: 0.20 };
+const FLUX_FRAME_COST = 0.05; // Flux-кадр под каждый b-roll (image-first)
+const TYPICAL_VIDEO_SECONDS = 35; // до генерации сценария длительность неизвестна
+
+function splitStoryboardSeconds(script, totalSeconds) {
+  // Говорящие кадры и b-roll тарифицируются разными моделями.
+  if (Array.isArray(script?.shots) && script.shots.length > 0) {
+    let broll = 0;
+    let brollShots = 0;
+    for (const shot of script.shots) {
+      const dur = Math.max(3, Number(shot.end || 0) - Number(shot.start || 0) || Number(shot.duration || 0) || 3);
+      if ((shot.visual_type || '').toLowerCase() === 'broll') {
+        broll += dur;
+        brollShots += 1;
+      }
+    }
+    return { talking: Math.max(0, totalSeconds - broll), broll, brollShots };
+  }
+  // Сценария ещё нет: типичная раскадровка ~70% речи в кадре и 2 b-roll вставки.
+  return { talking: totalSeconds * 0.7, broll: totalSeconds * 0.3, brollShots: 2 };
+}
+
+function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null, storyboardGenerationMode = 'sliced_avatar' }) {
+  // Длительность: реальные кадры сценария > оценка по тексту озвучки > типичный ролик.
+  // Описание бизнеса — не текст озвучки, по нему длительность не считаем.
+  const hasNarration = Boolean((text || '').trim());
+  const seconds = hasNarration ? estimateSpeechSeconds(text) : TYPICAL_VIDEO_SECONDS;
+  const storyboardSeconds = Array.isArray(script?.shots) && script.shots.length > 0
+    ? estimateStoryboardSeconds(script, text)
+    : seconds;
   const ttsRate = ttsProvider === 'fal_minimax' ? 0.0001 : 0.00003;
-  const voiceCost = (text || '').length * ttsRate;
+  const voiceCost = hasNarration ? (text || '').length * ttsRate : storyboardSeconds * 13 * 0.00003;
   const storyboardMode = videoMode.startsWith('storyboard_');
   const actorCost = (hasSelectedActor || hasReusableHead || storyboardMode) ? 0 : 0.05;
   let videoCost = 0;
+  let brollCost = 0;
 
   if (hasReusableHead) {
     const option = LIPSYNC_MODEL_OPTIONS.find((item) => item.id === lipsyncModel) || LIPSYNC_MODEL_OPTIONS[0];
     videoCost = (seconds / 60) * option.pricePerMinute;
-  } else if (videoMode === 'storyboard_v3_standard') {
-    videoCost = storyboardSeconds * 0.084;
-  } else if (videoMode === 'storyboard_v3_pro') {
-    videoCost = storyboardSeconds * 0.112;
-  } else if (videoMode === 'storyboard_veo31_quality') {
-    videoCost = storyboardSeconds * 0.20;
+  } else if (storyboardMode && storyboardGenerationMode === 'sliced_avatar') {
+    // Говорящие кадры — Kling Avatar, b-roll — Kling V3 + Flux-кадр (как на бэкенде).
+    const avatarTier = videoMode === 'storyboard_v3_standard' ? 'standard' : 'pro';
+    const brollRate = STORYBOARD_RATE[videoMode] && videoMode !== 'storyboard_veo31_quality'
+      ? STORYBOARD_RATE[videoMode]
+      : STORYBOARD_RATE.storyboard_v3_standard;
+    const { talking, broll, brollShots } = splitStoryboardSeconds(script, storyboardSeconds);
+    videoCost = talking * AVATAR_RATE[avatarTier];
+    brollCost = broll * brollRate + brollShots * FLUX_FRAME_COST;
+  } else if (storyboardMode) {
+    videoCost = storyboardSeconds * (STORYBOARD_RATE[videoMode] || STORYBOARD_RATE.storyboard_v3_standard);
   } else if (videoMode === 'lowcost') {
     videoCost = 0.19 + 0.20;
   } else if (videoMode === 'premium') {
@@ -318,7 +353,9 @@ function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSel
     videoCost = seconds * 0.0562;
   }
 
-  const brollCost = storyboardMode ? 0 : (brollMode === 'ai' ? 0.10 : 0);
+  if (!storyboardMode) {
+    brollCost = brollMode === 'ai' ? 0.10 : 0;
+  }
   const total = actorCost + voiceCost + videoCost + brollCost;
   return {
     seconds: storyboardMode ? storyboardSeconds : seconds,
@@ -1314,7 +1351,9 @@ export default function SaaShortsTab({
     if (scriptMode === 'custom' && customScript.trim()) return customScript;
     if (editedNarration.trim()) return editedNarration;
     if (scripts[selectedScript]?.full_narration) return scripts[selectedScript].full_narration;
-    return [description, topic].filter(Boolean).join(' ');
+    // Описание бизнеса — не текст озвучки: длительность по нему не оцениваем,
+    // иначе плитки показывают цену 75-секундного ролика вместо типичных ~35с.
+    return '';
   })();
 
   const estimateForMode = (modeId) => estimateSaasVideoCost({
@@ -1324,6 +1363,7 @@ export default function SaaShortsTab({
     brollMode,
     hasSelectedActor: Boolean(selectedActor),
     script: scripts[selectedScript],
+    storyboardGenerationMode,
   });
 
   const estimateModePriceLabel = (modeId) => `~${formatUsd(estimateForMode(modeId).total)}`;
@@ -1508,7 +1548,8 @@ export default function SaaShortsTab({
 
               {/* Video Mode Selector */}
               <div data-section="video-mode-section">
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Режим генерации видео</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-1">Модель видео и качество</label>
+                <p className="text-[11px] text-zinc-500 mb-3">Какая ИИ-модель нарисует картинку и насколько детально. Цена — оценка за весь ролик.</p>
                 <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))' }}>
                   {activeVideoModeOptions(scriptFormat).map((mode) => {
                     const active = videoMode === mode.id;
@@ -1595,51 +1636,27 @@ export default function SaaShortsTab({
                 </div>
               )}
 
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5">
+                <span className="text-xs text-zinc-500">
+                  Язык и пол актёра — из проекта:
+                  <span className="text-zinc-300 ml-1.5 font-medium">
+                    {({ en: '🇺🇸 English', es: '🇪🇸 Español', ru: '🇷🇺 Русский' })[language] || language}
+                    {' · '}
+                    {actorGender === 'male' ? '👨 мужчина' : '👩 женщина'}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onManageProjects?.()}
+                  className="text-[11px] text-violet-300 hover:text-violet-200"
+                >
+                  Изменить в Проектах
+                </button>
+              </div>
+
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Язык</label>
-                <div className="flex gap-2 mb-6">
-                  {[
-                    { id: 'en', label: 'English', flag: '🇺🇸' },
-                    { id: 'es', label: 'Español', flag: '🇪🇸' },
-                    { id: 'ru', label: 'Русский', flag: '🇷🇺' },
-                  ].map((l) => (
-                    <button
-                      key={l.id}
-                      onClick={() => setLanguage(l.id)}
-                      className={`flex-1 p-3 rounded-xl border text-center transition-all ${
-                        language === l.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <span className="text-lg">{l.flag}</span>
-                      <div className="text-xs font-medium mt-1">{l.label}</div>
-                    </button>
-                  ))}
-                </div>
-
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Пол актёра</label>
-                <div className="flex gap-2 mb-6">
-                  {[
-                    { id: 'female', label: 'Женщина', icon: '👩' },
-                    { id: 'male', label: 'Мужчина', icon: '👨' },
-                  ].map((g) => (
-                    <button
-                      key={g.id}
-                      onClick={() => setActorGender(g.id)}
-                      className={`flex-1 p-3 rounded-xl border text-center transition-all ${
-                        actorGender === g.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <span className="text-lg">{g.icon}</span>
-                      <div className="text-xs font-medium mt-1">{g.label}</div>
-                    </button>
-                  ))}
-                </div>
-
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Стиль ролика</label>
+                <label className="block text-sm font-medium text-zinc-300 mb-1">Стиль ролика</label>
+                <p className="text-[11px] text-zinc-500 mb-3">Задаёт структуру сценария: с чего начнётся ролик и как построен рассказ.</p>
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                   {STYLE_OPTIONS.map((s) => (
                     <button
@@ -1695,12 +1712,12 @@ export default function SaaShortsTab({
                 {analyzing ? (
                   <>
                     <Loader2 size={16} className="animate-spin" />
-                    {scriptMode === 'custom' ? 'Preparing custom script...' : (url.trim() ? 'Scraping + Researching web + Generating scripts... (45-90s)' : 'Generating scripts... (20-40s)')}
+                    {scriptMode === 'custom' ? 'Готовим ваш текст...' : (url.trim() ? 'Изучаем сайт и пишем сценарии... (45-90с)' : 'Пишем сценарии... (20-40с)')}
                   </>
                 ) : (
                   <>
                     <Sparkles size={16} />
-                    {scriptMode === 'custom' ? 'Prepare Custom Script' : (url.trim() ? 'Research & Generate Scripts' : 'Generate Scripts')}
+                    {scriptMode === 'custom' ? 'Подготовить мой текст' : (url.trim() ? 'Изучить сайт и написать сценарии' : 'Написать сценарии')}
                   </>
                 )}
               </button>
@@ -1720,7 +1737,7 @@ export default function SaaShortsTab({
               </div>
               <div className="glass-panel p-4">
                 <Film size={16} className="text-violet-400 mb-2" />
-                <h3 className="text-sm font-medium text-zinc-300">AI Actor Videos</h3>
+                <h3 className="text-sm font-medium text-zinc-300">Ваши AI-ролики</h3>
                 <p className="text-xs text-zinc-500 mt-1">Realistic AI-generated actors with lip-sync, b-roll, and viral subtitles. From ~$0.50/video.</p>
               </div>
             </div>
@@ -2402,7 +2419,7 @@ export default function SaaShortsTab({
               {ttsProvider !== 'fal_minimax' && (
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <Volume2 size={14} /> Voice {language === 'es' ? '(Spanish)' : language === 'ru' ? '(Russian)' : '(English)'}
+                  <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
                 </label>
                 {(() => {
                   // Filter voices by language/accent
@@ -2694,6 +2711,30 @@ export default function SaaShortsTab({
                 <p className="text-xs text-zinc-500 mb-3">
                   Выбери сохранённого аватара из UGC-галереи или загрузи новый. Это постоянный визуальный персонаж проекта.
                 </p>
+
+                <div className="flex items-center gap-3 mb-3">
+                  <span className="text-xs text-zinc-500">Пол актёра:</span>
+                  <div className="flex gap-1 bg-white/5 p-1 rounded-lg">
+                    {[
+                      { id: 'female', label: '👩 Женщина' },
+                      { id: 'male', label: '👨 Мужчина' },
+                    ].map((g) => (
+                      <button
+                        key={g.id}
+                        type="button"
+                        onClick={() => setActorGender(g.id)}
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                          actorGender === g.id
+                            ? 'bg-violet-500/25 text-violet-200'
+                            : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/5'
+                        }`}
+                      >
+                        {g.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
+                </div>
 
                 <div className="grid grid-cols-2 gap-1 bg-white/5 p-1 rounded-xl mb-3">
                   {[
@@ -3034,21 +3075,22 @@ export default function SaaShortsTab({
                   hasReusableHead: Boolean(selectedHeadTemplate),
                   lipsyncModel: lipSyncModel,
                   script: scripts[selectedScript],
+                  storyboardGenerationMode,
                 });
                 const costDetails =
                   selectedHeadTemplate
                     ? 'Сохранённый talking-head + новая озвучка + Sync Lipsync. Быстрее, чем заново генерировать Kling/Hailuo.'
                     : videoMode === 'storyboard_v3_standard'
-                    ? 'Озвучка + Kling V3 Standard по кадрам. Рабочий режим для раскадровок.'
+                    ? 'Озвучка ElevenLabs + видео Kling V3. Говорящие кадры считаются по тарифу Kling Avatar, b-roll — по тарифу V3.'
                     : videoMode === 'storyboard_v3_pro'
-                    ? 'Озвучка + Kling V3 Pro по кадрам: дороже; включай для более аккуратного финального визуала.'
+                    ? 'Озвучка ElevenLabs + видео Kling V3 Pro: выше детализация лиц и движений, тариф выше.'
                     : videoMode === 'storyboard_veo31_quality'
-                    ? 'Озвучка + Google Veo 3.1 через fal.ai по кадрам. Самый дорогой режим для финального визуала; audio в Veo отключен, используем наш TTS.'
+                    ? 'Озвучка ElevenLabs + видео Google Veo 3.1 — самая качественная и самая дорогая картинка.'
                     : videoMode === 'lowcost'
-                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. AI-slop черновик: дешево, но качество может плыть.'
+                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешёвый черновик: качество может плыть.'
                     : videoMode === 'premium'
-                      ? 'Озвучка + Kling Avatar v2 Pro: дороже; использовать для контрольного финального дубля.'
-                      : 'Озвучка + Kling Avatar v2 Standard. Основной UGC-режим: хорошее качество при нормальной цене.';
+                      ? 'Озвучка + Kling Avatar v2 Pro: чётче лицо и движения, тариф примерно вдвое выше.'
+                      : 'Озвучка + Kling Avatar v2 Standard. Основной режим: хорошее качество по разумной цене.';
 
                 return (
                   <div className="max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10">
@@ -3102,9 +3144,9 @@ export default function SaaShortsTab({
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Select an actor first</>
                 ) : storyboardSelected ? (
-                  <><Film size={14} /> Generate storyboard ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Film size={14} /> Сгенерировать видео ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : selectedHeadTemplate ? (
-                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Volume2 size={14} /> Видео из сохранённой головы ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : (
                   <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
                 )}

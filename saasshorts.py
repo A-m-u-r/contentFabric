@@ -574,11 +574,33 @@ def generate_scripts(
     client = genai.Client(api_key=gemini_key)
 
     style_guide = {
-        "ugc": "Natural, authentic UGC style. Person talking to camera like sharing a discovery with a friend. Casual, genuine.",
-        "educational": "Educational style. Clear explanations.",
-        "shock": "Shock/discovery style. Surprising opener.",
-        "story": "Storytelling style. Mini narrative.",
-        "comparison": "Before/after comparison.",
+        "ugc": (
+            "Natural, authentic UGC style. Person talking to camera like sharing a discovery "
+            "with a friend. Casual, genuine, first person, imperfect phrasing welcome."
+        ),
+        "educational": (
+            "Educational explainer. Structure: the hook names a concrete mistake or question the "
+            "viewer has -> 2-3 numbered actionable points ('первое... второе...') -> one-line "
+            "takeaway. Confident 'знающая подруга' tone, zero fluff, every point specific enough "
+            "to apply today."
+        ),
+        "shock": (
+            "Shock/discovery format. The FIRST spoken line is a surprising counterintuitive claim "
+            "or number that contradicts what the viewer believes. Then immediately justify it, "
+            "resolve the tension, and end with what to do instead. High-energy opening, calmer "
+            "confident resolution."
+        ),
+        "story": (
+            "First-person storytelling arc, one continuous mini-narrative (NOT a list). Structure: "
+            "setup anchored to a specific moment ('в прошлый вторник...') -> struggle or failure -> "
+            "turning point (the discovery) -> result with one concrete, believable detail. "
+            "Past tense, personal."
+        ),
+        "comparison": (
+            "Before/after comparison. Contrast the old painful way vs the new way point by point "
+            "('раньше... теперь...'). Make the 'before' visceral and specific, the 'after' "
+            "measurable. End with how to switch."
+        ),
     }
 
     lang_instructions = ""
