@@ -3899,9 +3899,17 @@ async def saasshorts_generate(
 
     resolved_language = req.language or req.script.get("language") or "en"
 
+    # Gemini is optional here: it powers advisory vision QC of generated clips,
+    # so a missing key must never block the (paid) generation itself.
+    try:
+        gemini_key = resolve_effective_api_key("gemini", user, None, req.use_platform_keys)
+    except Exception:
+        gemini_key = None
+
     config = {
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
+        "gemini_key": gemini_key,
         "voice_id": req.voice_id,  # None -> per-language default in saasshorts
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,

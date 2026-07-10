@@ -3974,6 +3974,93 @@ def generate_storyboard_chunk_clip(
     return output_path
 
 
+def _parse_review_issues(text: str) -> list:
+    """Extract {"issues": [...]} from a Gemini reply that may have prose around it."""
+    try:
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        data = json.loads(text[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        return []
+    return [str(issue).strip() for issue in issues if str(issue).strip()][:5]
+
+
+def review_clip_quality(
+    clip_path: str,
+    shot: dict,
+    gemini_key: str,
+    log: Callable[[str], None] = print,
+) -> list:
+    """Gemini-vision QC of one generated clip (deferred audit item #13).
+
+    Flags defects a duration check can't see: strangers in b-roll, garbled
+    on-screen glyphs, deformed hands. Advisory only — warnings go to the job
+    log and quality_warnings; the user decides whether to regenerate (a retry
+    is a paid fal call). Result is cached next to the clip.
+    """
+    review_path = f"{clip_path}.review.json"
+    if os.path.exists(review_path):
+        try:
+            with open(review_path, encoding="utf-8") as f:
+                return json.load(f).get("issues", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    grid_path = f"{clip_path}.review.jpg"
+    duration = _get_media_duration(clip_path)
+    fps = 4.0 / max(duration, 0.5)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", clip_path,
+            "-vf", f"fps={fps:.4f},scale=360:-2,tile=2x2",
+            "-frames:v", "1", "-q:v", "4", grid_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+    broll = _is_broll_shot(shot)
+    person_rule = (
+        "- any visible person, human face or human figure "
+        "(this b-roll must contain no people; hands alone are acceptable)"
+        if broll
+        else "- a second person appearing, or the actor's identity visibly changing between frames"
+    )
+    prompt = (
+        "You are a QC reviewer for AI-generated vertical video ads. The image is a 2x2 grid of "
+        "frames from ONE clip, in time order. Report ONLY defects severe enough that the ad "
+        "cannot be published — a casual viewer would immediately notice something is wrong:\n"
+        f"{person_rule}\n"
+        "- garbled glyph-like pseudo-text on screens, labels or documents\n"
+        "- deformed hands, extra or missing fingers, extra limbs, impossible object geometry\n"
+        "Do NOT report clothing wrinkles, lighting, blur, styling or other cosmetic nitpicks.\n"
+        'Reply with JSON only: {"issues": ["короткое описание проблемы по-русски", ...]}. '
+        'If the clip is publishable, reply {"issues": []}.'
+    )
+
+    from google import genai
+    from google.genai import types
+
+    with open(grid_path, "rb") as f:
+        image_bytes = f.read()
+    client = genai.Client(api_key=gemini_key)
+    last_error = None
+    for model in _gemini_model_chain():
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), prompt],
+            )
+            issues = _parse_review_issues(response.text or "")
+            _write_json_file(review_path, {"issues": issues, "model": model, "broll": broll})
+            return issues
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Gemini vision review failed: {last_error}")
+
+
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 _MUSIC_DIR = os.path.join(_ASSETS_DIR, "music")
 _FONTS_DIR = os.path.join(_ASSETS_DIR, "fonts")
@@ -4062,12 +4149,24 @@ def composite_storyboard_video(
     for index, clip in enumerate(clips):
         actual = _get_media_duration(clip["path"])
         duration = max(0.1, float(clip.get("duration") or actual))
-        chain = f"[{index}:v]trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS,{norm}"
-        # If the generated clip came back shorter than its slot, freeze the
-        # last frame instead of silently shifting every later shot off-sync.
         deficit = duration - actual
-        if actual > 0 and deficit > 0.05:
-            chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
+        stretchable = _is_broll_shot(clip.get("shot") or {})
+        if actual > 0 and 0.05 < deficit <= actual * 0.15 and stretchable:
+            # Short b-roll: slow the whole clip a touch instead of a visible
+            # end-freeze — motion carries through and the seam disappears.
+            # Talking shots keep the freeze: stretching them would drag the
+            # lips out of sync with the master voiceover.
+            ratio = duration / actual
+            chain = (
+                f"[{index}:v]setpts={ratio:.6f}*PTS,{norm},"
+                f"trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS"
+            )
+        else:
+            chain = f"[{index}:v]trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS,{norm}"
+            # Clip came back shorter than its slot: freeze the last frame
+            # instead of silently shifting every later shot off-sync.
+            if actual > 0 and deficit > 0.05:
+                chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
         filter_parts.append(chain + f"[v{index}]")
         concat_parts.append(f"[v{index}]")
     filter_parts.append(f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0[vout]")
@@ -4257,6 +4356,44 @@ def _broll_slice_shot(shot: dict, slice_duration: float) -> dict:
     return v3_shot
 
 
+def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Callable[[str], None] = print) -> str:
+    """Flux still of the b-roll scene, so Kling animates it via image-to-video.
+
+    Text-only Kling controls composition poorly (it invented strangers before
+    the no-people rules); a cheap Flux frame pins the exact composition and a
+    consistent aesthetic. Returns "" on any failure — the caller falls back to
+    plain text-to-video, a worse shot beats a failed job.
+    """
+    if _nonempty(output_path):
+        return output_path
+    base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
+    prompt = (
+        f"{base_prompt}. Single photographic frame, vertical 9:16, first frame of a short "
+        "product b-roll: realistic close-up of objects, natural light, shallow depth of field, "
+        "smartphone realism, no people, no faces, no readable text, no logos, no watermark"
+    )
+    try:
+        result = _fal_run(
+            "fal-ai/flux-2-pro",
+            {"prompt": prompt, "image_size": "portrait_16_9", "safety_tolerance": 5},
+            fal_key,
+            timeout=600,
+        )
+        images = result.get("images") or result.get("output", [])
+        if not images:
+            raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
+        img_url = images[0]["url"] if isinstance(images[0], dict) else images[0]
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.get(img_url)
+            resp.raise_for_status()
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+        return output_path
+    except Exception as e:
+        log(f"  ⚠️ B-roll reference frame failed ({e}); falling back to text-to-video")
+        return ""
+
+
 # Gentle alternating punch-ins (zoom, center-x, center-y as fractions). Variant 0
 # keeps the original so the first shot matches the approved actor photo.
 _AVATAR_REFERENCE_VARIANTS = [
@@ -4305,6 +4442,7 @@ def generate_sliced_avatar_clips(
     actor_description: str = "",
     selected_actor_path: str = "",
     broll_tier: str = "standard",
+    broll_image_first: bool = True,
     log: Callable[[str], None] = print,
 ) -> list:
     """
@@ -4378,8 +4516,17 @@ def generate_sliced_avatar_clips(
         )
         if job["broll"]:
             slice_duration = job["slice"]["end"] - job["slice"]["start"]
+            v3_shot = _broll_slice_shot(job["slice"]["shot"], slice_duration)
+            if broll_image_first:
+                ref = _broll_reference_image(
+                    v3_shot, fal_key,
+                    job["clip_path"].replace(".mp4", "_ref.png"),
+                    log=log,
+                )
+                if ref:
+                    v3_shot["image_path"] = ref
             return generate_storyboard_shot_clip(
-                _broll_slice_shot(job["slice"]["shot"], slice_duration),
+                v3_shot,
                 fal_key,
                 job["clip_path"],
                 tier=broll_tier,
@@ -4556,6 +4703,7 @@ def generate_storyboard_video(
             actor_description=config.get("actor_description") or script.get("actor_description") or "",
             selected_actor_path=config.get("selected_actor_path") or "",
             broll_tier=broll_tier,
+            broll_image_first=bool(config.get("broll_image_first", True)),
             log=log,
         )
     elif generation_mode == "multi_shot":
@@ -4583,6 +4731,26 @@ def generate_storyboard_video(
                 log(f"  Generating shot {index}/{len(shots)}...")
                 generate_storyboard_shot_clip(shot, fal_key, clip_path, tier=tier)
             clips.append({"path": clip_path, "duration": _shot_duration(shot), "shot": shot})
+
+    vision_warnings = []
+    gemini_key = config.get("gemini_key")
+    if gemini_key:
+        log("[3/5] Vision-проверка клипов (Gemini)...")
+        for clip_index, clip in enumerate(clips, start=1):
+            clip_shot = clip.get("shot")
+            if not clip_shot:
+                continue
+            try:
+                issues = review_clip_quality(clip["path"], clip_shot, gemini_key, log=log)
+            except Exception as e:
+                log(f"  ⚠️ Клип {clip_index}: vision-проверка не удалась: {e}")
+                continue
+            for issue in issues:
+                warning = f"Клип {clip_index}: {issue}"
+                vision_warnings.append(warning)
+                log(f"  ⚠️ {warning}")
+        if not vision_warnings:
+            log("  ✅ Vision-проверка: дефектов не найдено.")
 
     log("[3/5] Transcribing voiceover and generating subtitles...")
     if not spoken_words:
@@ -4650,7 +4818,7 @@ def generate_storyboard_video(
         "head_template_id": None,
         "lipsync_model": None,
         "quality_status": "storyboard",
-        "quality_warnings": [],
+        "quality_warnings": vision_warnings,
         "talking_head_quality": {},
         "storyboard_shots": shots,
         "storyboard_generation_mode": generation_mode,
