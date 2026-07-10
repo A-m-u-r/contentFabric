@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
+import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Target, CalendarDays } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -7,6 +7,8 @@ import ProcessingAnimation from './components/ProcessingAnimation';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
+import ProjectsTab from './components/ProjectsTab';
+import ContentPlanTab from './components/ContentPlanTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import { getApiUrl } from './config';
@@ -757,6 +759,8 @@ function App() {
   const navItems = [
     { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard, activeClass: 'bg-primary/10 text-primary' },
     { id: 'saasshorts', label: 'AI Shorts', shortLabel: 'Shorts', icon: Sparkles, activeClass: 'bg-violet-500/10 text-violet-400' },
+    { id: 'projects', label: 'Проекты', shortLabel: 'Проекты', icon: Target, activeClass: 'bg-violet-500/10 text-violet-400' },
+    { id: 'content-plan', label: 'Контент-план', shortLabel: 'План', icon: CalendarDays, activeClass: 'bg-emerald-500/10 text-emerald-400' },
     { id: 'ai-agent', label: 'AI-агент', shortLabel: 'Агент', icon: Bot, activeClass: 'bg-emerald-500/10 text-emerald-400' },
     { id: 'ugc-gallery', label: 'UGC-галерея', shortLabel: 'UGC', icon: LayoutGrid, activeClass: 'bg-violet-500/10 text-violet-400' },
     { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image, activeClass: 'bg-primary/10 text-primary' },
@@ -793,6 +797,26 @@ function App() {
         >
           <Sparkles size={20} />
           <span className="font-medium hidden xl:block">AI Shorts</span>
+        </button>
+
+        <button
+          type="button"
+          aria-label="Проекты"
+          onClick={() => setActiveTab('projects')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'projects' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <Target size={20} />
+          <span className="font-medium hidden xl:block">Проекты</span>
+        </button>
+
+        <button
+          type="button"
+          aria-label="Контент-план"
+          onClick={() => setActiveTab('content-plan')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'content-plan' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <CalendarDays size={20} />
+          <span className="font-medium hidden xl:block">Контент-план</span>
         </button>
 
         <button
@@ -1215,6 +1239,27 @@ function App() {
               uploadUserId={uploadUserId}
               authToken={authToken}
               usePlatformKeys={usingPlatformKeys}
+              onManageProjects={() => setActiveTab('projects')}
+            />
+          )}
+
+          {/* View: Projects */}
+          {activeTab === 'projects' && (
+            <ProjectsTab
+              authToken={authToken}
+              onUseInShorts={() => setActiveTab('saasshorts')}
+              onOpenContentPlan={() => setActiveTab('content-plan')}
+            />
+          )}
+
+          {/* View: Content plan */}
+          {activeTab === 'content-plan' && (
+            <ContentPlanTab
+              geminiApiKey={effectiveGeminiKey}
+              authToken={authToken}
+              usePlatformKeys={usingPlatformKeys}
+              onCreateVideo={() => setActiveTab('saasshorts')}
+              onOpenProjects={() => setActiveTab('projects')}
             />
           )}
 

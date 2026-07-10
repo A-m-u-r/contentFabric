@@ -1,6 +1,15 @@
-import React, { useState, useEffect } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
+import {
+  loadBusinessProfiles,
+  saveBusinessProfiles,
+  loadSelectedProfileId,
+  saveSelectedProfileId,
+  profileId as businessProfileKey,
+  peekPendingTopic,
+  clearPendingTopic,
+} from '../lib/businessProfiles';
 
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'UGC Natural', desc: 'Authentic, talking to camera' },
@@ -33,9 +42,21 @@ const BROLL_MODE_OPTIONS = [
 ];
 
 const STORYBOARD_GENERATION_OPTIONS = [
-  { id: 'per_shot', label: '6 отдельных кадров', desc: 'Лучше чинить и перегенерировать один кадр' },
-  { id: 'multi_shot', label: 'Multi-shot draft', desc: 'Меньше запросов, но сложнее заменить один плохой кадр' },
-  { id: 'sliced_avatar', label: 'Говорящие кадры (1 озвучка)', desc: 'Один войсовер режется по фразам, каждый кадр — Kling Avatar с липсинком' },
+  {
+    id: 'sliced_avatar',
+    label: 'Актёр говорит в кадре (рекомендуем)',
+    desc: 'Одна озвучка на весь ролик, актёр проговаривает текст — губы совпадают с речью. Лучший вариант, когда в кадре человек.',
+  },
+  {
+    id: 'per_shot',
+    label: 'Каждый кадр отдельно',
+    desc: 'Ролик собирается из 5–6 отдельных клипов, голос накладывается поверх — губы не попадают в слова. Зато неудачный кадр можно перегенерировать отдельно.',
+  },
+  {
+    id: 'multi_shot',
+    label: 'Весь ролик одной генерацией',
+    desc: 'Быстрый черновик: всё видео создаётся одним запросом. Дешевле и быстрее, но плохой кадр отдельно не заменить — только перегенерировать весь ролик.',
+  },
 ];
 
 const VIDEO_MODE_OPTIONS = [
@@ -117,7 +138,6 @@ function defaultMiniMaxVoice(language, actorGender) {
 }
 
 const CACHE_KEY = 'saasshorts_cache';
-const BUSINESS_PROFILES_KEY = 'saasshorts_business_profiles';
 const CACHE_VERSION = 2;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -331,6 +351,50 @@ function loadCache() {
   } catch { return null; }
 }
 
+// Последний запущенный job генерации: страница может перезагрузиться посреди
+// (или сразу после) генерации, а job живёт на сервере — по сохранённому id
+// мастер снова подцепляется к статусу и результату.
+const LAST_JOB_KEY = 'saasshorts_last_job';
+
+function loadLastJob() {
+  try {
+    return JSON.parse(localStorage.getItem(LAST_JOB_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function saveLastJob(jobId) {
+  try {
+    localStorage.setItem(LAST_JOB_KEY, JSON.stringify({ jobId, savedAt: Date.now() }));
+  } catch { /* localStorage full */ }
+}
+
+function clearLastJob() {
+  try {
+    localStorage.removeItem(LAST_JOB_KEY);
+  } catch { /* ignore */ }
+}
+
+// Выбор голоса, провайдера озвучки и актёра должен переживать перезагрузку:
+// иначе повторный запуск после reload уходит с дефолтами (английская Rachel
+// вместо выбранного голоса, сгенерированный Flux-актёр вместо загруженного фото).
+const VIDEO_PREFS_KEY = 'saasshorts_video_prefs';
+
+function loadVideoPrefs() {
+  try {
+    return JSON.parse(localStorage.getItem(VIDEO_PREFS_KEY) || 'null') || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveVideoPrefs(prefs) {
+  try {
+    localStorage.setItem(VIDEO_PREFS_KEY, JSON.stringify(prefs));
+  } catch { /* localStorage full */ }
+}
+
 function saveCache(input, analysis, webResearch, scripts) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({
@@ -341,22 +405,6 @@ function saveCache(input, analysis, webResearch, scripts) {
       scripts,
       timestamp: Date.now(),
     }));
-  } catch { /* localStorage full */ }
-}
-
-function loadBusinessProfiles() {
-  try {
-    const raw = localStorage.getItem(BUSINESS_PROFILES_KEY);
-    const profiles = raw ? JSON.parse(raw) : [];
-    return Array.isArray(profiles) ? profiles : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveBusinessProfiles(profiles) {
-  try {
-    localStorage.setItem(BUSINESS_PROFILES_KEY, JSON.stringify(profiles.slice(0, 20)));
   } catch { /* localStorage full */ }
 }
 
@@ -438,6 +486,7 @@ export default function SaaShortsTab({
   uploadUserId,
   authToken,
   usePlatformKeys = false,
+  onManageProjects,
 }) {
   // Wizard state
   const [step, setStep] = useState(() => {
@@ -452,8 +501,7 @@ export default function SaaShortsTab({
   const [topic, setTopic] = useState(() => loadCache()?.topic || '');
   const [businessName, setBusinessName] = useState(() => loadCache()?.businessName || '');
   const [businessProfiles, setBusinessProfiles] = useState(() => loadBusinessProfiles());
-  const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => loadCache()?.businessProfileId || '');
-  const [businessProfileStatus, setBusinessProfileStatus] = useState('');
+  const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => loadSelectedProfileId() || loadCache()?.businessProfileId || '');
   const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
   const [scriptFormat, setScriptFormat] = useState(() => loadCache()?.scriptFormat || 'ugc');
   const [textModel, setTextModel] = useState(() => loadCache()?.textModel || 'fast');
@@ -476,15 +524,15 @@ export default function SaaShortsTab({
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
-  const [ttsProvider, setTtsProvider] = useState('auto');
+  const [ttsProvider, setTtsProvider] = useState(() => loadVideoPrefs().ttsProvider || 'auto');
   const [brollMode, setBrollMode] = useState('mockup');
-  const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('per_shot');
-  const [selectedVoice, setSelectedVoice] = useState('21m00Tcm4TlvDq8ikWAM');
+  const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('sliced_avatar');
+  const [selectedVoice, setSelectedVoice] = useState(() => loadVideoPrefs().selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
   const [editedNarration, setEditedNarration] = useState('');
   const [actorOptions, setActorOptions] = useState([]);
-  const [selectedActor, setSelectedActor] = useState(null);
+  const [selectedActor, setSelectedActor] = useState(() => loadVideoPrefs().selectedActor || null);
   const [actorSource, setActorSource] = useState('saved');
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
@@ -497,7 +545,11 @@ export default function SaaShortsTab({
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
   const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
-  const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
+  const [uploadedActorPreview, setUploadedActorPreview] = useState(() => {
+    // {localPreview, serverUrl}; после перезагрузки превью строим от серверного URL
+    const url = loadVideoPrefs().uploadedActorUrl;
+    return url ? { localPreview: getApiUrl(url), serverUrl: url } : null;
+  });
   const [actorUploadStatus, setActorUploadStatus] = useState('');
   const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
   const [productDescription, setProductDescription] = useState('');
@@ -527,6 +579,63 @@ export default function SaaShortsTab({
     if (fromCache && scripts.length > 0) {
       setEditedNarration(scripts[0].full_narration || '');
     }
+  }, []);
+
+  // Активный проект со страницы «Проекты» + тема, выбранная в контент-плане.
+  // Тема читается lazy-инициализатором и очищается отдельно: StrictMode гоняет
+  // mount-эффект дважды, и повторный прогон не должен терять уже снятую тему.
+  const [pendingTopicOnMount] = useState(() => peekPendingTopic());
+  useEffect(() => {
+    const storedId = loadSelectedProfileId();
+    if (storedId) {
+      const profile = loadBusinessProfiles().find((item) => businessProfileKey(item) === storedId);
+      // Кеш держит правки пользователя для того же проекта; при смене
+      // активного проекта на странице «Проекты» кеш надо перезаписать.
+      const cachedId = loadCache()?.businessProfileId || '';
+      if (profile && (!description.trim() || storedId !== cachedId)) {
+        handleLoadBusinessProfile(profile);
+      }
+    }
+    if (pendingTopicOnMount) {
+      setTopic(pendingTopicOnMount);
+      setStep(0);
+      setFromCache(false);
+      clearPendingTopic();
+    }
+  }, []);
+
+  // Восстановление генерации после перезагрузки страницы: по сохранённому
+  // job_id снова подцепляемся к статусу/результату. Если пользователь пришёл
+  // из контент-плана делать новый ролик — старый job не восстанавливаем.
+  useEffect(() => {
+    if (pendingTopicOnMount) return;
+    const last = loadLastJob();
+    if (!last?.jobId) return;
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl(`/api/saasshorts/status/${last.jobId}`), { headers: authHeaders() });
+        if (!res.ok) {
+          // Job вычищен на сервере (рестарт или >1ч) — готовое видео остаётся в галерее UGC
+          if (res.status === 404) clearLastJob();
+          return;
+        }
+        const data = await res.json();
+        setJobId(last.jobId);
+        if (data.logs) setGenLogs(data.logs);
+        if (data.status === 'completed') {
+          setGenStatus('completed');
+          setGenResult(data.result);
+          setStep(4);
+        } else if (data.status === 'failed') {
+          setGenStatus('failed');
+          setStep(3);
+        } else {
+          setGenStatus('processing');
+          setGenerating(true);
+          setStep(3);
+        }
+      } catch { /* backend недоступен — оставляем мастер как есть */ }
+    })();
   }, []);
 
   // Fetch actor gallery on mount
@@ -563,14 +672,20 @@ export default function SaaShortsTab({
     }
   }, [elevenLabsKey]);
 
-  // Reset selected voice when actor gender changes
+  // Reset selected voice when actor gender or language changes.
+  // Восстановленный из prefs голос не затираем, пока комбинация язык+пол
+  // та же, при которой пользователь его выбирал.
+  const voiceAutoKeyRef = useRef(loadVideoPrefs().voiceKey || '');
   useEffect(() => {
+    const comboKey = `${language}-${actorGender}`;
+    if (voiceAutoKeyRef.current === comboKey) return;
+    voiceAutoKeyRef.current = comboKey;
     const genderDefaults = {
       'en-female': '21m00Tcm4TlvDq8ikWAM',  // Rachel
       'en-male': '29vD33N1CtxCmqQRPOHJ',    // Drew
       'es-female': 'EXAVITQu4vr4xnSDxMaL',  // Bella
       'es-male': 'ErXwobaYiN019PkySvjV',     // Antoni
-      'ru-female': '21m00Tcm4TlvDq8ikWAM',  // Multilingual fallback
+      'ru-female': 'D5RRIJYa9pFwxiSpbGbR',  // Victoria — родной русский, утверждённый дефолт
       'ru-male': '29vD33N1CtxCmqQRPOHJ',    // Multilingual fallback
     };
     // Prefer a voice that matches both gender and selected language/accent.
@@ -584,6 +699,17 @@ export default function SaaShortsTab({
       setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
     }
   }, [actorGender, language]);
+
+  // Персистим выбор озвучки и актёра (см. loadVideoPrefs)
+  useEffect(() => {
+    saveVideoPrefs({
+      selectedVoice,
+      voiceKey: `${language}-${actorGender}`,
+      ttsProvider,
+      selectedActor: selectedActor || '',
+      uploadedActorUrl: uploadedActorPreview?.serverUrl || '',
+    });
+  }, [selectedVoice, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender]);
 
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
@@ -650,75 +776,11 @@ export default function SaaShortsTab({
     }
   };
 
-  const handleSaveBusinessProfile = async () => {
-    const brief = description.trim();
-    if (!brief) {
-      setBusinessProfileStatus('Добавь описание бизнеса перед сохранением.');
-      return;
-    }
-    const name = businessName.trim() || brief.split('\n')[0].slice(0, 48) || 'Новый бизнес';
-    const profile = {
-      id: `${Date.now()}`,
-      name,
-      description: brief,
-      topic: topic.trim(),
-      scriptMode,
-      script_mode: scriptMode,
-      scriptFormat,
-      script_format: scriptFormat,
-      textModel,
-      text_model: textModel,
-      style,
-      language,
-      actorGender,
-      actor_gender: actorGender,
-      updatedAt: new Date().toISOString(),
-    };
-    const nextProfiles = [
-      profile,
-      ...businessProfiles.filter((item) => item.name.toLowerCase() !== name.toLowerCase()),
-    ].slice(0, 20);
-    setBusinessProfiles(nextProfiles);
-    saveBusinessProfiles(nextProfiles);
-    setBusinessName(name);
-    setSelectedBusinessProfileId(profile.id);
-    setBusinessProfileStatus('Проект сохранён. Его можно выбрать в следующий раз.');
-
-    if (authToken) {
-      try {
-        const res = await fetch(getApiUrl('/api/user/business-profiles'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({
-            name,
-            description: brief,
-            topic: topic.trim(),
-            script_mode: scriptMode,
-            script_format: scriptFormat,
-            text_model: textModel,
-            style,
-            language,
-            actor_gender: actorGender,
-          }),
-        });
-        if (!res.ok) throw new Error('account save failed');
-        const data = await res.json();
-        if (Array.isArray(data.profiles)) {
-          setBusinessProfiles(data.profiles);
-          saveBusinessProfiles(data.profiles);
-          const savedProfile = data.profiles.find((item) => item.name === name);
-          if (savedProfile) setSelectedBusinessProfileId(savedProfile.id || savedProfile.name);
-        }
-        setBusinessProfileStatus('Проект сохранён в аккаунте.');
-      } catch {
-        setBusinessProfileStatus('Проект сохранён локально. В аккаунт сейчас не записался.');
-      }
-    }
-  };
-
   const handleLoadBusinessProfile = (profile) => {
     if (!profile) return;
-    setSelectedBusinessProfileId(profile.id || profile.name || '');
+    const id = businessProfileKey(profile);
+    setSelectedBusinessProfileId(id);
+    saveSelectedProfileId(id);
     setBusinessName(profile.name || '');
     setDescription(profile.description || '');
     setTopic(profile.topic || '');
@@ -728,7 +790,6 @@ export default function SaaShortsTab({
     if (profile.style) setStyle(profile.style);
     if (profile.language) setLanguage(profile.language);
     if (profile.actorGender || profile.actor_gender) setActorGender(profile.actorGender || profile.actor_gender);
-    setBusinessProfileStatus(`Загружен проект: ${profile.name}`);
   };
 
   const handleAnalyze = async () => {
@@ -1012,6 +1073,7 @@ export default function SaaShortsTab({
 
       const data = await res.json();
       setJobId(data.job_id);
+      saveLastJob(data.job_id);
     } catch (e) {
       setGenStatus('failed');
       setGenLogs((prev) => [...prev, `Error: ${e.message}`]);
@@ -1055,6 +1117,7 @@ export default function SaaShortsTab({
           actor_gender: actorGender,
           language,
           actor_description: actorDescription || undefined,
+          selected_actor_url: selectedActor || undefined,
           retry_job_id: jobId,
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
@@ -1073,6 +1136,7 @@ export default function SaaShortsTab({
 
       const data = await res.json();
       setJobId(data.job_id);
+      saveLastJob(data.job_id);
     } catch (e) {
       setGenStatus('failed');
       setGenLogs((prev) => [...prev, `Retry error: ${e.message}`]);
@@ -1228,13 +1292,13 @@ export default function SaaShortsTab({
 
   const handleReset = () => {
     setStep(0);
-    setUrl('');
     setAnalyzeError('');
     setAnalysis(null);
     setWebResearch(null);
     setScripts([]);
     setFromCache(false);
     localStorage.removeItem(CACHE_KEY);
+    clearLastJob();
     setSelectedScript(0);
     setJobId(null);
     setGenLogs([]);
@@ -1318,93 +1382,38 @@ export default function SaaShortsTab({
         {step === 0 && (
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             <div className="glass-panel p-8 space-y-6">
-              <section className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-4">
-                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Target size={15} className="text-violet-300" />
-                      <h2 className="text-sm font-semibold text-zinc-100">Проект</h2>
-                    </div>
-                    <p className="text-xs text-zinc-500 mt-1">
-                      Сохрани конкретный бизнес один раз, потом выбирай его перед генерацией роликов.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleSaveBusinessProfile}
-                    className="btn-secondary px-4 py-2.5 text-sm flex items-center justify-center gap-2 md:w-auto"
-                  >
-                    <Save size={14} /> Сохранить проект
-                  </button>
-                </div>
-
-                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.45fr)]">
-                  <label className="space-y-1.5">
-                    <span className="text-xs font-medium text-zinc-400">Название проекта</span>
-                    <input
-                      value={businessName}
-                      onChange={(e) => {
-                        setBusinessName(e.target.value);
-                        setSelectedBusinessProfileId('');
-                      }}
-                      className="input-field"
-                      placeholder="Например: Неделя без срывов"
-                    />
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <div className="min-w-0 flex-1">
+                  <label className="block text-sm font-medium text-zinc-300 mb-2">
+                    <span className="inline-flex items-center gap-1.5"><Target size={14} className="text-violet-300" /> Проект</span>
                   </label>
-                  <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-                    <span className="text-[10px] uppercase tracking-wide text-zinc-600">Выбрано</span>
-                    <div className="mt-1 text-sm font-semibold text-zinc-200 truncate">
-                      {businessProfiles.find((profile) => (profile.id || profile.name) === selectedBusinessProfileId)?.name || businessName.trim() || 'Новый проект'}
-                    </div>
-                    <div className="text-[11px] text-zinc-500 truncate">
-                      {selectedBusinessProfileId ? 'Используется сохранённый профиль' : 'Заполни и сохрани профиль'}
-                    </div>
-                  </div>
+                  {businessProfiles.length > 0 ? (
+                    <OptionPicker
+                      value={selectedBusinessProfileId}
+                      onChange={(value) => {
+                        const profile = businessProfiles.find((item) => businessProfileKey(item) === value);
+                        if (profile) handleLoadBusinessProfile(profile);
+                      }}
+                      options={businessProfiles.map((profile) => ({
+                        value: businessProfileKey(profile),
+                        label: profile.name,
+                      }))}
+                      placeholder="Выбери сохранённый проект..."
+                    />
+                  ) : (
+                    <p className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-xs text-zinc-500">
+                      Нет сохранённых проектов — можно заполнить описание вручную или создать проект.
+                    </p>
+                  )}
                 </div>
-
-                {businessProfiles.length > 0 && (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-xs font-semibold text-zinc-300">Библиотека проектов</p>
-                      <span className="text-[10px] text-zinc-600">{businessProfiles.length} сохранено</span>
-                    </div>
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      {businessProfiles.slice(0, 6).map((profile) => {
-                        const profileId = profile.id || profile.name;
-                        const active = selectedBusinessProfileId === profileId;
-                        return (
-                          <button
-                            key={profileId}
-                            type="button"
-                            onClick={() => handleLoadBusinessProfile(profile)}
-                            className={`rounded-xl border p-3 text-left transition-all ${
-                              active
-                                ? 'border-violet-500/50 bg-violet-500/10 text-violet-100'
-                                : 'border-white/10 bg-white/[0.04] text-zinc-300 hover:border-violet-400/40 hover:bg-white/[0.07]'
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="text-sm font-semibold truncate">{profile.name}</div>
-                                <div className="text-[11px] text-zinc-500 line-clamp-2 mt-1">
-                                  {profile.topic || profile.description || 'Без темы ролика'}
-                                </div>
-                              </div>
-                              {active && <Check size={14} className="text-violet-300 shrink-0 mt-0.5" />}
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {businessProfileStatus && (
-                  <p className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-zinc-400">
-                    {businessProfileStatus}
-                  </p>
-                )}
-              </section>
+                <button
+                  type="button"
+                  onClick={() => onManageProjects?.()}
+                  className="btn-secondary px-4 py-3 text-sm flex items-center justify-center gap-2 shrink-0"
+                >
+                  <Settings2 size={14} /> Управлять проектами
+                </button>
+              </div>
 
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
@@ -1723,12 +1732,12 @@ export default function SaaShortsTab({
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             {/* Analysis Summary */}
             <div className="glass-panel p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold flex items-center gap-2">
-                  <Eye size={18} className="text-violet-400" />
-                  {analysis.product_name || 'Analysis'}
+              <div className="flex items-start justify-between gap-3 mb-4">
+                <h2 className="text-lg font-semibold flex items-start gap-2 min-w-0">
+                  <Eye size={18} className="text-violet-400 shrink-0 mt-1" />
+                  <span className="break-words">{analysis.product_name || 'Analysis'}</span>
                 </h2>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 shrink-0">
                   {fromCache && (
                     <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full border border-amber-500/20 flex items-center gap-1">
                       Cached
@@ -1737,44 +1746,58 @@ export default function SaaShortsTab({
                       </button>
                     </span>
                   )}
-                  <span className="text-xs bg-violet-500/10 text-violet-400 px-2 py-1 rounded-full border border-violet-500/20">
-                    {analysis.industry}
-                  </span>
+                  {analysis.industry && (
+                    <span className="text-xs bg-violet-500/10 text-violet-400 px-2 py-1 rounded-full border border-violet-500/20">
+                      {analysis.industry}
+                    </span>
+                  )}
                 </div>
               </div>
-              <p className="text-sm text-zinc-400 mb-4">{analysis.one_liner}</p>
+              {(analysis.one_liner || analysis.description) && (
+                <p className="text-sm text-zinc-400 mb-4">{analysis.one_liner || analysis.description}</p>
+              )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Pain Points</h3>
-                  <div className="space-y-1.5">
-                    {(analysis.pain_points || []).map((pp, i) => (
-                      <div key={i} className="flex items-start gap-2 text-sm">
-                        <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${
-                          pp.intensity === 'high' ? 'bg-red-400' : pp.intensity === 'medium' ? 'bg-yellow-400' : 'bg-green-400'
-                        }`} />
-                        <div>
-                          <span className="text-zinc-300">{pp.pain}</span>
-                          {pp.source && pp.source !== 'website' && (
-                            <span className="ml-1.5 text-[9px] bg-blue-500/10 text-blue-400 px-1 py-0.5 rounded">{pp.source}</span>
-                          )}
-                        </div>
+              {((analysis.pain_points || []).length > 0 || (analysis.emotional_hooks || []).length > 0) ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {(analysis.pain_points || []).length > 0 && (
+                    <div>
+                      <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Pain Points</h3>
+                      <div className="space-y-1.5">
+                        {(analysis.pain_points || []).map((pp, i) => (
+                          <div key={i} className="flex items-start gap-2 text-sm">
+                            <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${
+                              pp.intensity === 'high' ? 'bg-red-400' : pp.intensity === 'medium' ? 'bg-yellow-400' : 'bg-green-400'
+                            }`} />
+                            <div>
+                              <span className="text-zinc-300">{pp.pain}</span>
+                              {pp.source && pp.source !== 'website' && (
+                                <span className="ml-1.5 text-[9px] bg-blue-500/10 text-blue-400 px-1 py-0.5 rounded">{pp.source}</span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                </div>
-                <div>
-                  <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Emotional Hooks</h3>
-                  <div className="space-y-1.5">
-                    {(analysis.emotional_hooks || []).map((h, i) => (
-                      <div key={i} className="text-sm text-zinc-300 flex items-start gap-2">
-                        <TrendingUp size={12} className="text-violet-400 mt-1 shrink-0" />
-                        {h}
+                    </div>
+                  )}
+                  {(analysis.emotional_hooks || []).length > 0 && (
+                    <div>
+                      <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Emotional Hooks</h3>
+                      <div className="space-y-1.5">
+                        {(analysis.emotional_hooks || []).map((h, i) => (
+                          <div key={i} className="text-sm text-zinc-300 flex items-start gap-2">
+                            <TrendingUp size={12} className="text-violet-400 mt-1 shrink-0" />
+                            {h}
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                  )}
                 </div>
-              </div>
+              ) : (
+                <p className="text-xs text-zinc-600">
+                  Быстрый режим: сценарии построены напрямую из описания проекта, без глубокого анализа болей аудитории.
+                </p>
+              )}
             </div>
 
             {/* Web Research Results */}
@@ -1854,7 +1877,9 @@ export default function SaaShortsTab({
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Sparkles size={18} className="text-yellow-400" />
                 Generated Scripts
-                <span className="text-xs bg-white/10 px-2 py-0.5 rounded-full ml-auto">{scripts.length} scripts</span>
+                <span className="text-xs bg-white/10 px-2 py-0.5 rounded-full ml-auto">
+                  {scripts.length} {scripts.length === 1 ? 'сценарий' : scripts.length < 5 ? 'сценария' : 'сценариев'}
+                </span>
               </h2>
 
               <div className="grid grid-cols-1 gap-4">
@@ -2289,7 +2314,7 @@ export default function SaaShortsTab({
               {storyboardSelected && (
                 <div>
                   <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                    <Film size={14} /> Storyboard generation
+                    <Film size={14} /> Способ генерации видео
                   </label>
                   <div className="grid sm:grid-cols-2 gap-2">
                     {STORYBOARD_GENERATION_OPTIONS.map((option) => (
@@ -3077,11 +3102,11 @@ export default function SaaShortsTab({
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Select an actor first</>
                 ) : storyboardSelected ? (
-                  <><Film size={14} /> Generate storyboard ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Film size={14} /> Generate storyboard ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
                 ) : selectedHeadTemplate ? (
-                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Volume2 size={14} /> Generate via saved head ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
                 ) : (
-                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
                 )}
               </button>
             </div>
