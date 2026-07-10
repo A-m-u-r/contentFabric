@@ -117,7 +117,8 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertEqual(script["shots"][1]["role"], "problem")
         self.assertIn("После 30 тело меняется", script["full_narration"])
 
-    def test_storyboard_ass_contains_overlay_and_speech_subtitle_styles(self):
+    def test_storyboard_ass_has_no_top_overlay_plates(self):
+        # User decision 2026-07-10: top hook/overlay plates are visual clutter.
         with tempfile.TemporaryDirectory() as tmp:
             output_path = os.path.join(tmp, "storyboard.ass")
             shots = [
@@ -140,11 +141,10 @@ class SaaSStoryboardTests(unittest.TestCase):
             with open(output_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            self.assertIn("Style: Overlay", content)
-            self.assertIn("Style: Hook", content)
+            self.assertNotIn("Style: Overlay", content)
+            self.assertNotIn("Style: Hook", content)
             self.assertIn("Style: Subtitle", content)
-            self.assertIn("Dialogue: 0,0:00:00.00,0:00:03.00,Hook", content)
-            self.assertIn("ВЕС ВСТАЛ?", content)
+            self.assertNotIn("ВЕС ВСТАЛ?", content)
             self.assertIn("ТЫ ДЕЛАЕШЬ", content)
 
     def test_storyboard_ass_uses_submagic_like_safe_zones_and_keyword_highlight(self):
@@ -178,13 +178,16 @@ class SaaSStoryboardTests(unittest.TestCase):
             with open(output_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            self.assertIn("Style: Hook,Arial Black,78", content)
-            self.assertIn("Style: Subtitle,Arial Black,64", content)
-            self.assertRegex(content, r"Style: Subtitle,.*?,2,96,96,360,1")
-            self.assertRegex(content, r"Style: Hook,.*?,8,96,96,150,1")
-            self.assertIn("{\\c&H0066D1FF&\\bord8}", content)
-            self.assertIn("{\\rSubtitle}", content)
-            self.assertIn("Dialogue: 0,0:00:03.00,0:00:06.00,Overlay", content)
+            self.assertIn("Style: Subtitle,Montserrat ExtraBold,72", content)
+            # BorderStyle=1 (outline+shadow, no opaque box), safe-zone margin 520.
+            self.assertRegex(content, r"Style: Subtitle,.*?,1,3,2,2,96,96,520,1")
+            # Keyword accent: color-only, reset back to white (not \r).
+            self.assertIn("{\\c&H0066D1FF&}", content)
+            self.assertIn("{\\c&HFFFFFF&}", content)
+            self.assertNotIn("\\bord8", content)
+            # Pop-in animation on caption lines.
+            self.assertIn("\\t(0,90,\\fscx100\\fscy100)", content)
+            self.assertNotIn("Overlay", content.split("[Events]")[1])
 
     def test_builds_kling_v3_text_to_video_multishot_payload_without_native_audio(self):
         shots = [
@@ -423,7 +426,7 @@ class SaaSStoryboardTests(unittest.TestCase):
                     f.write("[Script Info]\n")
                 return output_path
 
-            def fake_composite(clips, audio_path, srt_path, output_path):
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
                 return output_path
@@ -476,7 +479,7 @@ class SaaSStoryboardTests(unittest.TestCase):
                     f.write("[Script Info]\n")
                 return output_path
 
-            def fake_composite(clips, audio_path, srt_path, output_path):
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
                 return output_path

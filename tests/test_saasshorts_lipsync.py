@@ -144,6 +144,45 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertTrue(os.path.exists(report["path"]))
             self.assertTrue(os.path.exists(f"{report['path']}.meta.json"))
 
+    def test_prepare_voiceover_falls_back_when_trim_truncates_speech(self):
+        # Regression: a conversational voiceover has internal pauses; the trim
+        # must never collapse 28.84s of speech to 0.89s (cut at first pause).
+        class FakeRunResult:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = os.path.join(tmp, "voice.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(b"raw-audio")
+
+            seen_commands = []
+
+            def fake_run(cmd, *args, **kwargs):
+                command = " ".join(str(part) for part in cmd)
+                seen_commands.append(command)
+                if "silencedetect" in command:
+                    return FakeRunResult(stderr="silence_start: 0.89\nsilence_end: 1.40 | silence_duration: 0.51\n")
+                if "silenceremove" in command:
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"truncated-audio")
+                    return FakeRunResult()
+                raise AssertionError(f"Unexpected command: {command}")
+
+            with patch("saasshorts._get_media_duration", side_effect=[28.84, 0.89]), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                report = saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
+
+            self.assertEqual(report["status"], "fallback_raw_audio")
+            self.assertEqual(report["path"], audio_path)
+            self.assertAlmostEqual(report["duration"], 28.84)
+            self.assertFalse(os.path.exists(saasshorts.prepared_voiceover_path(audio_path)))
+            trim_command = next(cmd for cmd in seen_commands if "silenceremove" in cmd)
+            self.assertIn("areverse", trim_command)
+            self.assertNotIn("stop_periods", trim_command)
+
     def test_full_video_uses_prepared_voiceover_for_kling_subtitles_and_cost(self):
         with tempfile.TemporaryDirectory() as tmp:
             prepared_audio_holder = {}
@@ -174,7 +213,7 @@ class SaaSLipSyncTests(unittest.TestCase):
                     "status": "trimmed",
                 }
 
-            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
                 self.assertEqual(audio_path, prepared_audio_holder["path"])
                 with open(output_path, "wb") as f:
                     f.write(b"head")
@@ -451,7 +490,7 @@ class SaaSLipSyncTests(unittest.TestCase):
                     f.write(b"voice")
                 return {"path": output_path, "provider": "fal_minimax", "voice_id": "Russian_AmbitiousWoman"}
 
-            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"head")
                 quality_path = output_path.replace(".mp4", "_quality.json")
@@ -583,9 +622,11 @@ class JumpCutTests(unittest.TestCase):
             self.assertNotIn("crop=938:1668", v0)
             self.assertIn("crop=938:1668", v1)
 
-            # Audio must come straight from the talking head, uncut
+            # Audio must come from the talking head, uncut — one continuous
+            # normalized track, not per-shot slices.
             audio_map = cmd[cmd.index("-map", cmd.index("-map") + 1) + 1]
-            self.assertEqual(audio_map, "0:a")
+            self.assertEqual(audio_map, "[aout]")
+            self.assertIn("[0:a]loudnorm", filter_str)
 
     def test_composite_without_punch_in_keeps_single_take(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -604,7 +645,12 @@ class JumpCutTests(unittest.TestCase):
                     head, [], os.path.join(tmp, "subs.ass"), "hook", final, punch_in=False
                 )
 
-            self.assertNotIn("-filter_complex", captured["cmd"])
+            # Video stays one uncut take: no concat chain, no punch-in crop.
+            cmd = captured["cmd"]
+            filter_str = cmd[cmd.index("-filter_complex") + 1]
+            self.assertNotIn("concat=", filter_str)
+            self.assertNotIn("crop=938:1668", filter_str)
+            self.assertIn("loudnorm", filter_str)
 
 
 class SlicedAvatarTests(unittest.TestCase):
@@ -707,18 +753,18 @@ class SlicedAvatarTests(unittest.TestCase):
                     f.write(b"slice")
                 return output_path
 
-            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard"):
-                head_calls.append({"image": image_path, "audio": audio_path, "tier": tier})
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
+                head_calls.append({"image": image_path, "audio": audio_path, "tier": tier, "scene_prompt": kwargs.get("scene_prompt", "")})
                 with open(output_path, "wb") as f:
                     f.write(b"clip")
                 return output_path
 
-            def fake_composite(clips, audio_path, srt_path, output_path):
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
                 return output_path
 
-            def fake_subs(audio_path, shots, output_path, max_words=2, words=None):
+            def fake_subs(audio_path, shots, output_path, max_words=2, words=None, **kwargs):
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write("[Script Info]\n")
                 return output_path
@@ -760,6 +806,9 @@ class SlicedAvatarTests(unittest.TestCase):
             self.assertEqual(len(head_calls), 2)
             self.assertEqual({c["image"] for c in head_calls}, {ref1, ref2})
             self.assertEqual({c["tier"] for c in head_calls}, {"standard"})
+            scene_prompts = " | ".join(c["scene_prompt"] for c in head_calls)
+            self.assertIn("close-up", scene_prompts)
+            self.assertIn("medium", scene_prompts)
 
             clips = composite_mock.call_args[0][0]
             self.assertEqual(len(clips), 2)
@@ -767,6 +816,116 @@ class SlicedAvatarTests(unittest.TestCase):
 
             self.assertEqual(result["storyboard_generation_mode"], "sliced_avatar")
             self.assertIn("sliced_avatar_kling_standard", result["cost_estimate"])
+
+    def test_storyboard_sliced_avatar_routes_broll_shots_to_v3(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref1 = os.path.join(tmp, "ref1.png")
+            ref3 = os.path.join(tmp, "ref3.png")
+            for p in (ref1, ref3):
+                with open(p, "wb") as f:
+                    f.write(b"img")
+
+            head_calls = []
+            v3_calls = []
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+
+            def fake_prepare(audio_path, log=print):
+                return {"path": audio_path, "status": "ok", "trimmed": False}
+
+            def fake_slice(audio_path, start, end, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"slice")
+                return output_path
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
+                head_calls.append({"image": image_path, "output": output_path})
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_v3_shot(shot, fal_key, output_path, tier="standard", **kwargs):
+                v3_calls.append({"shot": shot, "tier": tier, "output": output_path})
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            def fake_subs(audio_path, shots, output_path, max_words=2, words=None, **kwargs):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            script = {
+                "title": "Hybrid sliced avatar",
+                "format": "storyboard_v3",
+                "language": "ru",
+                "full_narration": "Раз два три четыре. Пять шесть семь восемь. Девять десять один два.",
+                "shots": [
+                    {"shot_number": 1, "role": "hook", "start": 0, "end": 4,
+                     "speech": "Раз два три четыре.", "image_path": ref1,
+                     "scene": "close-up", "overlay_text": "", "transition": "cut",
+                     "visual_type": "talking"},
+                    {"shot_number": 2, "role": "solution", "start": 4, "end": 8,
+                     "speech": "Пять шесть семь восемь.",
+                     "scene": "hands chopping vegetables on a wooden board",
+                     "overlay_text": "", "transition": "cut",
+                     "visual_type": "broll"},
+                    {"shot_number": 3, "role": "cta", "start": 8, "end": 12,
+                     "speech": "Девять десять один два.", "image_path": ref3,
+                     "scene": "medium", "overlay_text": "", "transition": "cut",
+                     "visual_type": "talking"},
+                ],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "video_mode": "storyboard_v3_standard",
+                "storyboard_generation_mode": "sliced_avatar",
+            }
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=fake_prepare), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=fake_v3_shot), \
+                 patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
+                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite) as composite_mock, \
+                 patch("saasshorts.generate_actor_image", side_effect=AssertionError("broll must not trigger actor generation")), \
+                 patch("saasshorts._get_media_duration", return_value=12.0):
+                result = saasshorts.generate_storyboard_video(script, config, tmp)
+
+            # Talking shots -> Kling Avatar, broll shot -> Kling V3
+            self.assertEqual(len(head_calls), 2)
+            self.assertEqual({c["image"] for c in head_calls}, {ref1, ref3})
+            self.assertEqual(len(v3_calls), 1)
+            self.assertIn("_avatar_broll_02", v3_calls[0]["output"])
+            self.assertEqual(v3_calls[0]["tier"], "standard")
+
+            # V3 shot copy: duration ceiled to cover the 4s slice, lips shut
+            v3_shot = v3_calls[0]["shot"]
+            self.assertEqual(v3_shot["start"], 0)
+            self.assertEqual(v3_shot["end"], 4)
+            self.assertIn("no lip movement", v3_shot["generation_prompt"])
+            self.assertIn("vegetables", v3_shot["generation_prompt"])
+
+            clips = composite_mock.call_args[0][0]
+            self.assertEqual(len(clips), 3)
+            self.assertAlmostEqual(sum(c["duration"] for c in clips), 12.0, delta=0.01)
+
+            cost = result["cost_estimate"]
+            self.assertIn("sliced_avatar_kling_standard", cost)
+            self.assertIn("sliced_broll_kling_v3_standard", cost)
+            self.assertGreater(cost["sliced_broll_kling_v3_standard"], 0)
 
 
 if __name__ == "__main__":

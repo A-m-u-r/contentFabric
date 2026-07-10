@@ -40,3 +40,8 @@ output/
 skills/
 skills-lock.json
 
+
+# Test artifacts (keep the .py scripts, not the media they produce)
+voice_test/*.mp3
+voice_test/*.png
+*.gif

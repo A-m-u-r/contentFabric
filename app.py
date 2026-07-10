@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import subprocess
 import threading
@@ -452,6 +453,15 @@ def list_business_profiles(user_id: str) -> List[dict]:
             (user_id,),
         ).fetchall()
     return [_public_business_profile(row) for row in rows]
+
+
+def delete_business_profile(user_id: str, profile_id: str) -> bool:
+    with _auth_db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM business_profiles WHERE id = ? AND user_id = ?",
+            (profile_id, user_id),
+        )
+    return cursor.rowcount > 0
 
 
 def _metadata_json_paths_for_legacy_claim() -> List[str]:
@@ -1001,6 +1011,16 @@ async def user_save_business_profile(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.delete("/api/user/business-profiles/{profile_id}")
+async def user_delete_business_profile(
+    profile_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    delete_business_profile(user["id"], profile_id)
+    return {"profiles": list_business_profiles(user["id"])}
+
+
 @app.post("/api/user/claim-legacy-assets")
 async def user_claim_legacy_assets(authorization: Optional[str] = Header(None, alias="Authorization")):
     user = require_user_from_authorization(authorization)
@@ -1270,10 +1290,11 @@ def list_local_saas_gallery(limit: int = 50, owner_user_id: Optional[str] = None
         if not os.path.isdir(job_dir):
             continue
         meta = _read_local_gallery_meta(job_dir) or _infer_local_gallery_meta(job_dir)
+        if not meta or not meta.get("video_url"):
+            continue
         if owner_user_id and meta.get("owner_user_id") != owner_user_id:
             continue
-        if meta and meta.get("video_url"):
-            videos.append(meta)
+        videos.append(meta)
 
     videos.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return videos[:limit] if limit else videos
@@ -2928,6 +2949,7 @@ from saasshorts import (
     research_saas_online,
     analyze_saas,
     generate_scripts,
+    generate_content_plan,
     build_custom_script,
     GeminiTemporaryError,
     generate_full_video,
@@ -2940,6 +2962,32 @@ from saasshorts import (
 
 # State for SaaSShorts jobs (separate from video processing jobs)
 saas_jobs: Dict[str, Dict] = {}
+
+
+def _derive_product_name(description: str = "", topic: str = "", fallback: str = "Product") -> str:
+    """Human-readable product name from a free-form business description.
+
+    A brand name wrapped in quotes wins; otherwise take the first line up to a
+    dash/comma/sentence break and never cut mid-word (the old [:60] slice
+    produced titles like "...и энергии дл").
+    """
+    text = (description or "").strip()
+    if not text:
+        return (topic or "").strip()[:60] or fallback
+
+    quoted = re.search(r"[«\"“]([^»\"”]{2,60})[»\"”]", text)
+    if quoted:
+        return quoted.group(1).strip()
+
+    head = re.split(r"\s+[—–]\s+|[,.!?:;\n]", text.split("\n")[0], maxsplit=1)[0].strip()
+    if not head:
+        return fallback
+    if len(head) <= 60:
+        return head
+    trimmed = head[:60]
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0]
+    return trimmed.strip() + "…"
 
 
 class SaaSAnalyzeRequest(BaseModel):
@@ -2990,7 +3038,7 @@ async def saasshorts_analyze(
             if is_custom:
                 context = (req.description or req.topic or "Custom video").strip()
                 analysis = {
-                    "product_name": (req.topic or context).split("\n")[0].strip()[:60] or "Custom Script",
+                    "product_name": _derive_product_name(req.description, req.topic, fallback="Custom Script"),
                     "description": req.description or req.topic or "",
                     "value_proposition": req.description or req.topic or "",
                     "target_audience": "custom script audience",
@@ -3031,7 +3079,8 @@ async def saasshorts_analyze(
             else:
                 # Manual description: build analysis from description
                 analysis = {
-                    "product_name": req.description.split(",")[0].strip()[:60] if req.description else "Product",
+                    "product_name": _derive_product_name(req.description, req.topic),
+                    "one_liner": (req.description or "").strip().split("\n")[0],
                     "description": req.description,
                     "value_proposition": req.description,
                     "target_audience": "general audience",
@@ -3060,6 +3109,59 @@ async def saasshorts_analyze(
         result = await loop.run_in_executor(None, run_analysis)
         return result
 
+    except GeminiTemporaryError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaaSContentPlanRequest(BaseModel):
+    name: Optional[str] = None
+    description: str
+    topic: Optional[str] = None
+    language: str = "ru"
+    num_items: int = 12
+    period_days: int = 30
+    text_model: str = "fast"
+    use_platform_keys: bool = False
+
+
+@app.post("/api/saasshorts/content-plan")
+async def saasshorts_content_plan(
+    req: SaaSContentPlanRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Generate a monthly short-video content plan for a business profile (text-only)."""
+    user = get_user_from_authorization(authorization)
+    try:
+        gemini_key = resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
+    if not (req.description or "").strip():
+        raise HTTPException(status_code=400, detail="Provide a business description")
+
+    num_items = max(4, min(31, req.num_items))
+    period_days = max(7, min(31, req.period_days))
+
+    try:
+        loop = asyncio.get_event_loop()
+        items = await loop.run_in_executor(
+            None,
+            lambda: generate_content_plan(
+                {"name": req.name, "description": req.description, "topic": req.topic},
+                gemini_key,
+                num_items=num_items,
+                period_days=period_days,
+                language=req.language,
+                text_model=req.text_model,
+            ),
+        )
+        return {"items": items}
     except GeminiTemporaryError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -3800,7 +3902,7 @@ async def saasshorts_generate(
     config = {
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
-        "voice_id": req.voice_id or "21m00Tcm4TlvDq8ikWAM",
+        "voice_id": req.voice_id,  # None -> per-language default in saasshorts
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
         "actor_gender": req.actor_gender or "female",
