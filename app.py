@@ -3753,6 +3753,7 @@ class SaaSGenerateRequest(BaseModel):
     use_platform_keys: bool = False
     clip_vision_qc: bool = True  # advisory Gemini review of each generated clip
     broll_image_first: bool = True  # Flux still -> image-to-video for b-roll shots
+    background_music: bool = True  # ducked music bed under the voiceover
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -3914,6 +3915,7 @@ async def saasshorts_generate(
         "gemini_key": gemini_key,
         "clip_vision_qc": req.clip_vision_qc,
         "broll_image_first": req.broll_image_first,
+        "background_music": req.background_music,
         "voice_id": req.voice_id,  # None -> per-language default in saasshorts
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,

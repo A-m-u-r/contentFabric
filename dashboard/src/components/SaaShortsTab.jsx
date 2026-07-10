@@ -564,6 +564,11 @@ export default function SaaShortsTab({
   const [ttsProvider, setTtsProvider] = useState(() => loadVideoPrefs().ttsProvider || 'auto');
   const [brollMode, setBrollMode] = useState('mockup');
   const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('sliced_avatar');
+  // Тонкие настройки пайплайна: по умолчанию всё включено, «!== false» —
+  // чтобы старые prefs без этих полей не выключали фичи.
+  const [backgroundMusic, setBackgroundMusic] = useState(() => loadVideoPrefs().backgroundMusic !== false);
+  const [clipVisionQc, setClipVisionQc] = useState(() => loadVideoPrefs().clipVisionQc !== false);
+  const [brollImageFirst, setBrollImageFirst] = useState(() => loadVideoPrefs().brollImageFirst !== false);
   const [selectedVoice, setSelectedVoice] = useState(() => loadVideoPrefs().selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
@@ -745,8 +750,11 @@ export default function SaaShortsTab({
       ttsProvider,
       selectedActor: selectedActor || '',
       uploadedActorUrl: uploadedActorPreview?.serverUrl || '',
+      backgroundMusic,
+      clipVisionQc,
+      brollImageFirst,
     });
-  }, [selectedVoice, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender]);
+  }, [selectedVoice, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
 
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
@@ -1099,6 +1107,9 @@ export default function SaaShortsTab({
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
+          background_music: backgroundMusic,
+          clip_vision_qc: clipVisionQc,
+          broll_image_first: brollImageFirst,
         }),
       });
 
@@ -1162,6 +1173,9 @@ export default function SaaShortsTab({
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
+          background_music: backgroundMusic,
+          clip_vision_qc: clipVisionQc,
+          broll_image_first: brollImageFirst,
         }),
       });
 
@@ -1588,6 +1602,42 @@ export default function SaaShortsTab({
                       </button>
                     );
                   })}
+                </div>
+                <div className="flex flex-wrap gap-2 mt-3">
+                  {[
+                    {
+                      checked: backgroundMusic,
+                      toggle: () => setBackgroundMusic((v) => !v),
+                      label: '🎵 Фоновая музыка',
+                      hint: 'Тихая музыкальная подложка под озвучкой',
+                    },
+                    {
+                      checked: clipVisionQc,
+                      toggle: () => setClipVisionQc((v) => !v),
+                      label: '👁 ИИ-проверка кадров',
+                      hint: 'Gemini ищет брак в готовых клипах (~$0.001 за ролик), только предупреждает',
+                    },
+                    {
+                      checked: brollImageFirst,
+                      toggle: () => setBrollImageFirst((v) => !v),
+                      label: '🖼 B-roll через кадр-референс',
+                      hint: 'Сначала Flux-картинка, потом анимация — стабильнее композиция (+$0.05 за b-roll кадр)',
+                    },
+                  ].map((opt) => (
+                    <button
+                      key={opt.label}
+                      type="button"
+                      onClick={opt.toggle}
+                      title={opt.hint}
+                      className={`px-3 py-1.5 rounded-full border text-[11px] transition-all ${
+                        opt.checked
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                          : 'border-white/10 bg-white/5 text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      {opt.checked ? '✓ ' : ''}{opt.label}
+                    </button>
+                  ))}
                 </div>
               </div>
 

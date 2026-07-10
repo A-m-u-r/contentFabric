@@ -5,9 +5,18 @@ import unittest
 from unittest.mock import patch
 
 from saasshorts import (
+    _avatar_clip_cache_valid,
+    _avatar_request_prompt,
+    _avatar_scene_parts_prompt,
+    _avatar_scene_prompt,
     _broll_reference_image,
+    _broll_slice_shot,
+    _chunk_request_prompts,
     _parse_review_issues,
+    _shot_request_prompt,
     composite_storyboard_video,
+    generate_sliced_avatar_clips,
+    generate_storyboard_chunk_clip,
     generate_storyboard_shot_clip,
     review_clip_quality,
 )
@@ -202,6 +211,209 @@ class ClipCacheInvalidationTest(unittest.TestCase):
             fal_mock.assert_called_once()
             self.assertEqual(result, "")  # failure path: fell back, stale file removed
             self.assertFalse(os.path.exists(ref))
+
+
+class AvatarPromptTest(unittest.TestCase):
+    """The UI's editable «Kling prompt» must drive talking shots too."""
+
+    def test_generation_prompt_drives_avatar_framing(self):
+        shot = {
+            "scene": "kitchen counter",
+            "camera": "close-up",
+            "generation_prompt": "woman at a sunset window, vertical 9:16",
+        }
+        prompt = _avatar_scene_prompt(shot)
+        self.assertIn("woman at a sunset window", prompt)
+        self.assertIn("no readable on-screen text", prompt)
+        self.assertNotIn("kitchen counter", prompt)
+
+    def test_scene_fields_fallback_without_prompt(self):
+        prompt = _avatar_scene_prompt({"scene": "kitchen counter", "camera": "close-up"})
+        self.assertIn("kitchen counter", prompt)
+        self.assertIn("close-up", prompt)
+
+    def test_bare_shot_keeps_empty_contract(self):
+        self.assertEqual(_avatar_scene_prompt({"speech": "только текст"}), "")
+
+
+class AvatarClipCacheValidTest(unittest.TestCase):
+    shot = {"scene": "kitchen", "camera": "close-up", "generation_prompt": "sunset window"}
+
+    def _clip(self, tmp, stored_prompt=None):
+        clip = os.path.join(tmp, "job_avatar_01.mp4")
+        with open(clip, "wb") as f:
+            f.write(b"clip")
+        if stored_prompt is not None:
+            with open(clip.replace(".mp4", "_base_fal.json"), "w", encoding="utf-8") as f:
+                json.dump({"payload": {"prompt": stored_prompt}}, f)
+        return clip
+
+    def test_missing_file_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(_avatar_clip_cache_valid(os.path.join(tmp, "nope.mp4"), self.shot))
+
+    def test_clip_without_meta_stays_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp), self.shot))
+
+    def test_current_prompt_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stored = _avatar_request_prompt(_avatar_scene_prompt(self.shot))
+            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+
+    def test_legacy_scene_recipe_stays_valid(self):
+        # Clips generated before the generation_prompt switch must not be
+        # surprise-regenerated: an avatar clip is the priciest artifact.
+        with tempfile.TemporaryDirectory() as tmp:
+            stored = _avatar_request_prompt(_avatar_scene_parts_prompt(self.shot))
+            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+
+    def test_edited_prompt_invalidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stored = _avatar_request_prompt("a completely different framing")
+            self.assertFalse(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+
+
+class SlicedAvatarCacheTest(unittest.TestCase):
+    """Retry of a sliced-avatar job regenerates only the prompt-edited shots."""
+
+    TALKING_PROMPT = "creator at a desk, vertical 9:16, no burned-in text, no watermark"
+    BROLL_PROMPT = "coffee cup close-up, vertical 9:16, no burned-in text, no watermark"
+
+    def _shots(self, ref):
+        return [
+            {"shot_number": 1, "start": 0, "end": 3, "visual_type": "talking",
+             "speech": "Первая фраза кадра.", "scene": "close-up", "image_path": ref,
+             "generation_prompt": self.TALKING_PROMPT},
+            {"shot_number": 2, "start": 3, "end": 6, "visual_type": "broll",
+             "speech": "Вторая фраза кадра.",
+             "generation_prompt": self.BROLL_PROMPT},
+        ]
+
+    @staticmethod
+    def _fake_slice(audio_path, start, end, output_path):
+        with open(output_path, "wb") as f:
+            f.write(b"slice")
+        return output_path
+
+    def _run(self, tmp, shots, head_mock, v3_mock):
+        with patch("saasshorts._get_media_duration", return_value=6.0), \
+             patch("saasshorts._slice_voiceover_segment", side_effect=self._fake_slice), \
+             patch("saasshorts.generate_talking_head", side_effect=head_mock), \
+             patch("saasshorts.generate_storyboard_shot_clip", side_effect=v3_mock), \
+             patch("saasshorts.generate_actor_image", side_effect=AssertionError("no actor gen")):
+            return generate_sliced_avatar_clips(
+                shots, os.path.join(tmp, "voice.mp3"), [], "key", tmp, "job",
+                broll_image_first=False, log=lambda *_: None,
+            )
+
+    def _seed_cached_clips(self, tmp, shots, talking_meta_prompt, broll_meta_prompt):
+        talking_clip = os.path.join(tmp, "job_avatar_01.mp4")
+        broll_clip = os.path.join(tmp, "job_avatar_broll_02.mp4")
+        for clip in (talking_clip, broll_clip):
+            with open(clip, "wb") as f:
+                f.write(b"cached")
+        with open(talking_clip.replace(".mp4", "_base_fal.json"), "w", encoding="utf-8") as f:
+            json.dump({"payload": {"prompt": talking_meta_prompt}}, f)
+        with open(f"{broll_clip}.meta.json", "w", encoding="utf-8") as f:
+            json.dump({"payload": {"prompt": broll_meta_prompt}}, f)
+        return talking_clip, broll_clip
+
+    def test_unchanged_prompts_reuse_both_cached_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            with open(ref, "wb") as f:
+                f.write(b"img")
+            shots = self._shots(ref)
+            self._seed_cached_clips(
+                tmp, shots,
+                talking_meta_prompt=_avatar_request_prompt(_avatar_scene_prompt(shots[0])),
+                broll_meta_prompt=_shot_request_prompt(_broll_slice_shot(shots[1], 3.0)),
+            )
+            clips = self._run(
+                tmp, shots,
+                head_mock=AssertionError("avatar must stay cached"),
+                v3_mock=AssertionError("broll must stay cached"),
+            )
+        self.assertEqual(len(clips), 2)
+
+    def test_edited_prompts_regenerate_both_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            with open(ref, "wb") as f:
+                f.write(b"img")
+            shots = self._shots(ref)
+            self._seed_cached_clips(
+                tmp, shots,
+                talking_meta_prompt=_avatar_request_prompt("stale avatar framing"),
+                broll_meta_prompt="stale broll prompt",
+            )
+            calls = {"head": 0, "v3": 0}
+
+            def fake_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
+                calls["head"] += 1
+                with open(output_path, "wb") as f:
+                    f.write(b"new-clip")
+                return output_path
+
+            def fake_v3(shot, fal_key, output_path, tier="standard", **kwargs):
+                calls["v3"] += 1
+                with open(output_path, "wb") as f:
+                    f.write(b"new-clip")
+                return output_path
+
+            self._run(tmp, shots, head_mock=fake_head, v3_mock=fake_v3)
+        self.assertEqual(calls, {"head": 1, "v3": 1})
+
+
+class ChunkCacheInvalidationTest(unittest.TestCase):
+    """Multi-shot chunks must also honor prompt edits on retry."""
+
+    def _chunk_shots(self):
+        return [
+            {"shot_number": 1, "duration": 5, "scene": "kitchen", "speech": "hi",
+             "generation_prompt": "cup close-up, vertical 9:16, no burned-in text, no watermark"},
+            {"shot_number": 2, "duration": 5, "scene": "desk", "speech": "yo",
+             "generation_prompt": "desk pan, vertical 9:16, no burned-in text, no watermark"},
+        ]
+
+    def _make_cached_chunk(self, tmp, prompts):
+        clip = os.path.join(tmp, "chunk_01.mp4")
+        with open(clip, "wb") as f:
+            f.write(b"cached-chunk")
+        with open(f"{clip}.meta.json", "w", encoding="utf-8") as f:
+            json.dump({"payload": {"multi_prompt": [
+                {"duration": "5", "prompt": prompt} for prompt in prompts
+            ]}}, f)
+        return clip
+
+    def test_cache_reused_when_prompts_unchanged(self):
+        shots = self._chunk_shots()
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = self._make_cached_chunk(tmp, _chunk_request_prompts(shots))
+            with patch("saasshorts._fal_run", side_effect=AssertionError("must not call fal")):
+                result = generate_storyboard_chunk_clip(shots, "key", clip)
+            self.assertEqual(result, clip)
+
+    def test_cache_invalidated_when_prompt_changed(self):
+        shots = self._chunk_shots()
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = self._make_cached_chunk(tmp, ["old one", "old two"])
+            with patch("saasshorts._fal_run", side_effect=RuntimeError("fal-called")):
+                with self.assertRaisesRegex(RuntimeError, "fal-called"):
+                    generate_storyboard_chunk_clip(shots, "key", clip)
+            self.assertFalse(os.path.exists(clip))
+            self.assertFalse(os.path.exists(f"{clip}.meta.json"))
+
+    def test_legacy_chunk_without_meta_is_kept(self):
+        shots = self._chunk_shots()
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "chunk_01.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"legacy")
+            with patch("saasshorts._fal_run", side_effect=AssertionError("must not call fal")):
+                result = generate_storyboard_chunk_clip(shots, "key", clip)
+            self.assertEqual(result, clip)
 
 
 if __name__ == "__main__":

@@ -2360,6 +2360,20 @@ def prepare_kling_actor_image(image_path: str, output_path: str) -> str:
     return output_path
 
 
+def _avatar_request_prompt(scene_prompt: str) -> str:
+    """The prompt a Kling Avatar request carries — single source for cache checks."""
+    framing = (scene_prompt or "").strip() or "Natural UGC creator talking to camera in a steady close-up."
+    if not framing.endswith("."):
+        framing += "."
+    return (
+        f"{framing} "
+        "Keep body movement minimal and controlled. Use only subtle head movement, "
+        "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
+        "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
+        "keep lips closed and hold a calm neutral expression."
+    )
+
+
 def generate_talking_head(
     image_path: str,
     audio_path: str,
@@ -2385,16 +2399,7 @@ def generate_talking_head(
         prepare_kling_actor_image(image_path, kling_image_path),
         fal_key,
     )
-    framing = (scene_prompt or "").strip() or "Natural UGC creator talking to camera in a steady close-up."
-    if not framing.endswith("."):
-        framing += "."
-    base_prompt = (
-        f"{framing} "
-        "Keep body movement minimal and controlled. Use only subtle head movement, "
-        "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
-        "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
-        "keep lips closed and hold a calm neutral expression."
-    )
+    base_prompt = _avatar_request_prompt(scene_prompt)
     attempts_config = [
         {"name": "base", "audio_path": audio_path, "prompt": base_prompt},
     ]
@@ -3949,6 +3954,50 @@ def _cached_clip_prompt(output_path: str) -> Optional[str]:
     return None
 
 
+def _storyboard_clip_cache_valid(shot: dict, output_path: str) -> bool:
+    """True while a cached Kling V3 clip still matches the shot's current prompt.
+
+    Every caller must go through this (not a bare os.path.exists check), or
+    edited prompts get silently ignored on retry. Clips without meta.json
+    (legacy jobs) stay valid: regenerating them is a paid call the user did
+    not ask for.
+    """
+    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+        return False
+    cached_prompt = _cached_clip_prompt(output_path)
+    return cached_prompt is None or cached_prompt == _shot_request_prompt(shot)
+
+
+def _chunk_request_prompts(shots: list) -> list:
+    """Prompts a multi-shot fal request would carry (mirrors build_kling_v3_storyboard_request)."""
+    normalized = normalize_storyboard_shots({"shots": shots})
+    return [
+        shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot"
+        for shot in normalized
+    ]
+
+
+def _cached_chunk_prompts(output_path: str) -> Optional[list]:
+    try:
+        with open(f"{output_path}.meta.json", encoding="utf-8") as f:
+            payload = (json.load(f).get("payload") or {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    multi = payload.get("multi_prompt")
+    if isinstance(multi, list):
+        return [entry.get("prompt") for entry in multi if isinstance(entry, dict)]
+    if "prompt" in payload:
+        return [payload["prompt"]]
+    return None
+
+
+def _storyboard_chunk_cache_valid(shots: list, output_path: str) -> bool:
+    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+        return False
+    cached = _cached_chunk_prompts(output_path)
+    return cached is None or cached == _chunk_request_prompts(shots)
+
+
 def generate_storyboard_shot_clip(
     shot: dict,
     fal_key: str,
@@ -3959,10 +4008,8 @@ def generate_storyboard_shot_clip(
     """Generate one storyboard shot with Kling V3 and no native audio."""
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         # The UI lets the user edit a shot's Kling prompt and retry the job:
-        # the cached clip is only valid while the prompt still matches. Legacy
-        # clips without meta are kept — surprise regeneration is a paid call.
-        cached_prompt = _cached_clip_prompt(output_path)
-        if cached_prompt is None or cached_prompt == _shot_request_prompt(shot):
+        # the cached clip is only valid while the prompt still matches.
+        if _storyboard_clip_cache_valid(shot, output_path):
             return output_path
         print(f"[SaaSShorts] Prompt changed for {os.path.basename(output_path)} — regenerating clip.")
         for stale in (
@@ -4013,7 +4060,15 @@ def generate_storyboard_chunk_clip(
 ) -> str:
     """Generate a <=15s multi-shot Kling V3 storyboard chunk."""
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        return output_path
+        if _storyboard_chunk_cache_valid(shots, output_path):
+            return output_path
+        print(f"[SaaSShorts] Prompts changed for {os.path.basename(output_path)} — regenerating chunk.")
+        for stale in (output_path, f"{output_path}.fal_url.txt", f"{output_path}.meta.json"):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
 
     model_id, payload = build_kling_v3_storyboard_request(
         shots,
@@ -4375,11 +4430,11 @@ def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) 
     return ""
 
 
-def _avatar_scene_prompt(shot: dict) -> str:
-    """Per-shot Kling Avatar framing built from storyboard scene data.
+def _avatar_scene_parts_prompt(shot: dict) -> str:
+    """Avatar framing built from scene/camera/action/emotion fields.
 
-    Uses the scene/camera/action/emotion Gemini already wrote for the shot so
-    consecutive avatar clips look like different shots, not five identical takes.
+    Pre-generation_prompt recipe: kept as the fallback for shots without a
+    prompt and for cache-compat checks on clips generated before the switch.
     """
     parts = []
     for value in (
@@ -4397,6 +4452,46 @@ def _avatar_scene_prompt(shot: dict) -> str:
         # Kling рисует мусорные глифы вместо текста: экраны в кадре — только нечитаемые
         parts.append("no readable on-screen text, any device screens turned away or out of focus")
     return ". ".join(parts)
+
+
+def _avatar_scene_prompt(shot: dict) -> str:
+    """Per-shot Kling Avatar framing.
+
+    The UI exposes each shot's generation_prompt as the editable «Kling prompt»,
+    so when it is set it must drive the avatar framing too — otherwise edits to
+    talking shots are silently ignored. Shots without one (bare dicts) fall back
+    to the scene-field recipe.
+    """
+    custom = (shot.get("generation_prompt") or "").strip().rstrip(".")
+    if custom:
+        return (
+            f"{custom}. "
+            "no readable on-screen text, any device screens turned away or out of focus"
+        )
+    return _avatar_scene_parts_prompt(shot)
+
+
+def _avatar_clip_cache_valid(clip_path: str, shot: dict) -> bool:
+    """True while a cached Kling Avatar clip still matches the shot's framing prompt.
+
+    Clips without meta (legacy jobs) stay valid, and so do clips built with the
+    old scene-fields recipe — an avatar clip is the most expensive artifact in
+    the pipeline, so only a real user edit may trigger regeneration.
+    """
+    if not _nonempty(clip_path):
+        return False
+    meta_path = clip_path.replace(".mp4", "_base_fal.json")
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            stored = (json.load(f).get("payload") or {}).get("prompt")
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(stored, str):
+        return True
+    return stored in (
+        _avatar_request_prompt(_avatar_scene_prompt(shot)),
+        _avatar_request_prompt(_avatar_scene_parts_prompt(shot)),
+    )
 
 
 def _is_broll_shot(shot: dict) -> bool:
@@ -4588,17 +4683,18 @@ def generate_sliced_avatar_clips(
         sl["shot"]["end"] = sl["end"]
 
     def _gen_clip(job):
-        label = "b-roll" if job["broll"] else "avatar"
-        if _nonempty(job["clip_path"]):
-            log(f"  {label.capitalize()} shot {job['index']} cached.")
-            return job["clip_path"]
-        log(
-            f"  Generating {label} shot {job['index']}/{len(jobs)} "
-            f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
-        )
+        # Cache checks are prompt-aware (a bare exists() would silently ignore
+        # edited Kling prompts on retry), so the request prompt is built first.
         if job["broll"]:
             slice_duration = job["slice"]["end"] - job["slice"]["start"]
             v3_shot = _broll_slice_shot(job["slice"]["shot"], slice_duration)
+            if _storyboard_clip_cache_valid(v3_shot, job["clip_path"]):
+                log(f"  B-roll shot {job['index']} cached.")
+                return job["clip_path"]
+            log(
+                f"  Generating b-roll shot {job['index']}/{len(jobs)} "
+                f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
+            )
             if broll_image_first:
                 ref = _broll_reference_image(
                     v3_shot, fal_key,
@@ -4613,6 +4709,25 @@ def generate_sliced_avatar_clips(
                 job["clip_path"],
                 tier=broll_tier,
             )
+        if _avatar_clip_cache_valid(job["clip_path"], job["slice"]["shot"]):
+            log(f"  Avatar shot {job['index']} cached.")
+            return job["clip_path"]
+        if _nonempty(job["clip_path"]):
+            log(f"  Avatar shot {job['index']}: промпт изменился — перегенерация кадра.")
+            for stale in (
+                job["clip_path"],
+                f"{job['clip_path']}.review.json",
+                f"{job['clip_path']}.review.jpg",
+            ):
+                try:
+                    if os.path.exists(stale):
+                        os.remove(stale)
+                except OSError:
+                    pass
+        log(
+            f"  Generating avatar shot {job['index']}/{len(jobs)} "
+            f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
+        )
         return generate_talking_head(
             job["image"],
             job["audio"],
@@ -4793,7 +4908,9 @@ def generate_storyboard_video(
         shot_chunks = split_storyboard_shots(shots, max_duration=15)
         for index, chunk in enumerate(shot_chunks, start=1):
             clip_path = os.path.join(output_dir, f"{title_slug}_chunk_{index:02d}.mp4")
-            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+            # Cache validity is prompt-aware: a bare exists() check here would
+            # silently ignore edited prompts on retry.
+            if _storyboard_chunk_cache_valid(chunk, clip_path):
                 log(f"  Chunk {index} cached.")
             else:
                 log(f"  Generating chunk {index}/{len(shot_chunks)} ({len(chunk)} shots)...")
@@ -4807,7 +4924,9 @@ def generate_storyboard_video(
         log(f"[2/5] Generating storyboard with {storyboard_label} ({generation_mode})...")
         for index, shot in enumerate(shots, start=1):
             clip_path = os.path.join(output_dir, f"{title_slug}_shot_{index:02d}.mp4")
-            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+            # Cache validity is prompt-aware: a bare exists() check here would
+            # silently ignore edited prompts on retry.
+            if _storyboard_clip_cache_valid(shot, clip_path):
                 log(f"  Shot {index} cached.")
             else:
                 log(f"  Generating shot {index}/{len(shots)}...")
