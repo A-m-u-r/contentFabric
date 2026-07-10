@@ -3751,6 +3751,8 @@ class SaaSGenerateRequest(BaseModel):
     reusable_head_template_id: Optional[str] = None
     reusable_lipsync_model: str = "sync-3"
     use_platform_keys: bool = False
+    clip_vision_qc: bool = True  # advisory Gemini review of each generated clip
+    broll_image_first: bool = True  # Flux still -> image-to-video for b-roll shots
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -3910,6 +3912,8 @@ async def saasshorts_generate(
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
         "gemini_key": gemini_key,
+        "clip_vision_qc": req.clip_vision_qc,
+        "broll_image_first": req.broll_image_first,
         "voice_id": req.voice_id,  # None -> per-language default in saasshorts
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,

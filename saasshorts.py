@@ -4734,7 +4734,7 @@ def generate_storyboard_video(
 
     vision_warnings = []
     gemini_key = config.get("gemini_key")
-    if gemini_key:
+    if gemini_key and config.get("clip_vision_qc", True):
         log("[3/5] Vision-проверка клипов (Gemini)...")
         for clip_index, clip in enumerate(clips, start=1):
             clip_shot = clip.get("shot")
