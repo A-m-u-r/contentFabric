@@ -685,8 +685,8 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
 ]
 
 RULES:
-- Generate 5-6 shots, total 15-22 seconds.
-- shot durations should be 3-5 seconds.
+- One shot = one short beat of about 3 seconds (5 at the absolute limit). Generate as many shots as the script needs so NO shot runs long: a ~30-second video needs about 8-10 shots, a ~20-second one about 6-7. Never compress a long script into few long shots.
+- Every shot must be visually distinct from its neighbours (new scene, angle or subject) — the point of many short shots is variety, not the same framing repeated.
 - Use visual variety: close-up, kitchen/lifestyle, exercise/home, product close-up, final CTA.
 - Do NOT rely only on talking head. Use the actor as a consistent character across shots.
 - visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = insert shot while the voiceover keeps playing — close-ups of objects, food, product or environment, hands allowed but strictly NO faces and NO people in frame (the video model has no photo reference for broll, so any person it invents will look like a stranger, breaking actor continuity). Split-screen collages of such object shots are allowed. The first shot (hook) and the last shot (cta) MUST be "talking". Make 1-2 middle shots "broll" for visual dynamics.
@@ -700,7 +700,7 @@ RULES:
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Prefer plates, food, hands, analog objects.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
-- Keep each talking shot's speech to ONE short sentence of 8-12 words (about 3 seconds spoken); 14 words is the hard maximum. NEVER write a long monologue for a single shot — a shot is 3 seconds, 5 at the absolute limit.
+- Each shot's speech is ONE short sentence of about 8-12 words (~3 seconds spoken), 14 words hard max. If the script has more to say, add another shot — never grow one shot's speech instead of adding shots.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
