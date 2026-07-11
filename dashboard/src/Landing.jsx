@@ -28,11 +28,11 @@ const TikTokIcon = ({ size = 18, className = '' }) => (
   </svg>
 );
 
-const BRAND_NAME = 'OpenShorts';
 const BRAND_ICON = '/favicon-192.png';
 
 const LANDING_COPY = {
   ru: {
+    brand: 'Контентфабрика',
     nav: {
       product: 'Что собирает',
       pipeline: 'Как это работает',
@@ -42,10 +42,10 @@ const LANDING_COPY = {
       legal: 'Документы',
     },
     hero: {
-      eyebrow: 'OpenShorts / series engine',
+      eyebrow: 'Контентфабрика / серийный движок',
       title: '10 AI-роликов из одного оффера — за один запуск',
       description:
-        'Задайте продукт, нишу или URL. OpenShorts разложит оффер на hooks, соберет сценарии, AI-аватара, голос, субтитры, публикацию и сигналы для следующей серии.',
+        'Задайте продукт, нишу или URL. Контентфабрика разложит оффер на hooks, соберет сценарии, AI-аватара, голос, субтитры, публикацию и сигналы для следующей серии.',
       primary: 'Собрать тестовую серию',
       secondary: 'Забрать карту hooks',
       note: 'Первый шаг - пачка гипотез на 7-10 видео вместо одного идеального ролика. Свои API можно подключить для контроля себестоимости генерации.',
@@ -200,6 +200,7 @@ const LANDING_COPY = {
     },
   },
   en: {
+    brand: 'OpenShorts',
     nav: {
       product: 'What it builds',
       pipeline: 'Loop',
@@ -723,7 +724,7 @@ export default function Landing({ onLaunchApp }) {
         <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4">
           <a href="#" className="flex min-h-11 items-center gap-3">
             <img src={BRAND_ICON} alt="" className="h-8 w-8 rounded-lg" />
-            <span className="whitespace-nowrap text-sm font-bold sm:text-base">{BRAND_NAME}</span>
+            <span className="whitespace-nowrap text-sm font-bold sm:text-base">{copy.brand}</span>
           </a>
           <div className="hidden items-center gap-5 text-sm text-zinc-400 md:flex">
             <a href="#product" className="inline-flex min-h-11 min-w-11 items-center justify-center py-2 hover:text-white">{copy.nav.product}</a>
@@ -950,7 +951,7 @@ export default function Landing({ onLaunchApp }) {
                 </h2>
                 <p className="mt-4 text-base leading-7 text-zinc-400">
                   {language === 'ru'
-                    ? 'Смысл OpenShorts в том, чтобы темы, hooks, аватары, CTA и форматы уточнялись по реакции аудитории: вместо споров о вкусах вы смотрите, что дало удержание, DM или заявку.'
+                    ? 'Смысл Контентфабрики в том, чтобы темы, hooks, аватары, CTA и форматы уточнялись по реакции аудитории: вместо споров о вкусах вы смотрите, что дало удержание, DM или заявку.'
                     : 'OpenShorts keeps topics, hooks, avatars, CTAs and formats improving from audience response. Instead of debating taste, you look for retention, DMs and leads.'}
                 </p>
               </div>
@@ -1011,7 +1012,7 @@ export default function Landing({ onLaunchApp }) {
         <div className="mx-auto flex max-w-7xl flex-col gap-4 text-sm text-zinc-500 md:flex-row md:items-center md:justify-between">
           <div className="flex min-h-11 items-center gap-3">
             <img src={BRAND_ICON} alt="" className="h-6 w-6 rounded-md" />
-            <span>{BRAND_NAME}</span>
+            <span>{copy.brand}</span>
           </div>
           <div className="flex flex-wrap gap-x-5 gap-y-1">
             <a href="#product" className="inline-flex min-h-11 min-w-11 items-center py-2 hover:text-white">{copy.nav.product}</a>
