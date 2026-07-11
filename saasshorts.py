@@ -699,7 +699,8 @@ RULES:
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Prefer plates, food, hands, analog objects.
-- In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync. Keep each talking shot's speech to at most two short sentences (roughly 18 words); a long monologue on one shot degrades lip-sync.
+- In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
+- Keep each talking shot's speech to ONE short sentence of 8-12 words (about 3 seconds spoken); 14 words is the hard maximum. NEVER write a long monologue for a single shot — a shot is 3 seconds, 5 at the absolute limit.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
@@ -4434,6 +4435,90 @@ def _slice_voiceover_segment(audio_path: str, start: float, end: float, output_p
     return output_path
 
 
+def _ensure_slice_audio(
+    audio_path: str,
+    start: float,
+    end: float,
+    output_path: str,
+    clip_path: str,
+    log: Callable[[str], None] = print,
+) -> str:
+    """Cut the voiceover slice, invalidating stale audio when its bounds moved.
+
+    Slice files are cached by name. If a code change (e.g. long shots now split
+    into jump cuts) moves the bounds, the cached audio — and the avatar clip
+    that was lip-synced against it — no longer match the timeline. Duration is
+    the tell: renumbered slices land on files cut for different bounds.
+    """
+    expected = max(0.0, end - start)
+    if _nonempty(output_path):
+        actual = _get_media_duration(output_path)
+        if abs(actual - expected) <= 0.08:
+            return output_path
+        log(
+            f"  Слайс {os.path.basename(output_path)}: границы сместились "
+            f"({actual:.2f}s -> {expected:.2f}s) — пересечка звука и перегенерация клипа."
+        )
+        for stale in (
+            output_path,
+            f"{output_path}.fal_url.txt",
+            clip_path,
+            clip_path.replace(".mp4", "_base.mp4"),
+            clip_path.replace(".mp4", "_base_fal.json"),
+            f"{clip_path}.meta.json",
+            f"{clip_path}.review.json",
+            f"{clip_path}.review.jpg",
+            f"{clip_path}.fal_url.txt",
+        ):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
+    return _slice_voiceover_segment(audio_path, start, end, output_path)
+
+
+_MAX_TALKING_SLICE_SECONDS = 5.0
+
+
+def _split_long_slices(slices: list, words: list, max_len: float = _MAX_TALKING_SLICE_SECONDS) -> list:
+    """Split talking slices longer than max_len into jump-cut sub-slices.
+
+    A shot is ~3 seconds, 5 at the absolute limit (user rule): Kling Avatar
+    lip-sync drifts over long takes and a long static monologue reads dead.
+    Cuts snap to inter-word pauses; each sub-slice carries a copy of the shot,
+    so the per-clip reference punch-ins render the splits as natural jump cuts.
+    B-roll slices pass through: the master voiceover plays over them, no
+    lip-sync involved.
+    """
+    result = []
+    for sl in slices:
+        duration = sl["end"] - sl["start"]
+        if _is_broll_shot(sl["shot"]) or duration <= max_len + 0.01:
+            result.append(sl)
+            continue
+        parts = int(math.ceil(duration / max_len))
+        gaps = []
+        for prev, nxt in zip(words or [], (words or [])[1:]):
+            boundary = (float(prev["end"]) + float(nxt["start"])) / 2
+            if sl["start"] + 1.0 < boundary < sl["end"] - 1.0:
+                gaps.append((boundary, max(0.0, float(nxt["start"]) - float(prev["end"]))))
+        bounds = [sl["start"]]
+        for i in range(1, parts):
+            target = sl["start"] + duration * i / parts
+            usable = [g for g in gaps if g[0] > bounds[-1] + 1.0]
+            if usable:
+                cut = max(usable, key=lambda g: g[1] - 0.15 * abs(g[0] - target))[0]
+            else:
+                cut = target
+            cut = min(max(cut, bounds[-1] + 1.0), sl["end"] - 1.0)
+            bounds.append(round(cut, 3))
+        bounds.append(sl["end"])
+        for i in range(len(bounds) - 1):
+            result.append({"shot": dict(sl["shot"]), "start": bounds[i], "end": bounds[i + 1]})
+    return result
+
+
 def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) -> str:
     """Return a local path to the shot's reference frame, downloading remote URLs."""
     local_ref = (shot.get("image_path") or shot.get("local_path") or "").strip()
@@ -4671,6 +4756,13 @@ def generate_sliced_avatar_clips(
         )
     if not slices:
         raise ValueError("Sliced-avatar mode requires at least one shot with speech")
+    pre_split = len(slices)
+    slices = _split_long_slices(slices, words)
+    if len(slices) != pre_split:
+        log(
+            f"  Длинная речь в кадре: {pre_split} кадров -> {len(slices)} клипов "
+            f"(джамп-каты, каждый дубль <= {_MAX_TALKING_SLICE_SECONDS:.0f}s — липсинк держится на коротких дублях)."
+        )
 
     fallback_actor_img = ""
 
@@ -4697,16 +4789,17 @@ def generate_sliced_avatar_clips(
     jobs = []
     for index, sl in enumerate(slices, start=1):
         slice_audio = os.path.join(output_dir, f"{title_slug}_slice_{index:02d}.mp3")
-        _slice_voiceover_segment(audio_path, sl["start"], sl["end"], slice_audio)
         broll = _is_broll_shot(sl["shot"])
         # Distinct names so a shot flipping talking<->broll never reuses a stale clip
         clip_name = f"{title_slug}_avatar_broll_{index:02d}.mp4" if broll else f"{title_slug}_avatar_{index:02d}.mp4"
+        clip_path = os.path.join(output_dir, clip_name)
+        _ensure_slice_audio(audio_path, sl["start"], sl["end"], slice_audio, clip_path, log)
         jobs.append({
             "index": index,
             "slice": sl,
             "audio": slice_audio,
             "image": "" if broll else _resolve_image(sl, index),
-            "clip_path": os.path.join(output_dir, clip_name),
+            "clip_path": clip_path,
             "broll": broll,
         })
         # Keep overlay/subtitle timing aligned with the real audio timeline

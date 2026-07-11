@@ -711,6 +711,33 @@ class SlicedAvatarTests(unittest.TestCase):
         self.assertGreater(slices[0]["end"], words[12]["end"])
         self.assertLess(slices[0]["end"], words[13]["start"])
 
+    def test_split_long_slices_breaks_into_jumpcuts(self):
+        # A single 8.5s talking slice must split into <=5s sub-clips at pauses.
+        words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(18)]
+        shot = {"visual_type": "talking", "speech": "long monologue"}
+        slices = [{"shot": shot, "start": 0.0, "end": 8.5}]
+
+        out = saasshorts._split_long_slices(slices, words)
+
+        self.assertGreater(len(out), 1)
+        for sub in out:
+            self.assertLessEqual(sub["end"] - sub["start"], saasshorts._MAX_TALKING_SLICE_SECONDS + 0.01)
+        # Sub-slices tile the original range with no gaps or overlaps
+        self.assertEqual(out[0]["start"], 0.0)
+        self.assertEqual(out[-1]["end"], 8.5)
+        for a, b in zip(out, out[1:]):
+            self.assertEqual(a["end"], b["start"])
+        # Each split carries its own shot dict so per-clip punch-ins differ
+        self.assertIsNot(out[0]["shot"], out[1]["shot"])
+
+    def test_split_long_slices_leaves_short_and_broll_untouched(self):
+        words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(18)]
+        short = [{"shot": {"visual_type": "talking"}, "start": 0.0, "end": 4.0}]
+        self.assertEqual(len(saasshorts._split_long_slices(short, words)), 1)
+        # b-roll plays under the master voiceover: no lip-sync, never split
+        broll = [{"shot": {"visual_type": "broll"}, "start": 0.0, "end": 9.0}]
+        self.assertEqual(len(saasshorts._split_long_slices(broll, words)), 1)
+
     def test_align_proportional_without_words(self):
         shots = [
             {"shot_number": 1, "speech": "a b c d e"},
