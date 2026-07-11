@@ -35,7 +35,7 @@ const LANDING_COPY = {
   ru: {
     nav: {
       product: 'Что собирает',
-      pipeline: 'Петля',
+      pipeline: 'Как это работает',
       pricing: 'Доступ',
       faq: 'FAQ',
       login: 'Собрать серию',
@@ -48,7 +48,7 @@ const LANDING_COPY = {
         'Задайте продукт, нишу или URL. OpenShorts разложит оффер на hooks, соберет сценарии, AI-аватара, голос, субтитры, публикацию и сигналы для следующей серии.',
       primary: 'Собрать тестовую серию',
       secondary: 'Забрать карту hooks',
-      note: 'Первый шаг - не один идеальный ролик, а пачка гипотез на 7-10 видео. Свои API можно подключить для контроля себестоимости генерации.',
+      note: 'Первый шаг - пачка гипотез на 7-10 видео вместо одного идеального ролика. Свои API можно подключить для контроля себестоимости генерации.',
     },
     heroMockup: {
       lineLabel: 'Пульт серии',
@@ -61,7 +61,7 @@ const LANDING_COPY = {
       queue: 'Очередь на 3 площадки',
       analytics: 'удержание',
       leads: 'DM / заявки',
-      hypothesis: 'следующая связка',
+      hypothesis: 'следующий угол',
       hooks: ['Боль в первые 2 секунды', 'До / после без обещаний', 'Оффер через личную историю'],
       signals: ['42% удержание', '5 DM', '2 заявки'],
     },
@@ -111,7 +111,7 @@ const LANDING_COPY = {
     ],
     pipelineTitle: 'Петля роста: оффер → серия → сигнал',
     pipelineText:
-      'Не угадывайте один идеальный ролик. Выпускайте маленькую серию, смотрите удержание, DM и заявки, затем размножайте только те углы, где появился сигнал.',
+      'Вместо поиска одного идеального ролика выпустите маленькую серию, посмотрите удержание, DM и заявки, затем размножайте только те углы, где появился сигнал.',
     pipeline: [
       'Оффер',
       'Hooks',
@@ -138,7 +138,7 @@ const LANDING_COPY = {
       {
         key: 'reaction',
         title: 'Сигнал',
-        text: 'Сравниваем удержание, DM, лиды и сохраняем связки, которые стоит масштабировать.',
+        text: 'Сравниваем удержание, DM, лиды и сохраняем углы, которые стоит масштабировать.',
         steps: [5, 6, 7],
       },
     ],
@@ -194,8 +194,8 @@ const LANDING_COPY = {
       },
     ],
     finalCta: {
-      title: 'Запустите первую серию, а не один ролик',
-      text: 'Начните с одного оффера и 7-10 коротких видео. Дальше сравните реакции и оставьте только те связки, которые дают сигнал.',
+      title: 'Запустите первую серию сегодня',
+      text: 'Начните с одного оффера и 7-10 коротких видео. Дальше сравните реакции и оставьте только те углы, которые дают сигнал.',
       button: 'Собрать тестовую серию',
     },
   },
@@ -701,7 +701,7 @@ const PipelineDiagram = ({ copy }) => {
 };
 
 export default function Landing({ onLaunchApp }) {
-  const [language, setLanguage] = React.useState(getInitialLanguage);
+  const [language] = React.useState(getInitialLanguage);
   const [openFaq, setOpenFaq] = React.useState(0);
   const [theme, setTheme] = React.useState(getInitialTheme);
   const copy = LANDING_COPY[language] || LANDING_COPY.ru;
@@ -710,6 +710,10 @@ export default function Landing({ onLaunchApp }) {
   React.useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  React.useEffect(() => {
+    document.documentElement.lang = language;
+  }, [language]);
 
   return (
     <div className={`landing-page ${isLight ? THEME_LIGHT_CLASS : THEME_DARK_CLASS} min-h-screen overflow-hidden text-white`}>
@@ -745,21 +749,6 @@ export default function Landing({ onLaunchApp }) {
             >
               {isLight ? <Moon size={16} /> : <Sun size={16} />}
             </button>
-            <div className="hidden rounded-lg border border-white/10 bg-white/5 p-1 sm:flex">
-              {['ru', 'en'].map((lang) => (
-                <button
-                  key={lang}
-                  type="button"
-                  onClick={() => setLanguage(lang)}
-                  className={`flex h-11 min-w-11 items-center justify-center rounded-md px-2.5 text-xs font-semibold transition ${
-                    language === lang ? 'bg-white text-zinc-950' : 'text-zinc-400 hover:text-white'
-                  }`}
-                  aria-pressed={language === lang}
-                >
-                  {lang.toUpperCase()}
-                </button>
-              ))}
-            </div>
             <button
               type="button"
               onClick={onLaunchApp}
@@ -880,7 +869,7 @@ export default function Landing({ onLaunchApp }) {
                 title={language === 'ru' ? 'Одна линия вместо ChatGPT, аватаров, голоса, монтажки и автопостинга' : 'One release line instead of scripts, avatars, voice, editing and autoposting tabs'}
                 text={
                   language === 'ru'
-                    ? 'Вы работаете не с набором чужих интерфейсов, а с этапами выпуска: оффер, hooks, ролики, публикация, сигналы и следующая серия.'
+                    ? 'Вы работаете с этапами выпуска: оффер, hooks, ролики, публикация, сигналы и следующая серия - без прыжков между чужими интерфейсами.'
                     : 'Work with release stages, not vendor tabs: offer, hooks, videos, publishing, signals and the next batch.'
                 }
               />
@@ -889,7 +878,7 @@ export default function Landing({ onLaunchApp }) {
                   ? [
                       ['01', 'Гипотеза', 'задаем нишу, оффер, аудиторию и ограничения для серии'],
                       ['02', 'Выпуск', 'собираем ролики из сценариев, аватара, голоса и субтитров'],
-                      ['03', 'Повтор', 'берем реакцию аудитории и запускаем следующую связку'],
+                      ['03', 'Повтор', 'берем реакцию аудитории и запускаем следующий угол'],
                     ]
                   : [
                       ['01', 'Hypothesis', 'set the niche, offer, audience and constraints'],
@@ -957,11 +946,11 @@ export default function Landing({ onLaunchApp }) {
                   {language === 'ru' ? 'Цикл тестов' : 'Testing loop'}
                 </div>
                 <h2 className="text-3xl font-bold text-white md:text-4xl">
-                  {language === 'ru' ? 'Ролики должны приносить сигналы, а не просто лежать в галерее' : 'Videos should create signals, not just sit in a gallery'}
+                  {language === 'ru' ? 'Ролики должны приносить сигналы: удержание, DM, заявки' : 'Videos should create signals, not just sit in a gallery'}
                 </h2>
                 <p className="mt-4 text-base leading-7 text-zinc-400">
                   {language === 'ru'
-                    ? 'Смысл OpenShorts в том, чтобы темы, hooks, аватары, CTA и форматы уточнялись по реакции аудитории. Вы не спорите о вкусах, а смотрите, что дало удержание, DM или заявку.'
+                    ? 'Смысл OpenShorts в том, чтобы темы, hooks, аватары, CTA и форматы уточнялись по реакции аудитории: вместо споров о вкусах вы смотрите, что дало удержание, DM или заявку.'
                     : 'OpenShorts keeps topics, hooks, avatars, CTAs and formats improving from audience response. Instead of debating taste, you look for retention, DMs and leads.'}
                 </p>
               </div>
@@ -969,7 +958,7 @@ export default function Landing({ onLaunchApp }) {
                 {[
                   { icon: Play, label: language === 'ru' ? 'серия' : 'series' },
                   { icon: BarChart3, label: language === 'ru' ? 'сигналы' : 'signals' },
-                  { icon: Sparkles, label: language === 'ru' ? 'следующая связка' : 'next angle' },
+                  { icon: Sparkles, label: language === 'ru' ? 'следующий угол' : 'next angle' },
                 ].map((item) => (
                   <div key={item.label} className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
                     <item.icon size={22} className="mb-8 text-cyan-200" />

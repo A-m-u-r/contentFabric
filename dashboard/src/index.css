@@ -222,6 +222,23 @@
   color: #175cd3 !important;
 }
 
+.landing-page.theme-light .text-lime-100 {
+  color: #3f6212 !important;
+}
+
+.landing-page.theme-light .text-cyan-100\/70 {
+  color: #0e7490 !important;
+}
+
+.landing-page.theme-light .border-lime-300\/20,
+.landing-page.theme-light .border-lime-300\/25 {
+  border-color: rgba(77, 124, 15, 0.3) !important;
+}
+
+.landing-page.theme-light .bg-lime-300\/10 {
+  background-color: rgba(163, 230, 53, 0.16) !important;
+}
+
 .landing-page.theme-light .border-white\/10,
 .landing-page.theme-light .border-white\/15 {
   border-color: rgba(16, 24, 40, 0.12) !important;
@@ -248,16 +265,32 @@
 
 .landing-page.theme-light .bg-white\/\[0\.035\],
 .landing-page.theme-light .bg-white\/\[0\.045\],
+.landing-page.theme-light .bg-white\/\[0\.04\],
 .landing-page.theme-light .bg-white\/5,
 .landing-page.theme-light .bg-white\/10,
+.landing-page.theme-light .bg-black\/20,
 .landing-page.theme-light .bg-black\/25,
 .landing-page.theme-light .bg-cyan-300\/10,
+.landing-page.theme-light .bg-cyan-300\/15,
 .landing-page.theme-light .bg-pink-300\/10,
 .landing-page.theme-light .bg-amber-200\/10,
 .landing-page.theme-light .bg-amber-300\/10,
 .landing-page.theme-light .bg-blue-300\/10,
 .landing-page.theme-light .bg-emerald-300\/10 {
   background-color: rgba(255, 255, 255, 0.66) !important;
+}
+
+.landing-page.theme-light .bg-black\/30 {
+  background-color: rgba(16, 24, 40, 0.06) !important;
+}
+
+.landing-page.theme-light input {
+  color: #101828 !important;
+  caret-color: #101828;
+}
+
+.landing-page.theme-light input::placeholder {
+  color: #667085 !important;
 }
 
 .landing-page.theme-light .bg-\[\#07080d\] {
