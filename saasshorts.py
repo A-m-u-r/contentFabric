@@ -622,7 +622,7 @@ SPEECH STYLE (critical — the speech/narration text goes straight to TTS and mu
 - Mark natural pauses and hesitations with ellipses "…" and dashes "—": "а сладкое… ну, это самый быстрый путь".
 - Ask the viewer rhetorical questions: "Знакомо?", "Когда? Где?".
 - Write ALL numbers in words: "двадцать минут", never "20 минут".
-- You MAY add up to 2-3 ElevenLabs audio tags per script inside speech/narration, in English square brackets: [sighs], [excited], [whispers]. They are acting directions and are never spoken. NEVER put a tag as the last token of a line, and NEVER put tags in overlay_text, captions, or hashtags.
+- REQUIRED: add 2-3 ElevenLabs audio tags per script inside speech/narration, in English square brackets: [sighs], [excited], [whispers]. They are acting directions and are never spoken; without them the TTS delivery sounds flat and robotic. NEVER put a tag as the last token of a line, and NEVER put tags in overlay_text, captions, or hashtags.
 """
     else:
         lang_instructions = """
@@ -697,6 +697,9 @@ RULES:
 - speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
 - generation_prompt MUST be in English and MUST say: vertical 9:16, realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. For "broll" shots it must additionally say: no people, no faces.
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
+- Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
+- In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Prefer plates, food, hands, analog objects.
+- In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync. Keep each talking shot's speech to at most two short sentences (roughly 18 words); a long monologue on one shot degrades lip-sync.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
@@ -1669,12 +1672,15 @@ def generate_voiceover(
     voice_id: str = "21m00Tcm4TlvDq8ikWAM",
     model_id: str = "eleven_v3",
 ) -> str:
-    """Generate voiceover audio using ElevenLabs TTS.
+    """Generate voiceover audio using ElevenLabs TTS. Returns the model actually used.
 
     Defaults to eleven_v3 in Creative mode (stability 0.0): lively human
     delivery that honors [sighs]/[excited]-style audio tags in the text.
     Falls back to multilingual_v2 with the legacy settings when the account
     has no v3 access; tags are stripped there since v2 would voice them.
+    The fallback voice sounds noticeably more robotic, so the caller must
+    persist the returned model — otherwise "why does it sound AI" is
+    undebuggable after the fact.
     """
     print(f"[SaaSShorts] 🎙️ Generating voiceover ({len(text)} chars, {model_id})...")
 
@@ -1723,19 +1729,21 @@ def generate_voiceover(
             return resp
         raise last_error
 
+    used_model = model_id
     with httpx.Client(timeout=180.0) as client:
         resp = post_with_retries(client, request_body(model_id))
         if resp.status_code != 200 and model_id == "eleven_v3":
             print(f"[SaaSShorts] ⚠️ eleven_v3 failed ({resp.status_code}), retrying with multilingual_v2...")
-            resp = post_with_retries(client, request_body("eleven_multilingual_v2"))
+            used_model = "eleven_multilingual_v2"
+            resp = post_with_retries(client, request_body(used_model))
         if resp.status_code != 200:
             raise Exception(f"ElevenLabs TTS error ({resp.status_code}): {resp.text}")
 
         with open(output_path, "wb") as f:
             f.write(resp.content)
 
-    print(f"[SaaSShorts] ✅ Voiceover: {output_path}")
-    return output_path
+    print(f"[SaaSShorts] ✅ Voiceover: {output_path} (model: {used_model})")
+    return used_model
 
 
 def generate_voiceover_minimax(
@@ -1883,7 +1891,7 @@ def generate_voiceover_with_fallback(
         if provider == "auto" and not elevenlabs_key:
             log("[1/6] ElevenLabs key missing; using fal MiniMax TTS fallback.")
         generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id, language)
-        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
+        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id, "model": "minimax-speech-02-hd"}
 
     if provider not in ("auto", "elevenlabs"):
         raise Exception(f"Unknown TTS provider: {provider}")
@@ -1891,14 +1899,16 @@ def generate_voiceover_with_fallback(
         raise Exception("ElevenLabs API key is required for ElevenLabs TTS.")
 
     try:
-        generate_voiceover(text, elevenlabs_key, output_path, elevenlabs_voice_id)
-        return {"path": output_path, "provider": "elevenlabs", "voice_id": elevenlabs_voice_id}
+        used_model = generate_voiceover(text, elevenlabs_key, output_path, elevenlabs_voice_id)
+        if used_model != "eleven_v3":
+            log(f"[1/6] ⚠️ ElevenLabs used {used_model} (v3 unavailable) — delivery will sound flatter than the approved v3 Creative voice.")
+        return {"path": output_path, "provider": "elevenlabs", "voice_id": elevenlabs_voice_id, "model": used_model}
     except Exception as error:
         if provider != "auto":
             raise
         log(f"[1/6] ElevenLabs TTS failed; falling back to fal MiniMax TTS: {error}")
         generate_voiceover_minimax(text, fal_key, output_path, minimax_voice_id, language)
-        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id}
+        return {"path": output_path, "provider": "fal_minimax", "voice_id": minimax_voice_id, "model": "minimax-speech-02-hd"}
 
 
 def get_elevenlabs_voices(elevenlabs_key: str) -> list:
@@ -2370,7 +2380,9 @@ def _avatar_request_prompt(scene_prompt: str) -> str:
         "Keep body movement minimal and controlled. Use only subtle head movement, "
         "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
         "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
-        "keep lips closed and hold a calm neutral expression."
+        "keep lips closed and hold a calm neutral expression. "
+        "Keep the outfit, skin and background exactly as in the reference image: "
+        "never add text, letters, numbers, logos, prints or tattoos to clothing, skin or background."
     )
 
 
@@ -3572,6 +3584,29 @@ def _align_asr_words_to_script(asr_words: list, script_text: str, log: Callable[
     return aligned
 
 
+_CAPTION_SENTENCE_END_RE = re.compile(r"[.!?…]+[\"»')]*$")
+
+
+def _chunk_caption_words(words: list, max_words: int) -> list:
+    """Group ASR words into caption chunks, breaking early at sentence ends.
+
+    A fixed word stride splits captions mid-phrase («ПРЕДАЛО? ВЕС» — the end of
+    one sentence glued to the start of the next); cutting on sentence-final
+    punctuation keeps every caption inside a single phrase.
+    """
+    chunks = []
+    group = []
+    for word in words:
+        group.append(word)
+        token = str(word.get("word") or "").strip()
+        if len(group) >= max_words or _CAPTION_SENTENCE_END_RE.search(token):
+            chunks.append(group)
+            group = []
+    if group:
+        chunks.append(group)
+    return chunks
+
+
 def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3, words: Optional[list] = None) -> str:
     """
     Generate TikTok-style ASS subtitles from audio using Whisper transcription.
@@ -3589,10 +3624,8 @@ def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3, 
             f.write("")
         return output_path
 
-    # Group words into chunks of max_words
     chunks = []
-    for i in range(0, len(words), max_words):
-        group = words[i : i + max_words]
+    for group in _chunk_caption_words(words, max_words):
         text = _strip_pictographs(" ".join(w["word"] for w in group)).upper()
         if not text:
             continue
@@ -3648,10 +3681,7 @@ def generate_storyboard_ass_subtitles(
     if words is None:
         words = transcribe_audio_for_subs(audio_path)
     chunks = []
-    for i in range(0, len(words), max_words):
-        group = words[i : i + max_words]
-        if not group:
-            continue
+    for group in _chunk_caption_words(words, max_words):
         text = _strip_pictographs(" ".join(w["word"] for w in group)).upper()
         if not text:
             continue
@@ -4511,7 +4541,8 @@ def _broll_slice_shot(shot: dict, slice_duration: float) -> dict:
     base = (v3_shot.get("generation_prompt") or "").strip() or _build_storyboard_generation_prompt(v3_shot)
     v3_shot["generation_prompt"] = (
         f"{base}, nobody speaks on camera, mouth closed, no lip movement, "
-        "no readable text, any device screens turned away or out of focus, "
+        "no readable text, no labels or lettering on objects, no digital displays, "
+        "no devices with screens, any screens turned away or out of focus, "
         "voiceover plays over the scene"
     )
     return v3_shot
@@ -4830,6 +4861,7 @@ def generate_storyboard_video(
     cached_meta = _read_tts_metadata(audio_path) if _nonempty(audio_path) else {}
     if _nonempty(audio_path) and cached_meta.get("signature") == expected_signature:
         tts_provider_used = cached_meta.get("provider") or tts_provider
+        tts_model_used = cached_meta.get("model") or ""
         log("[1/5] Voiceover cached, skipping.")
     else:
         if _nonempty(audio_path):
@@ -4848,10 +4880,12 @@ def generate_storyboard_video(
             log=log,
         )
         tts_provider_used = voice_result["provider"]
+        tts_model_used = voice_result.get("model") or ""
         _write_tts_metadata(audio_path, {
             "signature": expected_signature,
             "provider": voice_result["provider"],
             "voice_id": voice_result["voice_id"],
+            "model": tts_model_used,
         })
 
     voiceover_preparation = prepare_voiceover_for_video_generation(audio_path, log=log)
@@ -5014,6 +5048,7 @@ def generate_storyboard_video(
         "duration": audio_duration,
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
+        "tts_model": tts_model_used,
         "broll_mode": "storyboard",
         "head_source": "storyboard",
         "head_template_id": None,
@@ -5130,6 +5165,7 @@ def generate_full_video(
         tts_metadata = {}
 
     tts_provider_used = tts_metadata.get("provider") or tts_provider
+    tts_model_used = tts_metadata.get("model") or ""
 
     if use_reusable_head and reusable_head_poster_path and os.path.exists(reusable_head_poster_path) and not _exists(actor_img):
         import shutil
@@ -5177,10 +5213,12 @@ def generate_full_video(
                 voice_result = future_voice.result()
                 audio_path = voice_result["path"]
                 tts_provider_used = voice_result["provider"]
+                tts_model_used = voice_result.get("model") or ""
                 _write_tts_metadata(audio_path, {
                     "signature": tts_cache_signature,
                     "provider": voice_result["provider"],
                     "voice_id": voice_result["voice_id"],
+                    "model": tts_model_used,
                 })
 
         log("[2/6] Actor image and voiceover ready.")
@@ -5441,6 +5479,7 @@ def generate_full_video(
         "duration": audio_duration,
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
+        "tts_model": tts_model_used,
         "broll_mode": broll_mode,
         "head_source": "template" if use_reusable_head else "generated",
         "head_template_id": reusable_head_template_id,
