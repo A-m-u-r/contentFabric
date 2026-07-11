@@ -87,8 +87,9 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_ai_shorts_storyboard_setup_supports_business_profiles_and_frame_uploads(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        self.assertIn("BUSINESS_PROFILES_KEY", tab)
-        self.assertIn("handleSaveBusinessProfile", tab)
+        self.assertIn("loadBusinessProfiles", tab)
+        self.assertIn("saveBusinessProfiles", tab)
+        self.assertIn("handleLoadBusinessProfile", tab)
         self.assertIn("/api/user/business-profiles", tab)
         self.assertIn("handleStoryboardFrameUpload", tab)
         self.assertIn("/api/saasshorts/storyboard-frame-upload", tab)
@@ -101,15 +102,16 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_ai_shorts_project_avatar_and_mode_copy_are_clear(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        self.assertIn("AI-slop черновик", tab)
-        self.assertIn("Основной режим для коротких UGC", tab)
+        self.assertIn("Черновик (дёшево)", tab)
+        self.assertIn("картинка может плыть и глючить", tab)
+        self.assertIn("Оптимально по цене и качеству", tab)
         self.assertIn("дороже", tab)
         self.assertNotIn("Good baseline for tests and daily volume", tab)
         self.assertNotIn("Best choice when the video is going to publish", tab)
         self.assertIn("Количество вариантов сценария", tab)
         self.assertIn("Сейчас:", tab)
         self.assertIn("selectedBusinessProfileId", tab)
-        self.assertIn("Библиотека проектов", tab)
+        self.assertIn("Управлять проектами", tab)
         self.assertIn("Аватар проекта", tab)
         self.assertIn("Сохранённые аватары", tab)
 
