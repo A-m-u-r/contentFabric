@@ -1,0 +1,74 @@
+import json
+import os
+import tempfile
+import unittest
+
+import app
+
+
+class JobActorPortraitGalleryTests(unittest.TestCase):
+    """The actor gallery must surface portraits created inside finished video
+    jobs, not only the dedicated actor_uploads / saas_actors_* folders."""
+
+    def setUp(self):
+        self._prev_output_dir = app.OUTPUT_DIR
+        self._tmp = tempfile.TemporaryDirectory()
+        app.OUTPUT_DIR = self._tmp.name
+
+    def tearDown(self):
+        app.OUTPUT_DIR = self._prev_output_dir
+        self._tmp.cleanup()
+
+    def _make_job(self, job_id, actor_name, owner, title):
+        job_dir = os.path.join(app.OUTPUT_DIR, f"saas_{job_id}")
+        os.makedirs(job_dir, exist_ok=True)
+        # Primary portrait plus noise that must NOT be picked as the avatar.
+        for name in (
+            f"{actor_name}_actor.png",
+            f"{actor_name}_actor_ref_02.png",
+            f"{actor_name}_avatar_01_actor_9x16.png",
+        ):
+            with open(os.path.join(job_dir, name), "wb") as f:
+                f.write(b"\x89PNG\r\n" + b"0" * 2048)
+        meta = {"title": title, "owner_user_id": owner, "created_at": "2026-06-01T00:00:00Z"}
+        with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        return job_dir
+
+    def test_surfaces_primary_portrait_per_job(self):
+        self._make_job("job1", "_30_", "user-a", "Тело после 30")
+        images = app.list_local_actor_gallery(owner_user_id="user-a")
+
+        self.assertEqual(len(images), 1)
+        entry = images[0]
+        self.assertTrue(entry["key"].endswith("_30__actor.png"))
+        self.assertNotIn("9x16", entry["key"])
+        self.assertNotIn("_ref_", entry["key"])
+        self.assertEqual(entry["description"], "Тело после 30")
+        self.assertEqual(entry["source"], "job")
+
+    def test_owner_filter_hides_other_users_portraits(self):
+        self._make_job("job1", "a", "user-a", "A")
+        self._make_job("job2", "b", "user-b", "B")
+
+        mine = app.list_local_actor_gallery(owner_user_id="user-a")
+        self.assertEqual([e["description"] for e in mine], ["A"])
+
+        anon = app.list_local_actor_gallery(owner_user_id=None)
+        self.assertEqual(len(anon), 2)
+
+    def test_ignores_dedicated_actor_dirs_to_avoid_double_listing(self):
+        # saas_actors_* is handled by the normal actor-dir scan; the job scan
+        # must skip it so a generated avatar is not listed twice.
+        actors_dir = os.path.join(app.OUTPUT_DIR, "saas_actors_xyz")
+        os.makedirs(actors_dir, exist_ok=True)
+        with open(os.path.join(actors_dir, "actor_01.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n" + b"0" * 2048)
+
+        images = app.list_local_actor_gallery(owner_user_id=None)
+        keys = [e["key"] for e in images]
+        self.assertEqual(len(keys), len(set(keys)))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3222,6 +3222,60 @@ def _read_local_actor_metadata(file_path: str) -> dict:
     }
 
 
+def _job_actor_portraits(owner_user_id: Optional[str] = None) -> List[dict]:
+    """Surface the main actor portrait created inside each finished video job.
+
+    Faces generated during a video render live in ``output/saas_<job_id>/`` and
+    were never part of the reusable actor gallery, so they vanished from the
+    "Avatars" tab. This exposes one clean portrait per job (skipping the 9x16
+    Kling crops and ``_ref_`` variants), inheriting owner/title from the job's
+    ``gallery_metadata.json`` so ownership filtering still holds.
+    """
+    entries = []
+    for job_dir in glob.glob(os.path.join(OUTPUT_DIR, "saas_*")):
+        base = os.path.basename(job_dir.rstrip(os.sep))
+        # saas_actors_* is the dedicated actor gallery, already scanned elsewhere.
+        if not os.path.isdir(job_dir) or base.startswith("saas_actors_"):
+            continue
+
+        candidates = []
+        for ext in ACTOR_IMAGE_EXTENSIONS:
+            candidates.extend(glob.glob(os.path.join(job_dir, f"*_actor{ext}")))
+        primary = sorted(
+            p for p in candidates
+            if "9x16" not in os.path.basename(p) and "_ref_" not in os.path.basename(p)
+        )
+        if not primary:
+            continue
+        file_path = primary[0]
+        try:
+            if os.path.getsize(file_path) < 1000:
+                continue
+        except OSError:
+            continue
+
+        meta = _read_local_gallery_meta(job_dir) or {}
+        job_owner = meta.get("owner_user_id") or ""
+        if owner_user_id and job_owner != owner_user_id:
+            continue
+
+        created_at = meta.get("created_at")
+        if not created_at:
+            created_at = datetime.datetime.utcfromtimestamp(
+                os.path.getmtime(file_path)
+            ).isoformat() + "Z"
+        entries.append({
+            "url": _output_file_url(file_path),
+            "key": os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"),
+            "description": (meta.get("title") or "").strip(),
+            "storage": "local",
+            "owner_user_id": job_owner,
+            "source": "job",
+            "created_at": created_at,
+        })
+    return entries
+
+
 def list_local_actor_gallery(owner_user_id: Optional[str] = None) -> List[dict]:
     """List actor images saved on local disk, used when S3 is not configured."""
     image_paths = []
@@ -3251,6 +3305,15 @@ def list_local_actor_gallery(owner_user_id: Optional[str] = None) -> List[dict]:
         entry.setdefault("storage", "local")
         if owner_user_id and entry.get("owner_user_id") != owner_user_id:
             continue
+        images.append(entry)
+
+    # Also surface the portrait each finished video job produced, so avatars
+    # created during generation stay reusable instead of disappearing.
+    for entry in _job_actor_portraits(owner_user_id):
+        abs_path = os.path.abspath(os.path.join(OUTPUT_DIR, entry["key"]))
+        if abs_path in seen_paths:
+            continue
+        seen_paths.add(abs_path)
         images.append(entry)
 
     images.sort(key=lambda x: x.get("created_at", ""), reverse=True)
