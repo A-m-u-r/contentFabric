@@ -3393,6 +3393,19 @@ def _public_avatar_voice(binding: Optional[dict]) -> Optional[dict]:
     }
 
 
+def resolve_avatar_bound_voice(selected_actor_url: Optional[str]) -> Optional[dict]:
+    """Return the ElevenLabs voice bound to a local avatar URL, if any."""
+    if not selected_actor_url or selected_actor_url.startswith("http"):
+        return None
+    avatar_key = selected_actor_url.replace("/videos/", "", 1).lstrip("/")
+    binding = load_avatar_voice_bindings().get(avatar_key)
+    if not binding or not binding.get("voice_id"):
+        return None
+    if (binding.get("provider") or "elevenlabs") != "elevenlabs":
+        return None
+    return binding
+
+
 @app.post("/api/saasshorts/actor-upload")
 async def saasshorts_actor_upload(
     file: UploadFile = File(...),
@@ -4076,6 +4089,18 @@ async def saasshorts_generate(
             if os.path.exists(src):
                 selected_actor_path = src
 
+    # A voice bound to the selected avatar wins over the request's ElevenLabs
+    # voice, so "attach a voice to an avatar" holds even for retries / API calls
+    # / restored prefs where the UI never re-applied it.
+    effective_voice_id = req.voice_id
+    _bound = resolve_avatar_bound_voice(req.selected_actor_url)
+    if _bound:
+        if _bound["voice_id"] != effective_voice_id:
+            saas_jobs[job_id]["logs"].append(
+                f"🔗 Using voice bound to avatar ({_bound.get('voice_name') or _bound['voice_id']})."
+            )
+        effective_voice_id = _bound["voice_id"]
+
     reusable_head = None
     if req.reusable_head_template_id:
         try:
@@ -4102,7 +4127,7 @@ async def saasshorts_generate(
         "clip_vision_qc": req.clip_vision_qc,
         "broll_image_first": req.broll_image_first,
         "background_music": req.background_music,
-        "voice_id": req.voice_id,  # None -> per-language default in saasshorts
+        "voice_id": effective_voice_id,  # avatar binding > request > per-language default
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
         "actor_gender": req.actor_gender or "female",

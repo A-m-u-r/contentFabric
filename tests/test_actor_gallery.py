@@ -131,6 +131,27 @@ class AvatarVoiceBindingTests(unittest.TestCase):
     def test_load_missing_store_returns_empty(self):
         self.assertEqual(app.load_avatar_voice_bindings(), {})
 
+    def test_resolve_bound_voice_from_local_url(self):
+        app.set_avatar_voice_binding(
+            "actor_uploads/custom_1.png", "vid-123", voice_name="Victoria"
+        )
+        bound = app.resolve_avatar_bound_voice("/videos/actor_uploads/custom_1.png")
+        self.assertIsNotNone(bound)
+        self.assertEqual(bound["voice_id"], "vid-123")
+
+    def test_resolve_bound_voice_ignores_unbound_and_remote(self):
+        app.set_avatar_voice_binding("actor_uploads/custom_1.png", "vid-123")
+        # No binding for this key
+        self.assertIsNone(app.resolve_avatar_bound_voice("/videos/actor_uploads/other.png"))
+        # Remote S3 URLs are not resolved
+        self.assertIsNone(app.resolve_avatar_bound_voice("https://s3.example/img.png"))
+        # Empty input
+        self.assertIsNone(app.resolve_avatar_bound_voice(None))
+
+    def test_resolve_bound_voice_skips_non_elevenlabs(self):
+        app.set_avatar_voice_binding("actor_uploads/m.png", "minimax-x", provider="fal_minimax")
+        self.assertIsNone(app.resolve_avatar_bound_voice("/videos/actor_uploads/m.png"))
+
 
 if __name__ == "__main__":
     unittest.main()

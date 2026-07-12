@@ -2472,6 +2472,16 @@ export default function SaaShortsTab({
                   <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
                 </label>
                 {(() => {
+                  const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
+                  if (!boundVoice?.voice_id) return null;
+                  return (
+                    <div className="mb-2 flex items-start gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
+                      <Volume2 size={12} className="mt-0.5 shrink-0" />
+                      <span>Аватар привязан к голосу <b>{boundVoice.voice_name || boundVoice.voice_id}</b> — он и будет использован для ролика. Сменить можно во вкладке «Аватары».</span>
+                    </div>
+                  );
+                })()}
+                {(() => {
                   // Filter voices by language/accent
                   const filtered = voices.length > 0
                     ? voices.filter((v) => {
