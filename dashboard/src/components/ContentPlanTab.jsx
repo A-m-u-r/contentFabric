@@ -147,7 +147,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
       <div className="max-w-5xl mx-auto p-6 pb-28 md:pb-8 lg:p-8">
         <div className="mb-8">
           <h1 className="text-2xl font-bold flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center">
+            <div className="w-10 h-10 bg-gradient-to-br from-violet-500 to-fuchsia-500 rounded-xl flex items-center justify-center">
               <CalendarDays size={20} className="text-white" />
             </div>
             Контент-план
@@ -183,7 +183,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                         onClick={() => handleSelectProfile(profile)}
                         className={`rounded-xl border px-3 py-2 text-left text-xs transition-all max-w-[240px] ${
                           active
-                            ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200'
+                            ? 'border-primary/50 bg-primary/10 text-violet-200'
                             : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
                         }`}
                       >
@@ -204,7 +204,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                       onClick={() => setNumItems(option.id)}
                       className={`rounded-xl border px-3 py-2 text-left transition-all ${
                         numItems === option.id
-                          ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200'
+                          ? 'border-primary/50 bg-primary/10 text-violet-200'
                           : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
                       }`}
                     >
@@ -245,7 +245,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-semibold flex items-center gap-2">
-                    <Sparkles size={18} className="text-emerald-400" />
+                    <Sparkles size={18} className="text-primary" />
                     План на месяц
                   </h2>
                   <span className="text-xs text-zinc-500">

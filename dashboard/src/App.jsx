@@ -756,16 +756,20 @@ function App() {
 
   // --- UI Components ---
 
+  // One nav config drives both the desktop sidebar and the mobile bar so they
+  // can never drift. A single brand accent (violet) marks the active tab.
   const navItems = [
-    { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard, activeClass: 'bg-primary/10 text-primary' },
-    { id: 'saasshorts', label: 'AI Shorts', shortLabel: 'Shorts', icon: Sparkles, activeClass: 'bg-violet-500/10 text-violet-400' },
-    { id: 'projects', label: 'Проекты', shortLabel: 'Проекты', icon: Target, activeClass: 'bg-violet-500/10 text-violet-400' },
-    { id: 'content-plan', label: 'Контент-план', shortLabel: 'План', icon: CalendarDays, activeClass: 'bg-emerald-500/10 text-emerald-400' },
-    { id: 'ai-agent', label: 'AI-агент', shortLabel: 'Агент', icon: Bot, activeClass: 'bg-emerald-500/10 text-emerald-400' },
-    { id: 'ugc-gallery', label: 'UGC-галерея', shortLabel: 'UGC', icon: LayoutGrid, activeClass: 'bg-violet-500/10 text-violet-400' },
-    { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image, activeClass: 'bg-primary/10 text-primary' },
-    { id: 'settings', label: 'Настройки', shortLabel: 'Ключи', icon: Settings, activeClass: 'bg-primary/10 text-primary' },
+    { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard },
+    { id: 'saasshorts', label: 'AI Shorts', shortLabel: 'Shorts', icon: Sparkles },
+    { id: 'projects', label: 'Проекты', shortLabel: 'Проекты', icon: Target },
+    { id: 'content-plan', label: 'Контент-план', shortLabel: 'План', icon: CalendarDays },
+    { id: 'ai-agent', label: 'AI-агент', shortLabel: 'Агент', icon: Bot },
+    { id: 'ugc-gallery', label: 'UGC-галерея', shortLabel: 'UGC', icon: LayoutGrid },
+    { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image },
+    { id: 'settings', label: 'Настройки', shortLabel: 'Ключи', icon: Settings },
   ];
+  const NAV_ACTIVE = 'bg-primary/10 text-primary';
+  const NAV_INACTIVE = 'text-zinc-400 hover:text-white hover:bg-white/5';
   const activeNavItem = navItems.find((item) => item.id === activeTab) || navItems[0];
   const ActiveHeaderIcon = activeNavItem.icon;
 
@@ -778,94 +782,25 @@ function App() {
         <span className="font-bold text-lg text-white hidden xl:block tracking-tight">Контентфабрика</span>
       </div>
 
-      <nav className="flex-1 px-4 py-4 space-y-2">
-        <button
-          type="button"
-          aria-label="Генератор клипов"
-          onClick={() => setActiveTab('dashboard')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'dashboard' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <LayoutDashboard size={20} />
-          <span className="font-medium hidden xl:block">Генератор клипов</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="AI Shorts"
-          onClick={() => setActiveTab('saasshorts')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'saasshorts' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Sparkles size={20} />
-          <span className="font-medium hidden xl:block">AI Shorts</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="Проекты"
-          onClick={() => setActiveTab('projects')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'projects' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Target size={20} />
-          <span className="font-medium hidden xl:block">Проекты</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="Контент-план"
-          onClick={() => setActiveTab('content-plan')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'content-plan' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <CalendarDays size={20} />
-          <span className="font-medium hidden xl:block">Контент-план</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="AI-агент"
-          onClick={() => setActiveTab('ai-agent')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ai-agent' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Bot size={20} />
-          <span className="font-medium hidden xl:block">AI-агент</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="UGC-галерея"
-          onClick={() => setActiveTab('ugc-gallery')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ugc-gallery' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <LayoutGrid size={20} />
-          <span className="font-medium hidden xl:block">UGC-галерея</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="YouTube-студия"
-          onClick={() => setActiveTab('thumbnails')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'thumbnails' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Image size={20} />
-          <span className="font-medium hidden xl:block">YouTube-студия</span>
-        </button>
-
-        {/* <button
-          onClick={() => setActiveTab('gallery')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'gallery' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <LayoutGrid size={20} />
-          <span className="font-medium hidden lg:block">Gallery</span>
-        </button> */}
-
-        <button
-          type="button"
-          aria-label="Настройки"
-          onClick={() => setActiveTab('settings')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'settings' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Settings size={20} />
-          <span className="font-medium hidden xl:block">Настройки</span>
-        </button>
+      <nav className="flex-1 px-4 py-4 space-y-1.5">
+        {navItems.map((item) => {
+          const Icon = item.icon;
+          const isActive = activeTab === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              aria-label={item.label}
+              aria-current={isActive ? 'page' : undefined}
+              title={item.label}
+              onClick={() => setActiveTab(item.id)}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-colors ${isActive ? NAV_ACTIVE : NAV_INACTIVE}`}
+            >
+              <Icon size={20} className="shrink-0" />
+              <span className="font-medium hidden xl:block">{item.label}</span>
+            </button>
+          );
+        })}
       </nav>
 
       <div className="p-4 border-t border-white/5">
@@ -896,7 +831,10 @@ function App() {
 
   const MobileTabBar = () => (
     <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
-      <div className="grid grid-cols-6 gap-1">
+      <div
+        className="grid gap-1"
+        style={{ gridTemplateColumns: `repeat(${navItems.length}, minmax(0, 1fr))` }}
+      >
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
@@ -905,12 +843,13 @@ function App() {
               key={item.id}
               type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-1 text-[10px] font-semibold transition-colors ${
-                isActive ? item.activeClass : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
-              }`}
               aria-label={item.label}
+              aria-current={isActive ? 'page' : undefined}
+              className={`flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-0.5 text-[10px] font-semibold transition-colors ${
+                isActive ? 'bg-primary/10 text-primary' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+              }`}
             >
-              <Icon size={18} />
+              <Icon size={18} className="shrink-0" />
               <span className="max-w-full truncate">{item.shortLabel}</span>
             </button>
           );
@@ -1002,10 +941,10 @@ function App() {
               <button
                 onClick={() => setActiveTab('settings')}
                 className="text-xs text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-1 rounded-full border border-amber-500/30 transition-colors flex items-center gap-1.5"
-                title="Click to configure your API key"
+                title="Открыть настройки и указать API-ключ"
               >
                 <AlertTriangle size={12} />
-                Gemini API Key Missing
+                Нет ключа Gemini
               </button>
             )}
           </div>
@@ -1017,7 +956,7 @@ function App() {
             <div className="flex items-center gap-3 text-sm text-amber-200">
               <KeyRound size={16} className="shrink-0 text-amber-400" />
               <div>
-                <span className="font-semibold">Required API key missing.</span>{' '}
+                <span className="font-semibold">Не хватает обязательного API-ключа.</span>{' '}
                 <span className="text-amber-200/80">
                   Укажи API-ключ Gemini, чтобы пользоваться Контентфабрикой.
                 </span>
@@ -1038,8 +977,8 @@ function App() {
           <div className="mx-6 mt-2 p-3 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-between animate-[fadeIn_0.3s_ease-out] shrink-0">
             <div className="flex items-center gap-2 text-sm text-primary">
               <RotateCcw size={16} />
-              <span className="font-medium">Session recovered</span>
-              <span className="text-zinc-400 text-xs">Your previous work has been restored.</span>
+              <span className="font-medium">Сессия восстановлена</span>
+              <span className="text-zinc-400 text-xs">Предыдущая работа возвращена.</span>
             </div>
             <button
               type="button"
@@ -1059,7 +998,7 @@ function App() {
           {activeTab === 'settings' && (
             <div className="h-full overflow-y-auto p-6 pb-28 md:p-8 md:pb-8 max-w-2xl mx-auto animate-[fadeIn_0.3s_ease-out]">
               <div className="flex items-center justify-between mb-8">
-                <h1 className="text-2xl font-bold">Settings</h1>
+                <h1 className="text-2xl font-bold">Настройки</h1>
                 <div className="px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[10px] text-green-400 font-medium flex items-center gap-2">
                   <Shield size={12} /> Ключи хранятся в аккаунте на backend
                 </div>
@@ -1165,7 +1104,7 @@ function App() {
                     </p>
                   </div>
                   <span className="w-fit rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
-                    Account vault
+                    Хранилище аккаунта
                   </span>
                 </div>
 
@@ -1270,14 +1209,14 @@ function App() {
 
                 {/* Header */}
                 <div className="space-y-3">
-                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-[11px] uppercase tracking-wider text-emerald-400 font-semibold">
-                    <Bot size={12} /> Autonomous Skill
+                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 border border-primary/30 text-[11px] uppercase tracking-wider text-primary font-semibold">
+                    <Bot size={12} /> Автономный скилл
                   </div>
                   <h1 className="text-3xl md:text-4xl font-black bg-gradient-to-b from-white to-white/60 bg-clip-text text-transparent">
-                    Your Personal Clipping Team
+                    Персональная команда клипмейкеров
                   </h1>
                   <p className="text-zinc-400 text-base md:text-lg leading-relaxed max-w-2xl">
-                    Drop your videos in a folder and a team of AI clippers picks the viral moments, edits them, and queues them for your approval — like having a 24/7 short-form editing crew on autopilot.
+                    Кладёшь видео в папку — команда ИИ-клипмейкеров находит вирусные моменты, нарезает их и ставит в очередь на твоё одобрение. Как редакция коротких видео, работающая 24/7 на автопилоте.
                   </p>
                 </div>
 
@@ -1285,9 +1224,9 @@ function App() {
                 <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 flex items-start gap-3">
                   <Smartphone size={20} className="text-amber-400 shrink-0 mt-0.5" />
                   <div className="text-sm text-amber-100">
-                    <p className="font-semibold text-amber-300 mb-1">Upload videos already in vertical (9:16) mobile format.</p>
+                    <p className="font-semibold text-amber-300 mb-1">Загружай видео уже в вертикальном формате (9:16).</p>
                     <p className="text-amber-100/80 leading-relaxed">
-                      The agent does not reframe horizontal footage. Make sure every source video is shot or pre-cropped to mobile/portrait format before dropping it into the input folder.
+                      Агент не перекадрирует горизонтальное видео. Убедись, что каждый исходник снят или заранее обрезан под мобильный/портретный формат, прежде чем класть его в папку.
                     </p>
                   </div>
                 </div>
@@ -1295,32 +1234,32 @@ function App() {
                 {/* Workflow */}
                 <div className="grid md:grid-cols-3 gap-4">
                   <div className="glass-panel p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                    <div className="w-10 h-10 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
                       <Upload size={18} />
                     </div>
-                    <h3 className="font-semibold text-white">1. Drop your videos</h3>
+                    <h3 className="font-semibold text-white">1. Кладёшь видео</h3>
                     <p className="text-xs text-zinc-400 leading-relaxed">
-                      Put your long-form vertical footage in the watched folder. The skill picks one video per run.
+                      Положи длинное вертикальное видео в отслеживаемую папку. За один прогон скилл берёт одно видео.
                     </p>
                   </div>
 
                   <div className="glass-panel p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                    <div className="w-10 h-10 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
                       <Users size={18} />
                     </div>
-                    <h3 className="font-semibold text-white">2. AI clippers work</h3>
+                    <h3 className="font-semibold text-white">2. ИИ-клипмейкеры работают</h3>
                     <p className="text-xs text-zinc-400 leading-relaxed">
-                      Whisper transcribes, Gemini 3 Flash spots viral beats, FFmpeg cuts each clip and adds a hook overlay.
+                      Whisper расшифровывает речь, Gemini 3 Flash находит вирусные моменты, FFmpeg режет клипы и добавляет хук-плашку.
                     </p>
                   </div>
 
                   <div className="glass-panel p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                    <div className="w-10 h-10 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
                       <CheckCircle2 size={18} />
                     </div>
-                    <h3 className="font-semibold text-white">3. You validate, it ships</h3>
+                    <h3 className="font-semibold text-white">3. Ты проверяешь — он публикует</h3>
                     <p className="text-xs text-zinc-400 leading-relaxed">
-                      Approve the candidates you like and the skill auto-publishes them to TikTok, Reels and YouTube Shorts via Upload-Post.
+                      Одобряешь понравившиеся клипы, и скилл сам публикует их в TikTok, Reels и YouTube Shorts через Upload-Post.
                     </p>
                   </div>
                 </div>
@@ -1331,7 +1270,7 @@ function App() {
                     <div>
                       <h2 className="text-xl font-bold text-white mb-1">skill-autoshorts</h2>
                       <p className="text-sm text-zinc-400">
-                        The Claude Code skill that powers this workflow. Install it once and trigger it whenever you want a fresh batch of clips.
+                        Скилл Claude Code, на котором работает этот процесс. Установи один раз и запускай, когда нужна свежая порция клипов.
                       </p>
                     </div>
                     <a
@@ -1340,7 +1279,7 @@ function App() {
                       rel="noopener noreferrer"
                       className="btn-primary py-2 px-4 text-sm flex items-center gap-2 shrink-0"
                     >
-                      View on GitHub <ExternalLink size={14} />
+                      Открыть на GitHub <ExternalLink size={14} />
                     </a>
                   </div>
 
@@ -1351,7 +1290,7 @@ function App() {
                       aria-label="Скопировать команду установки"
                       onClick={() => navigator.clipboard.writeText('git clone https://github.com/mutonby/skill-autoshorts')}
                       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
-                      title="Copy"
+                      title="Скопировать"
                     >
                       <Copy size={14} />
                     </button>
@@ -1360,19 +1299,19 @@ function App() {
                   <div className="grid sm:grid-cols-2 gap-3 text-sm">
                     <div className="flex items-start gap-2 text-zinc-300">
                       <Check size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                      <span>Daily batch — picks one long video per run</span>
+                      <span>Ежедневная партия — одно длинное видео за прогон</span>
                     </div>
                     <div className="flex items-start gap-2 text-zinc-300">
                       <Check size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                      <span>Whisper transcription with word-level timing</span>
+                      <span>Расшифровка Whisper с точностью до слова</span>
                     </div>
                     <div className="flex items-start gap-2 text-zinc-300">
                       <Check size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                      <span>Gemini 3 Flash multimodal moment detection</span>
+                      <span>Поиск моментов мультимодальным Gemini 3 Flash</span>
                     </div>
                     <div className="flex items-start gap-2 text-zinc-300">
                       <Check size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                      <span>Auto-publish to TikTok, Reels & YouTube Shorts</span>
+                      <span>Автопубликация в TikTok, Reels и YouTube Shorts</span>
                     </div>
                   </div>
                 </div>
@@ -1551,29 +1490,29 @@ function App() {
       {showKeyModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowKeyModal(false)}>
           <div className="bg-[#18181b] border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-bold text-white">Gemini API Key Required</h2>
+            <h2 className="text-lg font-bold text-white">Нужен API-ключ Gemini</h2>
             <p className="text-sm text-zinc-400">
               Контентфабрике нужен API-ключ <strong className="text-zinc-200">Gemini</strong> для анализа и генерации сценариев. Upload-Post опционален и нужен только для публикации.
             </p>
 
             {/* Gemini block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveGeminiKey ? 'bg-blue-500/5 border-blue-500/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
+            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveGeminiKey ? 'bg-primary/5 border-primary/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
               <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
                 {effectiveGeminiKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
-                Gemini API Key {effectiveGeminiKey && <span className="text-green-400">— set</span>}
+                Ключ Gemini {effectiveGeminiKey && <span className="text-green-400">— задан</span>}
               </p>
               {!effectiveGeminiKey && (
                 <>
                   <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
-                    <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-blue-400 underline">aistudio.google.com/app/apikey</a></li>
-                    <li>Sign in with your Google account</li>
-                    <li>Click "Create API Key"</li>
-                    <li>Copy the key and paste it below</li>
+                    <li>Открой <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-primary underline">aistudio.google.com/app/apikey</a></li>
+                    <li>Войди под своим аккаунтом Google</li>
+                    <li>Нажми «Create API Key»</li>
+                    <li>Скопируй ключ и вставь ниже</li>
                   </ol>
                   <input
                     type="text"
-                    placeholder="Paste your Gemini API key here..."
-                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                    placeholder="Вставь сюда API-ключ Gemini..."
+                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-primary"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && e.target.value.trim()) {
                         setApiKey(e.target.value.trim());
@@ -1588,23 +1527,23 @@ function App() {
             <div className={`rounded-lg p-4 space-y-2 border ${!effectiveUploadPostKey ? 'bg-white/5 border-white/10' : 'bg-white/5 border-white/10 opacity-70'}`}>
               <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
                 {effectiveUploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-zinc-500" />}
-                Upload-Post API Key {effectiveUploadPostKey && <span className="text-green-400">— set</span>}
+                Ключ Upload-Post {effectiveUploadPostKey && <span className="text-green-400">— задан</span>}
               </p>
               {!effectiveUploadPostKey && (
                 <>
                   <p className="text-xs text-zinc-400">
-                    Optional. Add it only if you want to publish directly to TikTok, Instagram Reels, and YouTube Shorts.
+                    Опционально. Добавь, только если хочешь публиковать прямо в TikTok, Instagram Reels и YouTube Shorts.
                   </p>
                   <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
-                    <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-violet-400 underline">app.upload-post.com</a></li>
-                    <li>Connect your TikTok, Instagram, or YouTube accounts</li>
-                    <li>Go to <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-violet-400 underline">API Keys</a> and generate one</li>
-                    <li>Paste it below</li>
+                    <li>Зарегистрируйся на <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-primary underline">app.upload-post.com</a></li>
+                    <li>Подключи аккаунты TikTok, Instagram или YouTube</li>
+                    <li>Открой <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-primary underline">API Keys</a> и создай ключ</li>
+                    <li>Вставь его ниже</li>
                   </ol>
                   <input
                     type="text"
-                    placeholder="Paste your Upload-Post API key here..."
-                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-violet-500"
+                    placeholder="Вставь сюда API-ключ Upload-Post..."
+                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-primary"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && e.target.value.trim()) {
                         setUploadPostKey(e.target.value.trim());
@@ -1620,13 +1559,13 @@ function App() {
                 onClick={() => setShowKeyModal(false)}
                 className="flex-1 text-sm text-zinc-400 py-2 rounded-lg border border-white/10 hover:bg-white/5 transition-colors"
               >
-                Cancel
+                Отмена
               </button>
               <button
                 onClick={() => { setShowKeyModal(false); setActiveTab('settings'); }}
-                className="flex-1 text-sm text-white py-2 rounded-lg bg-blue-600 hover:bg-blue-500 transition-colors font-medium"
+                className="flex-1 text-sm text-white py-2 rounded-lg bg-primary hover:bg-violet-600 transition-colors font-medium"
               >
-                Go to Settings
+                Открыть настройки
               </button>
             </div>
           </div>

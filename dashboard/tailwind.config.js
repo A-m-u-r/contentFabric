@@ -9,7 +9,10 @@ export default {
       colors: {
         background: "#09090b",
         surface: "#18181b",
-        primary: "#3b82f6",
+        // Single brand accent across the whole app (was split blue/violet).
+        // primary === accent === Tailwind violet-500 so `bg-primary`,
+        // `text-primary`, focus rings and the violet-* scale all agree.
+        primary: "#8b5cf6",
         accent: "#8b5cf6",
       },
       animation: {

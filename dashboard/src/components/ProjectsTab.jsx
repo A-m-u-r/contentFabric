@@ -429,7 +429,7 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
                     <button
                       type="button"
                       onClick={() => { handleSelect(profile); onOpenContentPlan?.(profile); }}
-                      className="btn-secondary px-3 py-1.5 text-xs flex items-center gap-1.5 text-emerald-300"
+                      className="btn-secondary px-3 py-1.5 text-xs flex items-center gap-1.5 text-violet-300"
                     >
                       <CalendarDays size={12} /> Контент-план
                     </button>

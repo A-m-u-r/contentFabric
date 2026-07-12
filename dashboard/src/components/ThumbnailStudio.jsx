@@ -489,8 +489,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
             {/* Mode A: Video Analysis */}
             <div className="glass-panel p-6 space-y-4">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 rounded-lg bg-blue-500/20 flex items-center justify-center">
-                  <Video size={16} className="text-blue-400" />
+                <div className="w-8 h-8 rounded-lg bg-primary/20 flex items-center justify-center">
+                  <Video size={16} className="text-violet-400" />
                 </div>
                 <div>
                   <h3 className="text-sm font-semibold text-white">Analyze Video</h3>
@@ -508,7 +508,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               />
 
               {isPreprocessing && (
-                <div className="flex items-center gap-2 text-xs text-blue-400 bg-blue-500/10 border border-blue-500/20 rounded-lg px-3 py-2">
+                <div className="flex items-center gap-2 text-xs text-violet-400 bg-primary/10 border border-primary/20 rounded-lg px-3 py-2">
                   <Loader2 size={12} className="animate-spin" />
                   Pre-processing video (Whisper transcription starting)...
                 </div>

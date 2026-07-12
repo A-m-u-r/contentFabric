@@ -451,7 +451,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
             <div className="grid gap-4 lg:grid-cols-[minmax(280px,0.9fr)_minmax(320px,1.1fr)]">
               <div className="rounded-2xl border border-white/10 bg-white/5 p-5 space-y-4">
                 <div className="flex items-start gap-3">
-                  <div className="mt-0.5 rounded-lg bg-blue-500/15 p-2 text-blue-300">
+                  <div className="mt-0.5 rounded-lg bg-primary/15 p-2 text-violet-300">
                     <Upload size={17} />
                   </div>
                   <div>
@@ -462,9 +462,9 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
                   </div>
                 </div>
 
-                <label className="flex min-h-[164px] cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 bg-black/20 px-4 py-5 text-center transition-colors hover:border-blue-400/50 hover:bg-blue-500/5">
+                <label className="flex min-h-[164px] cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 bg-black/20 px-4 py-5 text-center transition-colors hover:border-primary/50 hover:bg-primary/5">
                   {avatarUploading ? (
-                    <Loader2 size={22} className="animate-spin text-blue-300" />
+                    <Loader2 size={22} className="animate-spin text-violet-300" />
                   ) : avatarUploadPreview ? (
                     <img src={avatarUploadPreview.localPreview} alt="Выбранный аватар" className="h-24 w-20 rounded-xl object-cover border border-white/10" />
                   ) : (
@@ -491,7 +491,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
                     type="button"
                     onClick={handleSaveAvatar}
                     disabled={avatarUploading || !avatarUploadFile}
-                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-blue-500 px-4 py-3 text-sm font-semibold text-white hover:bg-blue-400 disabled:opacity-50 disabled:hover:bg-blue-500 transition-colors"
+                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-semibold text-white hover:bg-violet-600 disabled:opacity-50 disabled:hover:bg-primary transition-colors"
                   >
                     {avatarUploading ? (
                       <><Loader2 size={16} className="animate-spin" /> Сохраняю...</>
@@ -855,7 +855,7 @@ function VideoActionModal({
               <a
                 href={mediaUrl(video.video_url)}
                 download
-                className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-400 transition-colors"
+                className="inline-flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-white hover:bg-violet-600 transition-colors"
               >
                 <Download size={15} /> Скачать
               </a>
@@ -880,7 +880,7 @@ function VideoActionModal({
                       key={`${version.id || index}-${version.video_url}`}
                       className={`rounded-xl border px-3 py-2 ${
                         version.current
-                          ? 'border-emerald-500/30 bg-emerald-500/10'
+                          ? 'border-primary/30 bg-primary/10'
                           : 'border-white/10 bg-black/20'
                       }`}
                     >
@@ -895,7 +895,7 @@ function VideoActionModal({
                           </p>
                         </div>
                         {version.current && (
-                          <span className="shrink-0 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[9px] font-semibold text-emerald-200">
+                          <span className="shrink-0 rounded-full bg-primary/20 px-2 py-0.5 text-[9px] font-semibold text-violet-200">
                             Текущая
                           </span>
                         )}
@@ -926,7 +926,7 @@ function VideoActionModal({
               type="button"
               onClick={() => onSaveHeadTemplate(video)}
               disabled={!isLocalSaasVideo || isSavingHeadTemplate}
-              className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm font-semibold text-emerald-200 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-primary/25 bg-primary/10 px-3 py-2 text-sm font-semibold text-violet-200 hover:bg-primary/15 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
             >
               {isSavingHeadTemplate ? (
                 <>

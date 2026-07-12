@@ -523,7 +523,7 @@ export default function ResultCard({
 
                     <button
                         onClick={() => setShowModal(true)}
-                        className="col-span-1 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2"
+                        className="col-span-1 py-2 bg-primary hover:bg-violet-600 text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2"
                     >
                         <Share2 size={14} className="shrink-0" /> Post
                     </button>

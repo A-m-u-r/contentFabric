@@ -55,10 +55,10 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                     disabled={!key || isSaved}
                     className={`px-6 rounded-xl font-medium transition-all flex items-center gap-2 ${isSaved
                         ? 'bg-green-500/20 text-green-400 cursor-default'
-                        : 'bg-primary hover:bg-blue-600 text-white shadow-lg shadow-primary/20'
+                        : 'bg-primary hover:bg-violet-600 text-white shadow-lg shadow-primary/20'
                         }`}
                 >
-                    {isSaved ? <><Check size={18} /> Ready</> : 'Set Key'}
+                    {isSaved ? <><Check size={18} /> Готово</> : 'Сохранить'}
                 </button>
             </div>
             <p className="mt-3 text-xs text-zinc-500">

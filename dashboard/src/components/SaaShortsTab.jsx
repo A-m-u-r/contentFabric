@@ -1838,7 +1838,7 @@ export default function SaaShortsTab({
                             <div>
                               <span className="text-zinc-300">{pp.pain}</span>
                               {pp.source && pp.source !== 'website' && (
-                                <span className="ml-1.5 text-[9px] bg-blue-500/10 text-blue-400 px-1 py-0.5 rounded">{pp.source}</span>
+                                <span className="ml-1.5 text-[9px] bg-primary/10 text-violet-300 px-1 py-0.5 rounded">{pp.source}</span>
                               )}
                             </div>
                           </div>
@@ -1871,10 +1871,10 @@ export default function SaaShortsTab({
             {webResearch && (
               <div className="glass-panel p-6">
                 <h3 className="text-sm font-semibold text-zinc-300 mb-3 flex items-center gap-2">
-                  <Globe size={14} className="text-blue-400" />
+                  <Globe size={14} className="text-violet-400" />
                   Web Research (Google Search)
                   {webResearch.grounding_sources && (
-                    <span className="text-[10px] bg-blue-500/10 text-blue-400 px-2 py-0.5 rounded-full ml-auto">
+                    <span className="text-[10px] bg-primary/10 text-violet-300 px-2 py-0.5 rounded-full ml-auto">
                       {webResearch.grounding_sources.length} sources
                     </span>
                   )}
@@ -1927,7 +1927,7 @@ export default function SaaShortsTab({
                           href={src.url}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/5 px-2 py-0.5 rounded-full border border-blue-500/10 hover:border-blue-500/30 transition-colors truncate max-w-[200px]"
+                          className="text-[10px] text-violet-400 hover:text-violet-300 bg-primary/5 px-2 py-0.5 rounded-full border border-primary/10 hover:border-primary/30 transition-colors truncate max-w-[200px]"
                           title={src.title}
                         >
                           {src.title || (() => { try { return new URL(src.url).hostname; } catch { return src.url; } })()}
@@ -2684,7 +2684,7 @@ export default function SaaShortsTab({
                     onClick={() => setSelectedHeadTemplate('')}
                     className={`p-3 rounded-xl border text-left transition-all ${
                       !selectedHeadTemplate
-                        ? 'border-blue-500/50 bg-blue-500/10 text-blue-200'
+                        ? 'border-primary/50 bg-primary/10 text-violet-200'
                         : 'border-white/10 bg-black/20 text-zinc-400 hover:bg-white/10'
                     }`}
                   >
@@ -3511,7 +3511,7 @@ export default function SaaShortsTab({
                     </button>
                   </div>
 
-                  <div className="p-4 bg-blue-500/5 rounded-xl border border-blue-500/20 space-y-2">
+                  <div className="p-4 bg-primary/5 rounded-xl border border-primary/20 space-y-2">
                     <h3 className="text-sm font-semibold text-zinc-300 flex items-center gap-2">
                       <User size={14} /> Reuse this talking head
                     </h3>
@@ -3531,7 +3531,7 @@ export default function SaaShortsTab({
                       )}
                     </button>
                     {headTemplateStatus && (
-                      <p className={`text-[11px] ${headTemplateStatus.toLowerCase().includes('не удалось') ? 'text-red-300' : 'text-blue-200'}`}>
+                      <p className={`text-[11px] ${headTemplateStatus.toLowerCase().includes('не удалось') ? 'text-red-300' : 'text-violet-200'}`}>
                         {headTemplateStatus}
                       </p>
                     )}
