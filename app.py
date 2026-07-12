@@ -46,6 +46,16 @@ MAX_FILE_SIZE_MB = 2048  # 2GB limit
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 
+# Directories under OUTPUT_DIR that hold reusable user assets (uploaded/generated
+# avatars, uploaded reference frames, saved head templates, gallery thumbnails).
+# These are NOT per-run scratch — cleanup must never purge them, otherwise saved
+# avatars silently vanish after JOB_RETENTION_SECONDS.
+DURABLE_OUTPUT_DIRS = {"actor_uploads", "storyboard_frames", "head_templates", "thumbnails"}
+
+
+def _is_durable_output_dir(name: str) -> bool:
+    return name in DURABLE_OUTPUT_DIRS or name.startswith("saas_actors_")
+
 # Application State
 job_queue = asyncio.Queue()
 jobs: Dict[str, Dict] = {}
@@ -608,6 +618,8 @@ async def cleanup_jobs():
             for job_id in os.listdir(OUTPUT_DIR):
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
+                    if _is_durable_output_dir(job_id):
+                        continue
                     if job_id.startswith("saas_") and glob.glob(os.path.join(job_path, "*_final.mp4")):
                         continue
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:

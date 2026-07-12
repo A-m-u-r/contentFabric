@@ -70,6 +70,26 @@ class JobActorPortraitGalleryTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
 
 
+class CleanupDurableDirTests(unittest.TestCase):
+    """cleanup_jobs must never purge reusable-asset dirs, or saved avatars
+    (actor_uploads / saas_actors_* / storyboard_frames / head_templates)
+    silently vanish after the 1h retention window."""
+
+    def test_avatar_and_asset_dirs_are_protected(self):
+        for name in (
+            "actor_uploads",
+            "storyboard_frames",
+            "head_templates",
+            "thumbnails",
+            "saas_actors_abc123",
+        ):
+            self.assertTrue(app._is_durable_output_dir(name), name)
+
+    def test_video_job_and_random_dirs_are_not_protected(self):
+        for name in ("saas_feddb8e4-f627", "saas_1234", "tmpxyz", "uploads"):
+            self.assertFalse(app._is_durable_output_dir(name), name)
+
+
 class AvatarVoiceBindingTests(unittest.TestCase):
     def setUp(self):
         self._prev_output_dir = app.OUTPUT_DIR

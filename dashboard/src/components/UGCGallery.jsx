@@ -638,6 +638,12 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
 
 function AvatarCard({ avatar, copied, onCopy, voiceOptions = null, onAttachVoice = null, voiceSaving = false }) {
   const boundVoiceId = avatar.voice?.voice_id || '';
+  // Make sure the currently bound voice is always selectable, even if the
+  // ElevenLabs list didn't return it — otherwise the dropdown would show
+  // "no voice" while a binding exists, and one click would silently drop it.
+  const options = boundVoiceId && voiceOptions && !voiceOptions.some((v) => v.voice_id === boundVoiceId)
+    ? [{ voice_id: boundVoiceId, name: avatar.voice?.voice_name || boundVoiceId }, ...voiceOptions]
+    : voiceOptions;
   return (
     <div className="group rounded-xl overflow-hidden border border-white/10 bg-white/5 hover:border-white/20 transition-all">
       <div className="relative aspect-[3/4] bg-black">
@@ -678,14 +684,14 @@ function AvatarCard({ avatar, copied, onCopy, voiceOptions = null, onAttachVoice
               disabled={voiceSaving}
               onChange={(e) => {
                 const id = e.target.value;
-                const opt = voiceOptions.find((v) => v.voice_id === id);
+                const opt = options.find((v) => v.voice_id === id);
                 onAttachVoice(avatar.key, id, opt?.name || '');
               }}
               className="w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[9px] text-zinc-200 focus:border-violet-400/50 focus:outline-none disabled:opacity-50"
               title="Прикрепить голос к этому аватару"
             >
               <option value="">— без голоса —</option>
-              {voiceOptions.map((v) => (
+              {options.map((v) => (
                 <option key={v.voice_id} value={v.voice_id}>{v.name}</option>
               ))}
             </select>
