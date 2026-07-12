@@ -3320,6 +3320,67 @@ def list_local_actor_gallery(owner_user_id: Optional[str] = None) -> List[dict]:
     return images
 
 
+def _avatar_voices_store_path() -> str:
+    return os.path.join(OUTPUT_DIR, "avatar_voices.json")
+
+
+def load_avatar_voice_bindings() -> dict:
+    """Map avatar key -> bound voice descriptor {voice_id, voice_name, provider, ...}."""
+    path = _avatar_voices_store_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_avatar_voice_bindings(bindings: dict) -> None:
+    path = _avatar_voices_store_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(bindings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def set_avatar_voice_binding(
+    avatar_key: str,
+    voice_id: Optional[str],
+    voice_name: Optional[str] = None,
+    provider: str = "elevenlabs",
+    owner_user_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Attach a voice to an avatar. A falsy voice_id detaches it. Returns the binding."""
+    bindings = load_avatar_voice_bindings()
+    if not voice_id:
+        bindings.pop(avatar_key, None)
+        _save_avatar_voice_bindings(bindings)
+        return None
+    binding = {
+        "voice_id": voice_id,
+        "voice_name": (voice_name or "").strip() or voice_id,
+        "provider": provider or "elevenlabs",
+        "owner_user_id": owner_user_id or "",
+        "updated_at": _utc_now(),
+    }
+    bindings[avatar_key] = binding
+    _save_avatar_voice_bindings(bindings)
+    return binding
+
+
+def _public_avatar_voice(binding: Optional[dict]) -> Optional[dict]:
+    if not binding:
+        return None
+    return {
+        "voice_id": binding.get("voice_id"),
+        "voice_name": binding.get("voice_name"),
+        "provider": binding.get("provider", "elevenlabs"),
+    }
+
+
 @app.post("/api/saasshorts/actor-upload")
 async def saasshorts_actor_upload(
     file: UploadFile = File(...),
@@ -3792,9 +3853,59 @@ async def saasshorts_actor_gallery(authorization: Optional[str] = Header(None, a
 
         images = list(by_url.values())
         images.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        # Attach the voice each avatar is bound to, so the wizard can auto-pick
+        # it and the gallery can show/edit it.
+        bindings = load_avatar_voice_bindings()
+        for entry in images:
+            binding = bindings.get(entry.get("key"))
+            if not binding:
+                continue
+            if owner_user_id and binding.get("owner_user_id") not in ("", owner_user_id):
+                continue
+            entry["voice"] = _public_avatar_voice(binding)
         return {"images": images}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AvatarVoiceRequest(BaseModel):
+    avatar_key: str
+    voice_id: Optional[str] = None
+    voice_name: Optional[str] = None
+    provider: Optional[str] = "elevenlabs"
+
+
+@app.post("/api/saasshorts/avatar-voice")
+async def saasshorts_set_avatar_voice(
+    req: AvatarVoiceRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Attach (or detach, when voice_id is empty) a voice to a reusable avatar."""
+    user = get_user_from_authorization(authorization)
+    owner_user_id = user.get("id") if user else None
+    avatar_key = (req.avatar_key or "").strip()
+    if not avatar_key:
+        raise HTTPException(status_code=400, detail="avatar_key is required")
+
+    # An authenticated user may only bind voices to avatars they own.
+    if owner_user_id:
+        import functools
+        loop = asyncio.get_running_loop()
+        owned = await loop.run_in_executor(
+            None, functools.partial(list_local_actor_gallery, owner_user_id=owner_user_id)
+        )
+        if avatar_key not in {e.get("key") for e in owned}:
+            raise HTTPException(status_code=404, detail="Avatar not found for this account")
+
+    binding = set_avatar_voice_binding(
+        avatar_key,
+        (req.voice_id or "").strip() or None,
+        voice_name=req.voice_name,
+        provider=req.provider or "elevenlabs",
+        owner_user_id=owner_user_id,
+    )
+    return {"avatar_key": avatar_key, "voice": _public_avatar_voice(binding)}
 
 
 class SaaSGenerateRequest(BaseModel):

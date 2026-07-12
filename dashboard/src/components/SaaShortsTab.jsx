@@ -2830,15 +2830,28 @@ export default function SaaShortsTab({
                           <button
                             key={img.url}
                             type="button"
-                            onClick={() => setSelectedActor(img.url)}
+                            onClick={() => {
+                              setSelectedActor(img.url);
+                              // Avatar carries its own bound voice — apply it.
+                              if (img.voice?.voice_id) setSelectedVoice(img.voice.voice_id);
+                            }}
                             className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
                               selectedActor === img.url
                                 ? 'border-violet-500 ring-2 ring-violet-500/30 scale-[1.02]'
                                 : 'border-white/10 hover:border-white/30'
                             }`}
-                            title={img.description || `Saved avatar ${i + 1}`}
+                            title={
+                              img.voice?.voice_name
+                                ? `${img.description || `Аватар ${i + 1}`} · голос: ${img.voice.voice_name}`
+                                : (img.description || `Аватар ${i + 1}`)
+                            }
                           >
                             <img src={img.url} alt={`Actor ${i + 1}`} className="w-full h-full object-cover" />
+                            {img.voice?.voice_id && (
+                              <span className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-0.5 bg-violet-600/80 py-0.5 text-[8px] font-semibold text-white">
+                                <Volume2 size={8} />голос
+                              </span>
+                            )}
                             {selectedActor === img.url && (
                               <div className="absolute top-1 right-1 w-5 h-5 bg-violet-500 rounded-full flex items-center justify-center shadow-lg">
                                 <Check size={10} className="text-white" />

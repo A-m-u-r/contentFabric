@@ -45,6 +45,24 @@ const LIPSYNC_MODEL_OPTIONS = [
 
 const mediaUrl = (url) => getApiUrl(url || '');
 
+// Always offer the approved Russian recipe even when the ElevenLabs list is
+// empty (no key / defaults fallback), so it stays one click away.
+const RECOMMENDED_AVATAR_VOICES = [
+  { voice_id: 'D5RRIJYa9pFwxiSpbGbR', name: 'Victoria — русский (рекомендуемый)' },
+];
+
+function buildVoiceOptions(voices) {
+  const seen = new Set();
+  const options = [];
+  for (const v of [...RECOMMENDED_AVATAR_VOICES, ...(voices || [])]) {
+    const id = v.voice_id;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    options.push({ voice_id: id, name: v.name || id });
+  }
+  return options;
+}
+
 export default function UGCGallery({ falKey, authToken, usePlatformKeys = false }) {
   const [tab, setTab] = useState('videos');
   const [videos, setVideos] = useState([]);
@@ -63,6 +81,9 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
   const [avatarUploadFile, setAvatarUploadFile] = useState(null);
   const [avatarUploadPreview, setAvatarUploadPreview] = useState(null);
   const [newAvatarUrls, setNewAvatarUrls] = useState([]);
+  const [voices, setVoices] = useState([]);
+  const [voiceSaving, setVoiceSaving] = useState('');
+  const [voiceError, setVoiceError] = useState('');
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
   const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
@@ -89,6 +110,36 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
   useEffect(() => {
     loadGallery();
   }, []);
+
+  useEffect(() => {
+    const url = getApiUrl(`/api/saasshorts/voices${usePlatformKeys ? '?use_platform_keys=true' : ''}`);
+    fetch(url, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : { voices: [] }))
+      .then((data) => setVoices(data.voices || []))
+      .catch(() => setVoices([]));
+  }, [usePlatformKeys, authToken]);
+
+  const handleAttachVoice = async (avatarKey, voiceId, voiceName) => {
+    setVoiceSaving(avatarKey);
+    setVoiceError('');
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/avatar-voice'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ avatar_key: avatarKey, voice_id: voiceId || '', voice_name: voiceName || '' }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || 'Не удалось сохранить голос');
+      }
+      const data = await res.json();
+      setAvatars((prev) => prev.map((a) => (a.key === avatarKey ? { ...a, voice: data.voice || null } : a)));
+    } catch (e) {
+      setVoiceError(e.message || 'Не удалось сохранить голос');
+    } finally {
+      setVoiceSaving('');
+    }
+  };
 
   const handleCopy = (text, id) => {
     navigator.clipboard.writeText(text);
@@ -545,9 +596,20 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
           ) : (
             <section className="space-y-2">
               <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Сохраненные аватары</h3>
+              {voiceError && (
+                <p className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">{voiceError}</p>
+              )}
               <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-3">
                 {avatars.map((avatar, i) => (
-                  <AvatarCard key={avatar.key || i} avatar={avatar} copied={copied} onCopy={handleCopy} />
+                  <AvatarCard
+                    key={avatar.key || i}
+                    avatar={avatar}
+                    copied={copied}
+                    onCopy={handleCopy}
+                    voiceOptions={buildVoiceOptions(voices)}
+                    onAttachVoice={handleAttachVoice}
+                    voiceSaving={voiceSaving === avatar.key}
+                  />
                 ))}
               </div>
             </section>
@@ -574,11 +636,20 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
   );
 }
 
-function AvatarCard({ avatar, copied, onCopy }) {
+function AvatarCard({ avatar, copied, onCopy, voiceOptions = null, onAttachVoice = null, voiceSaving = false }) {
+  const boundVoiceId = avatar.voice?.voice_id || '';
   return (
     <div className="group rounded-xl overflow-hidden border border-white/10 bg-white/5 hover:border-white/20 transition-all">
-      <div className="aspect-[3/4] bg-black">
+      <div className="relative aspect-[3/4] bg-black">
         <img src={mediaUrl(avatar.url)} alt="Аватар" className="w-full h-full object-cover" />
+        {boundVoiceId && (
+          <span
+            className="absolute top-1.5 left-1.5 flex items-center gap-1 rounded-full bg-violet-500/80 px-1.5 py-0.5 text-[8px] font-semibold text-white"
+            title={`Голос: ${avatar.voice?.voice_name || boundVoiceId}`}
+          >
+            <Volume2 size={8} />голос
+          </span>
+        )}
       </div>
       <div className="p-2 space-y-1">
         {avatar.description ? (
@@ -596,6 +667,29 @@ function AvatarCard({ avatar, copied, onCopy }) {
           </div>
         ) : (
           <p className="text-[9px] text-zinc-600 italic">Нет описания</p>
+        )}
+        {onAttachVoice && voiceOptions && (
+          <label className="block space-y-0.5">
+            <span className="flex items-center gap-1 text-[8px] uppercase tracking-wide text-zinc-500">
+              <Volume2 size={8} />Голос
+            </span>
+            <select
+              value={boundVoiceId}
+              disabled={voiceSaving}
+              onChange={(e) => {
+                const id = e.target.value;
+                const opt = voiceOptions.find((v) => v.voice_id === id);
+                onAttachVoice(avatar.key, id, opt?.name || '');
+              }}
+              className="w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[9px] text-zinc-200 focus:border-violet-400/50 focus:outline-none disabled:opacity-50"
+              title="Прикрепить голос к этому аватару"
+            >
+              <option value="">— без голоса —</option>
+              {voiceOptions.map((v) => (
+                <option key={v.voice_id} value={v.voice_id}>{v.name}</option>
+              ))}
+            </select>
+          </label>
         )}
         <a
           href={mediaUrl(avatar.url)}

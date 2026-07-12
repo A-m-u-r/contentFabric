@@ -70,5 +70,47 @@ class JobActorPortraitGalleryTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
 
 
+class AvatarVoiceBindingTests(unittest.TestCase):
+    def setUp(self):
+        self._prev_output_dir = app.OUTPUT_DIR
+        self._tmp = tempfile.TemporaryDirectory()
+        app.OUTPUT_DIR = self._tmp.name
+
+    def tearDown(self):
+        app.OUTPUT_DIR = self._prev_output_dir
+        self._tmp.cleanup()
+
+    def test_set_and_load_binding_roundtrips(self):
+        binding = app.set_avatar_voice_binding(
+            "actor_uploads/custom_1.png",
+            "D5RRIJYa9pFwxiSpbGbR",
+            voice_name="Victoria",
+            owner_user_id="user-a",
+        )
+        self.assertEqual(binding["voice_id"], "D5RRIJYa9pFwxiSpbGbR")
+        self.assertEqual(binding["voice_name"], "Victoria")
+
+        loaded = app.load_avatar_voice_bindings()
+        self.assertIn("actor_uploads/custom_1.png", loaded)
+        self.assertEqual(
+            loaded["actor_uploads/custom_1.png"]["voice_id"], "D5RRIJYa9pFwxiSpbGbR"
+        )
+
+    def test_empty_voice_id_detaches(self):
+        app.set_avatar_voice_binding("k", "vid", voice_name="V", owner_user_id="u")
+        self.assertIn("k", app.load_avatar_voice_bindings())
+
+        result = app.set_avatar_voice_binding("k", "", owner_user_id="u")
+        self.assertIsNone(result)
+        self.assertNotIn("k", app.load_avatar_voice_bindings())
+
+    def test_voice_name_defaults_to_voice_id(self):
+        binding = app.set_avatar_voice_binding("k", "vid", voice_name="  ")
+        self.assertEqual(binding["voice_name"], "vid")
+
+    def test_load_missing_store_returns_empty(self):
+        self.assertEqual(app.load_avatar_voice_bindings(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
