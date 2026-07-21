@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Settings2 } from 'lucide-react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -36,9 +36,9 @@ const TTS_PROVIDER_OPTIONS = [
 ];
 
 const BROLL_MODE_OPTIONS = [
-  { id: 'mockup', label: 'Product mockups', desc: 'Clean local inserts, no AI stock scenes' },
-  { id: 'off', label: 'Off', desc: 'Talking head only, fewer distractions' },
-  { id: 'ai', label: 'AI b-roll', desc: 'Flux image inserts, can look synthetic' },
+  { id: 'mockup', label: 'Кадры с товаром', desc: 'Аккуратные вставки с продуктом, без ИИ-стоков' },
+  { id: 'off', label: 'Без вставок', desc: 'Только человек в кадре, ничего не отвлекает' },
+  { id: 'ai', label: 'ИИ-картинки', desc: 'Вставки рисует нейросеть — иногда выглядят искусственно' },
 ];
 
 const STORYBOARD_GENERATION_OPTIONS = [
@@ -297,6 +297,14 @@ const AVATAR_RATE = { standard: 0.0562, pro: 0.115 };
 const STORYBOARD_RATE = { storyboard_v3_standard: 0.084, storyboard_v3_pro: 0.112, storyboard_veo31_quality: 0.20 };
 const FLUX_FRAME_COST = 0.05; // Flux-кадр под каждый b-roll (image-first)
 const TYPICAL_VIDEO_SECONDS = 35; // до генерации сценария длительность неизвестна
+
+function pluralShots(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'кадр';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'кадра';
+  return 'кадров';
+}
 
 function splitStoryboardSeconds(script, totalSeconds) {
   // Говорящие кадры и b-roll тарифицируются разными моделями.
@@ -995,6 +1003,66 @@ export default function SaaShortsTab({
   const handleSelectedScriptShot = (shotIndex, field, value) => {
     updateSelectedScriptShot(shotIndex, {
       [field]: field === 'start' || field === 'end' ? Number(value) : value,
+    });
+  };
+
+  // Keep shot_number in sync with position after add / delete / reorder.
+  const renumberShots = (shots) => shots.map((shot, idx) => ({ ...shot, shot_number: idx + 1 }));
+
+  const makeBlankShot = (shots) => {
+    const last = shots[shots.length - 1];
+    const start = last ? Number(last.end ?? last.start ?? 0) : 0;
+    return {
+      shot_number: shots.length + 1,
+      start,
+      end: start + 3,
+      role: '',
+      scene: '',
+      actor_action: '',
+      action: '',
+      camera: '',
+      speech: '',
+      overlay_text: '',
+      transition: 'cut',
+      generation_prompt: '',
+      visual_type: 'avatar',
+    };
+  };
+
+  // Rewrite the selected script's shots (add / remove / reorder), renumber and persist.
+  const mutateSelectedScriptShots = (mutator) => {
+    const nextScripts = scripts.map((script, idx) => {
+      if (idx !== selectedScript) return script;
+      const shots = renumberShots(mutator([...(script.shots || [])]));
+      return { ...script, format: 'storyboard_v3', shots };
+    });
+    setScripts(nextScripts);
+    persistScripts(nextScripts);
+  };
+
+  const addSelectedScriptShot = (afterIndex = null) => {
+    mutateSelectedScriptShots((shots) => {
+      const blank = makeBlankShot(shots);
+      const at = afterIndex == null ? shots.length : afterIndex + 1;
+      shots.splice(at, 0, blank);
+      return shots;
+    });
+  };
+
+  const removeSelectedScriptShot = (shotIndex) => {
+    mutateSelectedScriptShots((shots) => {
+      if (shots.length <= 1) return shots; // keep at least one shot
+      shots.splice(shotIndex, 1);
+      return shots;
+    });
+  };
+
+  const moveSelectedScriptShot = (shotIndex, direction) => {
+    mutateSelectedScriptShots((shots) => {
+      const target = shotIndex + direction;
+      if (target < 0 || target >= shots.length) return shots;
+      [shots[shotIndex], shots[target]] = [shots[target], shots[shotIndex]];
+      return shots;
     });
   };
 
@@ -2002,7 +2070,7 @@ export default function SaaShortsTab({
                             />
                           </label>
                           <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Hook overlay</span>
+                            <span>Текст-зацепка на экране</span>
                             <input
                               className="input-field py-2 text-sm"
                               value={scriptDraft.hook_text || ''}
@@ -2097,7 +2165,7 @@ export default function SaaShortsTab({
                                     />
                                   </label>
                                   <label className="space-y-1.5 text-xs text-zinc-400">
-                                    <span>Kling prompt</span>
+                                    <span>Подсказка для нейросети</span>
                                     <input
                                       className="input-field py-2 text-sm"
                                       value={shot.generation_prompt || ''}
@@ -2132,7 +2200,7 @@ export default function SaaShortsTab({
 
                         <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),minmax(220px,0.45fr)]">
                           <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Caption</span>
+                            <span>Подпись под видео</span>
                             <textarea
                               className="input-field min-h-[74px] resize-y py-2 text-sm"
                               value={scriptDraft.caption || ''}
@@ -2241,10 +2309,10 @@ export default function SaaShortsTab({
 
             <div className="flex justify-between">
               <button onClick={() => setStep(0)} className="btn-secondary px-4 py-2 text-sm flex items-center gap-2">
-                <ChevronLeft size={14} /> Back
+                <ChevronLeft size={14} /> Назад
               </button>
               <button onClick={() => setStep(2)} className="btn-primary px-6 py-2 text-sm flex items-center gap-2">
-                Configure Video <ChevronRight size={14} />
+                К настройке ролика <ChevronRight size={14} />
               </button>
             </div>
           </div>
@@ -2254,45 +2322,92 @@ export default function SaaShortsTab({
         {step === 2 && scripts[selectedScript] && (
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             <div className="glass-panel p-6 space-y-5">
-              <h2 className="text-lg font-semibold">Configure Video</h2>
+              <h2 className="text-lg font-semibold">Настройка ролика</h2>
               <p className="text-sm text-zinc-500">
-                Script: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
+                Сценарий: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
 
               {storyboardSelected && (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 space-y-4">
-                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
                     <div>
                       <h3 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
-                        <Film size={14} /> Кадры раскадровки
+                        <Film size={14} /> Кадры ролика
                       </h3>
-                      <p className="text-[11px] text-zinc-500">
-                        Здесь управляешь кадрами перед генерацией: текст, prompt и reference image для Kling V3.
+                      <p className="text-[11px] text-zinc-500 mt-0.5 max-w-xl">
+                        Ролик собирается по кадрам. Для каждого укажи, что в кадре и что человек говорит.
+                        Кадры можно добавлять, удалять и менять местами.
                       </p>
                     </div>
-                    <span className="text-[11px] text-zinc-500">
-                      {(scripts[selectedScript].shots || []).length} кадров
+                    <span className="shrink-0 rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
+                      {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
                     </span>
                   </div>
 
-                  <div className="space-y-3">
+                  <div className="space-y-2.5">
                     {(scripts[selectedScript].shots || []).map((shot, shotIndex) => {
+                      const shots = scripts[selectedScript].shots || [];
                       const previewUrl = shot.image_preview
                         || (shot.local_url ? getApiUrl(shot.local_url) : '')
                         || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url);
                       const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
+                      const isBroll = (shot.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
 
                       return (
                         <div key={shotIndex} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                          {/* Header: number + type + reorder/delete */}
+                          <div className="mb-3 flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-primary/15 px-2 text-xs font-semibold text-violet-200">
+                                {shotIndex + 1}
+                              </span>
+                              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isBroll ? 'bg-white/5 text-zinc-400' : 'bg-primary/10 text-violet-300'}`}>
+                                {isBroll ? 'Перебивка' : 'Говорит'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-0.5">
+                              <button
+                                type="button"
+                                onClick={() => moveSelectedScriptShot(shotIndex, -1)}
+                                disabled={shotIndex === 0}
+                                aria-label="Переместить кадр выше"
+                                title="Выше"
+                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200 disabled:opacity-30 disabled:hover:bg-transparent"
+                              >
+                                <ChevronUp size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => moveSelectedScriptShot(shotIndex, 1)}
+                                disabled={shotIndex === shots.length - 1}
+                                aria-label="Переместить кадр ниже"
+                                title="Ниже"
+                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200 disabled:opacity-30 disabled:hover:bg-transparent"
+                              >
+                                <ChevronDown size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => removeSelectedScriptShot(shotIndex)}
+                                disabled={shots.length <= 1}
+                                aria-label="Удалить кадр"
+                                title="Удалить кадр"
+                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-30 disabled:hover:bg-transparent"
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          </div>
+
                           <div className="grid gap-3 lg:grid-cols-[120px,minmax(0,1fr)]">
                             <div className="space-y-2">
                               <div className="aspect-[9/16] overflow-hidden rounded-lg border border-white/10 bg-zinc-950">
                                 {previewUrl ? (
-                                  <img src={previewUrl} alt={`Кадр ${shot.shot_number || shotIndex + 1}`} className="h-full w-full object-cover" />
+                                  <img src={previewUrl} alt={`Кадр ${shotIndex + 1}`} className="h-full w-full object-cover" />
                                 ) : (
                                   <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-[10px] text-zinc-600">
                                     <Upload size={18} />
-                                    Reference frame
+                                    Своё фото
                                   </div>
                                 )}
                               </div>
@@ -2308,7 +2423,7 @@ export default function SaaShortsTab({
                                 }}
                               />
                               <label htmlFor={inputId} className="btn-secondary w-full cursor-pointer px-2 py-2 text-[11px] flex items-center justify-center gap-1.5">
-                                <Upload size={12} /> Загрузить кадр
+                                <Upload size={12} /> Загрузить фото
                               </label>
                               {shot.frame_status && (
                                 <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
@@ -2316,41 +2431,62 @@ export default function SaaShortsTab({
                             </div>
 
                             <div className="space-y-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <span className="text-xs font-semibold text-violet-200">КАДР {shot.shot_number || shotIndex + 1}</span>
-                                <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="inline-flex overflow-hidden rounded-lg border border-white/10 text-[11px]">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSelectedScriptShot(shotIndex, 'visual_type', 'avatar')}
+                                    className={`px-2.5 py-1 transition-colors ${!isBroll ? 'bg-primary/15 text-violet-200' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                  >
+                                    Говорит
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSelectedScriptShot(shotIndex, 'visual_type', 'broll')}
+                                    className={`px-2.5 py-1 transition-colors ${isBroll ? 'bg-primary/15 text-violet-200' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                  >
+                                    Перебивка
+                                  </button>
+                                </div>
+                                <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
                                   <input
                                     type="number"
                                     value={shot.start ?? 0}
                                     onChange={(event) => handleSelectedScriptShot(shotIndex, 'start', event.target.value)}
-                                    className="input-field w-16 py-1 text-[11px]"
+                                    className="input-field w-14 py-1 text-[11px]"
+                                    aria-label="Начало кадра, сек"
                                   />
-                                  <span>-</span>
+                                  <span>–</span>
                                   <input
                                     type="number"
                                     value={shot.end ?? 3}
                                     onChange={(event) => handleSelectedScriptShot(shotIndex, 'end', event.target.value)}
-                                    className="input-field w-16 py-1 text-[11px]"
+                                    className="input-field w-14 py-1 text-[11px]"
+                                    aria-label="Конец кадра, сек"
                                   />
-                                  <span>sec</span>
+                                  <span>сек</span>
                                 </div>
                               </div>
                               <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                <span>Сцена</span>
+                                <span>Что в кадре</span>
                                 <textarea
                                   className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
                                   value={shot.scene || ''}
                                   onChange={(event) => handleSelectedScriptShot(shotIndex, 'scene', event.target.value)}
+                                  placeholder="Опиши, что видно в кадре"
                                 />
                               </label>
-                              <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                <span>Реплика</span>
-                                <textarea
-                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
-                                  value={shot.speech || ''}
-                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
-                                />
-                              </label>
+                              {!isBroll && (
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Что говорит</span>
+                                  <textarea
+                                    className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+                                    value={shot.speech || ''}
+                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
+                                    placeholder="Реплика для этого кадра"
+                                  />
+                                </label>
+                              )}
                               <div className="grid gap-3 md:grid-cols-2">
                                 <label className="space-y-1.5 text-xs text-zinc-400">
                                   <span>Текст на экране</span>
@@ -2358,14 +2494,16 @@ export default function SaaShortsTab({
                                     className="input-field py-2 text-sm"
                                     value={shot.overlay_text || ''}
                                     onChange={(event) => handleSelectedScriptShot(shotIndex, 'overlay_text', event.target.value)}
+                                    placeholder="Необязательно"
                                   />
                                 </label>
                                 <label className="space-y-1.5 text-xs text-zinc-400">
-                                  <span>Kling prompt</span>
+                                  <span>Подсказка для нейросети</span>
                                   <input
                                     className="input-field py-2 text-sm"
                                     value={shot.generation_prompt || ''}
                                     onChange={(event) => handleSelectedScriptShot(shotIndex, 'generation_prompt', event.target.value)}
+                                    placeholder="Как отрисовать кадр"
                                   />
                                 </label>
                               </div>
@@ -2375,6 +2513,14 @@ export default function SaaShortsTab({
                       );
                     })}
                   </div>
+
+                  <button
+                    type="button"
+                    onClick={() => addSelectedScriptShot()}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 py-2.5 text-sm text-zinc-400 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
+                  >
+                    <Plus size={16} /> Добавить кадр
+                  </button>
                 </div>
               )}
 
@@ -2643,7 +2789,7 @@ export default function SaaShortsTab({
               {!storyboardSelected && (
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <Film size={14} /> B-roll
+                  <Film size={14} /> Что показывать, пока идёт речь
                 </label>
                 <div className="grid sm:grid-cols-3 gap-2">
                   {BROLL_MODE_OPTIONS.map((option) => (
@@ -2662,7 +2808,7 @@ export default function SaaShortsTab({
                   ))}
                 </div>
                 <p className="text-[10px] text-zinc-600 mt-2">
-                  Product mockups are the default for this offer because dramatic AI lifestyle scenes often reduce trust.
+                  По умолчанию — кадры с товаром: яркие «киношные» сцены от нейросети часто наоборот снижают доверие к ролику.
                 </p>
               </div>
               )}
@@ -2673,10 +2819,10 @@ export default function SaaShortsTab({
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <label className="block text-sm font-medium text-zinc-300 flex items-center gap-2">
-                      <User size={14} /> Источник говорящей головы
+                      <User size={14} /> Кто говорит в кадре
                     </label>
                     <p className="text-xs text-zinc-500 mt-1">
-                      Можно один раз сгенерировать дорогой talking-head, сохранить его и дальше менять только озвучку через lipsync.
+                      Один раз сгенерировать говорящего человека — это дорого. Зато потом можно сохранить его и менять только озвучку — это уже дёшево.
                     </p>
                   </div>
                   {loadingHeadTemplates && <Loader2 size={14} className="animate-spin text-zinc-500 shrink-0" />}
@@ -2692,8 +2838,8 @@ export default function SaaShortsTab({
                         : 'border-white/10 bg-black/20 text-zinc-400 hover:bg-white/10'
                     }`}
                   >
-                    <div className="text-sm font-semibold">Создать новую</div>
-                    <div className="text-[10px] text-zinc-500 mt-1">Kling/Hailuo генерирует новый talking-head под эту озвучку.</div>
+                    <div className="text-sm font-semibold">Сгенерировать заново</div>
+                    <div className="text-[10px] text-zinc-500 mt-1">Нейросеть создаст нового говорящего человека под эту озвучку.</div>
                   </button>
                   <button
                     type="button"
@@ -2707,9 +2853,9 @@ export default function SaaShortsTab({
                         : 'border-white/10 bg-black/20 text-zinc-400 hover:bg-white/10 disabled:opacity-40'
                     }`}
                   >
-                    <div className="text-sm font-semibold">Использовать сохранённую</div>
+                    <div className="text-sm font-semibold">Взять сохранённого</div>
                     <div className="text-[10px] text-zinc-500 mt-1">
-                      {headTemplates.length > 0 ? 'Дешевле: новая озвучка + Sync Lipsync.' : 'Сначала сохрани talking-head из готового ролика.'}
+                      {headTemplates.length > 0 ? 'Дешевле: берём готового человека и только переозвучиваем.' : 'Сначала сохрани говорящего из готового ролика.'}
                     </div>
                   </button>
                 </div>
@@ -3209,7 +3355,7 @@ export default function SaaShortsTab({
 
             <div className="flex justify-between">
               <button onClick={() => setStep(1)} className="btn-secondary px-4 py-2 text-sm flex items-center gap-2">
-                <ChevronLeft size={14} /> Back
+                <ChevronLeft size={14} /> Назад
               </button>
               <button
                 onClick={handleGenerate}
@@ -3217,15 +3363,15 @@ export default function SaaShortsTab({
                 className="btn-primary px-6 py-2 text-sm flex items-center gap-2 disabled:opacity-50"
               >
                 {generating ? (
-                  <><Loader2 size={14} className="animate-spin" /> Generating...</>
+                  <><Loader2 size={14} className="animate-spin" /> Генерирую...</>
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
-                  <><User size={14} /> Select an actor first</>
+                  <><User size={14} /> Сначала выбери актёра</>
                 ) : storyboardSelected ? (
                   <><Film size={14} /> Сгенерировать видео ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : selectedHeadTemplate ? (
                   <><Volume2 size={14} /> Видео из сохранённой головы ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : (
-                  <><Film size={14} /> Generate Video ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
+                  <><Film size={14} /> Собрать ролик ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript] }).total)})</>
                 )}
               </button>
             </div>
@@ -3464,7 +3610,7 @@ export default function SaaShortsTab({
                   {genResult.script?.caption && (
                     <div>
                       <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-medium text-zinc-400">Caption</span>
+                        <span className="text-xs font-medium text-zinc-400">Подпись под видео</span>
                         <button
                           onClick={() => handleCopy(genResult.script.caption, 'caption')}
                           className="text-xs text-zinc-500 hover:text-white flex items-center gap-1"

@@ -38,6 +38,17 @@ videos/
 # Model files (downloaded at build time)
 *.pt
 
+# HuggingFace / model caches — symlink farm that breaks BuildKit context
+# transfer ("invalid file request"), and is re-downloaded at runtime anyway.
+.cache/
+**/.cache/
+
+# Runtime scratch/state — recreated on start and bind-mounted at runtime
+# (backend mounts .:/app + ./output), so it never needs to be baked in.
+output/
+uploads/
+.claude/
+
 # Docker
 Dockerfile
 docker-compose.yml
