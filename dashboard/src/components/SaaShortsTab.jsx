@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Settings2 } from 'lucide-react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Undo2, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -566,6 +566,9 @@ export default function SaaShortsTab({
   const [selectedScript, setSelectedScript] = useState(0);
   const [editingScriptIndex, setEditingScriptIndex] = useState(null);
   const [scriptDraft, setScriptDraft] = useState(null);
+  // Undo stack for storyboard shot edits: snapshots of shots before each
+  // add / delete / reorder, tagged with the script they belong to.
+  const [shotHistory, setShotHistory] = useState([]);
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
@@ -891,6 +894,7 @@ export default function SaaShortsTab({
       setAnalysis(data.analysis);
       setWebResearch(data.web_research || null);
       setScripts(data.scripts);
+      setShotHistory([]);
       setSelectedScript(0);
       setFromCache(false);
 
@@ -1029,15 +1033,38 @@ export default function SaaShortsTab({
     };
   };
 
-  // Rewrite the selected script's shots (add / remove / reorder), renumber and persist.
+  // Rewrite the selected script's shots (add / remove / reorder), renumber and
+  // persist. Snapshots the pre-change shots onto the undo stack first.
   const mutateSelectedScriptShots = (mutator) => {
+    const prevShots = (scripts[selectedScript]?.shots || []).map((shot) => ({ ...shot }));
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
       const shots = renumberShots(mutator([...(script.shots || [])]));
       return { ...script, format: 'storyboard_v3', shots };
     });
+    setShotHistory((history) => [
+      ...history.slice(-49),
+      { scriptIndex: selectedScript, shots: prevShots },
+    ]);
     setScripts(nextScripts);
     persistScripts(nextScripts);
+  };
+
+  const undoShotChange = () => {
+    let restoreIdx = -1;
+    for (let i = shotHistory.length - 1; i >= 0; i -= 1) {
+      if (shotHistory[i].scriptIndex === selectedScript) { restoreIdx = i; break; }
+    }
+    if (restoreIdx === -1) return;
+    const entry = shotHistory[restoreIdx];
+    const nextScripts = scripts.map((script, idx) => (
+      idx === entry.scriptIndex
+        ? { ...script, format: 'storyboard_v3', shots: entry.shots }
+        : script
+    ));
+    setScripts(nextScripts);
+    persistScripts(nextScripts);
+    setShotHistory((history) => history.filter((_, i) => i !== restoreIdx));
   };
 
   const addSelectedScriptShot = (afterIndex = null) => {
@@ -1115,6 +1142,7 @@ export default function SaaShortsTab({
       idx === editingScriptIndex ? updatedScript : script
     ));
     setScripts(nextScripts);
+    setShotHistory([]);
     setSelectedScript(editingScriptIndex);
     setEditedNarration(updatedScript.full_narration || '');
     persistScripts(nextScripts);
@@ -1415,6 +1443,7 @@ export default function SaaShortsTab({
     setAnalysis(null);
     setWebResearch(null);
     setScripts([]);
+    setShotHistory([]);
     setFromCache(false);
     localStorage.removeItem(CACHE_KEY);
     clearLastJob();
@@ -2339,9 +2368,21 @@ export default function SaaShortsTab({
                         Кадры можно добавлять, удалять и менять местами.
                       </p>
                     </div>
-                    <span className="shrink-0 rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
-                      {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
-                    </span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {shotHistory.some((entry) => entry.scriptIndex === selectedScript) && (
+                        <button
+                          type="button"
+                          onClick={undoShotChange}
+                          title="Отменить последнее действие с кадрами"
+                          className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
+                        >
+                          <Undo2 size={13} /> Отменить
+                        </button>
+                      )}
+                      <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
+                        {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="space-y-2.5">
@@ -2476,16 +2517,19 @@ export default function SaaShortsTab({
                                   placeholder="Опиши, что видно в кадре"
                                 />
                               </label>
-                              {!isBroll && (
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Что говорит</span>
-                                  <textarea
-                                    className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
-                                    value={shot.speech || ''}
-                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
-                                    placeholder="Реплика для этого кадра"
-                                  />
-                                </label>
+                              <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                <span>{isBroll ? 'Текст за кадром (озвучка)' : 'Что говорит'}</span>
+                                <textarea
+                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+                                  value={shot.speech || ''}
+                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
+                                  placeholder={isBroll ? 'Что звучит голосом, пока показываем вставку (можно оставить пустым)' : 'Реплика для этого кадра'}
+                                />
+                              </label>
+                              {isBroll && (
+                                <p className="-mt-1.5 text-[10px] text-zinc-600">
+                                  В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
+                                </p>
                               )}
                               <div className="grid gap-3 md:grid-cols-2">
                                 <label className="space-y-1.5 text-xs text-zinc-400">
