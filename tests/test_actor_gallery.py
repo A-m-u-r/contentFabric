@@ -153,5 +153,137 @@ class AvatarVoiceBindingTests(unittest.TestCase):
         self.assertIsNone(app.resolve_avatar_bound_voice("/videos/actor_uploads/m.png"))
 
 
+class SafeOutputSubpathTests(unittest.TestCase):
+    """A client-supplied /videos/ reference must never resolve outside
+    OUTPUT_DIR (path-traversal guard for the selected-actor image)."""
+
+    def setUp(self):
+        self._prev_output_dir = app.OUTPUT_DIR
+        self._tmp = tempfile.TemporaryDirectory()
+        app.OUTPUT_DIR = self._tmp.name
+
+    def tearDown(self):
+        app.OUTPUT_DIR = self._prev_output_dir
+        self._tmp.cleanup()
+
+    def test_resolves_normal_reference_inside_output(self):
+        rel = "actor_uploads/custom_1.png"
+        os.makedirs(os.path.join(app.OUTPUT_DIR, "actor_uploads"), exist_ok=True)
+        target = os.path.join(app.OUTPUT_DIR, rel)
+        with open(target, "wb") as f:
+            f.write(b"x")
+        resolved = app._safe_output_subpath(f"/videos/{rel}")
+        self.assertEqual(os.path.realpath(resolved), os.path.realpath(target))
+
+    def test_rejects_dotdot_traversal(self):
+        self.assertIsNone(app._safe_output_subpath("/videos/../../etc/passwd"))
+        self.assertIsNone(app._safe_output_subpath("/videos/x/../../../secret.txt"))
+        self.assertIsNone(app._safe_output_subpath("/videos/saas_x/../../../secret.txt"))
+        self.assertIsNone(app._safe_output_subpath("../../etc/passwd"))
+
+    def test_rejects_empty_and_root(self):
+        self.assertIsNone(app._safe_output_subpath(""))
+        self.assertIsNone(app._safe_output_subpath(None))
+        self.assertIsNone(app._safe_output_subpath("/videos/"))
+
+
+class AllowedRemoteActorUrlTests(unittest.TestCase):
+    """The http branch of selected_actor_url must only fetch our own S3 bucket
+    host, never arbitrary URLs (SSRF guard)."""
+
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in ("AWS_S3_BUCKET", "AWS_REGION")}
+        os.environ["AWS_S3_BUCKET"] = "my-clips-bucket"
+        os.environ["AWS_REGION"] = "eu-west-3"
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_allows_configured_bucket_host(self):
+        self.assertTrue(app._allowed_remote_actor_url(
+            "https://my-clips-bucket.s3.eu-west-3.amazonaws.com/actors/x.png"))
+        self.assertTrue(app._allowed_remote_actor_url(
+            "https://my-clips-bucket.s3.amazonaws.com/actors/x.png"))
+
+    def test_blocks_ssrf_targets(self):
+        for url in (
+            "http://my-clips-bucket.s3.eu-west-3.amazonaws.com/x.png",  # not https
+            "https://169.254.169.254/latest/meta-data/",               # cloud metadata
+            "https://localhost/x.png",
+            "https://evil.com/x.png",
+            "https://my-clips-bucket.s3.eu-west-3.amazonaws.com.evil.com/x.png",  # suffix trick
+            "https://other-bucket.s3.eu-west-3.amazonaws.com/x.png",   # wrong bucket
+        ):
+            self.assertFalse(app._allowed_remote_actor_url(url), url)
+
+    def test_blocks_all_remote_when_no_bucket_configured(self):
+        os.environ.pop("AWS_S3_BUCKET", None)
+        self.assertFalse(app._allowed_remote_actor_url(
+            "https://my-clips-bucket.s3.eu-west-3.amazonaws.com/x.png"))
+
+
+class PreserveExpiringJobAvatarTests(unittest.TestCase):
+    """A job that generated an avatar but never produced a final video should
+    have its portrait copied into actor_uploads before cleanup purges it."""
+
+    def setUp(self):
+        self._prev_output_dir = app.OUTPUT_DIR
+        self._tmp = tempfile.TemporaryDirectory()
+        app.OUTPUT_DIR = self._tmp.name
+
+    def tearDown(self):
+        app.OUTPUT_DIR = self._prev_output_dir
+        self._tmp.cleanup()
+
+    def _job_dir(self, job_id, owner="user-a", title="Мой аватар"):
+        job_dir = os.path.join(app.OUTPUT_DIR, f"saas_{job_id}")
+        os.makedirs(job_dir, exist_ok=True)
+        with open(os.path.join(job_dir, "_30__actor.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n" + b"0" * 2048)
+        # 9x16 and _ref_ variants must not be chosen as the primary portrait.
+        with open(os.path.join(job_dir, "_30__actor_9x16.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n" + b"0" * 2048)
+        meta = {"title": title, "owner_user_id": owner}
+        with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        return job_dir
+
+    def test_copies_primary_portrait_into_actor_uploads(self):
+        import shutil
+        job_dir = self._job_dir("job1")
+        app._preserve_expiring_job_avatar(job_dir)
+        # Cleanup purges the scratch job dir immediately after preserving.
+        shutil.rmtree(job_dir)
+
+        preserved = app.list_local_actor_gallery(owner_user_id="user-a")
+        self.assertEqual(len(preserved), 1)
+        entry = preserved[0]
+        self.assertTrue(entry["key"].startswith("actor_uploads/"))
+        self.assertNotIn("9x16", entry["key"])
+        self.assertEqual(entry.get("description"), "Мой аватар")
+
+    def test_owner_hint_wins_over_missing_metadata(self):
+        job_dir = os.path.join(app.OUTPUT_DIR, "saas_job2")
+        os.makedirs(job_dir, exist_ok=True)
+        with open(os.path.join(job_dir, "a_actor.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n" + b"0" * 2048)
+        app._preserve_expiring_job_avatar(job_dir, owner_hint="user-b")
+        self.assertEqual(len(app.list_local_actor_gallery(owner_user_id="user-b")), 1)
+        self.assertEqual(len(app.list_local_actor_gallery(owner_user_id="user-a")), 0)
+
+    def test_idempotent_second_call_is_noop(self):
+        job_dir = self._job_dir("job3")
+        app._preserve_expiring_job_avatar(job_dir)
+        app._preserve_expiring_job_avatar(job_dir)
+        # Two calls must not create two copies in actor_uploads.
+        uploads = os.path.join(app.OUTPUT_DIR, "actor_uploads")
+        pngs = [f for f in os.listdir(uploads) if f.endswith(".png")]
+        self.assertEqual(len(pngs), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

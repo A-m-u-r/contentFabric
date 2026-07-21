@@ -624,6 +624,12 @@ async def cleanup_jobs():
                         continue
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
                         print(f"🧹 Purging old job: {job_id}")
+                        # Keep a generated avatar from a run that never finished.
+                        if job_id.startswith("saas_"):
+                            _preserve_expiring_job_avatar(
+                                job_path,
+                                owner_hint=(saas_jobs.get(job_id.replace("saas_", "", 1)) or {}).get("owner_user_id"),
+                            )
                         shutil.rmtree(job_path, ignore_errors=True)
                         if job_id in jobs:
                             del jobs[job_id]
@@ -3288,6 +3294,49 @@ def _job_actor_portraits(owner_user_id: Optional[str] = None) -> List[dict]:
     return entries
 
 
+def _preserve_expiring_job_avatar(job_dir: str, owner_hint: Optional[str] = None) -> None:
+    """Copy an expiring job's primary actor portrait into the durable
+    ``actor_uploads`` gallery before the scratch dir is purged.
+
+    Completed jobs (``*_final.mp4``) are kept, so their portraits survive. Jobs
+    that generated an avatar but never finished were purged after retention,
+    which is exactly how avatars "disappeared" — this keeps that portrait.
+    """
+    try:
+        candidates = []
+        for ext in ACTOR_IMAGE_EXTENSIONS:
+            candidates.extend(glob.glob(os.path.join(job_dir, f"*_actor{ext}")))
+        primary = sorted(
+            p for p in candidates
+            if "9x16" not in os.path.basename(p) and "_ref_" not in os.path.basename(p)
+        )
+        if not primary:
+            return
+        src = primary[0]
+        if os.path.getsize(src) < 1000:
+            return
+
+        dest_dir = os.path.join(OUTPUT_DIR, "actor_uploads")
+        os.makedirs(dest_dir, exist_ok=True)
+        base = os.path.basename(job_dir.rstrip(os.sep)).replace("saas_", "", 1)
+        ext = os.path.splitext(src)[1] or ".png"
+        dest = os.path.join(dest_dir, f"job_{base}{ext}")
+        if os.path.exists(dest):
+            return
+
+        meta = _read_local_gallery_meta(job_dir) or {}
+        owner = owner_hint or meta.get("owner_user_id") or None
+        shutil.copy2(src, dest)
+        _write_local_actor_metadata(
+            dest,
+            url=_output_file_url(dest),
+            description=(meta.get("title") or "").strip(),
+            owner_user_id=owner,
+        )
+    except Exception:
+        pass
+
+
 def list_local_actor_gallery(owner_user_id: Optional[str] = None) -> List[dict]:
     """List actor images saved on local disk, used when S3 is not configured."""
     image_paths = []
@@ -3404,6 +3453,55 @@ def resolve_avatar_bound_voice(selected_actor_url: Optional[str]) -> Optional[di
     if (binding.get("provider") or "elevenlabs") != "elevenlabs":
         return None
     return binding
+
+
+def _safe_output_subpath(rel_url: Optional[str]) -> Optional[str]:
+    """Resolve a client-supplied ``/videos/...`` reference to an absolute path
+    that is guaranteed to live inside ``OUTPUT_DIR``.
+
+    Returns ``None`` when the input is empty or tries to escape the directory
+    (path traversal via ``..`` / absolute paths), so callers never open a file
+    outside the media root just because a request said so.
+    """
+    rel = (rel_url or "").replace("/videos/", "", 1).lstrip("/\\")
+    if not rel:
+        return None
+    # Reject any ``..`` segment outright before touching the filesystem.
+    if ".." in re.split(r"[\\/]+", rel):
+        return None
+    root = os.path.realpath(OUTPUT_DIR)
+    candidate = os.path.realpath(os.path.join(root, rel))
+    try:
+        if os.path.commonpath([candidate, root]) != root or candidate == root:
+            return None
+    except ValueError:
+        # Different drive on Windows, etc. — treat as an escape.
+        return None
+    return candidate
+
+
+def _allowed_remote_actor_url(url: Optional[str]) -> bool:
+    """Only fetch a pre-generated actor image from our own S3 bucket host.
+
+    The remote branch used to ``httpx.get`` any URL the client supplied, which
+    is a classic SSRF (internal services, cloud metadata endpoints). We pin the
+    host to the configured bucket so only legitimate gallery URLs are fetched.
+    """
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return False
+    region = os.environ.get("AWS_REGION", "eu-west-3")
+    allowed_hosts = {
+        f"{bucket}.s3.{region}.amazonaws.com",
+        f"{bucket}.s3.amazonaws.com",
+    }
+    return parsed.hostname.lower() in allowed_hosts
 
 
 @app.post("/api/saasshorts/actor-upload")
@@ -4034,12 +4132,31 @@ async def saasshorts_generate(
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
     if req.retry_job_id:
+        # retry_job_id feeds a directory name — it must be a plain UUID, never a
+        # path fragment, or "saas_{id}" could escape OUTPUT_DIR (path traversal).
+        try:
+            uuid.UUID(str(req.retry_job_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid retry_job_id")
+
         # Check memory first, then disk
         old_dir = os.path.join(OUTPUT_DIR, f"saas_{req.retry_job_id}")
         if req.retry_job_id in saas_jobs:
             old_dir = saas_jobs[req.retry_job_id]["output_dir"]
 
         if os.path.isdir(old_dir):
+            # A logged-in user may only retry a job they own, so retry can't be
+            # used to reuse/overwrite another account's job dir (write-path authz,
+            # mirroring the ownership check in saasshorts_status).
+            requester = user.get("id") if user else None
+            existing_owner = None
+            if req.retry_job_id in saas_jobs:
+                existing_owner = saas_jobs[req.retry_job_id].get("owner_user_id")
+            if not existing_owner:
+                existing_owner = (_read_local_gallery_meta(old_dir) or {}).get("owner_user_id")
+            if requester and existing_owner and existing_owner != requester:
+                raise HTTPException(status_code=404, detail="AI Shorts job not found")
+
             job_id = req.retry_job_id
             job_output_dir = old_dir
             reused = True
@@ -4072,21 +4189,23 @@ async def saasshorts_generate(
     selected_actor_path = None
     if req.selected_actor_url:
         if req.selected_actor_url.startswith("http"):
-            # Download from S3 public URL to job output dir
-            import httpx
-            try:
-                actor_local = os.path.join(job_output_dir, "selected_actor.png")
-                with httpx.Client(timeout=30.0) as client:
-                    resp = client.get(req.selected_actor_url)
-                    if resp.status_code == 200:
-                        with open(actor_local, "wb") as f:
-                            f.write(resp.content)
-                        selected_actor_path = actor_local
-            except Exception:
-                pass
+            # Download from S3 — but only from our own bucket host (SSRF guard).
+            if _allowed_remote_actor_url(req.selected_actor_url):
+                import httpx
+                try:
+                    actor_local = os.path.join(job_output_dir, "selected_actor.png")
+                    with httpx.Client(timeout=30.0) as client:
+                        resp = client.get(req.selected_actor_url)
+                        if resp.status_code == 200:
+                            with open(actor_local, "wb") as f:
+                                f.write(resp.content)
+                            selected_actor_path = actor_local
+                except Exception:
+                    pass
         else:
-            src = os.path.join(OUTPUT_DIR, req.selected_actor_url.replace("/videos/", ""))
-            if os.path.exists(src):
+            # Local reference — must stay inside OUTPUT_DIR (path-traversal guard).
+            src = _safe_output_subpath(req.selected_actor_url)
+            if src and os.path.exists(src):
                 selected_actor_path = src
 
     # A voice bound to the selected avatar wins over the request's ElevenLabs

@@ -2466,21 +2466,22 @@ export default function SaaShortsTab({
               )}
 
               {/* Voice Selection */}
-              {ttsProvider !== 'fal_minimax' && (
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
-                </label>
-                {(() => {
-                  const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
-                  if (!boundVoice?.voice_id) return null;
-                  return (
+              {ttsProvider !== 'fal_minimax' && (() => {
+                const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
+                return (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                    <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
+                  </label>
+                  {boundVoice?.voice_id ? (
+                    // Голос привязан к аватару — бэкенд использует именно его,
+                    // поэтому ручной выбор здесь скрыт, чтобы не вводить в заблуждение.
                     <div className="mb-2 flex items-start gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
                       <Volume2 size={12} className="mt-0.5 shrink-0" />
                       <span>Аватар привязан к голосу <b>{boundVoice.voice_name || boundVoice.voice_id}</b> — он и будет использован для ролика. Сменить можно во вкладке «Аватары».</span>
                     </div>
-                  );
-                })()}
+                  ) : (
+                  <>
                 {(() => {
                   // Filter voices by language/accent
                   const filtered = voices.length > 0
@@ -2632,8 +2633,11 @@ export default function SaaShortsTab({
                     ? `Voces ${actorGender === 'female' ? 'femeninas' : 'masculinas'} · Todas hablan español con modelo multilingual · Click altavoz para preview`
                     : `${actorGender === 'female' ? 'Female' : 'Male'} voices · Click speaker to preview`}
                 </p>
-              </div>
-              )}
+                  </>
+                  )}
+                </div>
+                );
+              })()}
 
               {/* B-roll Mode */}
               {!storyboardSelected && (

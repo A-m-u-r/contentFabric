@@ -833,7 +833,7 @@ function App() {
     <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
       <div
         className="grid gap-1"
-        style={{ gridTemplateColumns: `repeat(${navItems.length}, minmax(0, 1fr))` }}
+        style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' }}
       >
         {navItems.map((item) => {
           const Icon = item.icon;
