@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Undo2, Settings2 } from 'lucide-react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -569,6 +569,9 @@ export default function SaaShortsTab({
   // Undo stack for storyboard shot edits: snapshots of shots before each
   // add / delete / reorder, tagged with the script they belong to.
   const [shotHistory, setShotHistory] = useState([]);
+  // Drag-and-drop reordering of storyboard shots.
+  const [dragShotIndex, setDragShotIndex] = useState(null);
+  const [dragOverShotIndex, setDragOverShotIndex] = useState(null);
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
@@ -1089,6 +1092,30 @@ export default function SaaShortsTab({
       const target = shotIndex + direction;
       if (target < 0 || target >= shots.length) return shots;
       [shots[shotIndex], shots[target]] = [shots[target], shots[shotIndex]];
+      return shots;
+    });
+  };
+
+  const duplicateSelectedScriptShot = (shotIndex) => {
+    mutateSelectedScriptShots((shots) => {
+      const original = shots[shotIndex];
+      if (!original) return shots;
+      // Deep-ish copy; the generated-frame status is per-run, so drop it.
+      const { frame_status, ...rest } = original;
+      shots.splice(shotIndex + 1, 0, { ...rest });
+      return shots;
+    });
+  };
+
+  // Drag-and-drop reorder: move the dragged shot to the drop target's slot.
+  const dropShotOnto = (toIndex) => {
+    const from = dragShotIndex;
+    setDragShotIndex(null);
+    setDragOverShotIndex(null);
+    if (from == null || from === toIndex) return;
+    mutateSelectedScriptShots((shots) => {
+      const [moved] = shots.splice(from, 1);
+      shots.splice(toIndex, 0, moved);
       return shots;
     });
   };
@@ -2365,7 +2392,7 @@ export default function SaaShortsTab({
                       </h3>
                       <p className="text-[11px] text-zinc-500 mt-0.5 max-w-xl">
                         Ролик собирается по кадрам. Для каждого укажи, что в кадре и что человек говорит.
-                        Кадры можно добавлять, удалять и менять местами.
+                        Кадры можно добавлять, дублировать, удалять и перетаскивать за уголок <GripVertical size={11} className="inline align-[-1px] text-zinc-500" />, чтобы поменять порядок.
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
@@ -2395,10 +2422,36 @@ export default function SaaShortsTab({
                       const isBroll = (shot.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
 
                       return (
-                        <div key={shotIndex} className="rounded-xl border border-white/10 bg-black/20 p-3">
-                          {/* Header: number + type + reorder/delete */}
+                        <div
+                          key={shotIndex}
+                          onDragOver={(event) => {
+                            if (dragShotIndex === null) return;
+                            event.preventDefault();
+                            if (dragOverShotIndex !== shotIndex) setDragOverShotIndex(shotIndex);
+                          }}
+                          onDrop={(event) => { event.preventDefault(); dropShotOnto(shotIndex); }}
+                          className={`rounded-xl border bg-black/20 p-3 transition-all ${
+                            dragShotIndex === shotIndex
+                              ? 'border-primary/40 opacity-50'
+                              : dragOverShotIndex === shotIndex && dragShotIndex !== null
+                                ? 'border-primary/60 ring-1 ring-primary/40'
+                                : 'border-white/10'
+                          }`}
+                        >
+                          {/* Header: drag handle + number + type + actions */}
                           <div className="mb-3 flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                draggable
+                                onDragStart={() => setDragShotIndex(shotIndex)}
+                                onDragEnd={() => { setDragShotIndex(null); setDragOverShotIndex(null); }}
+                                aria-label="Перетащить кадр"
+                                title="Потяни, чтобы поменять порядок"
+                                className="cursor-grab rounded-md p-1 text-zinc-600 transition-colors hover:text-zinc-300 active:cursor-grabbing"
+                              >
+                                <GripVertical size={15} />
+                              </button>
                               <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-primary/15 px-2 text-xs font-semibold text-violet-200">
                                 {shotIndex + 1}
                               </span>
@@ -2426,6 +2479,15 @@ export default function SaaShortsTab({
                                 className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200 disabled:opacity-30 disabled:hover:bg-transparent"
                               >
                                 <ChevronDown size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => duplicateSelectedScriptShot(shotIndex)}
+                                aria-label="Дублировать кадр"
+                                title="Дублировать кадр"
+                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200"
+                              >
+                                <Copy size={15} />
                               </button>
                               <button
                                 type="button"
