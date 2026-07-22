@@ -700,7 +700,8 @@ RULES:
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Prefer plates, food, hands, analog objects.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
-- Each shot's speech is ONE short sentence of about 8-12 words (~3 seconds spoken), 14 words hard max. If the script has more to say, add another shot — never grow one shot's speech instead of adding shots.
+- Each shot's speech is ONE short sentence of about 8-10 words (~3-4 seconds spoken), 11 words HARD max — a shot must NEVER carry more than 5 seconds of speech (spoken Russian runs ~2.3 words/sec, so 12+ words already overflows 5s). If the script has more to say, add another shot (more, shorter shots are fine); never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
+- A reel is ~20-25 seconds, so aim for roughly 5-7 shots and keep every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
@@ -1885,6 +1886,13 @@ def generate_voiceover_with_fallback(
     log: Callable[[str], None] = print,
 ) -> dict:
     """Generate TTS with an optional ElevenLabs -> fal MiniMax fallback."""
+    if not (text or "").strip():
+        # Synthesising an empty string yields a sub-second silent blip that later
+        # collapses to a headerless MP3 and makes Kling reject the whole job with
+        # an opaque 422. Fail here, where the cause ("no spoken lines") is obvious.
+        raise ValueError(
+            "Voiceover text is empty — add spoken lines to the script before generating video."
+        )
     provider = (provider or "auto").lower()
     minimax_voice_id = _minimax_voice_for(language, actor_gender, minimax_voice_id)
 
@@ -2382,6 +2390,12 @@ def _avatar_request_prompt(scene_prompt: str) -> str:
         "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
         "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
         "keep lips closed and hold a calm neutral expression. "
+        # Kling occasionally clones the actor toward the frame edges when driven
+        # from a single portrait; forbid it explicitly so the vision QC stops
+        # flagging "дублирование персонажа по краям кадра".
+        "Show exactly one single person, centered and fully inside the frame. "
+        "Never duplicate the subject, never show a twin, clone, mirror copy or a second face, "
+        "and keep the edges of the frame free of any extra person. "
         "Keep the outfit, skin and background exactly as in the reference image: "
         "never add text, letters, numbers, logos, prints or tattoos to clothing, skin or background."
     )
@@ -3175,6 +3189,51 @@ def _get_media_stream_duration(path: str, stream_type: str) -> float:
     return 0.0
 
 
+# No real talking-head voiceover is under a second: anything shorter is a failed
+# TTS artifact (empty text, dropped request) that must not reach the video model.
+_MIN_VOICEOVER_SECONDS = 1.0
+
+
+def _decodable_audio_duration(path: str) -> Optional[float]:
+    """Duration of a real, decodable audio stream, or None when unusable.
+
+    Unlike `_get_media_duration`, this never masks a decode failure with a 30s
+    estimate. Callers use it to reject a voiceover ffmpeg/Kling cannot load
+    (e.g. an over-trimmed clip collapsed to a headerless MP3 stub), so a broken
+    file fails fast with a clear cause instead of surfacing three steps later as
+    an opaque "No completed talking-head attempts".
+    """
+    if not (os.path.exists(path) and os.path.getsize(path) > 0):
+        return None
+    # Probe the audio stream first, then the container: a valid VBR MP3 may report
+    # only one of the two, so we treat the file as broken only when both are absent.
+    probes = (
+        ("-select_streams", "a:0", "-show_entries", "stream=duration"),
+        ("-show_entries", "format=duration"),
+    )
+    for probe in probes:
+        cmd = [
+            "ffprobe", "-v", "error", *probe,
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            print(f"[SaaSShorts] audio decode probe failed for {path}: {e}")
+            continue
+        for line in result.stdout.splitlines():
+            value = line.strip()
+            if not value or value.upper() == "N/A":
+                continue
+            try:
+                seconds = float(value)
+            except ValueError:
+                continue
+            if seconds > 0:
+                return seconds
+    return None
+
+
 def talking_head_quality_path(video_path: str) -> str:
     """Sidecar path for quality diagnostics tied to a generated talking head."""
     if video_path.lower().endswith(".mp4"):
@@ -3250,7 +3309,19 @@ def select_best_talking_head_attempt(attempts: list) -> dict:
     """Pick the first passing attempt, otherwise the attempt closest to audio length."""
     completed = [attempt for attempt in attempts if attempt.get("output_path") and not attempt.get("error")]
     if not completed:
-        raise Exception("No completed talking-head attempts")
+        # Surface the underlying provider error (e.g. Kling's 422 audio_load_error)
+        # instead of a bare "no attempts": the real cause is otherwise buried in a
+        # per-attempt JSON sidecar and the failure looks inexplicable.
+        errors = "; ".join(
+            f"{attempt.get('name', '?')}: {attempt['error']}"
+            for attempt in attempts
+            if attempt.get("error")
+        )
+        raise Exception(
+            f"No completed talking-head attempts ({errors})"
+            if errors
+            else "No completed talking-head attempts"
+        )
 
     for attempt in completed:
         if attempt.get("quality", {}).get("status") == "ok":
@@ -3372,6 +3443,20 @@ def prepare_voiceover_for_video_generation(
         "source_mtime_ns": source_stat.st_mtime_ns,
     }
 
+    def _finalize(report: dict) -> dict:
+        # Last line of defence before the audio reaches Kling: reject anything
+        # empty, undecodable, or sub-second (a failed/empty TTS). This guards
+        # every return path — including a stale cache hit that still points at a
+        # corrupt clip — so the job fails with a clear cause, not a downstream 422.
+        usable = _decodable_audio_duration(report.get("path"))
+        if usable is None or usable < _MIN_VOICEOVER_SECONDS:
+            raise ValueError(
+                "Voiceover audio is empty or too short to animate "
+                f"({'unreadable' if usable is None else f'{usable:.2f}s'}) — "
+                "add spoken lines to the script before generating video."
+            )
+        return report
+
     cached = _read_json_file(meta_path)
     if (
         cached.get("source_size") == source_signature["source_size"]
@@ -3379,7 +3464,7 @@ def prepare_voiceover_for_video_generation(
         and os.path.exists(clean_path)
         and os.path.getsize(clean_path) > 0
     ):
-        return cached
+        return _finalize(cached)
 
     for stale_path in (clean_path, f"{clean_path}.fal_url.txt", meta_path):
         try:
@@ -3404,7 +3489,15 @@ def prepare_voiceover_for_video_generation(
             clean_path,
         ]
         subprocess.run(cmd, check=True, capture_output=True)
-        clean_duration = _get_media_duration(clean_path)
+        clean_duration = _decodable_audio_duration(clean_path)
+        if clean_duration is None:
+            # silenceremove collapsed the clip to an unreadable stub. Drop it and
+            # fall back to the raw audio below (which _finalize then re-checks).
+            try:
+                os.remove(clean_path)
+            except OSError:
+                pass
+            raise RuntimeError("cleaned audio is empty or undecodable")
         expected_speech = original_duration - silence.get("leading_silence", 0.0) - silence.get("trailing_silence", 0.0)
         if clean_duration + 1.0 < expected_speech:
             try:
@@ -3434,7 +3527,6 @@ def prepare_voiceover_for_video_generation(
                 f"{report['original_duration']:.2f}s -> {report['duration']:.2f}s "
                 f"(tail silence ~{report['trailing_silence']:.2f}s)."
             )
-        return report
     except Exception as error:
         report = {
             **source_signature,
@@ -3450,7 +3542,8 @@ def prepare_voiceover_for_video_generation(
             "warning": f"Voiceover cleanup skipped: {error}",
         }
         log(f"[2/6] Voiceover cleanup skipped: {error}")
-        return report
+
+    return _finalize(report)
 
 
 def _format_ass_time(seconds: float) -> str:
@@ -4687,6 +4780,83 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
         return ""
 
 
+# Image-conditioned Flux edit: keeps the reference person's identity while
+# staging a new scene. Swap here if a better identity model becomes available.
+AVATAR_REFERENCE_MODEL = "fal-ai/flux-pro/kontext"
+
+
+def _avatar_reference_image(
+    shot: dict,
+    actor_photo_path: str,
+    fal_key: str,
+    output_path: str,
+    log: Callable[[str], None] = print,
+) -> str:
+    """Per-shot avatar frame from the actor photo + the shot's scene description.
+
+    Keeps the saved avatar's identity (face, hair, outfit) via an image-conditioned
+    Flux edit, but stages the described scene so each cut is its own composition
+    instead of a crop of one static photo — which made Kling clone the person
+    toward the frame edges. Returns "" on any failure so the caller falls back to
+    a punch-in crop of the shared photo: a plainer frame beats a failed job.
+    """
+    if not (actor_photo_path and os.path.exists(actor_photo_path)):
+        return ""
+    scene = (shot.get("generation_prompt") or shot.get("scene") or "").strip().rstrip(".")
+    prompt = (
+        "Keep the exact same person, face, hairstyle and outfit as in the reference image. "
+        f"{scene + '. ' if scene else ''}"
+        "Vertical 9:16 portrait, one single person only, centered and fully inside the frame, "
+        "photorealistic UGC selfie look, natural light. Never duplicate the person, never add a "
+        "second face, keep the frame edges free of any extra person. No on-screen text, no logos, "
+        "no watermark."
+    )
+    prompt_sidecar = f"{output_path}.prompt.txt"
+    if _nonempty(output_path):
+        try:
+            with open(prompt_sidecar, encoding="utf-8") as f:
+                cached_prompt = f.read()
+        except OSError:
+            cached_prompt = None
+        # Reference stays valid while the shot's prompt is unchanged (user edits win).
+        if cached_prompt is None or cached_prompt == prompt:
+            return output_path
+        for stale in (output_path, f"{output_path}.fal_url.txt"):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
+    try:
+        image_url = _fal_upload_file(actor_photo_path, fal_key)
+        result = _fal_run(
+            AVATAR_REFERENCE_MODEL,
+            {
+                "prompt": prompt,
+                "image_url": image_url,
+                "aspect_ratio": "9:16",
+                "safety_tolerance": "5",
+            },
+            fal_key,
+            timeout=600,
+        )
+        images = result.get("images") or result.get("output", [])
+        if not images:
+            raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
+        img_url = images[0]["url"] if isinstance(images[0], dict) else images[0]
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.get(img_url)
+            resp.raise_for_status()
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+        with open(prompt_sidecar, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        return output_path
+    except Exception as e:
+        log(f"  ⚠️ Avatar reference frame failed ({e}); using cropped photo instead")
+        return ""
+
+
 # Gentle alternating punch-ins (zoom, center-x, center-y as fractions). Variant 0
 # keeps the original so the first shot matches the approved actor photo.
 _AVATAR_REFERENCE_VARIANTS = [
@@ -4736,6 +4906,7 @@ def generate_sliced_avatar_clips(
     selected_actor_path: str = "",
     broll_tier: str = "standard",
     broll_image_first: bool = True,
+    avatar_image_first: bool = True,
     log: Callable[[str], None] = print,
 ) -> list:
     """
@@ -4782,7 +4953,15 @@ def generate_sliced_avatar_clips(
                     )
                     generate_actor_image(desc, fal_key, fallback_actor_img)
             shared = fallback_actor_img
-        # Shared photo across shots: vary the crop so cuts read as camera changes
+        # Prefer a fresh per-shot frame that keeps the actor's identity but stages
+        # the described scene, so each cut is its own composition instead of a crop
+        # of one photo (which made Kling clone the person toward the edges).
+        if avatar_image_first:
+            scene_path = os.path.join(output_dir, f"{title_slug}_actor_scene_{index:02d}.png")
+            conditioned = _avatar_reference_image(sl["shot"], shared, fal_key, scene_path, log=log)
+            if conditioned:
+                return conditioned
+        # Fallback: vary the crop of the shared photo so cuts read as camera changes.
         variant_path = os.path.join(output_dir, f"{title_slug}_actor_ref_{index:02d}.png")
         return _avatar_reference_variant(shared, variant_path, index)
 
@@ -4939,10 +5118,17 @@ def generate_storyboard_video(
     if not shots:
         raise ValueError("Storyboard script has no shots")
 
-    full_narration = script.get("full_narration") or " ".join(
-        (shot.get("speech") or "").strip() for shot in shots if shot.get("speech")
-    )
-    if not full_narration.strip():
+    # Shots are the source of truth for a storyboard: rebuild the narration from
+    # the CURRENT shots so trimming/editing the shot list actually shortens the
+    # voiceover (and therefore the video length and cost). A stale script-level
+    # `full_narration` from the original AI draft must never override a user who
+    # deleted shots — otherwise 3 kept shots still get voiced as the original 7.
+    full_narration = " ".join(
+        (shot.get("speech") or "").strip() for shot in shots if (shot.get("speech") or "").strip()
+    ).strip()
+    if not full_narration:
+        full_narration = (script.get("full_narration") or "").strip()
+    if not full_narration:
         full_narration = " ".join((shot.get("overlay_text") or shot.get("scene") or "").strip() for shot in shots)
 
     audio_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
@@ -5028,6 +5214,7 @@ def generate_storyboard_video(
             selected_actor_path=config.get("selected_actor_path") or "",
             broll_tier=broll_tier,
             broll_image_first=bool(config.get("broll_image_first", True)),
+            avatar_image_first=bool(config.get("avatar_image_first", True)),
             log=log,
         )
     elif generation_mode == "multi_shot":
@@ -5112,8 +5299,10 @@ def generate_storyboard_video(
     extra_costs = {}
     if generation_mode == "sliced_avatar":
         avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
-        avatar_seconds = sum(c["duration"] for c in clips if not _is_broll_shot(c.get("shot") or {}))
-        broll_seconds = sum(c["duration"] for c in clips if _is_broll_shot(c.get("shot") or {}))
+        avatar_clips = [c for c in clips if not _is_broll_shot(c.get("shot") or {})]
+        broll_clips = [c for c in clips if _is_broll_shot(c.get("shot") or {})]
+        avatar_seconds = sum(c["duration"] for c in avatar_clips)
+        broll_seconds = sum(c["duration"] for c in broll_clips)
         video_cost_key = f"sliced_avatar_kling_{avatar_tier}"
         video_cost = round(avatar_seconds * kling_avatar_cost_per_second(avatar_tier), 2)
         if broll_seconds:
@@ -5121,6 +5310,14 @@ def generate_storyboard_video(
             extra_costs[f"sliced_broll_kling_v3_{broll_tier}"] = round(
                 broll_seconds * storyboard_video_cost_per_second(broll_tier), 2
             )
+        # Per-shot Flux reference frames (avatar scene + b-roll composition).
+        ref_frames = 0
+        if config.get("avatar_image_first", True):
+            ref_frames += len(avatar_clips)
+        if broll_seconds and config.get("broll_image_first", True):
+            ref_frames += len(broll_clips)
+        if ref_frames:
+            extra_costs["reference_frames_flux"] = round(ref_frames * 0.05, 2)
     else:
         video_seconds = sum(_shot_duration(shot) for shot in shots)
         video_cost_key = f"storyboard_{storyboard_family}_{tier}"

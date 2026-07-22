@@ -436,6 +436,7 @@ class SaaSStoryboardTests(unittest.TestCase):
                  patch("saasshorts.generate_storyboard_shot_clip", side_effect=AssertionError("per-shot should not run")), \
                  patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
                  patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
+                 patch("saasshorts._decodable_audio_duration", return_value=20), \
                  patch("saasshorts._get_media_duration", return_value=20):
                 result = generate_storyboard_video(script, config, tmp)
 
@@ -489,6 +490,7 @@ class SaaSStoryboardTests(unittest.TestCase):
                  patch("saasshorts.generate_storyboard_chunk_clip", side_effect=AssertionError("Veo should not use multi-shot chunks")), \
                  patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
                  patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
+                 patch("saasshorts._decodable_audio_duration", return_value=8), \
                  patch("saasshorts._get_media_duration", return_value=8):
                 result = generate_storyboard_video(script, config, tmp)
 

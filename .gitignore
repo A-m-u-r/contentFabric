@@ -45,3 +45,6 @@ skills-lock.json
 voice_test/*.mp3
 voice_test/*.png
 *.gif
+
+# Local debug artifacts (preserved failed jobs, assembled test videos)
+debug/

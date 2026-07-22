@@ -43,7 +43,7 @@ KEY_VAULT_SECRET = os.environ.get("OPENSHORTS_KEY_VAULT_SECRET") or os.environ.g
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+JOB_RETENTION_SECONDS = 86400  # 24 hour retention (keep finished/failed jobs for a full day of debugging)
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 
 # Directories under OUTPUT_DIR that hold reusable user assets (uploaded/generated

@@ -9,6 +9,13 @@ export default defineConfig({
       'openshorts.app',
       'www.openshorts.app'
     ],
+    // On Windows + Docker the bind-mount doesn't forward inotify events, so
+    // Vite's HMR never sees host edits. Polling makes the container re-check
+    // files on a timer instead — edits show up without restarting the container.
+    watch: {
+      usePolling: true,
+      interval: 300,
+    },
     proxy: {
       '/api': {
         target: 'http://backend:8000',

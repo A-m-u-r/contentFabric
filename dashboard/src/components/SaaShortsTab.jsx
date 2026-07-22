@@ -281,13 +281,14 @@ function activeVideoModeOptions(scriptFormat) {
 }
 
 function estimateStoryboardSeconds(script, fallbackText) {
+  // The rendered length is driven by the voiceover (assembled from each shot's
+  // speech), NOT by the shots' start/end — the backend tiles shots across the
+  // voiceover and ignores their durations. So estimate from spoken words, the
+  // same way the pipeline does; otherwise trimming shot lengths would falsely
+  // lower the quote while the real cost (set by the narration) stays put.
   if (Array.isArray(script?.shots) && script.shots.length > 0) {
-    return Math.max(3, Math.round(script.shots.reduce((sum, shot) => {
-      const start = Number(shot.start || 0);
-      const end = Number(shot.end || 0);
-      const duration = Number(shot.duration || 0);
-      return sum + Math.max(3, end > start ? end - start : duration || 3);
-    }, 0)));
+    const speech = script.shots.map((shot) => shot.speech || '').join(' ').trim();
+    if (speech) return estimateSpeechSeconds(speech);
   }
   return estimateSpeechSeconds(fallbackText);
 }
@@ -306,22 +307,60 @@ function pluralShots(n) {
   return 'кадров';
 }
 
+// Duration of a single shot in whole seconds (min 1). We keep the storyboard on
+// a "each shot has a length" model; absolute start/end are derived from it.
+function shotDurationSeconds(shot) {
+  const raw = Number(shot?.end ?? 0) - Number(shot?.start ?? 0);
+  if (Number.isFinite(raw) && raw >= 1) return Math.round(raw);
+  const explicit = Number(shot?.duration ?? 0);
+  return explicit >= 1 ? Math.round(explicit) : 3;
+}
+
+// Re-flow the timeline so shots are back-to-back: each shot keeps its own
+// length, but start/end are recomputed sequentially from the first shot's
+// anchor. Runs after any add / remove / reorder / duplicate / length edit so
+// the timing never ends up with gaps or overlaps.
+function resequenceShotTimeline(shots) {
+  let cursor = shots.length ? Number(shots[0].start ?? 0) || 0 : 0;
+  return shots.map((shot) => {
+    const dur = shotDurationSeconds(shot);
+    const start = cursor;
+    const end = start + dur;
+    cursor = end;
+    return { ...shot, start, end };
+  });
+}
+
+// Total storyboard length in whole seconds.
+function totalShotSeconds(shots) {
+  return (shots || []).reduce((sum, shot) => sum + shotDurationSeconds(shot), 0);
+}
+
 function splitStoryboardSeconds(script, totalSeconds) {
-  // Говорящие кадры и b-roll тарифицируются разными моделями.
+  // Говорящие кадры и b-roll тарифицируются разными моделями. Бэкенд нарезает
+  // время по словам речи (а не по длительностям кадров) и пропускает кадры без
+  // речи — поэтому долю b-roll считаем по словам, и только у кадров с речью.
   if (Array.isArray(script?.shots) && script.shots.length > 0) {
-    let broll = 0;
+    const wordsOf = (shot) => (shot.speech || '').trim().split(/\s+/).filter(Boolean).length;
+    const totalWords = script.shots.reduce((sum, shot) => sum + wordsOf(shot), 0);
+    let brollWords = 0;
     let brollShots = 0;
+    let talkingShots = 0;
     for (const shot of script.shots) {
-      const dur = Math.max(3, Number(shot.end || 0) - Number(shot.start || 0) || Number(shot.duration || 0) || 3);
+      const words = wordsOf(shot);
+      if (words <= 0) continue; // кадры без речи не генерируются
       if ((shot.visual_type || '').toLowerCase() === 'broll') {
-        broll += dur;
+        brollWords += words;
         brollShots += 1;
+      } else {
+        talkingShots += 1;
       }
     }
-    return { talking: Math.max(0, totalSeconds - broll), broll, brollShots };
+    const broll = totalWords > 0 ? (brollWords / totalWords) * totalSeconds : 0;
+    return { talking: Math.max(0, totalSeconds - broll), broll, brollShots, talkingShots };
   }
   // Сценария ещё нет: типичная раскадровка ~70% речи в кадре и 2 b-roll вставки.
-  return { talking: totalSeconds * 0.7, broll: totalSeconds * 0.3, brollShots: 2 };
+  return { talking: totalSeconds * 0.7, broll: totalSeconds * 0.3, brollShots: 2, talkingShots: 3 };
 }
 
 function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null, storyboardGenerationMode = 'sliced_avatar' }) {
@@ -348,8 +387,10 @@ function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSel
     const brollRate = STORYBOARD_RATE[videoMode] && videoMode !== 'storyboard_veo31_quality'
       ? STORYBOARD_RATE[videoMode]
       : STORYBOARD_RATE.storyboard_v3_standard;
-    const { talking, broll, brollShots } = splitStoryboardSeconds(script, storyboardSeconds);
-    videoCost = talking * AVATAR_RATE[avatarTier];
+    const { talking, broll, brollShots, talkingShots } = splitStoryboardSeconds(script, storyboardSeconds);
+    // Каждый говорящий кадр стартует со свежего Flux-кадра (аватар + сцена),
+    // как b-roll — иначе Kling клонирует человека по краям из одного фото.
+    videoCost = talking * AVATAR_RATE[avatarTier] + talkingShots * FLUX_FRAME_COST;
     brollCost = broll * brollRate + brollShots * FLUX_FRAME_COST;
   } else if (storyboardMode) {
     videoCost = storyboardSeconds * (STORYBOARD_RATE[videoMode] || STORYBOARD_RATE.storyboard_v3_standard);
@@ -572,6 +613,8 @@ export default function SaaShortsTab({
   // Drag-and-drop reordering of storyboard shots.
   const [dragShotIndex, setDragShotIndex] = useState(null);
   const [dragOverShotIndex, setDragOverShotIndex] = useState(null);
+  // Which shots have the (optional, technical) "prompt for the AI" field open.
+  const [openPromptShots, setOpenPromptShots] = useState({});
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
@@ -1013,6 +1056,23 @@ export default function SaaShortsTab({
     });
   };
 
+  // Change a single shot's length (seconds) and re-flow every shot after it so
+  // the timeline stays contiguous. Not an undo checkpoint — it's a plain edit.
+  const setSelectedShotDuration = (shotIndex, seconds) => {
+    const dur = Math.max(1, Math.round(Number(seconds) || 0) || 1);
+    const nextScripts = scripts.map((script, idx) => {
+      if (idx !== selectedScript) return script;
+      const shots = (script.shots || []).map((shot, j) => (
+        j === shotIndex
+          ? { ...shot, end: Number(shot.start ?? 0) + dur }
+          : { ...shot }
+      ));
+      return { ...script, format: 'storyboard_v3', shots: resequenceShotTimeline(shots) };
+    });
+    setScripts(nextScripts);
+    persistScripts(nextScripts);
+  };
+
   // Keep shot_number in sync with position after add / delete / reorder.
   const renumberShots = (shots) => shots.map((shot, idx) => ({ ...shot, shot_number: idx + 1 }));
 
@@ -1042,7 +1102,7 @@ export default function SaaShortsTab({
     const prevShots = (scripts[selectedScript]?.shots || []).map((shot) => ({ ...shot }));
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
-      const shots = renumberShots(mutator([...(script.shots || [])]));
+      const shots = resequenceShotTimeline(renumberShots(mutator([...(script.shots || [])])));
       return { ...script, format: 'storyboard_v3', shots };
     });
     setShotHistory((history) => [
@@ -2093,12 +2153,18 @@ export default function SaaShortsTab({
                         </span>
                         <div>
                           <h3 className="text-sm font-semibold text-zinc-200">{script.title}</h3>
-                          <span className="text-[10px] text-zinc-500">{script.duration_seconds}s &middot; {script.style} &middot; {script.target_platform}</span>
+                          <span className="text-[10px] text-zinc-500">
+                            {[
+                              `${script.duration_seconds || estimateStoryboardSeconds(script)} сек`,
+                              script.style,
+                              script.target_platform,
+                            ].filter(Boolean).join(' · ')}
+                          </span>
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
                         {selectedScript === i && (
-                          <span className="text-[10px] bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-full">Selected</span>
+                          <span className="text-[10px] bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-full">Выбран</span>
                         )}
                         <button
                           type="button"
@@ -2211,24 +2277,14 @@ export default function SaaShortsTab({
                                     onChange={(event) => handleScriptDraftShot(j, 'speech', event.target.value)}
                                   />
                                 </label>
-                                <div className="grid gap-3 md:grid-cols-2">
-                                  <label className="space-y-1.5 text-xs text-zinc-400">
-                                    <span>Текст на экране</span>
-                                    <input
-                                      className="input-field py-2 text-sm"
-                                      value={shot.overlay_text || ''}
-                                      onChange={(event) => handleScriptDraftShot(j, 'overlay_text', event.target.value)}
-                                    />
-                                  </label>
-                                  <label className="space-y-1.5 text-xs text-zinc-400">
-                                    <span>Подсказка для нейросети</span>
-                                    <input
-                                      className="input-field py-2 text-sm"
-                                      value={shot.generation_prompt || ''}
-                                      onChange={(event) => handleScriptDraftShot(j, 'generation_prompt', event.target.value)}
-                                    />
-                                  </label>
-                                </div>
+                                <label className="space-y-1.5 text-xs text-zinc-400 block">
+                                  <span>Подсказка для нейросети</span>
+                                  <input
+                                    className="input-field py-2 text-sm"
+                                    value={shot.generation_prompt || ''}
+                                    onChange={(event) => handleScriptDraftShot(j, 'generation_prompt', event.target.value)}
+                                  />
+                                </label>
                               </div>
                             ))}
                           </div>
@@ -2305,7 +2361,6 @@ export default function SaaShortsTab({
                                 <div className="min-w-0 space-y-1">
                                   <p className="text-zinc-300 leading-relaxed">{shot.scene || shot.generation_prompt}</p>
                                   {shot.speech && <p className="text-zinc-500 leading-relaxed">«{shot.speech}»</p>}
-                                  {shot.overlay_text && <span className="inline-flex text-[10px] bg-violet-500/10 text-violet-300 px-2 py-0.5 rounded-full">{shot.overlay_text}</span>}
                                 </div>
                               </div>
                             ))}
@@ -2409,6 +2464,9 @@ export default function SaaShortsTab({
                       <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
                         {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
                       </span>
+                      <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
+                        ~{totalShotSeconds(scripts[selectedScript].shots)} сек
+                      </span>
                     </div>
                   </div>
 
@@ -2438,7 +2496,9 @@ export default function SaaShortsTab({
                                 : 'border-white/10'
                           }`}
                         >
-                          {/* Header: drag handle + number + type + actions */}
+                          {/* Header: drag handle + number + actions. The shot
+                              type is set (and shown) by the Говорит/Перебивка
+                              toggle below, so no separate read-only badge here. */}
                           <div className="mb-3 flex items-center justify-between gap-2">
                             <div className="flex items-center gap-1.5">
                               <button
@@ -2454,9 +2514,6 @@ export default function SaaShortsTab({
                               </button>
                               <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-primary/15 px-2 text-xs font-semibold text-violet-200">
                                 {shotIndex + 1}
-                              </span>
-                              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isBroll ? 'bg-white/5 text-zinc-400' : 'bg-primary/10 text-violet-300'}`}>
-                                {isBroll ? 'Перебивка' : 'Говорит'}
                               </span>
                             </div>
                             <div className="flex items-center gap-0.5">
@@ -2552,20 +2609,15 @@ export default function SaaShortsTab({
                                   </button>
                                 </div>
                                 <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
+                                  <span>Длительность</span>
                                   <input
                                     type="number"
-                                    value={shot.start ?? 0}
-                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'start', event.target.value)}
+                                    min="1"
+                                    step="1"
+                                    value={shotDurationSeconds(shot)}
+                                    onChange={(event) => setSelectedShotDuration(shotIndex, event.target.value)}
                                     className="input-field w-14 py-1 text-[11px]"
-                                    aria-label="Начало кадра, сек"
-                                  />
-                                  <span>–</span>
-                                  <input
-                                    type="number"
-                                    value={shot.end ?? 3}
-                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'end', event.target.value)}
-                                    className="input-field w-14 py-1 text-[11px]"
-                                    aria-label="Конец кадра, сек"
+                                    aria-label="Длительность кадра, сек"
                                   />
                                   <span>сек</span>
                                 </div>
@@ -2593,26 +2645,35 @@ export default function SaaShortsTab({
                                   В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
                                 </p>
                               )}
-                              <div className="grid gap-3 md:grid-cols-2">
-                                <label className="space-y-1.5 text-xs text-zinc-400">
-                                  <span>Текст на экране</span>
-                                  <input
-                                    className="input-field py-2 text-sm"
-                                    value={shot.overlay_text || ''}
-                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'overlay_text', event.target.value)}
-                                    placeholder="Необязательно"
-                                  />
-                                </label>
-                                <label className="space-y-1.5 text-xs text-zinc-400">
-                                  <span>Подсказка для нейросети</span>
-                                  <input
-                                    className="input-field py-2 text-sm"
-                                    value={shot.generation_prompt || ''}
-                                    onChange={(event) => handleSelectedScriptShot(shotIndex, 'generation_prompt', event.target.value)}
-                                    placeholder="Как отрисовать кадр"
-                                  />
-                                </label>
-                              </div>
+                              {(() => {
+                                // Collapsed by default: the prompt is auto-derived from the
+                                // scene/speech and is noise for most users. They open it only
+                                // when they deliberately want to hand-tune how the shot is drawn.
+                                const promptOpen = shotIndex in openPromptShots
+                                  ? openPromptShots[shotIndex]
+                                  : false;
+                                return (
+                                  <div>
+                                    <button
+                                      type="button"
+                                      onClick={() => setOpenPromptShots((m) => ({ ...m, [shotIndex]: !promptOpen }))}
+                                      className="inline-flex items-center gap-1 text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
+                                    >
+                                      <ChevronDown size={12} className={`transition-transform ${promptOpen ? 'rotate-180' : ''}`} />
+                                      Подсказка для нейросети
+                                      <span className="text-zinc-600">— чем и как рисовать кадр, можно не трогать</span>
+                                    </button>
+                                    {promptOpen && (
+                                      <input
+                                        className="input-field mt-1.5 py-2 text-sm"
+                                        value={shot.generation_prompt || ''}
+                                        onChange={(event) => handleSelectedScriptShot(shotIndex, 'generation_prompt', event.target.value)}
+                                        placeholder="Напр.: крупный план, тёплый свет, реалистично"
+                                      />
+                                    )}
+                                  </div>
+                                );
+                              })()}
                             </div>
                           </div>
                         </div>

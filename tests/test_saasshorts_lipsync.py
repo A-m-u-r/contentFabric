@@ -42,6 +42,75 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertEqual(kling_avatar_cost_per_second("standard"), 0.0562)
         self.assertEqual(kling_avatar_cost_per_second("pro"), 0.115)
 
+    def test_avatar_prompt_forbids_duplicate_subject(self):
+        prompt = saasshorts._avatar_request_prompt("close-up, warm light")
+        self.assertIn("close-up, warm light", prompt)
+        lowered = prompt.lower()
+        self.assertIn("one single person", lowered)
+        self.assertIn("never duplicate", lowered)
+
+    def test_avatar_reference_image_conditions_on_photo_and_scene(self):
+        class FakeResp:
+            content = b"frame"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url):
+                return FakeResp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "avatar.png")
+            with open(photo, "wb") as f:
+                f.write(b"photo")
+            out = os.path.join(tmp, "scene_01.png")
+            fal_runs = []
+
+            def fake_run(model_id, payload, key, timeout=600):
+                fal_runs.append((model_id, payload))
+                return {"images": [{"url": "https://fal/out.png"}]}
+
+            with patch("saasshorts._fal_upload_file", return_value="https://fal/up.png"), \
+                 patch("saasshorts._fal_run", side_effect=fake_run), \
+                 patch("saasshorts.httpx.Client", FakeClient):
+                result = saasshorts._avatar_reference_image(
+                    {"scene": "kitchen close-up", "generation_prompt": ""},
+                    photo, "fal-key", out, log=lambda m: None,
+                )
+
+            self.assertEqual(result, out)
+            self.assertTrue(os.path.exists(out))
+            model_id, payload = fal_runs[0]
+            self.assertEqual(model_id, saasshorts.AVATAR_REFERENCE_MODEL)
+            self.assertEqual(payload["image_url"], "https://fal/up.png")
+            self.assertIn("kitchen close-up", payload["prompt"])
+            self.assertIn("same person", payload["prompt"].lower())
+            self.assertTrue(os.path.exists(f"{out}.prompt.txt"))
+
+    def test_avatar_reference_image_falls_back_to_empty_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "avatar.png")
+            with open(photo, "wb") as f:
+                f.write(b"photo")
+            out = os.path.join(tmp, "scene_01.png")
+            with patch("saasshorts._fal_upload_file", return_value="u"), \
+                 patch("saasshorts._fal_run", side_effect=RuntimeError("model down")):
+                result = saasshorts._avatar_reference_image(
+                    {"scene": "x"}, photo, "k", out, log=lambda m: None,
+                )
+            self.assertEqual(result, "")
+            self.assertFalse(os.path.exists(out))
+
     def test_builds_sync3_payload(self):
         model_id, payload = build_sync_lipsync_request(
             "https://cdn.example/head.mp4",
@@ -110,6 +179,20 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertEqual(selected["name"], "tail_silence")
         self.assertEqual(selected["output_path"], "tail.mp4")
 
+    def test_no_completed_attempts_surfaces_underlying_error(self):
+        attempts = [{
+            "name": "base",
+            "output_path": "base.mp4",
+            "error": "fal.ai result fetch error (422): audio_load_error",
+        }]
+
+        with self.assertRaises(Exception) as ctx:
+            select_best_talking_head_attempt(attempts)
+
+        message = str(ctx.exception)
+        self.assertIn("No completed talking-head attempts", message)
+        self.assertIn("audio_load_error", message)
+
     def test_prepare_voiceover_trims_tail_silence_and_writes_audit(self):
         class FakeRunResult:
             def __init__(self, stdout="", stderr=""):
@@ -132,7 +215,8 @@ class SaaSLipSyncTests(unittest.TestCase):
                     return FakeRunResult()
                 raise AssertionError(f"Unexpected command: {command}")
 
-            with patch("saasshorts._get_media_duration", side_effect=[4.21, 3.12]), \
+            with patch("saasshorts._get_media_duration", return_value=4.21), \
+                 patch("saasshorts._decodable_audio_duration", return_value=3.12), \
                  patch("saasshorts.subprocess.run", side_effect=fake_run):
                 report = saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
 
@@ -171,7 +255,8 @@ class SaaSLipSyncTests(unittest.TestCase):
                     return FakeRunResult()
                 raise AssertionError(f"Unexpected command: {command}")
 
-            with patch("saasshorts._get_media_duration", side_effect=[28.84, 0.89]), \
+            with patch("saasshorts._get_media_duration", return_value=28.84), \
+                 patch("saasshorts._decodable_audio_duration", side_effect=[0.89, 28.84]), \
                  patch("saasshorts.subprocess.run", side_effect=fake_run):
                 report = saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
 
@@ -182,6 +267,87 @@ class SaaSLipSyncTests(unittest.TestCase):
             trim_command = next(cmd for cmd in seen_commands if "silenceremove" in cmd)
             self.assertIn("areverse", trim_command)
             self.assertNotIn("stop_periods", trim_command)
+
+    def test_prepare_voiceover_rejects_empty_cleaned_audio(self):
+        # Regression: an empty/near-silent TTS collapses to an unreadable stub
+        # that Kling rejects with an opaque 422. prepare_voiceover must stop the
+        # job here with a clear cause instead of passing the broken clip on.
+        class FakeRunResult:
+            def __init__(self, stdout="", stderr=""):
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = os.path.join(tmp, "voice.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(b"raw-audio")
+
+            def fake_run(cmd, *args, **kwargs):
+                command = " ".join(str(part) for part in cmd)
+                if "silencedetect" in command:
+                    return FakeRunResult(stderr="")
+                if "silenceremove" in command:
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"stub")
+                    return FakeRunResult()
+                raise AssertionError(f"Unexpected command: {command}")
+
+            # First None: cleaned clip is unreadable -> fall back to raw audio.
+            # Second None: the raw audio is unusable too -> _finalize must raise.
+            with patch("saasshorts._get_media_duration", return_value=0.55), \
+                 patch("saasshorts._decodable_audio_duration", side_effect=[None, None]), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(ValueError) as ctx:
+                    saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
+
+            self.assertIn("add spoken lines", str(ctx.exception))
+            self.assertFalse(os.path.exists(saasshorts.prepared_voiceover_path(audio_path)))
+
+    def test_prepare_voiceover_cache_hit_rejects_corrupt_clip(self):
+        # Mirrors the real retry bug: a cached clean file exists but is a broken
+        # 670-byte MP3. The stale cache hit must still be validated and rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = os.path.join(tmp, "voice.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(b"raw-audio")
+            clean_path = saasshorts.prepared_voiceover_path(audio_path)
+            with open(clean_path, "wb") as f:
+                f.write(b"corrupt-stub")
+
+            source_stat = os.stat(audio_path)
+            saasshorts._write_json_file(f"{clean_path}.meta.json", {
+                "source_size": source_stat.st_size,
+                "source_mtime_ns": source_stat.st_mtime_ns,
+                "path": clean_path,
+                "duration": 30.0,
+                "status": "normalized",
+            })
+
+            with patch("saasshorts._decodable_audio_duration", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    saasshorts.prepare_voiceover_for_video_generation(audio_path, log=lambda message: None)
+
+            self.assertIn("add spoken lines", str(ctx.exception))
+
+    def test_generate_voiceover_with_fallback_rejects_empty_text(self):
+        # Empty narration must fail before any TTS call, with the real cause.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "voice.mp3")
+            with patch("saasshorts.generate_voiceover") as eleven, \
+                 patch("saasshorts.generate_voiceover_minimax") as minimax:
+                with self.assertRaises(ValueError) as ctx:
+                    saasshorts.generate_voiceover_with_fallback(
+                        "   ",
+                        output_path,
+                        provider="elevenlabs",
+                        fal_key="fal",
+                        elevenlabs_key="eleven",
+                    )
+            self.assertIn("text is empty", str(ctx.exception))
+            eleven.assert_not_called()
+            minimax.assert_not_called()
+            self.assertFalse(os.path.exists(output_path))
 
     def test_full_video_uses_prepared_voiceover_for_kling_subtitles_and_cost(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,6 +567,7 @@ class SaaSLipSyncTests(unittest.TestCase):
             with patch("saasshorts.generate_sync_lipsync_video", side_effect=fake_lipsync), \
                  patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
                  patch("saasshorts.composite_video", side_effect=fake_composite), \
+                 patch("saasshorts._decodable_audio_duration", return_value=12), \
                  patch("saasshorts._get_media_duration", return_value=12):
                 result = apply_lipsync_to_saas_job(tmp, "fal-test", model="lipsync-2")
 
@@ -465,6 +632,7 @@ class SaaSLipSyncTests(unittest.TestCase):
                  patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
                  patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
                  patch("saasshorts.composite_video", side_effect=fake_composite), \
+                 patch("saasshorts._decodable_audio_duration", return_value=18), \
                  patch("saasshorts._get_media_duration", return_value=18), \
                  patch("saasshorts.generate_talking_head", side_effect=AssertionError("should not generate Kling head")), \
                  patch("saasshorts.generate_talking_head_lowcost", side_effect=AssertionError("should not generate Hailuo head")), \
@@ -546,6 +714,7 @@ class SaaSLipSyncTests(unittest.TestCase):
                  patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
                  patch("saasshorts.generate_tiktok_subs", side_effect=fake_subs), \
                  patch("saasshorts.composite_video", side_effect=fake_composite) as composite_mock, \
+                 patch("saasshorts._decodable_audio_duration", return_value=10), \
                  patch("saasshorts._get_media_duration", return_value=10):
                 result = generate_full_video(script, config, tmp)
 
@@ -843,6 +1012,179 @@ class SlicedAvatarTests(unittest.TestCase):
 
             self.assertEqual(result["storyboard_generation_mode"], "sliced_avatar")
             self.assertIn("sliced_avatar_kling_standard", result["cost_estimate"])
+
+    def test_storyboard_voiceover_rebuilds_from_current_shots_not_stale_narration(self):
+        # Regression: deleting shots in the editor left a stale script-level
+        # full_narration (from the original 7-shot draft), so the voiceover — and
+        # thus the video length and cost — was generated for shots that no longer
+        # exist. The narration must come from the CURRENT shots.
+        with tempfile.TemporaryDirectory() as tmp:
+            ref1 = os.path.join(tmp, "ref1.png")
+            ref2 = os.path.join(tmp, "ref2.png")
+            for p in (ref1, ref2):
+                with open(p, "wb") as f:
+                    f.write(b"img")
+
+            voice_texts = []
+
+            def fake_voiceover(text, output_path, **kwargs):
+                voice_texts.append(text)
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+
+            def fake_prepare(audio_path, log=print):
+                return {"path": audio_path, "status": "ok", "trimmed": False}
+
+            def fake_slice(audio_path, start, end, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"slice")
+                return output_path
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            def fake_subs(audio_path, shots, output_path, max_words=2, words=None, **kwargs):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            script = {
+                "title": "Trimmed",
+                "format": "storyboard_v3",
+                "language": "ru",
+                # Stale draft narration for SEVEN shots — must be ignored.
+                "full_narration": "Раз. Два. Три. Четыре. Пять. Шесть. Семь.",
+                "shots": [
+                    {"shot_number": 1, "role": "hook", "start": 0, "end": 4,
+                     "speech": "Оставленная первая.", "image_path": ref1,
+                     "scene": "close-up", "overlay_text": "", "transition": "cut"},
+                    {"shot_number": 2, "role": "cta", "start": 4, "end": 8,
+                     "speech": "Оставленная вторая.", "image_path": ref2,
+                     "scene": "medium", "overlay_text": "", "transition": "cut"},
+                ],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "video_mode": "storyboard_v3_standard",
+                "storyboard_generation_mode": "sliced_avatar",
+            }
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=fake_prepare), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=AssertionError("should not use Kling V3")), \
+                 patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
+                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
+                 patch("saasshorts.generate_actor_image", side_effect=AssertionError("reference frames should be used")), \
+                 patch("saasshorts._get_media_duration", return_value=8.0):
+                saasshorts.generate_storyboard_video(script, config, tmp)
+
+            self.assertEqual(len(voice_texts), 1)
+            self.assertEqual(voice_texts[0], "Оставленная первая. Оставленная вторая.")
+            self.assertNotIn("Семь", voice_texts[0])
+
+    def test_sliced_avatar_stages_scene_from_saved_photo_and_trims_to_kept_shots(self):
+        # Covers two fixes at once:
+        #  - a saved avatar photo drives a per-shot conditioned frame (not a raw
+        #    crop that made Kling clone the person), and
+        #  - trimming the storyboard to 2 shots generates exactly 2 clips.
+        with tempfile.TemporaryDirectory() as tmp:
+            actor = os.path.join(tmp, "avatar.png")
+            with open(actor, "wb") as f:
+                f.write(b"avatarphoto")
+
+            head_calls = []
+            scene_calls = []
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+
+            def fake_prepare(audio_path, log=print):
+                return {"path": audio_path, "status": "ok", "trimmed": False}
+
+            def fake_slice(audio_path, start, end, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"slice")
+                return output_path
+
+            def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
+                head_calls.append(image_path)
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_avatar_ref(shot, actor_photo, fal_key, output_path, log=print):
+                scene_calls.append((actor_photo, output_path))
+                with open(output_path, "wb") as f:
+                    f.write(b"scene")
+                return output_path
+
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            def fake_subs(audio_path, shots, output_path, max_words=2, words=None, **kwargs):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            script = {
+                "title": "Saved actor",
+                "format": "storyboard_v3",
+                "language": "ru",
+                "shots": [
+                    {"shot_number": 1, "role": "hook", "start": 0, "end": 4,
+                     "speech": "Первая.", "scene": "close-up", "transition": "cut"},
+                    {"shot_number": 2, "role": "cta", "start": 4, "end": 8,
+                     "speech": "Вторая.", "scene": "medium", "transition": "cut"},
+                ],
+            }
+            config = {
+                "fal_key": "fal-test",
+                "tts_provider": "fal_minimax",
+                "language": "ru",
+                "video_mode": "storyboard_v3_standard",
+                "storyboard_generation_mode": "sliced_avatar",
+                "selected_actor_path": actor,
+            }
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=fake_prepare), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
+                 patch("saasshorts._avatar_reference_image", side_effect=fake_avatar_ref), \
+                 patch("saasshorts._avatar_reference_variant",
+                       side_effect=AssertionError("should stage from the photo, not crop it")), \
+                 patch("saasshorts.generate_storyboard_shot_clip",
+                       side_effect=AssertionError("talking shots must not use Kling V3")), \
+                 patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
+                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
+                 patch("saasshorts._get_media_duration", return_value=8.0):
+                saasshorts.generate_storyboard_video(script, config, tmp)
+
+            # Exactly two shots kept -> exactly two clips generated.
+            self.assertEqual(len(head_calls), 2)
+            # Every clip was staged from the saved photo, and the talking head was
+            # driven by the conditioned frame (not the raw photo/crop).
+            self.assertEqual(len(scene_calls), 2)
+            self.assertTrue(all(src == actor for src, _ in scene_calls))
+            self.assertEqual(set(head_calls), {out for _, out in scene_calls})
 
     def test_storyboard_sliced_avatar_routes_broll_shots_to_v3(self):
         with tempfile.TemporaryDirectory() as tmp:
