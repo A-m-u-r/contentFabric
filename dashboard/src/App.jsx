@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Target, CalendarDays } from 'lucide-react';
+import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Target, CalendarDays } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -320,6 +320,15 @@ const ProviderKeyInput = ({
   );
 };
 
+// Russian plural for "клип": 1 клип, 2 клипа, 5 клипов.
+const clipsPlural = (n) => {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'клип';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'клипа';
+  return 'клипов';
+};
+
 function App() {
   useRuntimeLocalization('ru');
 
@@ -364,10 +373,11 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [logsVisible, setLogsVisible] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  const [activeTab, setActiveTab] = useState('saasshorts'); // saasshorts (главный), dashboard, settings
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -759,11 +769,12 @@ function App() {
   // One nav config drives both the desktop sidebar and the mobile bar so they
   // can never drift. A single brand accent (violet) marks the active tab.
   const navItems = [
-    { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard },
     { id: 'saasshorts', label: 'AI Shorts', shortLabel: 'Shorts', icon: Sparkles },
+    { id: 'dashboard', label: 'Генератор клипов', shortLabel: 'Клипы', icon: LayoutDashboard },
     { id: 'projects', label: 'Проекты', shortLabel: 'Проекты', icon: Target },
     { id: 'content-plan', label: 'Контент-план', shortLabel: 'План', icon: CalendarDays },
-    { id: 'ai-agent', label: 'AI-агент', shortLabel: 'Агент', icon: Bot },
+    // 'ai-agent' скрыт из навигации: сейчас это маркетинговая страница со
+    // ссылкой на публичный GitHub, а не рабочая фича. Вернём, когда будет что показать.
     { id: 'ugc-gallery', label: 'UGC-галерея', shortLabel: 'UGC', icon: LayoutGrid },
     { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image },
     { id: 'settings', label: 'Настройки', shortLabel: 'Ключи', icon: Settings },
@@ -803,60 +814,80 @@ function App() {
         })}
       </nav>
 
-      <div className="p-4 border-t border-white/5">
-        <a
-          href="#"
-          onClick={(e) => { e.preventDefault(); localStorage.removeItem('openshorts_skip_landing'); window.location.hash = ''; window.location.reload(); }}
-          className="flex items-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors group"
-        >
-          <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-            <Globe size={16} />
-          </div>
-          <div className="hidden xl:block overflow-hidden">
-            <p className="text-sm font-bold text-white leading-none mb-0.5">Лендинг</p>
-            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">Открыть сайт</p>
-          </div>
-        </a>
-        {/*
-            <svg height="20" viewBox="0 0 16 16" version="1.1" width="20" aria-hidden="true"><path fillRule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-          </div>
-          <div className="hidden xl:block overflow-hidden">
-            <p className="text-[10px] text-zinc-400 group-hover:text-zinc-300 transition-colors truncate">Открытый код</p>
-          </div>
-        </a>
-        */}
-      </div>
     </div>
   );
 
-  const MobileTabBar = () => (
-    <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
-      <div
-        className="grid gap-1"
-        style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' }}
-      >
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setActiveTab(item.id)}
-              aria-label={item.label}
-              aria-current={isActive ? 'page' : undefined}
-              className={`flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-0.5 text-[10px] font-semibold transition-colors ${
-                isActive ? 'bg-primary/10 text-primary' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
-              }`}
-            >
-              <Icon size={18} className="shrink-0" />
-              <span className="max-w-full truncate">{item.shortLabel}</span>
-            </button>
-          );
-        })}
-      </div>
-    </nav>
-  );
+  // Bottom bar keeps one clean row: the 4 primary tabs + an «Ещё» button that
+  // reveals the rest in a popover. Everything stays reachable on mobile without
+  // a cramped two-row bar.
+  const MobileTabBar = () => {
+    const primary = navItems.slice(0, 4);
+    const overflow = navItems.slice(4);
+    const overflowActive = overflow.some((item) => item.id === activeTab);
+    const tabButtonClass = (isActive) =>
+      `flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-0.5 text-[10px] font-semibold transition-colors ${
+        isActive ? 'bg-primary/10 text-primary' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+      }`;
+
+    return (
+      <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
+        {mobileMoreOpen && (
+          <>
+            <div className="fixed inset-0 z-0" onClick={() => setMobileMoreOpen(false)} />
+            <div className="absolute bottom-full right-2 z-10 mb-2 w-56 rounded-2xl border border-white/10 bg-[#1a1a1a] p-2 shadow-2xl">
+              {overflow.map((item) => {
+                const Icon = item.icon;
+                const isActive = activeTab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => { setActiveTab(item.id); setMobileMoreOpen(false); }}
+                    aria-current={isActive ? 'page' : undefined}
+                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-colors ${
+                      isActive ? 'bg-primary/10 text-primary' : 'text-zinc-300 hover:bg-white/5'
+                    }`}
+                  >
+                    <Icon size={18} className="shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+        <div className="relative z-10 grid gap-1" style={{ gridTemplateColumns: 'repeat(5, minmax(0, 1fr))' }}>
+          {primary.map((item) => {
+            const Icon = item.icon;
+            const isActive = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => { setActiveTab(item.id); setMobileMoreOpen(false); }}
+                aria-label={item.label}
+                aria-current={isActive ? 'page' : undefined}
+                className={tabButtonClass(isActive)}
+              >
+                <Icon size={18} className="shrink-0" />
+                <span className="max-w-full truncate">{item.shortLabel}</span>
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => setMobileMoreOpen((v) => !v)}
+            aria-label="Ещё разделы"
+            aria-expanded={mobileMoreOpen}
+            className={tabButtonClass(overflowActive || mobileMoreOpen)}
+          >
+            <Menu size={18} className="shrink-0" />
+            <span className="max-w-full truncate">Ещё</span>
+          </button>
+        </div>
+      </nav>
+    );
+  };
 
   if (authLoading && !authUser) {
     return (
@@ -937,16 +968,6 @@ function App() {
               />
             )}
 
-            {!effectiveGeminiKey && (
-              <button
-                onClick={() => setActiveTab('settings')}
-                className="text-xs text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-1 rounded-full border border-amber-500/30 transition-colors flex items-center gap-1.5"
-                title="Открыть настройки и указать API-ключ"
-              >
-                <AlertTriangle size={12} />
-                Нет ключа Gemini
-              </button>
-            )}
           </div>
         </header>
 
@@ -1343,10 +1364,10 @@ function App() {
               <div className="max-w-xl w-full text-center space-y-8">
                 <div className="space-y-4">
                   <h1 className="text-4xl md:text-5xl font-black bg-gradient-to-b from-white to-white/60 bg-clip-text text-transparent">
-                    Create Viral Shorts
+                    Вирусные клипы из длинного видео
                   </h1>
                   <p className="text-zinc-400 text-lg">
-                    Drop your long-form video below to instantly generate viral clips with AI.
+                    Загрузи длинное вертикальное видео — ИИ сам найдёт лучшие моменты и нарежет из них клипы.
                   </p>
                 </div>
 
@@ -1370,13 +1391,13 @@ function App() {
                 <div className="mb-6 flex items-center justify-between">
                   <h2 className="text-lg font-semibold flex items-center gap-2">
                     <Activity className={`text-primary ${status === 'processing' ? 'animate-pulse' : ''}`} size={20} />
-                    Live Analysis
+                    Анализ в реальном времени
                   </h2>
                   <span className={`text-xs px-2 py-1 rounded-full border ${status === 'processing' ? 'bg-primary/10 border-primary/20 text-primary' :
                     status === 'complete' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
                       'bg-red-500/10 border-red-500/20 text-red-400'
                     }`}>
-                    {status.toUpperCase()}
+                    {status === 'processing' ? 'Обработка' : status === 'complete' ? 'Готово' : 'Ошибка'}
                   </span>
                 </div>
 
@@ -1395,7 +1416,7 @@ function App() {
                 <div className={`bg-[#0c0c0e] rounded-xl border border-white/10 overflow-hidden flex flex-col transition-all duration-500 ${status === 'complete' ? 'h-32 min-h-0 opacity-50 hover:opacity-100' : 'flex-1 min-h-[200px]'}`}>
                   <div className="px-4 py-2 border-b border-white/5 flex items-center justify-between bg-white/5 shrink-0">
                     <span className="text-xs font-mono text-zinc-400 flex items-center gap-2">
-                      <Terminal size={12} /> System Logs
+                      <Terminal size={12} /> Логи процесса
                     </span>
                     <button onClick={() => setLogsVisible(!logsVisible)} className="text-zinc-500 hover:text-white transition-colors">
                       {logsVisible ? <ChevronDown size={14} /> : <ChevronDown size={14} className="rotate-180" />}
@@ -1421,10 +1442,10 @@ function App() {
               <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 pb-28 md:pb-6 transition-all duration-700 ease-in-out`}>
                 <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                   <Sparkles className="text-yellow-400" size={20} />
-                  Generated Shorts
+                  Готовые клипы
                   {results?.clips?.length > 0 && (
                     <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full ml-auto">
-                      {results.clips.length} Clips
+                      {results.clips.length} {clipsPlural(results.clips.length)}
                     </span>
                   )}
                   {results?.cost_analysis && (
@@ -1438,7 +1459,7 @@ function App() {
                       className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-purple-500/20 to-indigo-500/20 hover:from-purple-500/30 hover:to-indigo-500/30 border border-purple-500/30 text-purple-300 hover:text-purple-200 rounded-full text-xs font-bold transition-all"
                     >
                       <Calendar size={14} />
-                      Programar Semana
+                      Запланировать неделю
                     </button>
                   )}
                 </h2>
@@ -1467,11 +1488,11 @@ function App() {
                     status === 'processing' ? (
                       <div className="h-full flex flex-col items-center justify-center text-zinc-500 space-y-4 opacity-50">
                         <div className="w-12 h-12 rounded-full border-2 border-zinc-800 border-t-primary animate-spin" />
-                        <p className="text-sm">Waiting for clips...</p>
+                        <p className="text-sm">Ждём клипы...</p>
                       </div>
                     ) : status === 'error' ? (
                       <div className="h-full flex flex-col items-center justify-center text-red-400 space-y-2">
-                        <p>Generation failed.</p>
+                        <p>Не удалось сгенерировать.</p>
                       </div>
                     ) : null
                   )}
