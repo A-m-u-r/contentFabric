@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
@@ -299,6 +299,28 @@ const STORYBOARD_RATE = { storyboard_v3_standard: 0.084, storyboard_v3_pro: 0.11
 const FLUX_FRAME_COST = 0.05; // Flux-кадр под каждый b-roll (image-first)
 const TYPICAL_VIDEO_SECONDS = 35; // до генерации сценария длительность неизвестна
 
+// Textarea that grows to fit its content instead of clipping to a fixed number
+// of rows and showing the ugly native scrollbar. `minRows` sets the resting
+// height; it never scrolls — it just gets taller as you type.
+function AutoTextarea({ value, minRows = 3, className = '', ...props }) {
+  const ref = useRef(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      rows={minRows}
+      className={`resize-none overflow-hidden ${className}`}
+      {...props}
+    />
+  );
+}
+
 function pluralShots(n) {
   const mod10 = n % 10;
   const mod100 = n % 100;
@@ -332,10 +354,6 @@ function resequenceShotTimeline(shots) {
 }
 
 // Total storyboard length in whole seconds.
-function totalShotSeconds(shots) {
-  return (shots || []).reduce((sum, shot) => sum + shotDurationSeconds(shot), 0);
-}
-
 function splitStoryboardSeconds(script, totalSeconds) {
   // Говорящие кадры и b-roll тарифицируются разными моделями. Бэкенд нарезает
   // время по словам речи (а не по длительностям кадров) и пропускает кадры без
@@ -494,76 +512,6 @@ function saveCache(input, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
-function buildScriptDraft(script) {
-  return {
-    ...script,
-    title: script?.title || '',
-    hook_text: script?.hook_text || '',
-    caption: script?.caption || '',
-    hashtagsText: (script?.hashtags || []).join(' '),
-    segments: (script?.segments || []).map((segment) => ({ ...segment })),
-    shots: (script?.shots || []).map((shot) => ({ ...shot })),
-  };
-}
-
-function normalizeScriptDraft(draft, fallbackScript = {}) {
-  const { hashtagsText, ...scriptFields } = draft;
-  const segments = (draft.segments || []).map((segment) => ({
-    ...segment,
-    narration: segment.narration || '',
-    subtitle_text: segment.subtitle_text || segment.narration || '',
-  }));
-  const fullNarration = segments
-    .map((segment) => (segment.narration || '').trim())
-    .filter(Boolean)
-    .join(' ');
-  const hashtags = (draft.hashtagsText || '')
-    .split(/\s+/)
-    .map((tag) => tag.trim())
-    .filter(Boolean)
-    .map((tag) => (tag.startsWith('#') ? tag : `#${tag}`));
-
-  if (draft.format === 'storyboard_v3' || Array.isArray(draft.shots)) {
-    const shots = (draft.shots || []).map((shot, idx) => ({
-      ...shot,
-      shot_number: Number(shot.shot_number || idx + 1),
-      start: Number(shot.start || 0),
-      end: Number(shot.end || Number(shot.start || 0) + 3),
-      role: shot.role || `shot_${idx + 1}`,
-      scene: shot.scene || '',
-      actor_action: shot.actor_action || shot.action || '',
-      action: shot.actor_action || shot.action || '',
-      camera: shot.camera || '',
-      speech: shot.speech || '',
-      overlay_text: shot.overlay_text || '',
-      transition: shot.transition || 'cut',
-      generation_prompt: shot.generation_prompt || shot.scene || shot.speech || '',
-    }));
-    const shotNarration = shots
-      .map((shot) => (shot.speech || '').trim())
-      .filter(Boolean)
-      .join(' ');
-
-    return {
-      ...fallbackScript,
-      ...scriptFields,
-      format: 'storyboard_v3',
-      shots,
-      hashtags,
-      full_narration: shotNarration || draft.full_narration || fallbackScript.full_narration || '',
-      duration_seconds: Math.max(...shots.map((shot) => Number(shot.end || 0)), Number(draft.duration_seconds || 0), 0),
-    };
-  }
-
-  return {
-    ...fallbackScript,
-    ...scriptFields,
-    segments,
-    hashtags,
-    full_narration: fullNarration || draft.full_narration || fallbackScript.full_narration || '',
-  };
-}
-
 export default function SaaShortsTab({
   geminiApiKey,
   elevenLabsKey,
@@ -605,8 +553,6 @@ export default function SaaShortsTab({
   const [webResearch, setWebResearch] = useState(() => loadCache()?.webResearch || null);
   const [scripts, setScripts] = useState(() => loadCache()?.scripts || []);
   const [selectedScript, setSelectedScript] = useState(0);
-  const [editingScriptIndex, setEditingScriptIndex] = useState(null);
-  const [scriptDraft, setScriptDraft] = useState(null);
   // Undo stack for storyboard shot edits: snapshots of shots before each
   // add / delete / reorder, tagged with the script they belong to.
   const [shotHistory, setShotHistory] = useState([]);
@@ -615,6 +561,7 @@ export default function SaaShortsTab({
   const [dragOverShotIndex, setDragOverShotIndex] = useState(null);
   // Which shots have the (optional, technical) "prompt for the AI" field open.
   const [openPromptShots, setOpenPromptShots] = useState({});
+  const [openAdvancedShots, setOpenAdvancedShots] = useState({});
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
@@ -632,7 +579,9 @@ export default function SaaShortsTab({
   const [editedNarration, setEditedNarration] = useState('');
   const [actorOptions, setActorOptions] = useState([]);
   const [selectedActor, setSelectedActor] = useState(() => loadVideoPrefs().selectedActor || null);
-  const [actorSource, setActorSource] = useState('saved');
+  // Пол/озвучка/загрузка аватара спрятаны в модалку, чтобы блок выбора
+  // аватара не был перегружен (видна только сетка аватаров + «Настройки»).
+  const [avatarSettingsOpen, setAvatarSettingsOpen] = useState(false);
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
@@ -661,6 +610,10 @@ export default function SaaShortsTab({
   const [genResult, setGenResult] = useState(null);
   const [lipSyncModel, setLipSyncModel] = useState('sync-3');
   const [lipSyncing, setLipSyncing] = useState(false);
+  // Frames-only preview: generate/regenerate the start frames of each shot on
+  // step 2 (перед платной генерацией видео), staying on the storyboard editor.
+  const [framesGenerating, setFramesGenerating] = useState(false);
+  const [framesShot, setFramesShot] = useState(null); // shot_number currently regenerating, or null for «все»
 
   // Publish
   const [publishing, setPublishing] = useState(false);
@@ -706,6 +659,37 @@ export default function SaaShortsTab({
   // Восстановление генерации после перезагрузки страницы: по сохранённому
   // job_id снова подцепляемся к статусу/результату. Если пользователь пришёл
   // из контент-плана делать новый ролик — старый job не восстанавливаем.
+  // After a render the backend returns each shot's generated frame/clip URLs (and
+  // the rebuilt prompt baseline). Merge them into the matching script by title so
+  // the storyboard editor shows the actual generated frames and future «Что в кадре»
+  // edits diff against the new baseline.
+  const applyGeneratedShots = (result) => {
+    const genShots = result?.shots;
+    const title = result?.script?.title;
+    if (!Array.isArray(genShots) || !genShots.length || !title) return;
+    const byNumber = new Map(genShots.map((s, i) => [s.shot_number ?? (i + 1), s]));
+    setScripts((prev) => prev.map((script) => {
+      if (script.title !== title || !Array.isArray(script.shots) || !script.shots.length) return script;
+      const shots = script.shots.map((shot, i) => {
+        const g = byNumber.get(shot.shot_number ?? (i + 1));
+        if (!g) return shot;
+        return {
+          ...shot,
+          preview_frame_url: g.preview_frame_url || shot.preview_frame_url,
+          clip_url: g.clip_url || shot.clip_url,
+          // Frames-only render also attaches the start frame the video will reuse.
+          image_url: g.image_url || shot.image_url,
+          local_url: g.local_url || shot.local_url,
+          image_path: g.image_path || shot.image_path,
+          image_preview: g.local_url ? getApiUrl(g.local_url) : shot.image_preview,
+          generation_prompt: g.generation_prompt || shot.generation_prompt,
+          _prompt_source_scene: g._prompt_source_scene ?? shot._prompt_source_scene,
+        };
+      });
+      return { ...script, shots };
+    }));
+  };
+
   useEffect(() => {
     if (pendingTopicOnMount) return;
     const last = loadLastJob();
@@ -724,6 +708,7 @@ export default function SaaShortsTab({
         if (data.status === 'completed') {
           setGenStatus('completed');
           setGenResult(data.result);
+          applyGeneratedShots(data.result);
           setStep(4);
         } else if (data.status === 'failed') {
           setGenStatus('failed');
@@ -846,6 +831,7 @@ export default function SaaShortsTab({
           if (data.status === 'completed') {
             setGenStatus('completed');
             setGenResult(data.result);
+            applyGeneratedShots(data.result);
             setGenerating(false);
             setLipSyncing(false);
             setStep(4);
@@ -994,47 +980,6 @@ export default function SaaShortsTab({
     }, analysis, webResearch, nextScripts);
   };
 
-  const handleStartScriptEdit = (idx, event) => {
-    event?.stopPropagation();
-    if (!scripts[idx]) return;
-    setSelectedScript(idx);
-    setEditingScriptIndex(idx);
-    setScriptDraft(buildScriptDraft(scripts[idx]));
-  };
-
-  const handleCancelScriptEdit = (event) => {
-    event?.stopPropagation();
-    setEditingScriptIndex(null);
-    setScriptDraft(null);
-  };
-
-  const handleScriptDraftField = (field, value) => {
-    setScriptDraft((draft) => ({ ...draft, [field]: value }));
-  };
-
-  const handleScriptDraftSegment = (segmentIndex, value) => {
-    setScriptDraft((draft) => ({
-      ...draft,
-      segments: (draft.segments || []).map((segment, idx) => (
-        idx === segmentIndex
-          ? { ...segment, narration: value, subtitle_text: value.slice(0, 90) }
-          : segment
-      )),
-    }));
-  };
-
-  const handleScriptDraftShot = (shotIndex, field, value) => {
-    setScriptDraft((draft) => ({
-      ...draft,
-      format: 'storyboard_v3',
-      shots: (draft.shots || []).map((shot, idx) => (
-        idx === shotIndex
-          ? { ...shot, [field]: field === 'start' || field === 'end' ? Number(value) : value }
-          : shot
-      )),
-    }));
-  };
-
   const updateSelectedScriptShot = (shotIndex, patch) => {
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
@@ -1054,23 +999,6 @@ export default function SaaShortsTab({
     updateSelectedScriptShot(shotIndex, {
       [field]: field === 'start' || field === 'end' ? Number(value) : value,
     });
-  };
-
-  // Change a single shot's length (seconds) and re-flow every shot after it so
-  // the timeline stays contiguous. Not an undo checkpoint — it's a plain edit.
-  const setSelectedShotDuration = (shotIndex, seconds) => {
-    const dur = Math.max(1, Math.round(Number(seconds) || 0) || 1);
-    const nextScripts = scripts.map((script, idx) => {
-      if (idx !== selectedScript) return script;
-      const shots = (script.shots || []).map((shot, j) => (
-        j === shotIndex
-          ? { ...shot, end: Number(shot.start ?? 0) + dur }
-          : { ...shot }
-      ));
-      return { ...script, format: 'storyboard_v3', shots: resequenceShotTimeline(shots) };
-    });
-    setScripts(nextScripts);
-    persistScripts(nextScripts);
   };
 
   // Keep shot_number in sync with position after add / delete / reorder.
@@ -1221,20 +1149,87 @@ export default function SaaShortsTab({
     }
   };
 
-  const handleSaveScriptDraft = (event) => {
-    event?.stopPropagation();
-    if (editingScriptIndex == null || !scriptDraft) return;
-    const updatedScript = normalizeScriptDraft(scriptDraft, scripts[editingScriptIndex]);
-    const nextScripts = scripts.map((script, idx) => (
-      idx === editingScriptIndex ? updatedScript : script
-    ));
-    setScripts(nextScripts);
-    setShotHistory([]);
-    setSelectedScript(editingScriptIndex);
-    setEditedNarration(updatedScript.full_narration || '');
-    persistScripts(nextScripts);
-    setEditingScriptIndex(null);
-    setScriptDraft(null);
+  // Сгенерировать начальные кадры шотов (Flux) БЕЗ платной генерации видео.
+  // shotNumber задан → перегенерировать один кадр, иначе все. По готовности
+  // мержим кадры в редактор (applyGeneratedShots) и остаёмся на шаге 2.
+  const handleGenerateFrames = async (shotNumber = null) => {
+    if (!falKey) {
+      alert('fal.ai API key required. Set it in Settings.');
+      return;
+    }
+    if (framesGenerating) return;
+
+    setFramesGenerating(true);
+    setFramesShot(shotNumber);
+
+    try {
+      const scriptToSend = { ...scripts[selectedScript] };
+      scriptToSend._product_name = analysis?.product_name || analysis?.name || '';
+      scriptToSend._business_name = businessName.trim();
+      scriptToSend._business_description = description.trim();
+      scriptToSend._video_topic = topic.trim();
+      scriptToSend._product_url = '';
+
+      const headers = {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      };
+      if (falKey && !isManagedKey(falKey)) headers['X-Fal-Key'] = falKey;
+
+      const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          script: scriptToSend,
+          voice_id: selectedVoice,
+          tts_provider: ttsProvider,
+          minimax_voice_id: minimaxVoice,
+          actor_gender: actorGender,
+          language,
+          actor_description: actorDescription || undefined,
+          selected_actor_url: selectedActor || undefined,
+          video_mode: videoMode,
+          broll_mode: storyboardSelected ? 'off' : brollMode,
+          storyboard_generation_mode: storyboardGenerationMode,
+          use_platform_keys: usePlatformKeys,
+          broll_image_first: brollImageFirst,
+          frames_only: true,
+          frames_only_shot: shotNumber ?? undefined,
+        }),
+      });
+
+      if (!res.ok) {
+        let msg = 'Frame generation failed';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+
+      const { job_id: framesJobId } = await res.json();
+
+      // Собственный опрос — не трогаем основной genStatus/step, чтобы остаться
+      // в редакторе раскадровки (шаг 2).
+      const deadline = Date.now() + 5 * 60 * 1000;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (Date.now() > deadline) throw new Error('Frame generation timed out');
+        const poll = await fetch(getApiUrl(`/api/saasshorts/status/${framesJobId}`), { headers: authHeaders() });
+        if (!poll.ok) continue;
+        const data = await poll.json();
+        if (data.status === 'completed') {
+          applyGeneratedShots(data.result);
+          break;
+        }
+        if (data.status === 'failed') {
+          throw new Error(data.error || 'Frame generation failed');
+        }
+      }
+    } catch (e) {
+      alert(`Не удалось сгенерировать кадры: ${e.message}`);
+    } finally {
+      setFramesGenerating(false);
+      setFramesShot(null);
+    }
   };
 
   const handleGenerate = async () => {
@@ -1657,11 +1652,11 @@ export default function SaaShortsTab({
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   Описание бизнеса / продукта <span className="text-zinc-600">(обязательно)</span>
                 </label>
-                <textarea
+                <AutoTextarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  rows={3}
-                  className="input-field resize-none text-sm"
+                  minRows={3}
+                  className="input-field text-sm"
                   placeholder="Что продаём, кому, какой результат, какие ограничения, тон коммуникации."
                 />
               </div>
@@ -1842,12 +1837,12 @@ export default function SaaShortsTab({
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   Тема текущего ролика <span className="text-zinc-600">(необязательно, но лучше заполнить)</span>
                 </label>
-                <textarea
+                <AutoTextarea
                   value={topic}
                   onChange={(e) => setTopic(e.target.value)}
-                  rows={2}
-                  className="input-field resize-none text-sm"
-                  placeholder="e.g. Почему вечерний срыв начинается утром; What to eat at 5 PM to avoid night cravings..."
+                  minRows={2}
+                  className="input-field text-sm"
+                  placeholder="Напр.: Почему вечерний срыв начинается утром; Что съесть в 17:00, чтобы не тянуло на сладкое вечером..."
                 />
                 <p className="text-[10px] text-zinc-600 mt-1">В AI-режиме варианты сценариев строятся вокруг этой темы. В ручном режиме тема нужна для заголовка, caption и визуальных подсказок.</p>
               </div>
@@ -1857,11 +1852,11 @@ export default function SaaShortsTab({
                   <label className="block text-sm font-medium text-zinc-300 mb-2">
                     Точный текст озвучки <span className="text-zinc-600">(обязательно)</span>
                   </label>
-                  <textarea
+                  <AutoTextarea
                     value={customScript}
                     onChange={(e) => setCustomScript(e.target.value)}
-                    rows={7}
-                    className="input-field resize-none font-mono text-xs"
+                    minRows={7}
+                    className="input-field font-mono text-xs"
                     placeholder={`Ты срываешься вечером не потому, что слабая.\nЧасто проблема начинается утром: кофе вместо завтрака, маленький обед...\nНапиши "НЕДЕЛЯ" - пришлю чеклист антисрыв-вечера.`}
                   />
                   <p className="text-[10px] text-zinc-600 mt-1">
@@ -1872,11 +1867,9 @@ export default function SaaShortsTab({
 
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5">
                 <span className="text-xs text-zinc-500">
-                  Язык и пол актёра — из проекта:
+                  Язык сценария — из проекта:
                   <span className="text-zinc-300 ml-1.5 font-medium">
                     {({ en: '🇺🇸 English', es: '🇪🇸 Español', ru: '🇷🇺 Русский' })[language] || language}
-                    {' · '}
-                    {actorGender === 'male' ? '👨 мужчина' : '👩 женщина'}
                   </span>
                 </span>
                 <button
@@ -2168,187 +2161,16 @@ export default function SaaShortsTab({
                         )}
                         <button
                           type="button"
-                          aria-label="Редактировать сценарий"
-                          onClick={(event) => handleStartScriptEdit(i, event)}
+                          aria-label="Открыть раскадровку"
+                          onClick={(event) => { event.stopPropagation(); setSelectedScript(i); setStep(2); }}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:border-violet-400/40 hover:bg-violet-500/10 hover:text-violet-100"
                         >
-                          <Pencil size={12} /> Править
+                          <Pencil size={12} /> Раскадровка
                         </button>
                       </div>
                     </div>
 
-                    {editingScriptIndex === i && scriptDraft ? (
-                      <div
-                        className="space-y-4 rounded-xl border border-violet-500/20 bg-black/20 p-4"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),minmax(220px,0.45fr)]">
-                          <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Заголовок</span>
-                            <input
-                              className="input-field py-2 text-sm"
-                              value={scriptDraft.title || ''}
-                              onChange={(event) => handleScriptDraftField('title', event.target.value)}
-                            />
-                          </label>
-                          <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Текст-зацепка на экране</span>
-                            <input
-                              className="input-field py-2 text-sm"
-                              value={scriptDraft.hook_text || ''}
-                              onChange={(event) => handleScriptDraftField('hook_text', event.target.value)}
-                            />
-                          </label>
-                        </div>
-
-                        {scriptDraft.format === 'storyboard_v3' ? (
-                          <div className="space-y-3">
-                            {(scriptDraft.shots || []).map((shot, j) => (
-                              <div key={j} className="rounded-xl border border-white/10 bg-black/20 p-3 space-y-3">
-                                <div className="flex items-center justify-between gap-3">
-                                  <span className="text-xs font-semibold text-violet-200">КАДР {shot.shot_number || j + 1}</span>
-                                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                                    <input
-                                      type="number"
-                                      value={shot.start ?? 0}
-                                      onChange={(event) => handleScriptDraftShot(j, 'start', event.target.value)}
-                                      className="input-field w-16 py-1 text-[11px]"
-                                    />
-                                    <span>–</span>
-                                    <input
-                                      type="number"
-                                      value={shot.end ?? 3}
-                                      onChange={(event) => handleScriptDraftShot(j, 'end', event.target.value)}
-                                      className="input-field w-16 py-1 text-[11px]"
-                                    />
-                                    <span>sec</span>
-                                  </div>
-                                </div>
-                                <div className="grid gap-3 md:grid-cols-3">
-                                  <label className="space-y-1.5 text-xs text-zinc-400">
-                                    <span>Роль кадра</span>
-                                    <input
-                                      className="input-field py-2 text-sm"
-                                      value={shot.role || ''}
-                                      onChange={(event) => handleScriptDraftShot(j, 'role', event.target.value)}
-                                      placeholder="hook / problem / cta"
-                                    />
-                                  </label>
-                                  <label className="space-y-1.5 text-xs text-zinc-400 md:col-span-2">
-                                    <span>Переход после кадра</span>
-                                    <input
-                                      className="input-field py-2 text-sm"
-                                      value={shot.transition || ''}
-                                      onChange={(event) => handleScriptDraftShot(j, 'transition', event.target.value)}
-                                      placeholder="cut / smooth_0.3s"
-                                    />
-                                  </label>
-                                </div>
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Сцена</span>
-                                  <textarea
-                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
-                                    value={shot.scene || ''}
-                                    onChange={(event) => handleScriptDraftShot(j, 'scene', event.target.value)}
-                                  />
-                                </label>
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Действие актера</span>
-                                  <textarea
-                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
-                                    value={shot.actor_action || shot.action || ''}
-                                    onChange={(event) => handleScriptDraftShot(j, 'actor_action', event.target.value)}
-                                  />
-                                </label>
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Камера</span>
-                                  <input
-                                    className="input-field py-2 text-sm"
-                                    value={shot.camera || ''}
-                                    onChange={(event) => handleScriptDraftShot(j, 'camera', event.target.value)}
-                                    placeholder="крупный план, легкая ручная камера"
-                                  />
-                                </label>
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Реплика</span>
-                                  <textarea
-                                    className="input-field min-h-[56px] resize-y py-2 text-sm leading-relaxed"
-                                    value={shot.speech || ''}
-                                    onChange={(event) => handleScriptDraftShot(j, 'speech', event.target.value)}
-                                  />
-                                </label>
-                                <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                  <span>Подсказка для нейросети</span>
-                                  <input
-                                    className="input-field py-2 text-sm"
-                                    value={shot.generation_prompt || ''}
-                                    onChange={(event) => handleScriptDraftShot(j, 'generation_prompt', event.target.value)}
-                                  />
-                                </label>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="space-y-2">
-                            {(scriptDraft.segments || []).map((seg, j) => (
-                              <label key={j} className="grid gap-2 text-xs text-zinc-400 md:grid-cols-[92px,minmax(0,1fr)] md:items-start">
-                                <span className={`w-fit shrink-0 px-1.5 py-1 rounded font-mono uppercase tracking-wider ${
-                                  seg.type === 'hook' ? 'bg-red-500/20 text-red-300' :
-                                  seg.type === 'problem' ? 'bg-yellow-500/20 text-yellow-300' :
-                                  seg.type === 'solution' ? 'bg-green-500/20 text-green-300' :
-                                  'bg-blue-500/20 text-blue-300'
-                                }`}>
-                                  {seg.type}
-                                </span>
-                                <textarea
-                                  className="input-field min-h-[74px] resize-y py-2 text-sm leading-relaxed"
-                                  value={seg.narration || ''}
-                                  onChange={(event) => handleScriptDraftSegment(j, event.target.value)}
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        )}
-
-                        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),minmax(220px,0.45fr)]">
-                          <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Подпись под видео</span>
-                            <textarea
-                              className="input-field min-h-[74px] resize-y py-2 text-sm"
-                              value={scriptDraft.caption || ''}
-                              onChange={(event) => handleScriptDraftField('caption', event.target.value)}
-                            />
-                          </label>
-                          <label className="space-y-1.5 text-xs text-zinc-400">
-                            <span>Hashtags</span>
-                            <textarea
-                              className="input-field min-h-[74px] resize-y py-2 text-sm"
-                              value={scriptDraft.hashtagsText || ''}
-                              onChange={(event) => handleScriptDraftField('hashtagsText', event.target.value)}
-                              placeholder="#reels #ugc"
-                            />
-                          </label>
-                        </div>
-
-                        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-                          <button
-                            type="button"
-                            onClick={handleCancelScriptEdit}
-                            className="btn-secondary px-4 py-2 text-sm inline-flex items-center justify-center gap-2"
-                          >
-                            <X size={14} /> Отмена
-                          </button>
-                          <button
-                            type="button"
-                            aria-label="Сохранить сценарий"
-                            onClick={handleSaveScriptDraft}
-                            className="btn-primary px-4 py-2 text-sm inline-flex items-center justify-center gap-2"
-                          >
-                            <Save size={14} /> Сохранить сценарий
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
+                    {(
                       <>
                         {isStoryboardScript(script) ? (
                           <div className="space-y-2">
@@ -2356,7 +2178,6 @@ export default function SaaShortsTab({
                               <div key={j} className="grid gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 text-xs md:grid-cols-[82px,minmax(0,1fr)]">
                                 <div className="text-violet-300 font-semibold">
                                   КАДР {shot.shot_number || j + 1}
-                                  <div className="text-[10px] text-zinc-500 font-normal">{shot.start ?? 0}-{shot.end ?? 0}s</div>
                                 </div>
                                 <div className="min-w-0 space-y-1">
                                   <p className="text-zinc-300 leading-relaxed">{shot.scene || shot.generation_prompt}</p>
@@ -2402,15 +2223,13 @@ export default function SaaShortsTab({
                           </>
                         )}
 
-                        {/* Hook text & hashtags */}
-                        <div className="mt-3 pt-3 border-t border-white/5 flex items-center gap-3 flex-wrap">
-                          <span className="text-[10px] bg-red-500/10 text-red-300 px-2 py-0.5 rounded-full">
-                            Hook: &quot;{script.hook_text}&quot;
-                          </span>
-                          {(script.hashtags || []).slice(0, 4).map((tag, j) => (
-                            <span key={j} className="text-[10px] text-zinc-500">{tag}</span>
-                          ))}
-                        </div>
+                        {(script.hashtags || []).length > 0 && (
+                          <div className="mt-3 pt-3 border-t border-white/5 flex items-center gap-3 flex-wrap">
+                            {(script.hashtags || []).slice(0, 4).map((tag, j) => (
+                              <span key={j} className="text-[10px] text-zinc-500">{tag}</span>
+                            ))}
+                          </div>
+                        )}
                       </>
                     )}
                   </div>
@@ -2465,9 +2284,28 @@ export default function SaaShortsTab({
                         {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
                       </span>
                       <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
-                        ~{totalShotSeconds(scripts[selectedScript].shots)} сек
+                        ~{estimateStoryboardSeconds(scripts[selectedScript], '')} сек
                       </span>
                     </div>
+                  </div>
+
+                  {/* Сгенерировать стартовые кадры (Flux) до платного видео,
+                      чтобы увидеть и утвердить композицию каждого шота. */}
+                  <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-[11px] text-zinc-400 max-w-md">
+                      Сгенерируй стартовые кадры и проверь композицию до платной генерации видео.
+                      Кадры можно перегенерировать по одному или заменить своим фото — видео переиспользует их.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateFrames(null)}
+                      disabled={framesGenerating}
+                      className="btn-secondary shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+                    >
+                      {framesGenerating && framesShot === null
+                        ? (<><Loader2 size={13} className="animate-spin" /> Генерирую…</>)
+                        : (<><Sparkles size={13} /> Сгенерить кадры (~{formatUsd(((scripts[selectedScript].shots || []).length) * 0.05)})</>)}
+                    </button>
                   </div>
 
                   <div className="space-y-2.5">
@@ -2475,7 +2313,12 @@ export default function SaaShortsTab({
                       const shots = scripts[selectedScript].shots || [];
                       const previewUrl = shot.image_preview
                         || (shot.local_url ? getApiUrl(shot.local_url) : '')
-                        || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url);
+                        || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url)
+                        || (shot.preview_frame_url ? getApiUrl(shot.preview_frame_url) : '');
+                      // After a render the shot carries its generated frame/clip; a manually
+                      // uploaded photo still wins so the user's choice isn't overwritten.
+                      const isGeneratedPreview = !shot.image_preview && !shot.local_url && !shot.image_url && Boolean(shot.preview_frame_url);
+                      const clipUrl = shot.clip_url ? getApiUrl(shot.clip_url) : '';
                       const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
                       const isBroll = (shot.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
 
@@ -2585,6 +2428,30 @@ export default function SaaShortsTab({
                               <label htmlFor={inputId} className="btn-secondary w-full cursor-pointer px-2 py-2 text-[11px] flex items-center justify-center gap-1.5">
                                 <Upload size={12} /> Загрузить фото
                               </label>
+                              <button
+                                type="button"
+                                onClick={() => handleGenerateFrames(shot.shot_number ?? (shotIndex + 1))}
+                                disabled={framesGenerating}
+                                title="Сгенерировать/перегенерировать кадр по описанию"
+                                className="btn-secondary w-full px-2 py-2 text-[11px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+                              >
+                                {framesGenerating && framesShot === (shot.shot_number ?? (shotIndex + 1))
+                                  ? (<><Loader2 size={12} className="animate-spin" /> Кадр…</>)
+                                  : (<><RefreshCw size={12} /> {previewUrl ? 'Перегенерить' : 'Сгенерить кадр'}</>)}
+                              </button>
+                              {isGeneratedPreview && (
+                                <p className="text-[10px] text-violet-300/80">Сгенерённый кадр</p>
+                              )}
+                              {clipUrl && (
+                                <a
+                                  href={clipUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="btn-secondary w-full px-2 py-1.5 text-[11px] flex items-center justify-center gap-1.5"
+                                >
+                                  ▶ Клип
+                                </a>
+                              )}
                               {shot.frame_status && (
                                 <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
                               )}
@@ -2607,19 +2474,6 @@ export default function SaaShortsTab({
                                   >
                                     Перебивка
                                   </button>
-                                </div>
-                                <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
-                                  <span>Длительность</span>
-                                  <input
-                                    type="number"
-                                    min="1"
-                                    step="1"
-                                    value={shotDurationSeconds(shot)}
-                                    onChange={(event) => setSelectedShotDuration(shotIndex, event.target.value)}
-                                    className="input-field w-14 py-1 text-[11px]"
-                                    aria-label="Длительность кадра, сек"
-                                  />
-                                  <span>сек</span>
                                 </div>
                               </div>
                               <label className="space-y-1.5 text-xs text-zinc-400 block">
@@ -2661,15 +2515,81 @@ export default function SaaShortsTab({
                                     >
                                       <ChevronDown size={12} className={`transition-transform ${promptOpen ? 'rotate-180' : ''}`} />
                                       Подсказка для нейросети
-                                      <span className="text-zinc-600">— чем и как рисовать кадр, можно не трогать</span>
+                                      <span className="text-zinc-600">— ручной промпт, перебивает «Что в кадре»</span>
                                     </button>
                                     {promptOpen && (
-                                      <input
-                                        className="input-field mt-1.5 py-2 text-sm"
-                                        value={shot.generation_prompt || ''}
-                                        onChange={(event) => handleSelectedScriptShot(shotIndex, 'generation_prompt', event.target.value)}
-                                        placeholder="Напр.: крупный план, тёплый свет, реалистично"
-                                      />
+                                      <div className="mt-1.5 space-y-1">
+                                        <input
+                                          className="input-field py-2 text-sm"
+                                          value={shot.generation_prompt || ''}
+                                          onChange={(event) => updateSelectedScriptShot(shotIndex, { generation_prompt: event.target.value, prompt_manual: true })}
+                                          placeholder="English prompt: close-up, warm light, realistic"
+                                        />
+                                        {shot.prompt_manual && (
+                                          <button
+                                            type="button"
+                                            onClick={() => updateSelectedScriptShot(shotIndex, { prompt_manual: false })}
+                                            className="text-[10px] text-zinc-500 transition-colors hover:text-zinc-300"
+                                          >
+                                            Сбросить — строить кадр из «Что в кадре»
+                                          </button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                              {(() => {
+                                const advOpen = Boolean(openAdvancedShots[shotIndex]);
+                                return (
+                                  <div>
+                                    <button
+                                      type="button"
+                                      onClick={() => setOpenAdvancedShots((m) => ({ ...m, [shotIndex]: !advOpen }))}
+                                      className="inline-flex items-center gap-1 text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
+                                    >
+                                      <ChevronDown size={12} className={`transition-transform ${advOpen ? 'rotate-180' : ''}`} />
+                                      Расширенные
+                                      <span className="text-zinc-600">— роль, переход, действие, камера</span>
+                                    </button>
+                                    {advOpen && (
+                                      <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
+                                        <label className="space-y-1 text-[11px] text-zinc-500 block">
+                                          <span>Роль кадра</span>
+                                          <input
+                                            className="input-field py-1.5 text-sm"
+                                            value={shot.role || ''}
+                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'role', event.target.value)}
+                                            placeholder="hook / problem / cta"
+                                          />
+                                        </label>
+                                        <label className="space-y-1 text-[11px] text-zinc-500 block">
+                                          <span>Переход после кадра</span>
+                                          <input
+                                            className="input-field py-1.5 text-sm"
+                                            value={shot.transition || ''}
+                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'transition', event.target.value)}
+                                            placeholder="cut / smooth_0.3s"
+                                          />
+                                        </label>
+                                        <label className="space-y-1 text-[11px] text-zinc-500 block sm:col-span-2">
+                                          <span>Действие актёра</span>
+                                          <textarea
+                                            className="input-field min-h-[48px] resize-y py-1.5 text-sm leading-relaxed"
+                                            value={shot.actor_action || shot.action || ''}
+                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_action', event.target.value)}
+                                          />
+                                        </label>
+                                        <label className="space-y-1 text-[11px] text-zinc-500 block sm:col-span-2">
+                                          <span>Камера</span>
+                                          <input
+                                            className="input-field py-1.5 text-sm"
+                                            value={shot.camera || ''}
+                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'camera', event.target.value)}
+                                            placeholder="крупный план, лёгкая ручная камера"
+                                          />
+                                        </label>
+                                      </div>
                                     )}
                                   </div>
                                 );
@@ -2778,8 +2698,113 @@ export default function SaaShortsTab({
                 </div>
               )}
 
-              {/* Voice Selection */}
-              {ttsProvider !== 'fal_minimax' && (() => {
+              {/* Настройки аватара: пол, озвучка, загрузка — спрятаны в модалку,
+                  чтобы блок выбора аватара оставался чистым (только сетка + кнопка). */}
+              {avatarSettingsOpen && (
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+                  onClick={() => setAvatarSettingsOpen(false)}
+                >
+                  <div
+                    className="glass-panel max-h-[85vh] w-full max-w-lg space-y-5 overflow-y-auto p-5 custom-scrollbar"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="flex items-center justify-between">
+                      <h3 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
+                        <Settings2 size={15} /> Настройки аватара
+                      </h3>
+                      <button
+                        type="button"
+                        onClick={() => setAvatarSettingsOpen(false)}
+                        className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-200"
+                        aria-label="Закрыть"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+
+                    {/* Пол актёра */}
+                    <div>
+                      <label className="mb-2 block text-sm font-medium text-zinc-300">Пол актёра</label>
+                      <div className="flex items-center gap-3">
+                        <div className="flex gap-1 rounded-lg bg-white/5 p-1">
+                          {[
+                            { id: 'female', label: '👩 Женщина' },
+                            { id: 'male', label: '👨 Мужчина' },
+                          ].map((g) => (
+                            <button
+                              key={g.id}
+                              type="button"
+                              onClick={() => setActorGender(g.id)}
+                              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                                actorGender === g.id
+                                  ? 'bg-violet-500/25 text-violet-200'
+                                  : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+                              }`}
+                            >
+                              {g.label}
+                            </button>
+                          ))}
+                        </div>
+                        <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
+                      </div>
+                    </div>
+
+                    {/* Загрузить свой аватар */}
+                    <div>
+                      <label className="mb-2 block text-sm font-medium text-zinc-300">Загрузить свой аватар</label>
+                      <div className="flex items-center gap-3">
+                        <label className="flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-white/20 bg-white/5 px-4 py-3 text-sm text-zinc-400 transition-colors hover:border-white/30 hover:bg-white/10">
+                          <Upload size={14} />
+                          <span>Загрузить и сохранить аватар</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              await handleActorUpload(file);
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                        {uploadedActorPreview && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (uploadedActorPreview.serverUrl) {
+                                setSelectedActor(uploadedActorPreview.serverUrl);
+                              }
+                            }}
+                            className={`relative h-20 w-16 flex-shrink-0 overflow-hidden rounded-lg border-2 transition-all ${
+                              selectedActor === uploadedActorPreview.serverUrl
+                                ? 'border-violet-500 ring-2 ring-violet-500/30'
+                                : 'border-white/20 hover:border-white/40'
+                            }`}
+                          >
+                            <img src={uploadedActorPreview.localPreview} alt="Uploaded" className="h-full w-full object-cover" />
+                            {selectedActor === uploadedActorPreview.serverUrl && (
+                              <div className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-violet-500">
+                                <Check size={8} className="text-white" />
+                              </div>
+                            )}
+                            {!uploadedActorPreview.serverUrl && (
+                              <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                                <Loader2 size={12} className="animate-spin text-white" />
+                              </div>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                      {actorUploadStatus && (
+                        <p className={`mt-2 text-[10px] ${actorUploadStatus.toLowerCase().includes('fail') ? 'text-red-300' : 'text-zinc-500'}`}>
+                          {actorUploadStatus}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Voice Selection */}
+                    {ttsProvider !== 'fal_minimax' && (() => {
                 const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
                 return (
                 <div>
@@ -2952,6 +2977,17 @@ export default function SaaShortsTab({
                 );
               })()}
 
+                    <button
+                      type="button"
+                      onClick={() => setAvatarSettingsOpen(false)}
+                      className="btn-primary w-full py-2.5 text-sm"
+                    >
+                      Готово
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* B-roll Mode */}
               {!storyboardSelected && (
               <div>
@@ -3077,64 +3113,26 @@ export default function SaaShortsTab({
 
               {/* Actor Selection: Gallery + Generate New */}
               <div className={selectedHeadTemplate ? 'opacity-50 pointer-events-none' : ''}>
-                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <User size={14} /> Аватар проекта {storyboardSelected && <span className="text-zinc-600">(необязательно)</span>}
-                </label>
-                {storyboardSelected && (
-                  <p className="text-xs text-zinc-500 mb-3">
-                    Для V3-раскадровки аватар не обязателен: кадры строятся по промптам. Но сохранённый аватар пригодится, когда будем делать постоянного персонажа проекта.
-                  </p>
-                )}
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
+                    <User size={14} /> Аватар проекта {storyboardSelected && <span className="text-zinc-600">(необязательно)</span>}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setAvatarSettingsOpen(true)}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
+                  >
+                    <Settings2 size={13} /> Настройки аватара
+                  </button>
+                </div>
                 <p className="text-xs text-zinc-500 mb-3">
-                  Выбери сохранённого аватара из UGC-галереи или загрузи новый. Это постоянный визуальный персонаж проекта.
+                  Аватар задаёт лицо говорящего в кадре — оно берётся из фото, а не из текста.
+                  Без выбранного аватара система придумает случайного человека, и в каждом ролике он будет
+                  разным. Для постоянного персонажа проекта выбери или загрузи аватар. Пол, озвучку и
+                  загрузку фото настрой в «Настройках аватара».
                 </p>
 
-                <div className="flex items-center gap-3 mb-3">
-                  <span className="text-xs text-zinc-500">Пол актёра:</span>
-                  <div className="flex gap-1 bg-white/5 p-1 rounded-lg">
-                    {[
-                      { id: 'female', label: '👩 Женщина' },
-                      { id: 'male', label: '👨 Мужчина' },
-                    ].map((g) => (
-                      <button
-                        key={g.id}
-                        type="button"
-                        onClick={() => setActorGender(g.id)}
-                        className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                          actorGender === g.id
-                            ? 'bg-violet-500/25 text-violet-200'
-                            : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/5'
-                        }`}
-                      >
-                        {g.label}
-                      </button>
-                    ))}
-                  </div>
-                  <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-1 bg-white/5 p-1 rounded-xl mb-3">
-                  {[
-                    { id: 'saved', label: 'Сохранённые' },
-                    { id: 'upload', label: 'Загрузить' },
-                  ].map((source) => (
-                    <button
-                      key={source.id}
-                      type="button"
-                      onClick={() => setActorSource(source.id)}
-                      className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                        actorSource === source.id
-                          ? 'bg-violet-500/25 text-violet-200'
-                          : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/5'
-                      }`}
-                    >
-                      {source.label}
-                    </button>
-                  ))}
-                </div>
-
-                {actorSource === 'saved' && (
-                  <div className="space-y-3">
+                <div className="space-y-3">
                     <div className="flex items-center justify-between gap-3">
                       <p className="text-xs font-semibold text-zinc-300">Сохранённые аватары ({actorGallery.length})</p>
                       {selectedActor && (
@@ -3189,64 +3187,10 @@ export default function SaaShortsTab({
                       </div>
                     ) : (
                       <div className="p-3 rounded-xl border border-dashed border-white/15 bg-white/5 text-xs text-zinc-500">
-                        В UGC-галерее пока нет аватаров. Загрузи фото здесь или создай аватара во вкладке «Аватары».
+                        В галерее пока нет аватаров. Открой «Настройки аватара», чтобы загрузить своё фото.
                       </div>
                     )}
                   </div>
-                )}
-
-                {actorSource === 'upload' && (
-                  <div className="space-y-3">
-                    <div className="flex items-center gap-3">
-                      <label className="flex-1 flex items-center justify-center gap-2 text-sm bg-white/5 text-zinc-400 px-4 py-3 rounded-xl border border-dashed border-white/20 hover:bg-white/10 hover:border-white/30 transition-colors cursor-pointer">
-                        <Upload size={14} />
-                        <span>Загрузить и сохранить аватар</span>
-                        <input
-                          type="file"
-                          accept="image/*"
-                          className="hidden"
-                          onChange={async (e) => {
-                            const file = e.target.files?.[0];
-                            await handleActorUpload(file);
-                            e.target.value = '';
-                          }}
-                        />
-                      </label>
-                      {uploadedActorPreview && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (uploadedActorPreview.serverUrl) {
-                              setSelectedActor(uploadedActorPreview.serverUrl);
-                            }
-                          }}
-                          className={`relative w-16 h-20 rounded-lg overflow-hidden border-2 transition-all flex-shrink-0 ${
-                            selectedActor === uploadedActorPreview.serverUrl
-                              ? 'border-violet-500 ring-2 ring-violet-500/30'
-                              : 'border-white/20 hover:border-white/40'
-                          }`}
-                        >
-                          <img src={uploadedActorPreview.localPreview} alt="Uploaded" className="w-full h-full object-cover" />
-                          {selectedActor === uploadedActorPreview.serverUrl && (
-                            <div className="absolute top-1 right-1 w-4 h-4 bg-violet-500 rounded-full flex items-center justify-center">
-                              <Check size={8} className="text-white" />
-                            </div>
-                          )}
-                          {!uploadedActorPreview.serverUrl && (
-                            <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                              <Loader2 size={12} className="animate-spin text-white" />
-                            </div>
-                          )}
-                        </button>
-                      )}
-                    </div>
-                    {actorUploadStatus && (
-                      <p className={`text-[10px] ${actorUploadStatus.toLowerCase().includes('fail') ? 'text-red-300' : 'text-zinc-500'}`}>
-                        {actorUploadStatus}
-                      </p>
-                    )}
-                  </div>
-                )}
 
                 {!selectedActor && (
                   <p className="text-xs text-amber-400 mt-3 flex items-center gap-1">
@@ -3440,19 +3384,24 @@ export default function SaaShortsTab({
 
               )}
 
-              {/* Narration Edit */}
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <MessageSquare size={14} /> Narration Script
-                </label>
-                <textarea
-                  value={editedNarration}
-                  onChange={(e) => setEditedNarration(e.target.value)}
-                  rows={5}
-                  className="input-field resize-none font-mono text-xs"
-                />
-                <p className="text-[10px] text-zinc-600 mt-1">{editedNarration.length} chars &middot; ~{estimateSpeechSeconds(editedNarration)}s speech</p>
-              </div>
+              {/* Narration Edit — только для UGC. В раскадровке озвучка
+                  собирается из речи кадров (saasshorts.py: full_narration от shots),
+                  поэтому отдельное поле пряталось бы за источник правды и молча
+                  теряло текст, которого нет ни в одном кадре. */}
+              {!storyboardSelected && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                    <MessageSquare size={14} /> Текст озвучки
+                  </label>
+                  <textarea
+                    value={editedNarration}
+                    onChange={(e) => setEditedNarration(e.target.value)}
+                    rows={5}
+                    className="input-field resize-none font-mono text-xs"
+                  />
+                  <p className="text-[10px] text-zinc-600 mt-1">{editedNarration.length} chars &middot; ~{estimateSpeechSeconds(editedNarration)}s speech</p>
+                </div>
+              )}
 
               {/* Cost Estimate */}
               {(() => {
@@ -3471,7 +3420,9 @@ export default function SaaShortsTab({
                   selectedHeadTemplate
                     ? 'Сохранённый talking-head + новая озвучка + Sync Lipsync. Быстрее, чем заново генерировать Kling/Hailuo.'
                     : videoMode === 'storyboard_v3_standard'
-                    ? 'Озвучка ElevenLabs + видео Kling V3. Говорящие кадры считаются по тарифу Kling Avatar, b-roll — по тарифу V3.'
+                    ? (storyboardGenerationMode === 'sliced_avatar'
+                        ? 'Озвучка ElevenLabs. Говорящие кадры — Kling Avatar (липсинк), b-roll — Kling V3; под каждый кадр ещё Flux-кадр.'
+                        : 'Озвучка ElevenLabs + видео Kling V3: кадры генерятся отдельно, липсинк не гарантирован.')
                     : videoMode === 'storyboard_v3_pro'
                     ? 'Озвучка ElevenLabs + видео Kling V3 Pro: выше детализация лиц и движений, тариф выше.'
                     : videoMode === 'storyboard_veo31_quality'

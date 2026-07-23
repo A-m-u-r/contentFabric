@@ -4051,6 +4051,8 @@ class SaaSGenerateRequest(BaseModel):
     clip_vision_qc: bool = True  # advisory Gemini review of each generated clip
     broll_image_first: bool = True  # Flux still -> image-to-video for b-roll shots
     background_music: bool = True  # ducked music bed under the voiceover
+    frames_only: bool = False  # generate only the Flux start frames (no paid video)
+    frames_only_shot: Optional[int] = None  # regenerate a single shot's frame
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -4246,6 +4248,8 @@ async def saasshorts_generate(
         "clip_vision_qc": req.clip_vision_qc,
         "broll_image_first": req.broll_image_first,
         "background_music": req.background_music,
+        "frames_only": req.frames_only,
+        "frames_only_shot": req.frames_only_shot,
         "voice_id": effective_voice_id,  # avatar binding > request > per-language default
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
@@ -4300,14 +4304,17 @@ async def saasshorts_generate(
                     "script_format": req.script.get("format") or req.script.get("script_format") or "ugc",
                     "shots": result.get("storyboard_shots") or req.script.get("shots", []),
                     "storyboard_generation_mode": result.get("storyboard_generation_mode"),
+                    "frames_only": result.get("frames_only", False),
                     "business_name": req.script.get("_business_name", ""),
                     "business_description": req.script.get("_business_description", ""),
                     "video_topic": req.script.get("_video_topic", ""),
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
 
-                # Upload to public gallery (non-blocking)
+                # Upload to public gallery (non-blocking) — skipped for frames-only previews.
                 try:
+                    if result.get("frames_only"):
+                        raise RuntimeError("frames-only preview — no gallery entry")
                     gallery_meta = {
                         "title": req.script.get("title", "Untitled"),
                         "hook_text": req.script.get("hook_text", ""),

@@ -51,11 +51,12 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_generated_scripts_can_be_edited_before_video_configuration(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        self.assertIn("editingScriptIndex", tab)
-        self.assertIn("handleSaveScriptDraft", tab)
-        self.assertIn("Редактировать сценарий", tab)
-        self.assertIn("Сохранить сценарий", tab)
-        self.assertIn("draft.segments", tab)
+        # Shots are edited in the single storyboard editor now — the separate
+        # inline draft editor was merged away.
+        self.assertIn("handleSelectedScriptShot", tab)
+        self.assertIn("updateSelectedScriptShot", tab)
+        self.assertIn("Раскадровка", tab)
+        self.assertIn("Что в кадре", tab)
 
 
     def test_ai_shorts_exposes_storyboard_v3_script_and_video_controls(self):
@@ -63,7 +64,7 @@ class UILayoutPolishTests(unittest.TestCase):
 
         self.assertIn("SCRIPT_FORMAT_OPTIONS", tab)
         self.assertIn("storyboard_v3", tab)
-        self.assertIn("handleScriptDraftShot", tab)
+        self.assertIn("handleSelectedScriptShot", tab)
         self.assertIn("generation_prompt", tab)
         self.assertIn("storyboard_v3_pro", tab)
         self.assertIn("storyboard_veo31_quality", tab)
@@ -74,6 +75,25 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("script_format", tab)
         self.assertIn("STORYBOARD_GENERATION_OPTIONS", tab)
         self.assertIn("storyboard_generation_mode", tab)
+
+    def test_storyboard_editor_can_generate_frames_before_paid_video(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Кадры генерируются/перегенерируются на шаге 2 без платного видео.
+        self.assertIn("handleGenerateFrames", tab)
+        self.assertIn("frames_only: true", tab)
+        self.assertIn("Сгенерить кадры", tab)
+        self.assertIn("Перегенерить", tab)
+
+    def test_avatar_settings_are_tucked_into_a_modal(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Блок аватара — только сетка + кнопка «Настройки аватара»; пол/озвучка/
+        # загрузка живут в модалке.
+        self.assertIn("avatarSettingsOpen", tab)
+        self.assertIn("Настройки аватара", tab)
+        # Табы «Сохранённые / Загрузить» убраны из основного блока.
+        self.assertNotIn("setActorSource", tab)
 
     def test_ai_shorts_exposes_ai_storyboard_format_selector_in_setup(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")

@@ -440,10 +440,170 @@ class SaaSStoryboardTests(unittest.TestCase):
                  patch("saasshorts._get_media_duration", return_value=20):
                 result = generate_storyboard_video(script, config, tmp)
 
+            # Shot durations are derived from the voiceover now (not the script's
+            # start/end): 6 one-word shots over a 20s track → ~3s each, so the
+            # 15s multi-shot cap packs 5 shots into the first chunk, 1 into the second.
             self.assertEqual(chunk_mock.call_count, 2)
-            self.assertEqual(len(chunk_mock.call_args_list[0].args[0]), 4)
-            self.assertEqual(len(chunk_mock.call_args_list[1].args[0]), 2)
-            self.assertEqual(result["cost_estimate"]["storyboard_kling_v3_standard"], 1.68)
+            self.assertEqual(len(chunk_mock.call_args_list[0].args[0]), 5)
+            self.assertEqual(len(chunk_mock.call_args_list[1].args[0]), 1)
+            self.assertEqual(result["cost_estimate"]["storyboard_kling_v3_standard"], 1.51)
+
+    def test_per_shot_durations_derived_from_voiceover(self):
+        # The manual seconds field is gone: per-shot length comes from each shot's
+        # share of the voiceover, not the script's start/end.
+        with tempfile.TemporaryDirectory() as tmp:
+            script = {
+                "title": "Derive dur",
+                "format": "storyboard_v3",
+                "full_narration": "One. Two. Three four.",
+                "shots": [
+                    {"shot_number": 1, "start": 0, "end": 3, "speech": "One.", "generation_prompt": "p1"},
+                    {"shot_number": 2, "start": 3, "end": 6, "speech": "Two.", "generation_prompt": "p2"},
+                    {"shot_number": 3, "start": 6, "end": 9, "speech": "Three four.", "generation_prompt": "p3"},
+                ],
+            }
+            config = {
+                "fal_key": "k", "tts_provider": "fal_minimax", "language": "ru",
+                "actor_gender": "female", "video_mode": "storyboard_v3_standard",
+                "storyboard_generation_mode": "per_shot",
+            }
+
+            def fake_voiceover(text, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"voice")
+                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+
+            def fake_shot(shot, fal_key, output_path, tier="standard", **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"clip")
+                return output_path
+
+            def fake_subs(audio_path, shots, output_path, max_words=2, **kwargs):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("[Script Info]\n")
+                return output_path
+
+            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return output_path
+
+            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=fake_shot), \
+                 patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
+                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
+                 patch("saasshorts._decodable_audio_duration", return_value=20), \
+                 patch("saasshorts._get_media_duration", return_value=20):
+                result = generate_storyboard_video(script, config, tmp)
+
+            durations = [round(s["end"] - s["start"]) for s in result["storyboard_shots"]]
+            # 4 spoken words over 20s: the 2-word shot gets double the 1-word shots.
+            self.assertEqual(durations, [5, 5, 10])
+
+    def test_scene_edit_rebuilds_generation_prompt(self):
+        # «Что в кадре» drives the picture: editing scene rebuilds the English
+        # prompt, but a hand-pinned prompt is left alone.
+        shots = [
+            {"shot_number": 1, "scene": "новая сцена", "_prompt_source_scene": "старая сцена",
+             "generation_prompt": "old english prompt", "visual_type": "talking"},
+            {"shot_number": 2, "scene": "изменённая", "_prompt_source_scene": "оригинал",
+             "generation_prompt": "keep me", "prompt_manual": True, "visual_type": "talking"},
+        ]
+
+        class FakeResp:
+            text = '[{"n": 0, "prompt": "a bright kitchen, woman smiling to camera"}]'
+
+        with patch("saasshorts._generate_gemini_content", return_value=FakeResp()):
+            saasshorts._rebuild_prompts_from_scene(shots, "gkey", actor_description="woman")
+
+        self.assertIn("bright kitchen", shots[0]["generation_prompt"])
+        self.assertEqual(shots[0]["_prompt_source_scene"], "новая сцена")
+        self.assertEqual(shots[1]["generation_prompt"], "keep me")
+
+    def test_scene_prompt_not_rebuilt_without_baseline(self):
+        # First run / legacy: no baseline → trust the existing prompt, just stamp.
+        shots = [{"shot_number": 1, "scene": "сцена", "generation_prompt": "orig"}]
+        with patch("saasshorts._generate_gemini_content", side_effect=AssertionError("should not call Gemini")):
+            saasshorts._rebuild_prompts_from_scene(shots, "gkey")
+        self.assertEqual(shots[0]["generation_prompt"], "orig")
+        self.assertEqual(shots[0]["_prompt_source_scene"], "сцена")
+
+    def test_shot_previews_attached_from_generated_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_path = os.path.join(tmp, "vid_shot_01.mp4")
+            with open(clip_path, "wb") as f:
+                f.write(b"clip")
+            shots = [{"shot_number": 1}, {"shot_number": 2}]
+            clips = [{"path": clip_path, "shot": {"shot_number": 1}}]
+
+            def fake_ffmpeg(cmd, **kwargs):
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"jpg")
+
+            with patch("saasshorts.subprocess.run", side_effect=fake_ffmpeg):
+                saasshorts._attach_shot_previews(shots, clips, tmp, "vid")
+
+            job = os.path.basename(tmp)
+            self.assertEqual(shots[0]["clip_url"], f"/videos/{job}/vid_shot_01.mp4")
+            self.assertTrue(shots[0]["preview_frame_url"].endswith("/vid_thumb_01.jpg"))
+            self.assertNotIn("clip_url", shots[1])
+
+    def test_frames_only_generates_and_attaches_per_shot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "scene": "kitchen", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "broll", "scene": "coffee", "generation_prompt": "p2"},
+            ]
+
+            def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print):
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                return output_path
+
+            def fake_broll(shot, fal_key, output_path, log=print):
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                return output_path
+
+            def fake_actor(desc, fal_key, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"a")
+
+            config = {"fal_key": "k", "selected_actor_path": "", "storyboard_generation_mode": "sliced_avatar"}
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._broll_reference_image", side_effect=fake_broll), \
+                 patch("saasshorts.generate_actor_image", side_effect=fake_actor):
+                result = saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
+
+            job = os.path.basename(tmp)
+            self.assertTrue(result["frames_only"])
+            self.assertTrue(shots[0]["local_url"].startswith(f"/videos/{job}/"))
+            self.assertTrue(shots[0]["image_path"].endswith(".png"))
+            self.assertEqual(shots[0]["preview_frame_url"], shots[0]["local_url"])
+            self.assertTrue(shots[1]["image_url"].endswith(".png"))
+            self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.10)
+
+    def test_frames_only_shot_filter_regenerates_single(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": 1, "visual_type": "broll", "scene": "a", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "broll", "scene": "b", "generation_prompt": "p2"},
+            ]
+            calls = []
+
+            def fake_broll(shot, fal_key, output_path, log=print):
+                calls.append(shot["shot_number"])
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                return output_path
+
+            config = {"fal_key": "k", "frames_only_shot": 2}
+            with patch("saasshorts._broll_reference_image", side_effect=fake_broll):
+                saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
+
+            self.assertEqual(calls, [2])
+            self.assertNotIn("local_url", shots[0])
+            self.assertTrue(shots[1]["local_url"])
 
     def test_veo31_storyboard_uses_per_shot_when_multishot_requested(self):
         with tempfile.TemporaryDirectory() as tmp:

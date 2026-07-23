@@ -749,6 +749,11 @@ RULES:
         for script in scripts:
             script["format"] = "storyboard_v3"
             script["shots"] = normalize_storyboard_shots(script)
+            # The AI writes scene and generation_prompt together, so the prompt
+            # matches this scene: stamp it as the baseline. Later, if the user
+            # edits «Что в кадре», the prompt is rebuilt from the new scene.
+            for shot in script["shots"]:
+                shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
             if not script.get("full_narration"):
                 script["full_narration"] = " ".join(shot.get("speech", "") for shot in script["shots"]).strip()
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
@@ -2159,6 +2164,98 @@ def _build_storyboard_generation_prompt(shot: dict) -> str:
         "no watermark",
     ]
     return ", ".join(bit for bit in bits if bit)
+
+
+def _needs_prompt_rebuild(shot: dict) -> bool:
+    """True when «Что в кадре» (scene) drifted from the prompt the user last saw.
+
+    `scene` is the human source of truth for the picture; the English Kling
+    prompt is derived from it. `_prompt_source_scene` records the scene the
+    current prompt was built from. A hand-edited prompt (`prompt_manual`) pins it
+    and is never overwritten. A missing baseline (legacy/custom scripts, or the
+    very first run) trusts the existing prompt — we only rebuild once the scene
+    actually changes afterwards.
+    """
+    if shot.get("prompt_manual"):
+        return False
+    baseline = shot.get("_prompt_source_scene")
+    if baseline is None:
+        return False
+    return (shot.get("scene") or "").strip() != (baseline or "").strip()
+
+
+def _rebuild_prompts_from_scene(
+    shots: list,
+    gemini_key: Optional[str],
+    actor_description: str = "",
+    log: Callable[[str], None] = print,
+) -> None:
+    """Rebuild each shot's English Kling prompt from its edited RU «Что в кадре».
+
+    So editing «Что в кадре» actually changes the rendered shot. Only shots whose
+    scene drifted (and whose prompt isn't hand-pinned) are rebuilt, in a single
+    batched Gemini call. Every shot without a baseline gets one stamped so future
+    scene edits are detectable. On any failure the existing prompts are kept.
+    """
+    stale = [s for s in shots if _needs_prompt_rebuild(s)]
+    # Stamp a baseline for shots that never had one (AI scripts stamp at creation;
+    # this covers custom/legacy). Done for all shots, rebuilt or not.
+    for s in shots:
+        if s.get("_prompt_source_scene") is None and not s.get("prompt_manual"):
+            s["_prompt_source_scene"] = (s.get("scene") or "").strip()
+    if not stale or not gemini_key:
+        return
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=gemini_key)
+        payload = [
+            {
+                "n": i,
+                "visual_type": "broll" if _is_broll_shot(s) else "talking",
+                "scene": (s.get("scene") or "").strip(),
+                "action": (s.get("actor_action") or s.get("action") or "").strip(),
+                "camera": (s.get("camera") or "").strip(),
+                "role": (s.get("role") or "").strip(),
+            }
+            for i, s in enumerate(stale)
+        ]
+        prompt = (
+            "You convert Russian shot descriptions into English video-generation prompts "
+            "for Kling V3 (vertical 9:16 realistic UGC ad).\n"
+            f"Actor: {actor_description or 'a consistent real person, same across all shots'}.\n"
+            "For each shot, write ONE English prompt that fully describes the scene, action "
+            "and camera on its own. Rules: vertical 9:16, same actor/character across shots, "
+            "natural light, authentic smartphone footage, no burned-in text, no logos, no "
+            "watermark. For visual_type 'broll': no people, no faces (object/food/hands "
+            "close-ups only). Never request readable on-screen text.\n"
+            f"Shots JSON: {json.dumps(payload, ensure_ascii=False)}\n"
+            'Return ONLY a JSON array: [{"n": <n>, "prompt": "<english prompt>"}].'
+        )
+        resp = _generate_gemini_content(
+            client,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", max_output_tokens=4096
+            ),
+        )
+        text = (resp.text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        result = json.loads(text)
+        by_n = {int(item["n"]): (item.get("prompt") or "").strip() for item in result if "n" in item}
+        for i, s in enumerate(stale):
+            new_prompt = by_n.get(i)
+            if new_prompt:
+                s["generation_prompt"] = _build_storyboard_generation_prompt(
+                    {**s, "generation_prompt": new_prompt}
+                )
+                s["_prompt_source_scene"] = (s.get("scene") or "").strip()
+                log(f"  Кадр {s.get('shot_number', i + 1)}: промпт перестроен из «Что в кадре».")
+    except Exception as e:
+        log(f"  ⚠️ Не удалось перестроить промпты из «Что в кадре» ({e}); оставляю прежние.")
 
 
 def normalize_storyboard_shots(script: dict) -> list:
@@ -5088,6 +5185,127 @@ def _purge_voiceover_derived_assets(output_dir: str, title_slug: str) -> None:
                     pass
 
 
+def _attach_shot_previews(
+    shots: list,
+    clips: list,
+    output_dir: str,
+    title_slug: str,
+    log: Callable[[str], None] = print,
+) -> None:
+    """Attach `preview_frame_url` / `clip_url` to each shot from generated files.
+
+    Lets the UI show the actual rendered frame of every shot after a video
+    render, with no extra generation. Maps by `shot_number` (jump-cut splits copy
+    the shot dict, so identity can't be trusted) and extracts one thumbnail per
+    shot from its clip. Best-effort: any failure just leaves the shot without a
+    preview.
+    """
+    job_dir = os.path.basename(output_dir.rstrip("/\\"))
+
+    def _url(path: str) -> str:
+        return f"/videos/{job_dir}/{os.path.basename(path)}"
+
+    clip_for_number: dict = {}
+    for clip in clips:
+        members = list(clip.get("shots") or [])
+        if clip.get("shot"):
+            members.append(clip["shot"])
+        for member in members:
+            num = member.get("shot_number")
+            if num is not None:
+                clip_for_number.setdefault(num, clip)
+
+    for i, shot in enumerate(shots):
+        clip = clip_for_number.get(shot.get("shot_number"))
+        clip_path = (clip or {}).get("path")
+        if not (clip_path and os.path.exists(clip_path)):
+            continue
+        shot["clip_url"] = _url(clip_path)
+        thumb = os.path.join(output_dir, f"{title_slug}_thumb_{shot.get('shot_number', i + 1):02d}.jpg")
+        try:
+            if not _nonempty(thumb):
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", clip_path, "-frames:v", "1", "-q:v", "3", thumb],
+                    check=True, capture_output=True,
+                )
+            if _nonempty(thumb):
+                shot["preview_frame_url"] = _url(thumb)
+        except Exception as e:
+            log(f"  ⚠️ Кадр {shot.get('shot_number', i + 1)}: превью не извлечено ({e}).")
+
+
+def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=print):
+    """Generate just the per-shot Flux start frames — no paid Kling video.
+
+    Lets the user preview and approve each shot's composition before committing
+    to a render. Frames land in the job dir and are attached to each shot as
+    image_path/local_url, so a later video render reuses them as start frames
+    (both `_storyboard_avatar_reference_image` and the b-roll path pick them up).
+    Set `frames_only_shot` to a shot_number to (re)generate a single shot.
+    """
+    fal_key = config["fal_key"]
+    selected_actor_path = config.get("selected_actor_path") or ""
+    actor_description = config.get("actor_description") or ""
+    only = config.get("frames_only_shot")
+    job_dir = os.path.basename(output_dir.rstrip("/\\"))
+    fallback_actor = {"path": ""}
+
+    def _actor_photo():
+        if selected_actor_path and os.path.exists(selected_actor_path):
+            return selected_actor_path
+        if not fallback_actor["path"]:
+            path = os.path.join(output_dir, f"{title_slug}_actor.png")
+            if not _nonempty(path):
+                desc = actor_description or (
+                    "a young professional in their late 20s, casual modern outfit, clean background"
+                )
+                generate_actor_image(desc, fal_key, path)
+            fallback_actor["path"] = path
+        return fallback_actor["path"]
+
+    made = 0
+    for shot in shots:
+        num = shot.get("shot_number")
+        if only is not None and num != only:
+            continue
+        frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
+        if only is not None:
+            # Explicit per-shot regenerate: drop the cached frame so a new one is drawn.
+            for stale in (frame_path, f"{frame_path}.prompt.txt", f"{frame_path}.fal_url.txt"):
+                try:
+                    if os.path.exists(stale):
+                        os.remove(stale)
+                except OSError:
+                    pass
+        log(f"[кадры] Генерирую кадр {num}...")
+        if _is_broll_shot(shot):
+            made_path = _broll_reference_image(shot, fal_key, frame_path, log=log)
+        else:
+            made_path = _avatar_reference_image(shot, _actor_photo(), fal_key, frame_path, log=log)
+        if made_path and _nonempty(made_path):
+            url = f"/videos/{job_dir}/{os.path.basename(made_path)}"
+            shot["image_path"] = made_path
+            shot["local_url"] = url
+            shot["image_url"] = url
+            shot["preview_frame_url"] = url
+            made += 1
+        else:
+            log(f"  ⚠️ Кадр {num}: не удалось сгенерировать.")
+
+    log(f"[кадры] Готово: {made} кадр(ов).")
+    cost = round(made * 0.05, 2)
+    return {
+        "video_path": "",
+        "video_filename": "",
+        "frames_only": True,
+        "duration": 0,
+        "storyboard_shots": shots,
+        "storyboard_generation_mode": (config.get("storyboard_generation_mode") or "sliced_avatar"),
+        "cost_estimate": {"reference_frames_flux": cost, "total": cost},
+        "quality_warnings": [],
+    }
+
+
 def generate_storyboard_video(
     script: dict,
     config: dict,
@@ -5117,6 +5335,20 @@ def generate_storyboard_video(
     shots = normalize_storyboard_shots(script)
     if not shots:
         raise ValueError("Storyboard script has no shots")
+
+    # «Что в кадре» is the source of truth for the picture: rebuild the English
+    # Kling prompt from the (possibly user-edited) scene before generating, unless
+    # the shot's prompt was hand-pinned. No-op on first run / for pinned prompts.
+    _rebuild_prompts_from_scene(
+        shots,
+        config.get("gemini_key"),
+        actor_description=config.get("actor_description") or script.get("actor_description") or "",
+        log=log,
+    )
+
+    # Frames-only: generate the Flux start frames for review, no paid Kling video.
+    if config.get("frames_only"):
+        return _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=log)
 
     # Shots are the source of truth for a storyboard: rebuild the narration from
     # the CURRENT shots so trimming/editing the shot list actually shortens the
@@ -5182,6 +5414,25 @@ def generate_storyboard_video(
     if generation_mode == "multi_shot" and storyboard_family != "kling_v3":
         generation_mode = "per_shot"
         log(f"[2/5] {storyboard_label} does not support multi-shot payloads here, using per-shot generation.")
+
+    # Length is the voiceover's, always: the final mux is `-shortest` against the
+    # master track, so a manual per-shot seconds field never really sets the
+    # runtime. Derive each shot's duration from its share of the voiceover (the
+    # same word-proportional tiling sliced_avatar uses) so per_shot/multi_shot
+    # clips match the audio, cost scales with speech, and no seconds UI is needed.
+    if generation_mode in ("per_shot", "multi_shot"):
+        try:
+            derived_duration = _get_media_duration(audio_path)
+            derived_slices, derived_skipped = _align_shots_to_voiceover(shots, [], derived_duration)
+            for sl in derived_slices:
+                sl["shot"]["start"] = round(sl["start"], 3)
+                sl["shot"]["end"] = round(sl["end"], 3)
+            for silent_shot in derived_skipped:
+                # No speech = no audio share; give it a short default beat.
+                silent_shot["start"] = 0
+                silent_shot["end"] = 3
+        except Exception as e:
+            log(f"[2/5] Could not derive shot durations from voiceover ({e}); keeping script timings.")
 
     spoken_words = []
     clips = []
@@ -5290,6 +5541,10 @@ def generate_storyboard_video(
     else:
         log("[4/5] Assembling storyboard edit...")
     composite_storyboard_video(clips, audio_path, srt_path, final_path, music_path=music_path)
+
+    # Surface each shot's rendered frame/clip so the editor can show generated
+    # results after a run (no extra generation — pulled from the job's files).
+    _attach_shot_previews(shots, clips, output_dir, title_slug, log=log)
 
     log("[5/5] Storyboard video complete.")
 
