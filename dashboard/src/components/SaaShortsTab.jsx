@@ -9,7 +9,19 @@ import {
   profileId as businessProfileKey,
   peekPendingTopic,
   clearPendingTopic,
+  peekPendingContentPlanItem,
+  clearPendingContentPlanItem,
 } from '../lib/businessProfiles';
+import {
+  workspaceStorageKey,
+  loadLocalWorkspace,
+  saveLocalWorkspace,
+  chooseNewestWorkspace,
+  workspaceStage,
+  loadActiveContentPlanContext,
+  saveActiveContentPlanContext,
+  clearActiveContentPlanContext,
+} from '../lib/contentPlanWorkspaces';
 
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'Разговор в камеру', desc: 'Живо и по-человечески, как сторис у знакомой' },
@@ -452,17 +464,17 @@ function formatUsd(value) {
   return `$${Math.max(value, 0).toFixed(2)}`;
 }
 
-function loadCache() {
+function loadCache(cacheKey = CACHE_KEY) {
   try {
-    const raw = localStorage.getItem(CACHE_KEY);
+    const raw = localStorage.getItem(cacheKey);
     if (!raw) return null;
     const cache = JSON.parse(raw);
     if (cache.version !== CACHE_VERSION) {
-      localStorage.removeItem(CACHE_KEY);
+      localStorage.removeItem(cacheKey);
       return null;
     }
     if (Date.now() - cache.timestamp > CACHE_MAX_AGE) {
-      localStorage.removeItem(CACHE_KEY);
+      localStorage.removeItem(cacheKey);
       return null;
     }
     return cache;
@@ -483,23 +495,27 @@ function jobIdFromVideoUrl(videoUrl) {
   return match ? match[1] : '';
 }
 
-function loadLastJob() {
+function workspaceLastJobKey(cacheKey) {
+  return !cacheKey || cacheKey === CACHE_KEY ? LAST_JOB_KEY : `${cacheKey}_last_job`;
+}
+
+function loadLastJob(cacheKey) {
   try {
-    return JSON.parse(localStorage.getItem(LAST_JOB_KEY) || 'null');
+    return JSON.parse(localStorage.getItem(workspaceLastJobKey(cacheKey)) || 'null');
   } catch {
     return null;
   }
 }
 
-function saveLastJob(jobId) {
+function saveLastJob(cacheKey, jobId) {
   try {
-    localStorage.setItem(LAST_JOB_KEY, JSON.stringify({ jobId, savedAt: Date.now() }));
+    localStorage.setItem(workspaceLastJobKey(cacheKey), JSON.stringify({ jobId, savedAt: Date.now() }));
   } catch { /* localStorage full */ }
 }
 
-function clearLastJob() {
+function clearLastJob(cacheKey) {
   try {
-    localStorage.removeItem(LAST_JOB_KEY);
+    localStorage.removeItem(workspaceLastJobKey(cacheKey));
   } catch { /* ignore */ }
 }
 
@@ -522,17 +538,29 @@ function saveVideoPrefs(prefs) {
   } catch { /* localStorage full */ }
 }
 
-function saveCache(input, analysis, webResearch, scripts) {
+function saveCache(cacheKey, input, analysis, webResearch, scripts, progress = {}) {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({
+    localStorage.setItem(cacheKey, JSON.stringify({
       version: CACHE_VERSION,
       ...input,
       analysis,
       webResearch,
       scripts,
+      ...progress,
       timestamp: Date.now(),
     }));
   } catch { /* localStorage full */ }
+}
+
+function resolveActiveWorkspaceContext() {
+  const pendingContentPlanContext = peekPendingContentPlanItem();
+  const activeContentPlanContext = pendingContentPlanContext || loadActiveContentPlanContext();
+  if (pendingContentPlanContext) {
+    saveActiveContentPlanContext(pendingContentPlanContext);
+    clearPendingContentPlanItem();
+    clearPendingTopic();
+  }
+  return { activeContentPlanContext, pendingContentPlanContext };
 }
 
 export default function SaaShortsTab({
@@ -545,11 +573,29 @@ export default function SaaShortsTab({
   usePlatformKeys = false,
   onManageProjects,
 }) {
+  const [workspaceContextState, setWorkspaceContextState] = useState(resolveActiveWorkspaceContext);
+  const { activeContentPlanContext, pendingContentPlanContext } = workspaceContextState;
+  const activeWorkspaceKey = activeContentPlanContext
+    ? workspaceStorageKey(activeContentPlanContext)
+    : CACHE_KEY;
+  const [initialCache] = useState(() => (
+    activeContentPlanContext
+      ? loadLocalWorkspace(activeContentPlanContext)
+      : loadCache(activeWorkspaceKey)
+  ));
+  const [pendingTopicOnMount] = useState(() => peekPendingTopic());
+  const initialHasProgress = Boolean(
+    initialCache?.analysis
+    || initialCache?.webResearch
+    || initialCache?.scripts?.length
+    || initialCache?.jobId
+    || initialCache?.genResult,
+  );
+
   // Wizard state
-  const [step, setStep] = useState(() => {
-    const cache = loadCache();
-    return cache ? 1 : 0;
-  });
+  const [step, setStep] = useState(() => (
+    Number.isInteger(initialCache?.step) ? initialCache.step : (initialHasProgress ? 1 : 0)
+  ));
 
   // Раскадровка, переданная из галереи кнопкой «Редактировать». Читаем ОДИН раз
   // в инициализаторе: StrictMode гоняет mount-эффекты дважды, и «прочитал и
@@ -566,28 +612,32 @@ export default function SaaShortsTab({
   // Step 0: Business brief
   const [url] = useState('');
   const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
-  const [description, setDescription] = useState(() => loadCache()?.description || '');
-  const [topic, setTopic] = useState(() => loadCache()?.topic || '');
-  const [businessName, setBusinessName] = useState(() => loadCache()?.businessName || '');
+  const [description, setDescription] = useState(() => initialCache?.description || '');
+  const [topic, setTopic] = useState(() => (
+    initialCache?.topic || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || ''
+  ));
+  const [businessName, setBusinessName] = useState(() => initialCache?.businessName || '');
   const [businessProfiles, setBusinessProfiles] = useState(() => loadBusinessProfiles());
-  const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => loadSelectedProfileId() || loadCache()?.businessProfileId || '');
-  const [scriptMode, setScriptMode] = useState(() => loadCache()?.scriptMode || 'ai'); // "ai" or "custom"
-  const [scriptFormat, setScriptFormat] = useState(() => loadCache()?.scriptFormat || 'ugc');
-  const [textModel, setTextModel] = useState(() => loadCache()?.textModel || 'fast');
-  const [customScript, setCustomScript] = useState(() => loadCache()?.customScript || '');
+  const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => (
+    initialCache?.businessProfileId || activeContentPlanContext?.profileId || loadSelectedProfileId() || ''
+  ));
+  const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || 'ai'); // "ai" or "custom"
+  const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || 'ugc');
+  const [textModel, setTextModel] = useState(() => initialCache?.textModel || 'fast');
+  const [customScript, setCustomScript] = useState(() => initialCache?.customScript || '');
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('ru');
   const [actorGender, setActorGender] = useState('female');
   const [numScripts, setNumScripts] = useState(3);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState('');
-  const [fromCache, setFromCache] = useState(() => !!loadCache());
+  const [fromCache, setFromCache] = useState(initialHasProgress);
 
   // Step 1: Analysis results
-  const [analysis, setAnalysis] = useState(() => loadCache()?.analysis || null);
-  const [webResearch, setWebResearch] = useState(() => loadCache()?.webResearch || null);
-  const [scripts, setScripts] = useState(() => loadCache()?.scripts || []);
-  const [selectedScript, setSelectedScript] = useState(0);
+  const [analysis, setAnalysis] = useState(() => initialCache?.analysis || null);
+  const [webResearch, setWebResearch] = useState(() => initialCache?.webResearch || null);
+  const [scripts, setScripts] = useState(() => initialCache?.scripts || []);
+  const [selectedScript, setSelectedScript] = useState(() => initialCache?.selectedScript ?? 0);
   // Undo stack for storyboard shot edits: snapshots of shots before each
   // add / delete / reorder, tagged with the script they belong to.
   const [shotHistory, setShotHistory] = useState([]);
@@ -611,7 +661,7 @@ export default function SaaShortsTab({
   const [selectedVoice, setSelectedVoice] = useState(() => loadVideoPrefs().selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
-  const [editedNarration, setEditedNarration] = useState('');
+  const [editedNarration, setEditedNarration] = useState(() => initialCache?.editedNarration || '');
   const [actorOptions, setActorOptions] = useState([]);
   const [selectedActor, setSelectedActor] = useState(() => loadVideoPrefs().selectedActor || null);
   // Блок ведущего свёрнут до одной строки «кто говорит + каким голосом».
@@ -646,10 +696,10 @@ export default function SaaShortsTab({
 
   // Step 3: Generate
   const [generating, setGenerating] = useState(false);
-  const [jobId, setJobId] = useState(null);
+  const [jobId, setJobId] = useState(() => initialCache?.jobId || null);
   const [genLogs, setGenLogs] = useState([]);
-  const [genStatus, setGenStatus] = useState('idle');
-  const [genResult, setGenResult] = useState(null);
+  const [genStatus, setGenStatus] = useState(() => initialCache?.genStatus || 'idle');
+  const [genResult, setGenResult] = useState(() => initialCache?.genResult || null);
   const [lipSyncModel, setLipSyncModel] = useState('sync-3');
   const [lipSyncing, setLipSyncing] = useState(false);
   // Frames-only preview: generate/regenerate the start frames of each shot on
@@ -667,30 +717,257 @@ export default function SaaShortsTab({
   // UI
   const [copied, setCopied] = useState('');
   const [logsExpanded, setLogsExpanded] = useState(true);
+  const workspaceSyncTimerRef = useRef(null);
+  const latestWorkspaceSnapshotRef = useRef(null);
+  const workspaceResettingRef = useRef(false);
+  const workspaceHydratedRef = useRef(!authToken || !activeContentPlanContext);
+  const [workspaceHydrationVersion, setWorkspaceHydrationVersion] = useState(0);
+
+  const workspaceEndpoint = (context = activeContentPlanContext) => {
+    const profileId = context?.profileId || '';
+    const itemId = context?.itemId ?? context?.item?.item_id ?? '';
+    return `/api/user/content-workspaces/${encodeURIComponent(profileId)}/${encodeURIComponent(itemId)}`;
+  };
+
+  const applyWorkspaceSnapshot = (snapshot) => {
+    if (!snapshot) return;
+    setDescription(snapshot.description || '');
+    setTopic(snapshot.topic || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || '');
+    setBusinessName(snapshot.businessName || '');
+    setSelectedBusinessProfileId(snapshot.businessProfileId || activeContentPlanContext?.profileId || '');
+    setScriptMode(snapshot.scriptMode || 'ai');
+    setScriptFormat(snapshot.scriptFormat || 'ugc');
+    setTextModel(snapshot.textModel || 'fast');
+    setCustomScript(snapshot.customScript || '');
+    setAnalysis(snapshot.analysis || null);
+    setWebResearch(snapshot.webResearch || null);
+    setScripts(snapshot.scripts || []);
+    setStep(Number.isInteger(snapshot.step) ? snapshot.step : 0);
+    setSelectedScript(snapshot.selectedScript ?? 0);
+    setEditedNarration(snapshot.editedNarration || '');
+    setJobId(snapshot.jobId || null);
+    setGenStatus(snapshot.genStatus || 'idle');
+    setGenResult(snapshot.genResult || null);
+    setFromCache(Boolean(
+      snapshot.analysis
+      || snapshot.webResearch
+      || snapshot.scripts?.length
+      || snapshot.jobId
+      || snapshot.genResult,
+    ));
+  };
+
+  const buildWorkspaceSnapshot = (overrides = {}) => ({
+    version: CACHE_VERSION,
+    url: '',
+    businessProfileId: selectedBusinessProfileId,
+    businessName: businessName.trim(),
+    description: description.trim(),
+    topic: topic.trim() || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || '',
+    scriptMode,
+    scriptFormat,
+    textModel,
+    customScript: scriptMode === 'custom' ? customScript.trim() : '',
+    analysis,
+    webResearch,
+    scripts,
+    step,
+    selectedScript,
+    editedNarration,
+    jobId,
+    genStatus,
+    genResult,
+    result: genResult,
+    status: genStatus === 'failed' ? 'failed' : undefined,
+    timestamp: Date.now(),
+    ...overrides,
+  });
+
+  function flushWorkspaceSync() {
+    if (workspaceSyncTimerRef.current) {
+      clearTimeout(workspaceSyncTimerRef.current);
+      workspaceSyncTimerRef.current = null;
+    }
+    if (!authToken || !activeContentPlanContext) return Promise.resolve();
+    const snapshot = latestWorkspaceSnapshotRef.current;
+    if (!snapshot) return Promise.resolve();
+    return fetch(getApiUrl(workspaceEndpoint()), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify({
+        revision: snapshot.revision,
+        stage: workspaceStage(snapshot),
+        snapshot,
+      }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data?.workspace || !activeContentPlanContext) return;
+        const remoteWorkspace = {
+          ...data.workspace.snapshot,
+          revision: data.workspace.revision,
+          updatedAt: data.workspace.updated_at,
+        };
+        const localWorkspace = loadLocalWorkspace(activeContentPlanContext);
+        const newestWorkspace = chooseNewestWorkspace(localWorkspace, remoteWorkspace);
+        if (newestWorkspace === remoteWorkspace) {
+          saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);
+        }
+      })
+      .catch(() => {});
+  }
+
+  function queueWorkspaceSync(snapshot) {
+    latestWorkspaceSnapshotRef.current = snapshot;
+    if (!authToken || !activeContentPlanContext) return;
+    if (workspaceSyncTimerRef.current) clearTimeout(workspaceSyncTimerRef.current);
+    workspaceSyncTimerRef.current = setTimeout(flushWorkspaceSync, 400);
+  }
+
+  const persistWorkspaceSnapshot = (overrides = {}) => {
+    const snapshot = buildWorkspaceSnapshot(overrides);
+    if (activeContentPlanContext) {
+      const saved = saveLocalWorkspace(activeContentPlanContext, snapshot);
+      queueWorkspaceSync(saved);
+      return saved;
+    }
+    saveCache(
+      activeWorkspaceKey,
+      {
+        url: '',
+        businessProfileId: snapshot.businessProfileId,
+        businessName: snapshot.businessName,
+        description: snapshot.description,
+        topic: snapshot.topic,
+        scriptMode: snapshot.scriptMode,
+        scriptFormat: snapshot.scriptFormat,
+        textModel: snapshot.textModel,
+        customScript: snapshot.customScript,
+      },
+      snapshot.analysis,
+      snapshot.webResearch,
+      snapshot.scripts,
+      {
+        step: snapshot.step,
+        selectedScript: snapshot.selectedScript,
+        editedNarration: snapshot.editedNarration,
+        jobId: snapshot.jobId,
+        genStatus: snapshot.genStatus,
+        genResult: snapshot.genResult,
+      },
+    );
+    return snapshot;
+  };
 
   // Pre-fill from cache on mount
   useEffect(() => {
-    if (fromCache && scripts.length > 0) {
-      setEditedNarration(scripts[0].full_narration || '');
+    if (fromCache && scripts.length > 0 && !initialCache?.editedNarration) {
+      setEditedNarration(scripts[selectedScript]?.full_narration || scripts[0].full_narration || '');
     }
   }, []);
+
+  useEffect(() => {
+    if (!authToken || !activeContentPlanContext) {
+      workspaceHydratedRef.current = true;
+      return undefined;
+    }
+    let cancelled = false;
+    workspaceHydratedRef.current = false;
+    fetch(getApiUrl(workspaceEndpoint()), { headers: authHeaders() })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data?.workspace) return;
+        const remoteWorkspace = {
+          ...data.workspace.snapshot,
+          revision: data.workspace.revision,
+          updatedAt: data.workspace.updated_at,
+        };
+        const localWorkspace = loadLocalWorkspace(activeContentPlanContext);
+        const newestWorkspace = chooseNewestWorkspace(localWorkspace, remoteWorkspace);
+        if (newestWorkspace === remoteWorkspace) {
+          const saved = saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);
+          applyWorkspaceSnapshot(saved);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (cancelled) return;
+        workspaceHydratedRef.current = true;
+        setWorkspaceHydrationVersion((version) => version + 1);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, activeWorkspaceKey]);
+
+  useEffect(() => {
+    if (workspaceResettingRef.current) {
+      workspaceResettingRef.current = false;
+      return;
+    }
+    if (!workspaceHydratedRef.current) return;
+    persistWorkspaceSnapshot();
+  }, [
+    description,
+    topic,
+    businessName,
+    selectedBusinessProfileId,
+    scriptMode,
+    scriptFormat,
+    textModel,
+    customScript,
+    analysis,
+    webResearch,
+    scripts,
+    step,
+    selectedScript,
+    editedNarration,
+    jobId,
+    genStatus,
+    genResult,
+    workspaceHydrationVersion,
+  ]);
+
+  useEffect(() => () => {
+    if (workspaceSyncTimerRef.current) clearTimeout(workspaceSyncTimerRef.current);
+    const snapshot = latestWorkspaceSnapshotRef.current;
+    if (!authToken || !activeContentPlanContext || !snapshot) return;
+    const { profileId, itemId } = activeContentPlanContext;
+    fetch(getApiUrl(`/api/user/content-workspaces/${encodeURIComponent(profileId)}/${encodeURIComponent(itemId)}`), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      },
+      body: JSON.stringify({
+        revision: snapshot.revision,
+        stage: workspaceStage(snapshot),
+        snapshot,
+      }),
+      keepalive: true,
+    }).catch(() => {});
+  }, [authToken, activeWorkspaceKey]);
 
   // Активный проект со страницы «Проекты» + тема, выбранная в контент-плане.
   // Тема читается lazy-инициализатором и очищается отдельно: StrictMode гоняет
   // mount-эффект дважды, и повторный прогон не должен терять уже снятую тему.
-  const [pendingTopicOnMount] = useState(() => peekPendingTopic());
   useEffect(() => {
-    const storedId = loadSelectedProfileId();
+    const storedId = activeContentPlanContext?.profileId || loadSelectedProfileId();
     if (storedId) {
       const profile = loadBusinessProfiles().find((item) => businessProfileKey(item) === storedId);
       // Кеш держит правки пользователя для того же проекта; при смене
       // активного проекта на странице «Проекты» кеш надо перезаписать.
-      const cachedId = loadCache()?.businessProfileId || '';
+      const cachedId = initialCache?.businessProfileId || '';
       if (profile && (!description.trim() || storedId !== cachedId)) {
         handleLoadBusinessProfile(profile);
       }
     }
-    if (pendingTopicOnMount) {
+    if (activeContentPlanContext) {
+      setTopic(initialCache?.topic || activeContentPlanContext.topic || activeContentPlanContext.item?.topic || '');
+    } else if (pendingTopicOnMount) {
       setTopic(pendingTopicOnMount);
       setStep(0);
       setFromCache(false);
@@ -745,15 +1022,15 @@ export default function SaaShortsTab({
   };
 
   useEffect(() => {
-    if (pendingTopicOnMount) return;
-    const last = loadLastJob();
+    if (pendingTopicOnMount && !pendingContentPlanContext) return;
+    const last = loadLastJob(activeWorkspaceKey);
     if (!last?.jobId) return;
     (async () => {
       try {
         const res = await fetch(getApiUrl(`/api/saasshorts/status/${last.jobId}`), { headers: authHeaders() });
         if (!res.ok) {
           // Job вычищен на сервере (рестарт или >1ч) — готовое видео остаётся в галерее UGC
-          if (res.status === 404) clearLastJob();
+          if (res.status === 404) clearLastJob(activeWorkspaceKey);
           return;
         }
         const data = await res.json();
@@ -987,23 +1264,21 @@ export default function SaaShortsTab({
       setSelectedScript(0);
       setFromCache(false);
 
-      // Cache results
-      saveCache({
-        url: '',
-        businessProfileId: selectedBusinessProfileId,
-        businessName: businessName.trim(),
-        description: description.trim(),
-        topic: topic.trim(),
-        scriptMode,
-        scriptFormat,
-        textModel,
+      const firstNarration = data.scripts[0]?.full_narration || '';
+      persistWorkspaceSnapshot({
+        analysis: data.analysis,
+        webResearch: data.web_research || null,
+        scripts: data.scripts,
+        step: 1,
+        selectedScript: 0,
+        editedNarration: firstNarration,
         customScript: isCustom ? customScript.trim() : '',
-      }, data.analysis, data.web_research, data.scripts);
+      });
 
       // Pre-fill actor description and narration from first script
       if (data.scripts.length > 0) {
         setActorDescription('');
-        setEditedNarration(data.scripts[0].full_narration || '');
+        setEditedNarration(firstNarration);
       }
 
       setStep(1);
@@ -1015,26 +1290,18 @@ export default function SaaShortsTab({
   };
 
   const handleSelectScript = (idx) => {
+    const nextNarration = scripts[idx]?.full_narration || '';
     setSelectedScript(idx);
     if (scripts[idx]) {
       setActorDescription('');
       setActorOptions([]);
-      setEditedNarration(scripts[idx].full_narration || '');
+      setEditedNarration(nextNarration);
     }
+    persistWorkspaceSnapshot({ selectedScript: idx, editedNarration: nextNarration });
   };
 
   const persistScripts = (nextScripts) => {
-    saveCache({
-      url: '',
-      businessProfileId: selectedBusinessProfileId,
-      businessName: businessName.trim(),
-      description: description.trim(),
-      topic: topic.trim(),
-      scriptMode,
-      scriptFormat,
-      textModel,
-      customScript: scriptMode === 'custom' ? customScript.trim() : '',
-    }, analysis, webResearch, nextScripts);
+    persistWorkspaceSnapshot({ scripts: nextScripts });
   };
 
   // Открытие раскадровки готового ролика из галереи: кадры приходят вместе с
@@ -1505,7 +1772,8 @@ export default function SaaShortsTab({
 
       const data = await res.json();
       setJobId(data.job_id);
-      saveLastJob(data.job_id);
+      saveLastJob(activeWorkspaceKey, data.job_id);
+      persistWorkspaceSnapshot({ jobId: data.job_id, genStatus: 'processing', genResult: null, step: 3 });
     } catch (e) {
       setGenStatus('failed');
       setGenLogs((prev) => [...prev, `Error: ${e.message}`]);
@@ -1571,7 +1839,8 @@ export default function SaaShortsTab({
 
       const data = await res.json();
       setJobId(data.job_id);
-      saveLastJob(data.job_id);
+      saveLastJob(activeWorkspaceKey, data.job_id);
+      persistWorkspaceSnapshot({ jobId: data.job_id, genStatus: 'processing', genResult: null });
     } catch (e) {
       setGenStatus('failed');
       setGenLogs((prev) => [...prev, `Retry error: ${e.message}`]);
@@ -1726,6 +1995,31 @@ export default function SaaShortsTab({
   };
 
   const handleReset = () => {
+    workspaceResettingRef.current = true;
+    latestWorkspaceSnapshotRef.current = null;
+    if (workspaceSyncTimerRef.current) {
+      clearTimeout(workspaceSyncTimerRef.current);
+      workspaceSyncTimerRef.current = null;
+    }
+    if (activeContentPlanContext) {
+      localStorage.removeItem(activeWorkspaceKey);
+      clearLastJob(activeWorkspaceKey);
+      if (authToken && activeContentPlanContext) {
+        fetch(getApiUrl(workspaceEndpoint(activeContentPlanContext)), {
+          method: 'DELETE',
+          headers: authHeaders(),
+        }).catch(() => {});
+      }
+      clearActiveContentPlanContext();
+      setWorkspaceContextState({
+        activeContentPlanContext: null,
+        pendingContentPlanContext: null,
+      });
+      setTopic('');
+    } else {
+      localStorage.removeItem(CACHE_KEY);
+      clearLastJob(CACHE_KEY);
+    }
     setStep(0);
     setAnalyzeError('');
     setAnalysis(null);
@@ -1733,8 +2027,6 @@ export default function SaaShortsTab({
     setScripts([]);
     setShotHistory([]);
     setFromCache(false);
-    localStorage.removeItem(CACHE_KEY);
-    clearLastJob();
     setSelectedScript(0);
     setJobId(null);
     setGenLogs([]);

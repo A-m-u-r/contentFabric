@@ -82,6 +82,109 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("export function clearPendingContentPlanItem()", profiles)
         self.assertIn("setPendingContentPlanItem", tab)
         self.assertIn("setPendingTopic(topic)", tab)
+
+    def test_ai_shorts_resolves_active_workspace_before_one_shared_initial_cache(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("peekPendingContentPlanItem", tab)
+        self.assertIn("clearPendingContentPlanItem", tab)
+        self.assertIn("loadActiveContentPlanContext", tab)
+        self.assertIn("saveActiveContentPlanContext", tab)
+        self.assertIn("const pendingContentPlanContext = peekPendingContentPlanItem();", tab)
+        self.assertIn(
+            "const activeContentPlanContext = pendingContentPlanContext || loadActiveContentPlanContext();",
+            tab,
+        )
+        self.assertIn("const activeWorkspaceKey = activeContentPlanContext", tab)
+        self.assertIn("const [initialCache] = useState(() => (", tab)
+        self.assertLess(
+            tab.index("const activeWorkspaceKey = activeContentPlanContext"),
+            tab.index("const [step, setStep] = useState"),
+        )
+        initializer_block = tab[
+            tab.index("export default function SaaShortsTab"):tab.index("// Pre-fill from cache on mount")
+        ]
+        self.assertNotIn("loadCache()?.", initializer_block)
+
+    def test_ai_shorts_restores_workspace_progress_and_scopes_last_job(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("function loadCache(cacheKey = CACHE_KEY)", tab)
+        self.assertIn("function saveCache(cacheKey, input, analysis, webResearch, scripts, progress = {})", tab)
+        self.assertIn("function workspaceLastJobKey(cacheKey)", tab)
+        self.assertIn("function loadLastJob(cacheKey)", tab)
+        self.assertIn("function saveLastJob(cacheKey, jobId)", tab)
+        self.assertIn("function clearLastJob(cacheKey)", tab)
+        self.assertIn("loadLastJob(activeWorkspaceKey)", tab)
+        self.assertIn("saveLastJob(activeWorkspaceKey, data.job_id)", tab)
+        self.assertIn("initialCache?.step", tab)
+        self.assertIn("initialCache?.selectedScript", tab)
+        self.assertIn("initialCache?.editedNarration", tab)
+        self.assertIn("initialCache?.jobId", tab)
+        self.assertIn("initialCache?.genStatus", tab)
+        self.assertIn("initialCache?.genResult", tab)
+
+    def test_ai_shorts_queues_authenticated_workspace_sync_and_flushes_on_unmount(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("function queueWorkspaceSync", tab)
+        self.assertIn("workspaceSyncTimerRef.current = setTimeout(flushWorkspaceSync, 400);", tab)
+        self.assertIn("latestWorkspaceSnapshotRef", tab)
+        self.assertIn("keepalive: true", tab)
+        self.assertIn(
+            "/api/user/content-workspaces/${encodeURIComponent(profileId)}/${encodeURIComponent(itemId)}",
+            tab,
+        )
+        self.assertIn("method: 'PUT'", tab)
+        self.assertIn("revision: snapshot.revision", tab)
+        self.assertIn("stage: workspaceStage(snapshot)", tab)
+        self.assertIn("chooseNewestWorkspace(localWorkspace, remoteWorkspace)", tab)
+        self.assertIn("if (!authToken || !activeContentPlanContext) return;", tab)
+        self.assertIn("const [workspaceHydrationVersion, setWorkspaceHydrationVersion] = useState(0);", tab)
+        persistence_effect = tab[
+            tab.index("useEffect(() => {\n    if (workspaceResettingRef.current)"):
+            tab.index("useEffect(() => () => {")
+        ]
+        self.assertIn("workspaceHydrationVersion,", persistence_effect)
+
+    def test_ai_shorts_persists_item_progress_and_resets_only_the_active_workspace(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        workspaces = CONTENT_PLAN_WORKSPACES.read_text(encoding="utf-8")
+
+        self.assertIn("saveLocalWorkspace(activeContentPlanContext, snapshot)", tab)
+        self.assertIn("version: CACHE_VERSION", tab)
+        self.assertIn("selectedScript,", tab)
+        self.assertIn("editedNarration,", tab)
+        self.assertIn("jobId,", tab)
+        self.assertIn("genStatus,", tab)
+        self.assertIn("genResult,", tab)
+        self.assertIn("localStorage.removeItem(activeWorkspaceKey)", tab)
+        self.assertIn("clearLastJob(activeWorkspaceKey)", tab)
+        self.assertIn("clearActiveContentPlanContext()", tab)
+        self.assertIn("method: 'DELETE'", tab)
+        self.assertIn("if (authToken && activeContentPlanContext)", tab)
+        self.assertIn("explicitStage !== 'not_started'", workspaces)
+
+    def test_ai_shorts_reset_deactivates_item_context_before_blank_state_persists(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        reset = tab[tab.index("const handleReset = () => {"):tab.index("const estimateInputText")]
+
+        self.assertIn("const [workspaceContextState, setWorkspaceContextState] = useState", tab)
+        self.assertIn("const workspaceResettingRef = useRef(false);", tab)
+        self.assertIn("if (workspaceResettingRef.current) {", tab)
+        self.assertIn("workspaceResettingRef.current = false;", tab)
+        self.assertIn("latestWorkspaceSnapshotRef.current = null;", reset)
+        self.assertIn("workspaceResettingRef.current = true;", reset)
+        self.assertIn("localStorage.removeItem(activeWorkspaceKey)", reset)
+        self.assertIn("clearActiveContentPlanContext();", reset)
+        self.assertIn("setWorkspaceContextState({", reset)
+        self.assertIn("activeContentPlanContext: null", reset)
+        self.assertLess(
+            reset.index("setWorkspaceContextState({"),
+            reset.index("setStep(0)"),
+        )
+        self.assertNotIn("saveLocalWorkspace(", reset)
+
     def test_app_shell_uses_mobile_bottom_navigation_instead_of_persistent_sidebar(self):
         app = APP.read_text(encoding="utf-8")
 

@@ -1,4 +1,5 @@
 const WORKSPACE_KEY_PREFIX = 'saasshorts_content_workspace_';
+const ACTIVE_CONTENT_PLAN_CONTEXT_KEY = 'saasshorts_active_content_plan_context';
 const WORKSPACE_STAGES = new Set(['not_started', 'script', 'frames', 'video', 'failed']);
 
 function contextIds(context) {
@@ -39,6 +40,29 @@ export function loadLocalWorkspace(context) {
   }
 }
 
+export function loadActiveContentPlanContext() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_CONTENT_PLAN_CONTEXT_KEY);
+    const context = raw ? JSON.parse(raw) : null;
+    return context && typeof context === 'object' ? context : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveActiveContentPlanContext(context) {
+  try {
+    if (context) localStorage.setItem(ACTIVE_CONTENT_PLAN_CONTEXT_KEY, JSON.stringify(context));
+    else localStorage.removeItem(ACTIVE_CONTENT_PLAN_CONTEXT_KEY);
+  } catch { /* ignore */ }
+}
+
+export function clearActiveContentPlanContext() {
+  try {
+    localStorage.removeItem(ACTIVE_CONTENT_PLAN_CONTEXT_KEY);
+  } catch { /* ignore */ }
+}
+
 function hasText(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -63,7 +87,6 @@ function hasFailedGeneration(snapshot) {
 
 export function workspaceStage(snapshot) {
   const explicitStage = snapshot?.stage;
-  if (WORKSPACE_STAGES.has(explicitStage)) return explicitStage;
 
   if (hasFailedGeneration(snapshot)) return 'failed';
 
@@ -85,6 +108,7 @@ export function workspaceStage(snapshot) {
     || hasText(snapshot?.script)
     || hasText(snapshot?.full_narration)
   ) return 'script';
+  if (WORKSPACE_STAGES.has(explicitStage) && explicitStage !== 'not_started') return explicitStage;
   return 'not_started';
 }
 
