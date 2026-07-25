@@ -49,6 +49,30 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertIn("one single person", lowered)
         self.assertIn("never duplicate", lowered)
 
+    def test_avatar_prompt_removes_ad_style_but_keeps_strict_glyph_ban(self):
+        prompt = saasshorts._avatar_request_prompt(
+            "Vertical 9:16 realistic UGC ad, same actor, a natural woman looking at "
+            "the camera, warm morning light, authentic smartphone video, no text, "
+            "no burned-in text, no watermark. no readable on-screen text, any device "
+            "screens turned away or out of focus"
+        )
+        lowered = prompt.lower()
+
+        self.assertIn("same actor", lowered)
+        self.assertIn("warm morning light", lowered)
+        for trigger in ("ugc", "smartphone video", "social video"):
+            self.assertNotIn(trigger, lowered)
+        for forbidden_visual in (
+            "written characters",
+            "letters",
+            "symbols",
+            "captions",
+            "subtitles",
+            "logos",
+            "watermarks",
+        ):
+            self.assertIn(forbidden_visual, lowered)
+
     def test_avatar_reference_image_conditions_on_photo_and_scene(self):
         class FakeResp:
             content = b"frame"

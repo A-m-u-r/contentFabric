@@ -3116,9 +3116,25 @@ def prepare_kling_actor_image(image_path: str, output_path: str) -> str:
     return output_path
 
 
+def _neutralize_avatar_ad_style(prompt: str) -> str:
+    """Remove style cues that make avatar models imitate captioned social ads."""
+    result = prompt or ""
+    replacements = (
+        (r"\brealistic\s+UGC(?:[-\s]+style)?(?:[-\s]+ad)?\b", "natural portrait video"),
+        (r"\bUGC(?:[-\s]+style)?(?:[-\s]+ad)?\b", "natural portrait video"),
+        (r"\b(?:authentic\s+)?smartphone\s+video\b", "natural camera framing"),
+        (r"\bsocial(?:[-\s]+media)?[-\s]+(?:video|ad|advertisement)\b", "portrait video"),
+    )
+    for pattern, replacement in replacements:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", result).strip()
+
+
 def _avatar_request_prompt(scene_prompt: str) -> str:
     """The prompt a Kling Avatar request carries — single source for cache checks."""
-    framing = (scene_prompt or "").strip() or "Natural UGC creator talking to camera in a steady close-up."
+    framing = _neutralize_avatar_ad_style(scene_prompt)
+    if not framing:
+        framing = "One person talking naturally to the camera in a steady close-up."
     if not framing.endswith("."):
         framing += "."
     return (
@@ -3133,8 +3149,10 @@ def _avatar_request_prompt(scene_prompt: str) -> str:
         "Show exactly one single person, centered and fully inside the frame. "
         "Never duplicate the subject, never show a twin, clone, mirror copy or a second face, "
         "and keep the edges of the frame free of any extra person. "
-        "Keep the outfit, skin and background exactly as in the reference image: "
-        "never add text, letters, numbers, logos, prints or tattoos to clothing, skin or background."
+        "Keep the outfit, skin and background exactly as in the reference image. "
+        "Do not create or display any written characters, letters, numbers, symbols, captions, "
+        "subtitles, logos, watermarks, signs, labels, interface elements or typography anywhere "
+        "in the frame."
     )
 
 
