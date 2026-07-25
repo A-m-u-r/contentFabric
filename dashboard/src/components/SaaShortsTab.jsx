@@ -563,6 +563,20 @@ function resolveActiveWorkspaceContext() {
   return { activeContentPlanContext, pendingContentPlanContext };
 }
 
+function workspaceHasProgress(snapshot) {
+  return Boolean(
+    snapshot?.analysis
+    || snapshot?.webResearch
+    || snapshot?.scripts?.length
+    || snapshot?.jobId
+    || snapshot?.genResult,
+  );
+}
+
+function workspaceStep(snapshot) {
+  return Number.isInteger(snapshot?.step) ? snapshot.step : (workspaceHasProgress(snapshot) ? 1 : 0);
+}
+
 export default function SaaShortsTab({
   geminiApiKey,
   elevenLabsKey,
@@ -584,18 +598,10 @@ export default function SaaShortsTab({
       : loadCache(activeWorkspaceKey)
   ));
   const [pendingTopicOnMount] = useState(() => peekPendingTopic());
-  const initialHasProgress = Boolean(
-    initialCache?.analysis
-    || initialCache?.webResearch
-    || initialCache?.scripts?.length
-    || initialCache?.jobId
-    || initialCache?.genResult,
-  );
+  const initialHasProgress = workspaceHasProgress(initialCache);
 
   // Wizard state
-  const [step, setStep] = useState(() => (
-    Number.isInteger(initialCache?.step) ? initialCache.step : (initialHasProgress ? 1 : 0)
-  ));
+  const [step, setStep] = useState(() => workspaceStep(initialCache));
 
   // Раскадровка, переданная из галереи кнопкой «Редактировать». Читаем ОДИН раз
   // в инициализаторе: StrictMode гоняет mount-эффекты дважды, и «прочитал и
@@ -614,7 +620,7 @@ export default function SaaShortsTab({
   const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
   const [description, setDescription] = useState(() => initialCache?.description || '');
   const [topic, setTopic] = useState(() => (
-    initialCache?.topic || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || ''
+    initialCache?.topic ?? activeContentPlanContext?.topic ?? activeContentPlanContext?.item?.topic ?? ''
   ));
   const [businessName, setBusinessName] = useState(() => initialCache?.businessName || '');
   const [businessProfiles, setBusinessProfiles] = useState(() => loadBusinessProfiles());
@@ -732,7 +738,7 @@ export default function SaaShortsTab({
   const applyWorkspaceSnapshot = (snapshot) => {
     if (!snapshot) return;
     setDescription(snapshot.description || '');
-    setTopic(snapshot.topic || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || '');
+    setTopic(snapshot.topic ?? activeContentPlanContext?.topic ?? activeContentPlanContext?.item?.topic ?? '');
     setBusinessName(snapshot.businessName || '');
     setSelectedBusinessProfileId(snapshot.businessProfileId || activeContentPlanContext?.profileId || '');
     setScriptMode(snapshot.scriptMode || 'ai');
@@ -742,19 +748,13 @@ export default function SaaShortsTab({
     setAnalysis(snapshot.analysis || null);
     setWebResearch(snapshot.webResearch || null);
     setScripts(snapshot.scripts || []);
-    setStep(Number.isInteger(snapshot.step) ? snapshot.step : 0);
+    setStep(workspaceStep(snapshot));
     setSelectedScript(snapshot.selectedScript ?? 0);
     setEditedNarration(snapshot.editedNarration || '');
     setJobId(snapshot.jobId || null);
     setGenStatus(snapshot.genStatus || 'idle');
     setGenResult(snapshot.genResult || null);
-    setFromCache(Boolean(
-      snapshot.analysis
-      || snapshot.webResearch
-      || snapshot.scripts?.length
-      || snapshot.jobId
-      || snapshot.genResult,
-    ));
+    setFromCache(workspaceHasProgress(snapshot));
   };
 
   const buildWorkspaceSnapshot = (overrides = {}) => ({
@@ -763,7 +763,7 @@ export default function SaaShortsTab({
     businessProfileId: selectedBusinessProfileId,
     businessName: businessName.trim(),
     description: description.trim(),
-    topic: topic.trim() || activeContentPlanContext?.topic || activeContentPlanContext?.item?.topic || '',
+    topic: topic.trim(),
     scriptMode,
     scriptFormat,
     textModel,
@@ -814,7 +814,10 @@ export default function SaaShortsTab({
         const localWorkspace = loadLocalWorkspace(activeContentPlanContext);
         const newestWorkspace = chooseNewestWorkspace(localWorkspace, remoteWorkspace);
         if (newestWorkspace === remoteWorkspace) {
-          saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);
+          const saved = saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);
+          latestWorkspaceSnapshotRef.current = saved;
+          applyWorkspaceSnapshot(saved);
+          setWorkspaceHydrationVersion((version) => version + 1);
         }
       })
       .catch(() => {});
@@ -966,7 +969,7 @@ export default function SaaShortsTab({
       }
     }
     if (activeContentPlanContext) {
-      setTopic(initialCache?.topic || activeContentPlanContext.topic || activeContentPlanContext.item?.topic || '');
+      setTopic(initialCache?.topic ?? activeContentPlanContext.topic ?? activeContentPlanContext.item?.topic ?? '');
     } else if (pendingTopicOnMount) {
       setTopic(pendingTopicOnMount);
       setStep(0);

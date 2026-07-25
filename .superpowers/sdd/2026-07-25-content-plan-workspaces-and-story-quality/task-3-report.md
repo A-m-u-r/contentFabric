@@ -34,3 +34,26 @@ Completed and verified.
 - Reviewed the final diff and ran `git diff --check`; no whitespace errors.
 - The build emits pre-existing advisory warnings about a stale Browserslist database and chunks above 500 kB. They do not fail the build and were not changed by this task.
 - The unrelated untracked `docs/diploma/` directory remains untouched and is excluded from the commit.
+
+## Fix Round 1
+
+### Findings Addressed
+
+- `saveLocalWorkspace` now preserves `snapshot.topic` before falling back to the content-plan context. Nullish fallback preserves an intentionally empty user topic.
+- Wizard step selection is centralized in `workspaceStep`. An explicit integer step remains authoritative; snapshots without a step now start at step 1 when analysis, research, scripts, a job, or a result exists.
+- A newer workspace returned by a PUT now becomes authoritative everywhere: it is saved locally, replaces `latestWorkspaceSnapshotRef`, is applied to React state, and retriggers persistence from the applied state rather than the stale request snapshot.
+- The reset guard remains unchanged.
+
+### TDD Evidence
+
+1. Added source contracts for topic precedence, shared progress-derived step fallback, and applying a remote PUT winner.
+2. Ran the three contracts against `63e63ea`; all failed for their intended missing behavior.
+3. Implemented the narrow fixes and reran the focused contracts: all three passed.
+4. The full UI suite initially exposed one old assertion coupled to the former inline step expression. Updated it to assert the shared helper, preserving the same restore contract.
+
+### Fix Round Verification
+
+- `C:\Python311\python.exe -m unittest tests.test_ui_layout_polish -v`
+  - Passed: 36 tests.
+- `npm.cmd run build --prefix dashboard`
+  - Passed. `npm.ps1` remains blocked by local PowerShell execution policy, so the command uses the Windows npm executable.

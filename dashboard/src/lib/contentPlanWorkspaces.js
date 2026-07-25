@@ -151,7 +151,7 @@ export function saveLocalWorkspace(context, snapshot) {
     profileId,
     itemId,
     item: context?.item ?? snapshot.item,
-    topic: context?.topic ?? snapshot.topic ?? '',
+    topic: snapshot.topic ?? context?.topic ?? '',
   };
   try {
     localStorage.setItem(workspaceStorageKey({ profileId, itemId }), JSON.stringify(saved));

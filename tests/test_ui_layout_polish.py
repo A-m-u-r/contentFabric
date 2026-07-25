@@ -117,7 +117,7 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("function clearLastJob(cacheKey)", tab)
         self.assertIn("loadLastJob(activeWorkspaceKey)", tab)
         self.assertIn("saveLastJob(activeWorkspaceKey, data.job_id)", tab)
-        self.assertIn("initialCache?.step", tab)
+        self.assertIn("workspaceStep(initialCache)", tab)
         self.assertIn("initialCache?.selectedScript", tab)
         self.assertIn("initialCache?.editedNarration", tab)
         self.assertIn("initialCache?.jobId", tab)
@@ -184,6 +184,33 @@ class UILayoutPolishTests(unittest.TestCase):
             reset.index("setStep(0)"),
         )
         self.assertNotIn("saveLocalWorkspace(", reset)
+
+    def test_content_workspace_snapshot_topic_wins_over_context_with_nullish_fallback(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        workspaces = CONTENT_PLAN_WORKSPACES.read_text(encoding="utf-8")
+
+        self.assertIn("topic: snapshot.topic ?? context?.topic ?? '',", workspaces)
+        self.assertIn("setTopic(snapshot.topic ?? activeContentPlanContext?.topic", tab)
+        self.assertIn("topic: topic.trim(),", tab)
+
+    def test_ai_shorts_uses_shared_progress_step_fallback_for_initial_and_remote_workspaces(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("function workspaceStep(snapshot)", tab)
+        self.assertIn("const [step, setStep] = useState(() => workspaceStep(initialCache));", tab)
+        self.assertIn("setStep(workspaceStep(snapshot));", tab)
+
+    def test_ai_shorts_applies_remote_put_winner_and_replaces_stale_sync_snapshot(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        put_response = tab[
+            tab.index("function flushWorkspaceSync()"):
+            tab.index("function queueWorkspaceSync")
+        ]
+
+        self.assertIn("const saved = saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);", put_response)
+        self.assertIn("latestWorkspaceSnapshotRef.current = saved;", put_response)
+        self.assertIn("applyWorkspaceSnapshot(saved);", put_response)
+        self.assertIn("setWorkspaceHydrationVersion((version) => version + 1);", put_response)
 
     def test_app_shell_uses_mobile_bottom_navigation_instead_of_persistent_sidebar(self):
         app = APP.read_text(encoding="utf-8")
