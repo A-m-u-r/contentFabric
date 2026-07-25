@@ -7,9 +7,57 @@ APP = ROOT / "dashboard" / "src" / "App.jsx"
 UGC_GALLERY = ROOT / "dashboard" / "src" / "components" / "UGCGallery.jsx"
 LANDING = ROOT / "dashboard" / "src" / "Landing.jsx"
 SAAS_SHORTS = ROOT / "dashboard" / "src" / "components" / "SaaShortsTab.jsx"
+CONTENT_PLAN = ROOT / "dashboard" / "src" / "components" / "ContentPlanTab.jsx"
+BUSINESS_PROFILES = ROOT / "dashboard" / "src" / "lib" / "businessProfiles.js"
+CONTENT_PLAN_WORKSPACES = ROOT / "dashboard" / "src" / "lib" / "contentPlanWorkspaces.js"
 
 
 class UILayoutPolishTests(unittest.TestCase):
+    def test_content_plan_workspace_helpers_define_stable_local_contracts(self):
+        workspaces = CONTENT_PLAN_WORKSPACES.read_text(encoding="utf-8")
+
+        self.assertIn("export function ensurePlanItemIds(items)", workspaces)
+        self.assertIn("export function workspaceStorageKey(context)", workspaces)
+        self.assertIn("encodeURIComponent(profileId)", workspaces)
+        self.assertIn("encodeURIComponent(itemId)", workspaces)
+        self.assertIn("export function loadLocalWorkspace(context)", workspaces)
+        self.assertIn("export function saveLocalWorkspace(context, snapshot)", workspaces)
+        self.assertIn("export function chooseNewestWorkspace(local, remote)", workspaces)
+        self.assertIn("export function workspaceStage(snapshot)", workspaces)
+        self.assertIn("revision: nextRevision", workspaces)
+        self.assertIn("updatedAt", workspaces)
+        self.assertIn("not_started", workspaces)
+        self.assertIn("frames", workspaces)
+        self.assertIn("video", workspaces)
+        self.assertIn("failed", workspaces)
+
+    def test_content_plan_uses_item_scoped_identity_and_workspace_hydration(self):
+        tab = CONTENT_PLAN.read_text(encoding="utf-8")
+
+        self.assertIn("ensurePlanItemIds", tab)
+        self.assertIn("item.item_id", tab)
+        self.assertIn("key={item.item_id}", tab)
+        self.assertNotIn("key={i}", tab)
+        self.assertIn("/api/user/content-workspaces?profile_id=", tab)
+        self.assertIn("/api/user/content-workspaces/${encodeURIComponent(selectedId)}/${encodeURIComponent(item.item_id)}", tab)
+        self.assertIn("chooseNewestWorkspace(localWorkspace, remoteWorkspace)", tab)
+        self.assertIn("setOpeningItemId(item.item_id)", tab)
+        self.assertIn("openingItemId === item.item_id", tab)
+        self.assertIn("РќРµ РЅР°С‡Р°С‚", tab)
+        self.assertIn("РЎС†РµРЅР°СЂРёР№", tab)
+        self.assertIn("РљР°РґСЂС‹", tab)
+        self.assertIn("Р’РёРґРµРѕ", tab)
+        self.assertIn("РћС€РёР±РєР°", tab)
+
+    def test_content_plan_sets_structured_pending_context_without_removing_legacy_topic(self):
+        profiles = BUSINESS_PROFILES.read_text(encoding="utf-8")
+        tab = CONTENT_PLAN.read_text(encoding="utf-8")
+
+        self.assertIn("export function setPendingContentPlanItem(context)", profiles)
+        self.assertIn("export function peekPendingContentPlanItem()", profiles)
+        self.assertIn("export function clearPendingContentPlanItem()", profiles)
+        self.assertIn("setPendingContentPlanItem", tab)
+        self.assertIn("setPendingTopic(topic)", tab)
     def test_app_shell_uses_mobile_bottom_navigation_instead_of_persistent_sidebar(self):
         app = APP.read_text(encoding="utf-8")
 

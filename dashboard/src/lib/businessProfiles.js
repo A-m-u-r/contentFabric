@@ -5,6 +5,7 @@
 export const BUSINESS_PROFILES_KEY = 'saasshorts_business_profiles';
 export const SELECTED_PROFILE_KEY = 'saasshorts_selected_profile_id';
 export const PENDING_TOPIC_KEY = 'saasshorts_pending_topic';
+export const PENDING_CONTENT_PLAN_ITEM_KEY = 'saasshorts_pending_content_plan_item';
 
 export function loadBusinessProfiles() {
   try {
@@ -61,5 +62,27 @@ export function peekPendingTopic() {
 export function clearPendingTopic() {
   try {
     localStorage.removeItem(PENDING_TOPIC_KEY);
+  } catch { /* ignore */ }
+}
+
+export function setPendingContentPlanItem(context) {
+  try {
+    localStorage.setItem(PENDING_CONTENT_PLAN_ITEM_KEY, JSON.stringify(context || null));
+  } catch { /* ignore */ }
+}
+
+export function peekPendingContentPlanItem() {
+  try {
+    const raw = localStorage.getItem(PENDING_CONTENT_PLAN_ITEM_KEY);
+    const context = raw ? JSON.parse(raw) : null;
+    return context && typeof context === 'object' ? context : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingContentPlanItem() {
+  try {
+    localStorage.removeItem(PENDING_CONTENT_PLAN_ITEM_KEY);
   } catch { /* ignore */ }
 }

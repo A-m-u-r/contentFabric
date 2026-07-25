@@ -8,7 +8,15 @@ import {
   saveSelectedProfileId,
   profileId,
   setPendingTopic,
+  setPendingContentPlanItem,
 } from '../lib/businessProfiles';
+import {
+  ensurePlanItemIds,
+  loadLocalWorkspace,
+  saveLocalWorkspace,
+  chooseNewestWorkspace,
+  workspaceStage,
+} from '../lib/contentPlanWorkspaces';
 
 const PLAN_KEY_PREFIX = 'saasshorts_content_plan_';
 
@@ -24,6 +32,14 @@ const GOAL_STYLES = {
   'вовлечение': 'bg-blue-500/10 text-blue-300 border-blue-500/20',
   'доверие': 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20',
   'продажа': 'bg-violet-500/10 text-violet-300 border-violet-500/20',
+};
+
+const WORKSPACE_STAGE_LABELS = {
+  not_started: 'РќРµ РЅР°С‡Р°С‚',
+  script: 'РЎС†РµРЅР°СЂРёР№',
+  frames: 'РљР°РґСЂС‹',
+  video: 'Р’РёРґРµРѕ',
+  failed: 'РћС€РёР±РєР°',
 };
 
 function loadPlan(id) {
@@ -42,6 +58,25 @@ function savePlan(id, plan) {
   } catch { /* localStorage full */ }
 }
 
+function upgradePlan(plan) {
+  if (!plan) return null;
+  const items = ensurePlanItemIds(plan.items);
+  const itemIdsChanged = items.some((item, index) => item !== plan.items[index]);
+  const done = Object.entries(plan.done || {}).reduce((next, [key, value]) => {
+    const item = Number.isInteger(Number(key)) ? items[Number(key)] : null;
+    next[item?.item_id || key] = value;
+    return next;
+  }, {});
+  const doneChanged = Object.keys(done).some((key) => !Object.prototype.hasOwnProperty.call(plan.done || {}, key));
+  return itemIdsChanged || doneChanged ? { ...plan, items, done } : plan;
+}
+
+function itemTopic(item) {
+  return [item.topic, item.hook ? `Хук: ${item.hook}` : '', item.cta ? `CTA: ${item.cta}` : '']
+    .filter(Boolean)
+    .join('\n');
+}
+
 export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKeys = false, onCreateVideo, onOpenProjects }) {
   const [profiles, setProfiles] = useState(() => loadBusinessProfiles());
   const [selectedId, setSelectedId] = useState(() => loadSelectedProfileId());
@@ -49,6 +84,8 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
   const [plan, setPlan] = useState(null);
+  const [workspaceSummaries, setWorkspaceSummaries] = useState({});
+  const [openingItemId, setOpeningItemId] = useState('');
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
   const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
@@ -69,8 +106,29 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
   }, [authToken]);
 
   useEffect(() => {
-    setPlan(selectedId ? loadPlan(selectedId) : null);
+    const loadedPlan = selectedId ? loadPlan(selectedId) : null;
+    const upgradedPlan = upgradePlan(loadedPlan);
+    setPlan(upgradedPlan);
+    if (selectedId && upgradedPlan !== loadedPlan) savePlan(selectedId, upgradedPlan);
   }, [selectedId]);
+
+  useEffect(() => {
+    if (!authToken || !selectedId) {
+      setWorkspaceSummaries({});
+      return;
+    }
+    let cancelled = false;
+    fetch(getApiUrl(`/api/user/content-workspaces?profile_id=${encodeURIComponent(selectedId)}`), { headers: authHeaders() })
+      .then((res) => (res.ok ? res.json() : { workspaces: [] }))
+      .then((data) => {
+        if (cancelled || !Array.isArray(data.workspaces)) return;
+        setWorkspaceSummaries(Object.fromEntries(data.workspaces.map((workspace) => [workspace.item_id, workspace])));
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaceSummaries({});
+      });
+    return () => { cancelled = true; };
+  }, [authToken, selectedId]);
 
   const handleSelectProfile = (profile) => {
     const id = profileId(profile);
@@ -112,7 +170,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
       }
       const data = await res.json();
       const nextPlan = {
-        items: data.items || [],
+        items: ensurePlanItemIds(data.items || []),
         generatedAt: new Date().toISOString(),
         done: {},
       };
@@ -125,19 +183,52 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
     }
   };
 
-  const toggleDone = (index) => {
+  const toggleDone = (itemId) => {
     if (!plan) return;
-    const nextPlan = { ...plan, done: { ...plan.done, [index]: !plan.done?.[index] } };
+    const nextPlan = { ...plan, done: { ...plan.done, [itemId]: !plan.done?.[itemId] } };
     setPlan(nextPlan);
     savePlan(selectedId, nextPlan);
   };
 
-  const handleCreateVideo = (item) => {
-    const topic = [item.topic, item.hook ? `Хук: ${item.hook}` : '', item.cta ? `CTA: ${item.cta}` : '']
-      .filter(Boolean)
-      .join('\n');
-    setPendingTopic(topic);
-    onCreateVideo?.(item);
+  const handleCreateVideo = async (item) => {
+    if (openingItemId) return;
+    const topic = itemTopic(item);
+    const context = { profileId: selectedId, itemId: item.item_id, item, topic };
+    setOpeningItemId(item.item_id);
+    try {
+      const localWorkspace = loadLocalWorkspace(context);
+      let remoteWorkspace = null;
+      if (authToken) {
+        try {
+          const res = await fetch(
+            getApiUrl(`/api/user/content-workspaces/${encodeURIComponent(selectedId)}/${encodeURIComponent(item.item_id)}`),
+            { headers: authHeaders() },
+          );
+          if (res.ok) {
+            const data = await res.json();
+            if (data.workspace) {
+              remoteWorkspace = {
+                ...data.workspace.snapshot,
+                revision: data.workspace.revision,
+                stage: data.workspace.stage,
+                updatedAt: data.workspace.updated_at,
+              };
+            }
+          }
+        } catch { /* local workspace remains usable */ }
+      }
+      const newestWorkspace = chooseNewestWorkspace(localWorkspace, remoteWorkspace);
+      const workspace = saveLocalWorkspace(context, newestWorkspace || {});
+      setWorkspaceSummaries((current) => ({
+        ...current,
+        [item.item_id]: { ...workspace, item_id: item.item_id },
+      }));
+      setPendingContentPlanItem(context);
+      setPendingTopic(topic);
+      onCreateVideo?.(item);
+    } finally {
+      setOpeningItemId('');
+    }
   };
 
   const doneCount = plan ? Object.values(plan.done || {}).filter(Boolean).length : 0;
@@ -254,17 +345,19 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                 </div>
 
                 <div className="space-y-3">
-                  {plan.items.map((item, i) => {
-                    const done = Boolean(plan.done?.[i]);
+                  {plan.items.map((item) => {
+                    const done = Boolean(plan.done?.[item.item_id]);
                     const goalClass = GOAL_STYLES[item.goal] || 'bg-white/5 text-zinc-400 border-white/10';
+                    const workspace = workspaceSummaries[item.item_id];
+                    const stage = workspace ? workspaceStage(workspace) : null;
                     return (
                       <div
-                        key={i}
+                        key={item.item_id}
                         className={`glass-panel p-4 flex gap-4 transition-opacity ${done ? 'opacity-50' : ''}`}
                       >
                         <button
                           type="button"
-                          onClick={() => toggleDone(i)}
+                          onClick={() => toggleDone(item.item_id)}
                           aria-label={done ? 'Отметить как несделанное' : 'Отметить как сделанное'}
                           className={`mt-0.5 w-6 h-6 shrink-0 rounded-lg border flex items-center justify-center transition-all ${
                             done
@@ -288,6 +381,11 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                                 {item.goal}
                               </span>
                             )}
+                            {stage && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full border border-cyan-400/20 bg-cyan-400/10 text-cyan-200">
+                                {WORKSPACE_STAGE_LABELS[stage]}
+                              </span>
+                            )}
                           </div>
                           {item.hook && (
                             <p className="text-xs text-zinc-300">«{item.hook}»</p>
@@ -303,6 +401,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                         <button
                           type="button"
                           onClick={() => handleCreateVideo(item)}
+                          disabled={openingItemId === item.item_id}
                           className="btn-secondary self-center px-3 py-2 text-xs flex items-center gap-1.5 shrink-0 text-violet-300"
                         >
                           <Sparkles size={12} /> Сделать ролик
