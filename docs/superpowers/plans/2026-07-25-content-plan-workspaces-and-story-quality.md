@@ -43,7 +43,7 @@ def test_newer_workspace_revision_wins(self):
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `python -m unittest tests.test_content_workspaces -v`  
+Run: `python -m unittest tests.test_content_workspaces -v`
 Expected: import or table/function failures.
 
 - [ ] **Step 3: Add the table and repository functions**
@@ -75,7 +75,7 @@ Reject non-object snapshots, revisions below one, and serialized payloads above 
 
 - [ ] **Step 5: Run tests**
 
-Run: `python -m unittest tests.test_content_workspaces -v`  
+Run: `python -m unittest tests.test_content_workspaces -v`
 Expected: all tests pass.
 
 - [ ] **Step 6: Commit**
@@ -116,7 +116,7 @@ def test_content_plan_uses_item_scoped_workspaces(self):
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `python -m unittest tests.test_ui_layout_polish -v`  
+Run: `python -m unittest tests.test_ui_layout_polish -v`
 Expected: missing helper and pending-context failures.
 
 - [ ] **Step 3: Implement stable ids and local snapshot merge**
@@ -140,8 +140,8 @@ context, and navigate to AI Shorts. Display a compact saved-stage badge.
 
 - [ ] **Step 5: Run tests and build**
 
-Run: `python -m unittest tests.test_ui_layout_polish -v`  
-Run: `npm run build --prefix dashboard`  
+Run: `python -m unittest tests.test_ui_layout_polish -v`
+Run: `npm run build --prefix dashboard`
 Expected: tests and build pass.
 
 - [ ] **Step 6: Commit**
@@ -174,7 +174,7 @@ def test_ai_shorts_uses_active_content_workspace(self):
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `python -m unittest tests.test_ui_layout_polish -v`  
+Run: `python -m unittest tests.test_ui_layout_polish -v`
 Expected: missing active-workspace behavior.
 
 - [ ] **Step 3: Parameterize cache and last-job helpers**
@@ -198,8 +198,8 @@ analysis and scripts. Reset removes only the active item workspace.
 
 - [ ] **Step 6: Run tests and build**
 
-Run: `python -m unittest tests.test_ui_layout_polish -v`  
-Run: `npm run build --prefix dashboard`  
+Run: `python -m unittest tests.test_ui_layout_polish -v`
+Run: `npm run build --prefix dashboard`
 Expected: tests and build pass.
 
 - [ ] **Step 7: Commit**
@@ -236,7 +236,7 @@ def test_duplicate_hook_openings_trigger_retry(self):
 
 - [ ] **Step 2: Run tests and confirm failure**
 
-Run: `python -m unittest tests.test_saasshorts_voiceover -v`  
+Run: `python -m unittest tests.test_saasshorts_voiceover -v`
 Expected: stale duration and single-call duplicate-hook failures.
 
 - [ ] **Step 3: Normalize duration from narration**
@@ -263,7 +263,7 @@ Replace the script-card use of `script.duration_seconds` with
 
 - [ ] **Step 7: Run tests**
 
-Run: `python -m unittest tests.test_saasshorts_voiceover tests.test_ui_layout_polish -v`  
+Run: `python -m unittest tests.test_saasshorts_voiceover tests.test_ui_layout_polish -v`
 Expected: all tests pass.
 
 - [ ] **Step 8: Commit**
@@ -301,7 +301,7 @@ def test_broll_refinement_replaces_unrelated_avocado_visual(self):
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `python -m unittest tests.test_saasshorts_storyboard -v`  
+Run: `python -m unittest tests.test_saasshorts_storyboard -v`
 Expected: missing refinement helper.
 
 - [ ] **Step 3: Implement one batched semantic review call**
@@ -323,7 +323,7 @@ visual analogy.
 
 - [ ] **Step 6: Run tests**
 
-Run: `python -m unittest tests.test_saasshorts_storyboard tests.test_saasshorts_quality -v`  
+Run: `python -m unittest tests.test_saasshorts_storyboard tests.test_saasshorts_quality -v`
 Expected: all tests pass.
 
 - [ ] **Step 7: Commit**
@@ -340,13 +340,13 @@ git commit -m "Ground B-roll prompts in spoken claims"
 
 - [ ] **Step 1: Run backend test suite**
 
-Run: `python -m unittest discover -s tests -v`  
+Run: `python -m unittest discover -s tests -v`
 Expected: all tests pass.
 
 - [ ] **Step 2: Run frontend checks**
 
-Run: `npm run lint --prefix dashboard`  
-Run: `npm run build --prefix dashboard`  
+Run: `npm run lint --prefix dashboard`
+Run: `npm run build --prefix dashboard`
 Expected: lint and build pass.
 
 - [ ] **Step 3: Inspect the content-plan flow**
