@@ -747,6 +747,148 @@ def _finalize_generated_script(script: dict) -> dict:
     return script
 
 
+def refine_storyboard_broll_alignment(
+    scripts: list,
+    gemini_key: str,
+    text_model: Optional[str] = None,
+) -> list:
+    """Make one non-blocking semantic review pass over generated B-roll shots.
+
+    The script writer knows the spoken claim, but a video-generation prompt can
+    still drift into generic wellness stock footage. This review keeps the
+    editable storyboard intact unless Gemini returns a complete, targeted
+    replacement for a non-manual B-roll shot.
+    """
+    if not gemini_key:
+        return scripts
+
+    candidates = []
+    for script_index, script in enumerate(scripts):
+        shots = script.get("shots") if isinstance(script, dict) else None
+        if not isinstance(shots, list):
+            continue
+        for shot_index, shot in enumerate(shots):
+            if not isinstance(shot, dict) or not _is_broll_shot(shot) or shot.get("prompt_manual"):
+                continue
+            previous_speech = ""
+            next_speech = ""
+            if shot_index:
+                previous = shots[shot_index - 1]
+                previous_speech = (previous.get("speech") or "").strip() if isinstance(previous, dict) else ""
+            if shot_index + 1 < len(shots):
+                following = shots[shot_index + 1]
+                next_speech = (following.get("speech") or "").strip() if isinstance(following, dict) else ""
+            candidates.append({
+                "script_index": script_index,
+                "shot_number": shot.get("shot_number", shot_index + 1),
+                "speech": (shot.get("speech") or "").strip(),
+                "previous_speech": previous_speech,
+                "next_speech": next_speech,
+                "role": (shot.get("role") or "").strip(),
+                "scene": (shot.get("scene") or "").strip(),
+                "camera": (shot.get("camera") or "").strip(),
+                "actor_action": (shot.get("actor_action") or shot.get("action") or "").strip(),
+                "generation_prompt": (shot.get("generation_prompt") or "").strip(),
+            })
+    if not candidates:
+        return scripts
+
+    prompt = f"""You are the final semantic storyboard reviewer for vertical 9:16 UGC ads.
+Review every B-roll shot below in one batch. The exact `speech` is the source of truth.
+
+Keep the visual only when it directly demonstrates the spoken claim or uses one immediately
+understandable visual analogy. Reject generic niche filler unrelated to the nouns, action, or
+claim in the speech. Avocado, salad, measuring tape, yoga mat, supplements, scales, and food
+prep are forbidden unless the exact spoken line is about that object or action.
+
+Each visual must have one clear subject and one action. Never request generated readable text,
+numbers, charts, labels, signs, or screens: percentages, ages, dates and values belong in a
+deterministic overlay added later. A conceptually necessary faceless human is allowed: back view,
+cropped body or hands, silhouette, or non-identifiable profile. Never request an identifiable
+generated face unless an actor reference is actually available.
+
+Do not rewrite speech, timing, overlay text, shot order, or talking-head shots. Return `keep`
+only when the current visual is semantically relevant. For `replace`, provide a localized scene,
+camera and actor_action for the UI plus a complete English generation prompt.
+
+Shots JSON:
+{json.dumps(candidates, ensure_ascii=False, indent=1)}
+
+Return ONLY a JSON array:
+[
+  {{
+    "script_index": 0,
+    "shot_number": 3,
+    "decision": "keep" or "replace",
+    "scene": "localized user-facing scene",
+    "camera": "localized user-facing camera",
+    "actor_action": "localized user-facing action",
+    "generation_prompt": "English prompt",
+    "reason": "short internal reason"
+  }}
+]"""
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=gemini_key)
+        response = _generate_gemini_content(
+            client,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", max_output_tokens=8192
+            ),
+            text_model=text_model,
+        )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        decisions = json.loads(_repair_gemini_json(text))
+        if not isinstance(decisions, list):
+            raise ValueError("B-roll review response is not a JSON array")
+    except Exception as error:
+        print(f"[SaaSShorts] WARNING: B-roll semantic review skipped: {error}")
+        return scripts
+
+    candidates_by_key = {
+        (candidate["script_index"], str(candidate["shot_number"])): candidate
+        for candidate in candidates
+    }
+    for decision in decisions:
+        if not isinstance(decision, dict) or (decision.get("decision") or "").strip().lower() != "replace":
+            continue
+        try:
+            script_index = int(decision.get("script_index"))
+        except (TypeError, ValueError):
+            continue
+        shot_number = str(decision.get("shot_number", ""))
+        if (script_index, shot_number) not in candidates_by_key:
+            continue
+        scene = (decision.get("scene") or "").strip()
+        generation_prompt = (decision.get("generation_prompt") or "").strip()
+        if not scene or not generation_prompt:
+            continue
+        shots = scripts[script_index]["shots"]
+        shot = next((item for item in shots if str(item.get("shot_number")) == shot_number), None)
+        if not isinstance(shot, dict) or not _is_broll_shot(shot) or shot.get("prompt_manual"):
+            continue
+        camera = (decision.get("camera") or "").strip()
+        actor_action = (decision.get("actor_action") or "").strip()
+        shot["scene"] = scene
+        if camera:
+            shot["camera"] = camera
+        if actor_action:
+            shot["actor_action"] = actor_action
+            shot["action"] = actor_action
+        shot["generation_prompt"] = _build_storyboard_generation_prompt({
+            **shot,
+            "generation_prompt": generation_prompt,
+        })
+        shot["_prompt_source_scene"] = scene
+    return scripts
+
+
 def _normalized_hook_text(text: str) -> str:
     without_tags = re.sub(r"\[[^\]]+\]", " ", text or "")
     separated = re.sub(r"[-‐‑‒–—―]+", " ", without_tags)
@@ -1050,16 +1192,16 @@ RULES:
 - Every shot must be visually distinct from its neighbours (new scene, angle or subject) — the point of many short shots is variety, not the same framing repeated.
 - Use visual variety: close-up, kitchen/lifestyle, exercise/home, product close-up, final CTA.
 - Do NOT rely only on talking head. Use the actor as a consistent character across shots.
-- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = insert shot while the voiceover keeps playing — close-ups of objects, food, product or environment, hands allowed but strictly NO faces and NO people in frame (the video model has no photo reference for broll, so any person it invents will look like a stranger, breaking actor continuity). Split-screen collages of such object shots are allowed. The first shot (hook) and the last shot (cta) MUST be "talking". Make 1-2 middle shots "broll" for visual dynamics.
+- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference. The first shot (hook) and the last shot (cta) MUST be "talking". Make 1-2 middle shots "broll" for visual dynamics.
 - Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
 - Each shot MUST include emotion — one of: excited, warm, confident, calm, urgent, playful. Vary it across shots to follow the narrative arc.
 - role must be one of: hook, problem, explanation, solution, proof, cta.
 - transition should be "cut" or "smooth_0.3s".
 - speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
-- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. For "broll" shots it must additionally say: no people, no faces.
+- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. For B-roll, forbid identifiable faces and generated readable text, but allow a faceless human action when it is needed by the exact spoken claim.
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
-- In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Prefer plates, food, hands, analog objects.
+- In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
 - Each shot's speech is ONE short sentence of about 8-10 words (~3-4 seconds spoken), 11 words HARD max — a shot must NEVER carry more than 5 seconds of speech (spoken Russian runs ~2.3 words/sec, so 12+ words already overflows 5s). If the script has more to say, add another shot (more, shorter shots are fine); never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
 - A reel is ~20-25 seconds, so aim for roughly 5-7 shots and keep every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
@@ -1094,6 +1236,7 @@ RULES:
             for shot in script["shots"]:
                 shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
             _finalize_generated_script(script)
+        refine_storyboard_broll_alignment(scripts, gemini_key, text_model=text_model)
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 
@@ -2548,6 +2691,7 @@ def _rebuild_prompts_from_scene(
                 "action": (s.get("actor_action") or s.get("action") or "").strip(),
                 "camera": (s.get("camera") or "").strip(),
                 "role": (s.get("role") or "").strip(),
+                "speech": (s.get("speech") or "").strip(),
             }
             for i, s in enumerate(stale)
         ]
@@ -2558,8 +2702,13 @@ def _rebuild_prompts_from_scene(
             "For each shot, write ONE English prompt that fully describes the scene, action "
             "and camera on its own. Rules: vertical 9:16, same actor/character across shots, "
             "natural light, authentic smartphone footage, no burned-in text, no logos, no "
-            "watermark. For visual_type 'broll': no people, no faces (object/food/hands "
-            "close-ups only). Never request readable on-screen text.\n"
+            "watermark. For visual_type 'broll', use the exact speech as the visual source of "
+            "truth: literally demonstrate the claim or use one clear visual analogy. Do not use "
+            "generic wellness filler (avocado, salad, measuring tape, yoga mat, supplements, "
+            "scales or food prep) unless the speech explicitly concerns it. A faceless human "
+            "action is allowed when conceptually necessary (back view, cropped body/hands, "
+            "silhouette, non-identifiable profile); never request an identifiable face. Never "
+            "request readable on-screen text, numbers, charts or screens.\n"
             f"Shots JSON: {json.dumps(payload, ensure_ascii=False)}\n"
             'Return ONLY a JSON array: [{"n": <n>, "prompt": "<english prompt>"}].'
         )
@@ -2650,10 +2799,14 @@ already filled in — only replace empty ones):
 RULES:
 - scene, camera, actor_action must be written in {lang_name} — the user reads them in the app.
 - visual_type: "talking" (the actor speaks to camera, lips visible) or "broll"
-  (insert shot over the voiceover: close-ups of objects, food, hands — strictly NO
-  faces and NO people). Prefer "talking" for lines that carry the argument, "broll"
-  for lines that describe a thing or a result. Never put two "broll" shots in a row
-  given the surrounding storyboard.
+  (insert shot over the voiceover). B-roll must be grounded in that exact speech:
+  literally demonstrate the claim or use one clear visual analogy, never generic
+  wellness filler such as avocado, salad, measuring tape, yoga mat, supplements,
+  scales or food prep unless the spoken line is about it. A faceless human action
+  is allowed when conceptually necessary (back view, cropped body/hands, silhouette,
+  non-identifiable profile); never request an identifiable face. Prefer "talking"
+  for lines that carry the argument, "broll" for lines that describe a thing or a
+  result. Never put two "broll" shots in a row given the surrounding storyboard.
 - In "talking" shots the actor holds a steady selfie pose: subtle expressions and
   small head movement only. No exercising, walking, drinking or big gestures —
   motion breaks lip-sync.
@@ -2665,7 +2818,8 @@ RULES:
   screens facing camera — video models render text as garbage glyphs.
 - generation_prompt MUST be English and fully describe scene, action and camera on
   its own: vertical 9:16, realistic UGC ad, same actor, natural light, no burned-in
-  text, no watermark. For "broll" add: no people, no faces.
+  text, no watermark. For "broll" forbid identifiable faces and generated readable
+  text, but allow a faceless human action when the speech requires it.
 
 Return ONLY a JSON array:
 [{{"shot_number": <n>, "scene": "...", "camera": "...", "actor_action": "...",
@@ -4937,8 +5091,8 @@ def review_clip_quality(
 
     broll = _is_broll_shot(shot)
     person_rule = (
-        "- any visible person, human face or human figure "
-        "(this b-roll must contain no people; hands alone are acceptable)"
+        "- no people or identifiable generated faces in a b-roll shot unless the requested action "
+        "needs a faceless back view, cropped body/hands, silhouette or non-identifiable profile"
         if broll
         else "- a second person appearing, or the actor's identity visibly changing between frames"
     )
@@ -5531,8 +5685,10 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
     base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
     prompt = (
         f"{base_prompt}. Single photographic frame, vertical 9:16, first frame of a short "
-        "product b-roll: realistic close-up of objects, natural light, shallow depth of field, "
-        "smartphone realism, no people, no faces, no readable text, no logos, no watermark"
+        "product b-roll: keep the requested subject and action, natural light, shallow depth "
+        "of field, smartphone realism. no people unless the requested action needs a faceless "
+        "back view, cropped body/hands, silhouette or non-identifiable profile; no identifiable "
+        "generated faces, no readable text, no logos, no watermark"
     )
     prompt_sidecar = f"{output_path}.prompt.txt"
     if _nonempty(output_path):
@@ -6116,7 +6272,7 @@ def _existing_shot_frame(shot: dict, output_root: str) -> str:
             candidates.append(os.path.join(output_root, url[len("/videos/"):]))
     for path in candidates:
         if _nonempty(path) and not _looks_blank(path):
-            return path
+            return os.path.normpath(path)
     return ""
 
 

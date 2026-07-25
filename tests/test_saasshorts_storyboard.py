@@ -65,6 +65,149 @@ def _storyboard_answer(title, shot_count):
     return json.dumps([script], ensure_ascii=False)
 
 
+class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
+    def _scripts_with_broll(self):
+        return [{
+            "title": "Metabolism",
+            "actor_description": "a woman in her 30s",
+            "shots": [
+                {
+                    "shot_number": 1, "visual_type": "talking", "role": "hook",
+                    "scene": "Living room", "camera": "close-up", "actor_action": "speaks",
+                    "speech": "You are not failing because your body changed.",
+                    "overlay_text": "Not your fault", "start": 0, "end": 3,
+                    "generation_prompt": "woman talking to camera",
+                },
+                {
+                    "shot_number": 2, "visual_type": "broll", "role": "explanation",
+                    "scene": "Stylish dining table", "camera": "macro top-down", "actor_action": "hands slice avocado",
+                    "speech": "Our metabolism naturally slows by a few percent every ten years.",
+                    "overlay_text": "Metabolism changes", "start": 3, "end": 6,
+                    "generation_prompt": "vertical 9:16, hands slicing avocado on a wooden board",
+                },
+                {
+                    "shot_number": 3, "visual_type": "talking", "role": "solution",
+                    "scene": "Window", "camera": "medium", "actor_action": "explains calmly",
+                    "speech": "That is why the old rules stop working for you.",
+                    "overlay_text": "New rules", "start": 6, "end": 9,
+                    "generation_prompt": "woman explaining by window",
+                },
+            ],
+        }]
+
+    def _refine(self, scripts, reply):
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                pass
+
+        with patch("google.genai.Client", FakeClient), \
+             patch("saasshorts._generate_gemini_content", return_value=SimpleNamespace(
+                 text=json.dumps(reply)
+             )) as generate:
+            result = saasshorts.refine_storyboard_broll_alignment(scripts, "key")
+        return result, generate
+
+    def test_replaces_unrelated_avocado_with_speech_grounded_visual(self):
+        scripts = self._scripts_with_broll()
+        original_speech = scripts[0]["shots"][1]["speech"]
+        result, _ = self._refine(scripts, [{
+            "script_index": 0, "shot_number": 2, "decision": "replace",
+            "scene": "One person walks the same route in three calm life stages, shown from behind.",
+            "camera": "Side tracking medium shot, gentle match cuts.",
+            "actor_action": "A faceless person keeps walking as the pace subtly slows.",
+            "generation_prompt": "vertical 9:16 realistic UGC b-roll, faceless woman seen from behind walking the same path across life stages, pace subtly slows, side tracking shot, natural light, no readable text, no watermark",
+            "reason": "The walking pace is a direct visual analogy for gradual metabolic change.",
+        }])
+
+        shot = result[0]["shots"][1]
+        self.assertEqual(shot["speech"], original_speech)
+        self.assertNotIn("avocado", shot["generation_prompt"].lower())
+        self.assertIn("pace subtly slows", shot["generation_prompt"])
+        self.assertEqual(shot["_prompt_source_scene"], shot["scene"])
+        self.assertEqual(shot["action"], shot["actor_action"])
+
+    def test_review_request_contains_current_and_neighboring_speech(self):
+        scripts = self._scripts_with_broll()
+        _, generate = self._refine(scripts, [{"script_index": 0, "shot_number": 2, "decision": "keep"}])
+
+        request = generate.call_args.kwargs["contents"][0]
+        self.assertIn(scripts[0]["shots"][0]["speech"], request)
+        self.assertIn(scripts[0]["shots"][1]["speech"], request)
+        self.assertIn(scripts[0]["shots"][2]["speech"], request)
+
+    def test_keep_decision_preserves_the_editable_shot(self):
+        scripts = self._scripts_with_broll()
+        before = dict(scripts[0]["shots"][1])
+
+        result, _ = self._refine(scripts, [{"script_index": 0, "shot_number": 2, "decision": "keep"}])
+
+        self.assertEqual(result[0]["shots"][1], before)
+
+    def test_malformed_or_failed_refinement_keeps_scripts(self):
+        scripts = self._scripts_with_broll()
+        before = json.loads(json.dumps(scripts))
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                pass
+
+        with patch("google.genai.Client", FakeClient), \
+             patch("saasshorts._generate_gemini_content", side_effect=RuntimeError("temporary failure")):
+            result = saasshorts.refine_storyboard_broll_alignment(scripts, "key")
+
+        self.assertEqual(result, before)
+
+    def test_malformed_refinement_json_keeps_scripts(self):
+        scripts = self._scripts_with_broll()
+        before = json.loads(json.dumps(scripts))
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                pass
+
+        with patch("google.genai.Client", FakeClient), \
+             patch("saasshorts._generate_gemini_content", return_value=MagicMock(text="not json")):
+            result = saasshorts.refine_storyboard_broll_alignment(scripts, "key")
+
+        self.assertEqual(result, before)
+
+    def test_no_broll_or_key_makes_zero_model_calls(self):
+        scripts = self._scripts_with_broll()
+        scripts[0]["shots"][1]["visual_type"] = "talking"
+        no_key_scripts = self._scripts_with_broll()
+        with patch("google.genai.Client") as client, \
+             patch("saasshorts._generate_gemini_content") as generate:
+            self.assertIs(saasshorts.refine_storyboard_broll_alignment(scripts, "key"), scripts)
+            self.assertIs(saasshorts.refine_storyboard_broll_alignment(no_key_scripts, ""), no_key_scripts)
+        client.assert_not_called()
+        generate.assert_not_called()
+
+    def test_generate_scripts_invokes_one_batched_refinement_for_broll(self):
+        answer = json.dumps([{
+            "title": "B-roll", "hook_type": "result_first", "shots": [
+                {**_storyboard_shot(1, "Start with the useful result."), "visual_type": "talking"},
+                {**_storyboard_shot(2, "This claim needs an insert shot."), "visual_type": "broll"},
+            ],
+        }])
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+        with patch("google.genai.Client", return_value=client), \
+             patch("saasshorts.refine_storyboard_broll_alignment", side_effect=lambda scripts, *_args, **_kwargs: scripts) as refine, \
+             patch("builtins.print"):
+            saasshorts.generate_scripts(
+                analysis={"product_name": "Test"}, gemini_key="key", num_scripts=1,
+                script_format="storyboard_v3", language="en",
+            )
+        refine.assert_called_once()
+
+    def test_storyboard_prompt_no_longer_bans_all_people_from_broll(self):
+        source = saasshorts.generate_scripts.__code__.co_consts
+        prompt_source = "\n".join(value for value in source if isinstance(value, str))
+        self.assertNotIn("strictly NO faces and NO people", prompt_source)
+
+
 def _cut_off_storyboard_answer(complete_shots=3):
     """Gemini's answer as it arrives when it runs out of output budget.
 
