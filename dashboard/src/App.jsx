@@ -1344,7 +1344,12 @@ function App() {
           {/* View: UGC Gallery */}
           {activeTab === 'ugc-gallery' && (
             <div className="h-full overflow-y-auto custom-scrollbar p-6 pb-28 md:p-8 md:pb-8">
-              <UGCGallery falKey={effectiveFalKey} authToken={authToken} usePlatformKeys={usingPlatformKeys} />
+              <UGCGallery
+                falKey={effectiveFalKey}
+                authToken={authToken}
+                usePlatformKeys={usingPlatformKeys}
+                onEditStoryboard={() => setActiveTab('saasshorts')}
+              />
             </div>
           )}
 

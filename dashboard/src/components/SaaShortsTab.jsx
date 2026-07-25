@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, X, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
+import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -172,10 +172,6 @@ function voiceLanguageScore(voice, language) {
   return 1;
 }
 
-function sortVoicesForLanguage(voices, language) {
-  return [...voices].sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language));
-}
-
 function voiceMatchesGenderOrUnknown(voice, actorGender) {
   const gender = (voice.labels?.gender || '').toLowerCase();
   return !gender || gender === actorGender;
@@ -265,8 +261,26 @@ function OptionPicker({ value, onChange, options, disabled = false, placeholder 
 }
 
 function estimateSpeechSeconds(text) {
-  const words = (text || '').trim().split(/\s+/).filter(Boolean).length;
-  return Math.max(12, Math.min(75, Math.round(words / 2.5)));
+  // Итоговая длина ролика = длина озвучки: бэкенд тайлит кадры по аудио
+  // (_align_shots_to_voiceover) и режет финал `-shortest`, так что видео НИКОГДА
+  // не длиннее речи. Значит и смету надо считать по озвучке.
+  //
+  // Оценка держится СЛЕГКА выше реального аудио, чтобы при генерации не списалось
+  // больше, чем показали:
+  //  • 2.2 сл/с — консервативный темп (медленнее «читательских» 2.5, с запасом
+  //    под русскую речь);
+  //  • теги [sighs]/[laughs] и паузы «…»/«—» ElevenLabs проговаривает как
+  //    придыхания/паузы — это реальные секунды, которых нет в счёте слов;
+  //  • пол 5с — реалистичный минимум говорящего кадра.
+  // Прежний плоский пол 12с задваивал смету коротких сценариев: ролик на ~5с речи
+  // показывал «~12 сек» и удвоенную стоимость.
+  const raw = text || '';
+  const words = raw.trim().split(/\s+/).filter(Boolean).length;
+  if (!words) return 0;
+  const tags = (raw.match(/\[[^\]]+\]/g) || []).length;
+  const pauses = (raw.match(/\.{3}|…|—/g) || []).length;
+  const seconds = words / 2.2 + tags * 0.8 + pauses * 0.4;
+  return Math.max(5, Math.min(90, Math.round(seconds)));
 }
 
 function isStoryboardScript(script) {
@@ -459,6 +473,8 @@ function loadCache() {
 // (или сразу после) генерации, а job живёт на сервере — по сохранённому id
 // мастер снова подцепляется к статусу и результату.
 const LAST_JOB_KEY = 'saasshorts_last_job';
+// Раскадровка готового ролика, переданная из UGC-галереи по кнопке «Редактировать».
+const PENDING_STORYBOARD_KEY = 'saasshorts_pending_storyboard';
 
 function loadLastJob() {
   try {
@@ -528,6 +544,18 @@ export default function SaaShortsTab({
     return cache ? 1 : 0;
   });
 
+  // Раскадровка, переданная из галереи кнопкой «Редактировать». Читаем ОДИН раз
+  // в инициализаторе: StrictMode гоняет mount-эффекты дважды, и «прочитал и
+  // удалил» внутри эффекта потерял бы значение на втором прогоне.
+  const [pendingStoryboard] = useState(() => {
+    try {
+      const raw = localStorage.getItem(PENDING_STORYBOARD_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+
   // Step 0: Business brief
   const [url] = useState('');
   const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
@@ -579,9 +607,13 @@ export default function SaaShortsTab({
   const [editedNarration, setEditedNarration] = useState('');
   const [actorOptions, setActorOptions] = useState([]);
   const [selectedActor, setSelectedActor] = useState(() => loadVideoPrefs().selectedActor || null);
-  // Пол/озвучка/загрузка аватара спрятаны в модалку, чтобы блок выбора
-  // аватара не был перегружен (видна только сетка аватаров + «Настройки»).
-  const [avatarSettingsOpen, setAvatarSettingsOpen] = useState(false);
+  // Блок ведущего свёрнут до одной строки «кто говорит + каким голосом».
+  // Сетка аватаров сама открывается, пока ведущий не выбран.
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(() => !loadVideoPrefs().selectedActor);
+  const [voicePickerOpen, setVoicePickerOpen] = useState(false);
+  // Кадры, которые сейчас дозаполняет ИИ (сцена/камера/действие), и ошибка этого запроса.
+  const [fillingShots, setFillingShots] = useState([]);
+  const [fillError, setFillError] = useState('');
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
@@ -668,7 +700,7 @@ export default function SaaShortsTab({
     const title = result?.script?.title;
     if (!Array.isArray(genShots) || !genShots.length || !title) return;
     const byNumber = new Map(genShots.map((s, i) => [s.shot_number ?? (i + 1), s]));
-    setScripts((prev) => prev.map((script) => {
+    const next = scripts.map((script) => {
       if (script.title !== title || !Array.isArray(script.shots) || !script.shots.length) return script;
       const shots = script.shots.map((shot, i) => {
         const g = byNumber.get(shot.shot_number ?? (i + 1));
@@ -687,7 +719,12 @@ export default function SaaShortsTab({
         };
       });
       return { ...script, shots };
-    }));
+    });
+    setScripts(next);
+    // Persist to the localStorage cache: `scripts` are re-loaded from it on mount
+    // (loadCache), so without this the freshly generated preview_frame_url values
+    // are dropped and every generated frame "disappears" after a page reload.
+    persistScripts(next);
   };
 
   useEffect(() => {
@@ -756,13 +793,17 @@ export default function SaaShortsTab({
     }
   }, [elevenLabsKey]);
 
-  // Reset selected voice when actor gender or language changes.
-  // Восстановленный из prefs голос не затираем, пока комбинация язык+пол
-  // та же, при которой пользователь его выбирал.
+  // Держим голос на утверждённом дефолте языка и НЕ даём ему «плавать».
+  // Раньше эффект брал первый подходящий голос из ElevenLabs-библиотеки — из-за
+  // порядка библиотеки один и тот же проект получал то Victoria, то другой голос
+  // между генерациями. Теперь: детерминированный дефолт по языку/полу, и ручной
+  // выбор НЕ затирается на смене пола / ремаунте — только когда реально нужно
+  // (сменился язык, голос не выбран, или голос не того языка).
   const voiceAutoKeyRef = useRef(loadVideoPrefs().voiceKey || '');
   useEffect(() => {
     const comboKey = `${language}-${actorGender}`;
     if (voiceAutoKeyRef.current === comboKey) return;
+    const prevLang = voiceAutoKeyRef.current.split('-')[0] || '';
     voiceAutoKeyRef.current = comboKey;
     const genderDefaults = {
       'en-female': '21m00Tcm4TlvDq8ikWAM',  // Rachel
@@ -772,16 +813,15 @@ export default function SaaShortsTab({
       'ru-female': 'D5RRIJYa9pFwxiSpbGbR',  // Victoria — родной русский, утверждённый дефолт
       'ru-male': '29vD33N1CtxCmqQRPOHJ',    // Multilingual fallback
     };
-    // Prefer a voice that matches both gender and selected language/accent.
-    const matchingVoice = sortVoicesForLanguage(
-      voices.filter(v => voiceVisibleForLanguage(v, language, actorGender)),
-      language
-    )[0];
-    if (matchingVoice) {
-      setSelectedVoice(matchingVoice.voice_id);
-    } else {
-      setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
-    }
+    const curated = genderDefaults[comboKey] || genderDefaults['en-female'];
+    const languageChanged = Boolean(prevLang) && prevLang !== language;
+    setSelectedVoice((prev) => {
+      const wrongForLanguage =
+        (language === 'ru' && prev === '21m00Tcm4TlvDq8ikWAM') ||  // Rachel (англ.) на русском
+        (language !== 'ru' && prev === 'D5RRIJYa9pFwxiSpbGbR');    // Victoria (рус.) на не-русском
+      if (!prev || languageChanged || wrongForLanguage) return curated;
+      return prev;  // уважаем ручной выбор — на смене пола/ремаунте не трогаем
+    });
   }, [actorGender, language]);
 
   // Персистим выбор озвучки и актёра (см. loadVideoPrefs)
@@ -980,6 +1020,45 @@ export default function SaaShortsTab({
     }, analysis, webResearch, nextScripts);
   };
 
+  // Открытие раскадровки готового ролика из галереи: кадры приходят вместе с
+  // уже сгенерёнными превью и клипами (их URL лежат в метаданных ролика), плюс
+  // архив удалённых кадров — так к ролику можно доснять кадры, ничего не
+  // переписывая заново.
+  useEffect(() => {
+    if (!pendingStoryboard?.shots?.length) return;
+    try {
+      localStorage.removeItem(PENDING_STORYBOARD_KEY);
+    } catch {
+      /* приватный режим — переживём */
+    }
+    const restored = {
+      title: pendingStoryboard.title || 'Раскадровка ролика',
+      caption: pendingStoryboard.caption || '',
+      hashtags: pendingStoryboard.hashtags || [],
+      full_narration: pendingStoryboard.full_narration || '',
+      actor_description: pendingStoryboard.actor_description || '',
+      language: pendingStoryboard.language || 'ru',
+      format: 'storyboard_v3',
+      shots: pendingStoryboard.shots,
+      shots_archived: pendingStoryboard.shots_archived || [],
+      _source_video_id: pendingStoryboard.video_id || '',
+    };
+    // Тот же ролик открыт повторно — обновляем запись, а не плодим копии.
+    const existing = scripts.findIndex((script) => script.title === restored.title);
+    const next = existing >= 0
+      ? scripts.map((script, i) => (i === existing ? restored : script))
+      : [restored, ...scripts];
+    setScripts(next);
+    persistScripts(next);
+    setSelectedScript(existing >= 0 ? existing : 0);
+    setScriptFormat('storyboard_v3');
+    if (pendingStoryboard.storyboard_generation_mode) {
+      setStoryboardGenerationMode(pendingStoryboard.storyboard_generation_mode);
+    }
+    setStep(2);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const updateSelectedScriptShot = (shotIndex, patch) => {
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
@@ -1026,19 +1105,27 @@ export default function SaaShortsTab({
 
   // Rewrite the selected script's shots (add / remove / reorder), renumber and
   // persist. Snapshots the pre-change shots onto the undo stack first.
-  const mutateSelectedScriptShots = (mutator) => {
-    const prevShots = (scripts[selectedScript]?.shots || []).map((shot) => ({ ...shot }));
+  const mutateSelectedScriptShots = (mutator, archiveMutator = null) => {
+    const current = scripts[selectedScript] || {};
+    const prevShots = (current.shots || []).map((shot) => ({ ...shot }));
+    const prevArchived = (current.shots_archived || []).map((shot) => ({ ...shot }));
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
       const shots = resequenceShotTimeline(renumberShots(mutator([...(script.shots || [])])));
-      return { ...script, format: 'storyboard_v3', shots };
+      const archived = archiveMutator
+        ? archiveMutator([...(script.shots_archived || [])])
+        : (script.shots_archived || []);
+      return { ...script, format: 'storyboard_v3', shots, shots_archived: archived };
     });
     setShotHistory((history) => [
       ...history.slice(-49),
-      { scriptIndex: selectedScript, shots: prevShots },
+      { scriptIndex: selectedScript, shots: prevShots, archived: prevArchived },
     ]);
     setScripts(nextScripts);
     persistScripts(nextScripts);
+    // Возвращаем результат: состояние обновляется асинхронно, а вызывающему
+    // коду (дозаполнение нового кадра ИИ) свежие кадры нужны прямо сейчас.
+    return nextScripts;
   };
 
   const undoShotChange = () => {
@@ -1050,7 +1137,9 @@ export default function SaaShortsTab({
     const entry = shotHistory[restoreIdx];
     const nextScripts = scripts.map((script, idx) => (
       idx === entry.scriptIndex
-        ? { ...script, format: 'storyboard_v3', shots: entry.shots }
+        // Архив откатывается вместе с кадрами: иначе undo удаления вернул бы
+        // кадр в список, оставив его копию в «удалённых».
+        ? { ...script, format: 'storyboard_v3', shots: entry.shots, shots_archived: entry.archived || [] }
         : script
     ));
     setScripts(nextScripts);
@@ -1067,12 +1156,104 @@ export default function SaaShortsTab({
     });
   };
 
+  // Удаление кадра = архив, а не потеря. Текст, сцена и промпт уезжают в
+  // `shots_archived`, попадают в метаданные ролика вместе с раскадровкой и
+  // возвращаются одной кнопкой — заново придумывать удалённый кадр не нужно.
   const removeSelectedScriptShot = (shotIndex) => {
-    mutateSelectedScriptShots((shots) => {
-      if (shots.length <= 1) return shots; // keep at least one shot
-      shots.splice(shotIndex, 1);
-      return shots;
-    });
+    const shots = scripts[selectedScript]?.shots || [];
+    if (shots.length <= 1) return; // keep at least one shot
+    const removed = { ...shots[shotIndex] };
+    mutateSelectedScriptShots(
+      (next) => { next.splice(shotIndex, 1); return next; },
+      (archived) => [...archived, removed],
+    );
+  };
+
+  // Кадру нужны сцена, камера и действие — видео-модель читает промпт, а не
+  // реплику. Пустой кадр = случайная картинка, поэтому добавленные и
+  // восстановленные кадры дозаполняем текстовым запросом к Gemini (бесплатно).
+  const fillShotDetails = async (shotNumbers, scriptsOverride = null) => {
+    // Состояние React обновляется асинхронно, поэтому только что добавленный
+    // кадр приходит сюда явным срезом, а не читается из `scripts`.
+    const base = scriptsOverride || scripts;
+    const script = base[selectedScript];
+    const targets = (script?.shots || []).filter((shot) => shotNumbers.includes(shot.shot_number));
+    if (!targets.length) return;
+    setFillingShots(shotNumbers);
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/storyboard-shot-fill'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders(),
+          ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
+        },
+        body: JSON.stringify({
+          script: {
+            title: script.title,
+            actor_description: script.actor_description || actorDescription,
+            _video_topic: topic,
+            shots: (script.shots || []).map((shot) => ({
+              shot_number: shot.shot_number,
+              speech: shot.speech,
+              scene: shot.scene,
+              visual_type: shot.visual_type,
+            })),
+          },
+          shots: targets,
+          language,
+          actor_gender: actorGender,
+          text_model: textModel,
+          use_platform_keys: usePlatformKeys,
+        }),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось заполнить кадр';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { /* оставим дефолт */ }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      const byNumber = new Map((data.shots || []).map((shot) => [shot.shot_number, shot]));
+      const next = base.map((item, idx) => {
+        if (idx !== selectedScript) return item;
+        return {
+          ...item,
+          shots: (item.shots || []).map((shot) => byNumber.get(shot.shot_number) || shot),
+        };
+      });
+      setScripts(next);
+      persistScripts(next);
+    } catch (e) {
+      setFillError(e.message || 'Не удалось заполнить кадр');
+      setTimeout(() => setFillError(''), 6000);
+    } finally {
+      setFillingShots([]);
+    }
+  };
+
+  const addShotWithSpeech = async (speech) => {
+    const shotNumber = (scripts[selectedScript]?.shots || []).length + 1;
+    const nextScripts = mutateSelectedScriptShots(
+      (next) => [...next, { ...makeBlankShot(next), speech }],
+    );
+    await fillShotDetails([shotNumber], nextScripts);
+  };
+
+  const restoreArchivedShot = (archiveIndex) => {
+    const archived = scripts[selectedScript]?.shots_archived || [];
+    const shot = archived[archiveIndex];
+    if (!shot) return;
+    mutateSelectedScriptShots(
+      (next) => [...next, { ...shot }],
+      (list) => list.filter((_, i) => i !== archiveIndex),
+    );
+  };
+
+  const dropArchivedShot = (archiveIndex) => {
+    mutateSelectedScriptShots(
+      (next) => next,
+      (list) => list.filter((_, i) => i !== archiveIndex),
+    );
   };
 
   const moveSelectedScriptShot = (shotIndex, direction) => {
@@ -1481,7 +1662,7 @@ export default function SaaShortsTab({
   const handleActorUpload = async (file) => {
     if (!file) return;
     const localPreview = URL.createObjectURL(file);
-    setActorUploadStatus('Uploading and saving...');
+    setActorUploadStatus('Загружаю и сохраняю...');
     setUploadedActorPreview({ localPreview, serverUrl: null });
     setSelectedActor(null);
 
@@ -1495,7 +1676,7 @@ export default function SaaShortsTab({
         body: formData,
       });
       if (!res.ok) {
-        let msg = 'Upload failed';
+        let msg = 'Не удалось загрузить фото';
         try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
         throw new Error(msg);
       }
@@ -1504,12 +1685,12 @@ export default function SaaShortsTab({
       if (data.url) {
         setUploadedActorPreview({ localPreview, serverUrl: data.url });
         setSelectedActor(data.url);
-        setActorUploadStatus(data.saved ? 'Saved to avatars and selected.' : 'Selected locally. S3 gallery save unavailable.');
+        setActorUploadStatus(data.saved ? 'Сохранено в аватары и выбрано.' : 'Выбрано локально: сохранить в галерею не вышло.');
         if (data.saved) await refreshActorGallery();
       }
     } catch (err) {
       console.error('Upload failed:', err);
-      setActorUploadStatus(err.message || 'Upload failed');
+      setActorUploadStatus(err.message || 'Не удалось загрузить фото');
     }
   };
 
@@ -1562,6 +1743,47 @@ export default function SaaShortsTab({
   const estimateModePriceLabel = (modeId) => `~${formatUsd(estimateForMode(modeId).total)}`;
   const currentScript = scripts[selectedScript];
   const storyboardSelected = isStoryboardScript(currentScript);
+
+  // Текст исходного сценария, который не попал ни в один кадр (кадры удалили
+  // до генерации). Для уже готового ролика full_narration — единственная
+  // уцелевшая копия удалённых реплик, поэтому предлагаем вернуть их кадром.
+  const leftoverNarration = (() => {
+    const narration = (currentScript?.full_narration || '').trim();
+    if (!narration || !isStoryboardScript(currentScript)) return [];
+    const norm = (text) => (text || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    const known = norm([
+      ...(currentScript.shots || []).map((shot) => shot.speech || ''),
+      ...(currentScript.shots_archived || []).map((shot) => shot.speech || ''),
+    ].join(' '));
+    return narration
+      .split(/(?<=[.!?…])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter((sentence) => norm(sentence).length > 8 && !known.includes(norm(sentence)));
+  })();
+
+  // Кадры с репликой, но без описания сцены: видео-модель читает промпт, а он
+  // строится из «Что в кадре» — такой кадр отрисуется наугад.
+  const emptyShotNumbers = (currentScript?.shots || [])
+    .filter((shot) => (shot.speech || '').trim() && !(shot.scene || '').trim())
+    .map((shot) => shot.shot_number);
+
+  // Кадры, за которые ещё не платили: у остальных уже есть стартовый кадр,
+  // своё фото или снятый клип, и повторная генерация — деньги на ветер.
+  const shotHasFrame = (shot) => Boolean(
+    shot?.clip_url || shot?.image_preview || shot?.local_url || shot?.image_url || shot?.preview_frame_url
+  );
+  const missingFrameCount = (currentScript?.shots || []).filter((shot) => !shotHasFrame(shot)).length;
+
+  // Свёрнутая строка «ведущий + голос» над раскрывающимися панелями.
+  const selectedActorPreviewUrl = (() => {
+    if (!selectedActor) return '';
+    if (uploadedActorPreview?.serverUrl === selectedActor) return uploadedActorPreview.localPreview;
+    return actorGallery.find((actor) => actor.url === selectedActor)?.url || selectedActor;
+  })();
+  const selectedVoiceLabel = ttsProvider === 'fal_minimax'
+    ? ((MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en)
+        .find((voice) => voice.id === minimaxVoice)?.name || minimaxVoice)
+    : (voices.find((voice) => voice.voice_id === selectedVoice)?.name || selectedVoice || 'по умолчанию');
 
   // ─── Render Steps ─────────────────────────────────────────────────
 
@@ -1820,6 +2042,412 @@ export default function SaaShortsTab({
                 </div>
               </div>
 
+              {/* ── Ведущий: аватар + голос ─────────────────────────────
+                  Выбор аватара и озвучки живёт здесь (на Setup), ДО платного
+                  превью кадров на шаге раскадровки — чтобы кадры сразу строились
+                  с нужным лицом и голосом, а не переигрывались после. */}
+              <div data-section="presenter-section" className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
+                    <User size={14} /> Аватар проекта{' '}
+                    {(scriptFormat === 'storyboard_v3' || String(videoMode || '').startsWith('storyboard')) && (
+                      <span className="text-zinc-600">(необязательно)</span>
+                    )}
+                  </label>
+                  <p className="text-xs text-zinc-500 mt-2 mb-3">
+                    Лицо ведущего берётся из фото. Без аватара система придумает случайного человека —
+                    в каждом ролике разного.
+                  </p>
+
+                  {/* Что выбрано сейчас: одна строка вместо простыни настроек.
+                      Всё остальное раскрывается по кнопке. */}
+                  <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-black/20 p-2.5">
+                    <div className="h-12 w-9 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                      {selectedActorPreviewUrl ? (
+                        <img src={selectedActorPreviewUrl} alt="Выбранный аватар" className="h-full w-full object-cover" />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                          <User size={14} />
+                        </div>
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-medium text-zinc-200">
+                        {selectedActor
+                          ? (actorGallery.find((actor) => actor.url === selectedActor)?.description || 'Аватар выбран')
+                          : 'Случайное лицо (аватар не выбран)'}
+                      </p>
+                      <p className="truncate text-[11px] text-zinc-500">
+                        Голос: {selectedVoiceLabel}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAvatarPickerOpen((open) => !open)}
+                      className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                    >
+                      {avatarPickerOpen ? 'Свернуть' : 'Сменить аватар'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setVoicePickerOpen((open) => !open)}
+                      className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                    >
+                      {voicePickerOpen ? 'Свернуть' : 'Сменить голос'}
+                    </button>
+                  </div>
+
+                  {avatarPickerOpen && (<>
+                  {/* Пол актёра */}
+                  <div className="mb-3 flex flex-wrap items-center gap-3">
+                    <span className="text-xs font-medium text-zinc-400">Пол</span>
+                    <div className="flex gap-1 rounded-lg bg-white/5 p-1">
+                      {[
+                        { id: 'female', label: '👩 Женщина' },
+                        { id: 'male', label: '👨 Мужчина' },
+                      ].map((g) => (
+                        <button
+                          key={g.id}
+                          type="button"
+                          onClick={() => setActorGender(g.id)}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                            actorGender === g.id
+                              ? 'bg-violet-500/25 text-violet-200'
+                              : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+                          }`}
+                        >
+                          {g.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
+                  </div>
+
+                  {/* Сохранённые аватары. Ряды НЕ обрезаем: скролл с фиксированной
+                      высотой резал плитки пополам — казалось, что вёрстка поехала. */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-xs font-semibold text-zinc-300">Сохранённые аватары ({actorGallery.length})</p>
+                      {selectedActor && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedActor(null)}
+                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                        >
+                          Сбросить выбор
+                        </button>
+                      )}
+                    </div>
+                    {loadingGallery ? (
+                      <p className="text-xs text-zinc-500 flex items-center gap-1">
+                        <Loader2 size={12} className="animate-spin" /> Загружаю сохранённые аватары...
+                      </p>
+                    ) : (
+                      <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
+                        {actorGallery.map((img, i) => (
+                          <button
+                            key={img.url}
+                            type="button"
+                            onClick={() => {
+                              setSelectedActor(img.url);
+                              // Avatar carries its own bound voice — apply it.
+                              if (img.voice?.voice_id) setSelectedVoice(img.voice.voice_id);
+                            }}
+                            className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
+                              selectedActor === img.url
+                                ? 'border-violet-500 ring-2 ring-violet-500/30 scale-[1.02]'
+                                : 'border-white/10 hover:border-white/30'
+                            }`}
+                            title={
+                              img.voice?.voice_name
+                                ? `${img.description || `Аватар ${i + 1}`} · голос: ${img.voice.voice_name}`
+                                : (img.description || `Аватар ${i + 1}`)
+                            }
+                          >
+                            <img src={img.url} alt={`Actor ${i + 1}`} className="w-full h-full object-cover" />
+                            {img.voice?.voice_id && (
+                              <span className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-0.5 bg-violet-600/80 py-0.5 text-[8px] font-semibold text-white">
+                                <Volume2 size={8} />голос
+                              </span>
+                            )}
+                            {selectedActor === img.url && (
+                              <div className="absolute top-1 right-1 w-5 h-5 bg-violet-500 rounded-full flex items-center justify-center shadow-lg">
+                                <Check size={10} className="text-white" />
+                              </div>
+                            )}
+                          </button>
+                        ))}
+                        {/* Загрузка — такая же плитка в конце сетки: отдельная
+                            широкая кнопка и висящее сбоку превью выглядели как
+                            два оторванных друг от друга элемента. Загруженное
+                            фото сразу выбирается и приезжает в сетку. */}
+                        <label className="flex aspect-[3/4] cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-white/15 bg-white/5 text-center text-[10px] leading-tight text-zinc-500 transition-colors hover:border-primary/40 hover:text-violet-200">
+                          {uploadedActorPreview && !uploadedActorPreview.serverUrl ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <>
+                              <Upload size={14} />
+                              <span>Своё фото</span>
+                            </>
+                          )}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              await handleActorUpload(file);
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                      </div>
+                    )}
+                    {!loadingGallery && actorGallery.length === 0 && (
+                      <p className="text-[11px] text-zinc-500">
+                        Сохранённых аватаров пока нет — загрузи фото, чтобы у роликов было одно лицо.
+                      </p>
+                    )}
+                    {actorUploadStatus && (
+                      <p className={`text-[10px] ${/не удалось|fail/i.test(actorUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                        {actorUploadStatus}
+                      </p>
+                    )}
+                  </div>
+                  </>)}
+                </div>
+
+                {/* Движок озвучки (TTS provider) */}
+                {voicePickerOpen && (<>
+                <div>
+                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                    <Volume2 size={14} /> Движок озвучки
+                  </label>
+                  <div className="grid sm:grid-cols-3 gap-2">
+                    {TTS_PROVIDER_OPTIONS.map((option) => (
+                      <button
+                        key={option.id}
+                        onClick={() => setTtsProvider(option.id)}
+                        className={`p-3 rounded-lg border text-left transition-all ${
+                          ttsProvider === option.id
+                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="text-sm font-semibold">{option.label}</div>
+                        <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                  {ttsProvider === 'auto' && (
+                    <p className="text-[10px] text-zinc-500 mt-2">
+                      Сначала ElevenLabs. Если голос из библиотеки требует платный план или падает — озвучка продолжится через fal MiniMax.
+                    </p>
+                  )}
+                  {ttsProvider === 'fal_minimax' && (
+                    <p className="text-[10px] text-zinc-500 mt-2">
+                      Озвучка через баланс fal.ai. Ключ ElevenLabs в этом режиме не нужен.
+                    </p>
+                  )}
+                </div>
+
+                {(ttsProvider === 'auto' || ttsProvider === 'fal_minimax') && (
+                  <div>
+                    <label className="block text-sm font-medium text-zinc-300 mb-2">
+                      Голос fal MiniMax (резервный)
+                    </label>
+                    <OptionPicker
+                      value={minimaxVoice}
+                      onChange={setMinimaxVoice}
+                      options={(MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en).map((voice) => ({
+                        value: voice.id,
+                        label: `${voice.name} - ${voice.desc}`,
+                        name: voice.name,
+                        desc: voice.desc,
+                      }))}
+                      renderOption={(option) => (
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold truncate">{option.name}</div>
+                            <div className="text-[10px] text-zinc-500 truncate">{option.desc}</div>
+                          </div>
+                          {option.value === minimaxVoice && <Check size={14} className="text-violet-300 shrink-0" />}
+                        </div>
+                      )}
+                    />
+                    <p className="text-[10px] text-zinc-600 mt-1">
+                      Используется сразу в режиме fal MiniMax или как запасной, если ElevenLabs не сработал в режиме Auto.
+                    </p>
+                  </div>
+                )}
+
+                {/* Голос озвучки (ElevenLabs) */}
+                {ttsProvider !== 'fal_minimax' && (() => {
+                  const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
+                  return (
+                    <div>
+                      <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                        <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
+                      </label>
+                      {boundVoice?.voice_id && (
+                        // Голос привязан к аватару — предлагаем его по умолчанию,
+                        // но НЕ блокируем ручной выбор (пользователь может сменить ниже).
+                        <div className="mb-2 flex items-start gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
+                          <Volume2 size={12} className="mt-0.5 shrink-0" />
+                          <span>У аватара есть привязанный голос <b>{boundVoice.voice_name || boundVoice.voice_id}</b> — он выбран по умолчанию. Можно оставить его или выбрать другой ниже.</span>
+                        </div>
+                      )}
+                      {(() => {
+                        // Filter voices by language/accent
+                        const filtered = voices.length > 0
+                          ? voices.filter((v) => voiceVisibleForLanguage(v, language, actorGender))
+                            .sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language))
+                          : [];
+                        const hasLanguageVoice = filtered.some((v) => voiceLanguageScore(v, language) === 0);
+
+                        if (filtered.length > 0) {
+                          return (
+                            <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
+                              {filtered.map((v) => (
+                                <div
+                                  key={v.voice_id}
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => setSelectedVoice(v.voice_id)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      setSelectedVoice(v.voice_id);
+                                    }
+                                  }}
+                                  className={`w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-all ${
+                                    selectedVoice === v.voice_id
+                                      ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                                      : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                                  }`}
+                                >
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-sm font-medium truncate">{v.name}</div>
+                                    <div className="text-[10px] text-zinc-500">
+                                      {[voiceLanguageSummary(v), v.labels?.accent, v.labels?.gender, v.category].filter(Boolean).join(' · ')}
+                                    </div>
+                                    {language === 'ru' && (
+                                      <span className={`inline-flex mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${
+                                        voiceLanguageScore(v, language) === 0
+                                          ? 'bg-green-500/15 text-green-300'
+                                          : 'bg-amber-500/15 text-amber-300'
+                                      }`}>
+                                        {voiceFitLabel(v, language)}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {v.preview_url && (
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); new Audio(v.preview_url).play(); }}
+                                      className="shrink-0 w-7 h-7 rounded-full bg-white/10 hover:bg-violet-500/30 flex items-center justify-center transition-colors"
+                                      title="Preview voice"
+                                    >
+                                      <Volume2 size={12} />
+                                    </button>
+                                  )}
+                                  {selectedVoice === v.voice_id && <Check size={14} className="text-violet-400 shrink-0" />}
+                                </div>
+                              ))}
+                              {language === 'ru' && !hasLanguageVoice && (
+                                <p className="text-[10px] text-amber-400/80 pt-1">
+                                  No Russian-accent ElevenLabs voice found. Add or select a Russian voice for natural Russian speech.
+                                </p>
+                              )}
+                            </div>
+                          );
+                        }
+
+                        // Fallback defaults by gender + language
+                        const defaults = {
+                          'en-female': [
+                            { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calm)' },
+                            { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (soft)' },
+                          ],
+                          'en-male': [
+                            { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confident)' },
+                            { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh (deep)' },
+                            { id: 'yoZ06aMxZJJ28mfd3POQ', name: 'Sam (raspy)' },
+                          ],
+                          'es-female': [
+                            { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (suave)' },
+                            { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calmada)' },
+                          ],
+                          'es-male': [
+                            { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (cálido)' },
+                            { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
+                          ],
+                        };
+                        defaults['ru-female'] = [
+                          { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (multilingual fallback)' },
+                          { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (multilingual fallback)' },
+                        ];
+                        defaults['ru-male'] = [
+                          { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (multilingual fallback)' },
+                          { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (multilingual fallback)' },
+                        ];
+                        const key = `${language}-${actorGender}`;
+                        const opts = defaults[key] || defaults['en-female'];
+                        return (
+                          <OptionPicker
+                            value={selectedVoice}
+                            onChange={setSelectedVoice}
+                            options={opts.map((o) => ({ value: o.id, label: o.name }))}
+                          />
+                        );
+                      })()}
+                      {(() => {
+                        if (language !== 'ru' || !selectedVoice) return null;
+                        const selectedVoiceMeta = voices.find((v) => v.voice_id === selectedVoice);
+
+                        if (!selectedVoiceMeta) {
+                          return (
+                            <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                              Голос задан вручную по ID. Убедись, что он русский или с русским акцентом.
+                            </div>
+                          );
+                        }
+
+                        const selectedScore = voiceLanguageScore(selectedVoiceMeta, language);
+                        if (selectedScore === 0) return null;
+
+                        return (
+                          <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                            Голос не похож на русский ({selectedVoiceMeta.labels?.accent || 'акцент неизвестен'}).
+                            Для естественной русской речи выбери русский голос или вставь его ID ниже.
+                          </div>
+                        );
+                      })()}
+                      {/* Ручной ID нужен раз в год — прячем, чтобы не мозолил глаза. */}
+                      <details className="mt-3 rounded-lg border border-white/10 bg-black/20">
+                        <summary className="cursor-pointer list-none px-3 py-2 text-[11px] text-zinc-500 hover:text-zinc-300">
+                          Ввести ID голоса вручную
+                        </summary>
+                        <div className="border-t border-white/10 p-3">
+                          <input
+                            value={selectedVoice}
+                            onChange={(e) => setSelectedVoice(e.target.value.trim())}
+                            className="input-field text-xs font-mono"
+                            placeholder="voice_id из ElevenLabs..."
+                          />
+                          <p className="text-[10px] text-zinc-600 mt-1">
+                            Пригодится, если нужный голос есть в ElevenLabs, но не попал в список выше.
+                          </p>
+                        </div>
+                      </details>
+                      <p className="text-[10px] text-zinc-600 mt-1">
+                        {actorGender === 'female' ? 'Женские' : 'Мужские'} голоса · нажми на динамик, чтобы послушать
+                      </p>
+                    </div>
+                  );
+                })()}
+                </>)}
+              </div>
+
               <div className="hidden">
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   {url.trim() ? 'Extra context' : 'Describe your product/business'} <span className="text-zinc-600">{url.trim() ? '(optional)' : '(required if no URL)'}</span>
@@ -1864,22 +2492,6 @@ export default function SaaShortsTab({
                   </p>
                 </div>
               )}
-
-              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5">
-                <span className="text-xs text-zinc-500">
-                  Язык сценария — из проекта:
-                  <span className="text-zinc-300 ml-1.5 font-medium">
-                    {({ en: '🇺🇸 English', es: '🇪🇸 Español', ru: '🇷🇺 Русский' })[language] || language}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => onManageProjects?.()}
-                  className="text-[11px] text-violet-300 hover:text-violet-200"
-                >
-                  Изменить в Проектах
-                </button>
-              </div>
 
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-1">Стиль ролика</label>
@@ -2283,28 +2895,58 @@ export default function SaaShortsTab({
                       <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
                         {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
                       </span>
-                      <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
+                      <span
+                        className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400"
+                        title="≈ длина озвучки. По ней собирается ролик — видео не длиннее речи, лишние кадры не оплачиваются."
+                      >
                         ~{estimateStoryboardSeconds(scripts[selectedScript], '')} сек
                       </span>
                     </div>
                   </div>
+
+                  {/* Кадры без описания сцены: ИИ-генерация видео читает промпт,
+                      собранный из «Что в кадре», а не реплику. */}
+                  {emptyShotNumbers.length > 0 && (
+                    <div className="flex flex-col gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <p className="max-w-md text-[11px] text-amber-100/80">
+                        В {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} есть реплика, но не описано, что в кадре.
+                        Без этого нейросеть нарисует случайную сцену.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => fillShotDetails(emptyShotNumbers)}
+                        disabled={fillingShots.length > 0}
+                        className="btn-secondary shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+                      >
+                        {fillingShots.length > 0
+                          ? (<><Loader2 size={13} className="animate-spin" /> Заполняю…</>)
+                          : (<><Sparkles size={13} /> Заполнить {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} ИИ</>)}
+                      </button>
+                    </div>
+                  )}
+                  {fillError && (
+                    <p className="text-[11px] text-red-300">{fillError}</p>
+                  )}
 
                   {/* Сгенерировать стартовые кадры (Flux) до платного видео,
                       чтобы увидеть и утвердить композицию каждого шота. */}
                   <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-[11px] text-zinc-400 max-w-md">
                       Сгенерируй стартовые кадры и проверь композицию до платной генерации видео.
-                      Кадры можно перегенерировать по одному или заменить своим фото — видео переиспользует их.
+                      Готовые кадры пропускаются — платишь только за недостающие. Перегенерить кадр
+                      или заменить его своим фото можно по кнопке на самом кадре.
                     </p>
                     <button
                       type="button"
                       onClick={() => handleGenerateFrames(null)}
-                      disabled={framesGenerating}
+                      disabled={framesGenerating || missingFrameCount === 0}
                       className="btn-secondary shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
                     >
                       {framesGenerating && framesShot === null
                         ? (<><Loader2 size={13} className="animate-spin" /> Генерирую…</>)
-                        : (<><Sparkles size={13} /> Сгенерить кадры (~{formatUsd(((scripts[selectedScript].shots || []).length) * 0.05)})</>)}
+                        : missingFrameCount === 0
+                          ? (<><Check size={13} /> Все кадры готовы</>)
+                          : (<><Sparkles size={13} /> Сгенерить недостающие: {missingFrameCount} (~{formatUsd(missingFrameCount * 0.05)})</>)}
                     </button>
                   </div>
 
@@ -2358,6 +3000,21 @@ export default function SaaShortsTab({
                               <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-primary/15 px-2 text-xs font-semibold text-violet-200">
                                 {shotIndex + 1}
                               </span>
+                              {/* Что по этому кадру уже оплачено и лежит на диске:
+                                  снятый клип или только стартовый кадр. */}
+                              {clipUrl ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-semibold text-green-300">
+                                  <Check size={10} /> Снят
+                                </span>
+                              ) : previewUrl ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-300">
+                                  <Check size={10} /> Кадр готов
+                                </span>
+                              ) : (
+                                <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-zinc-500">
+                                  Без кадра
+                                </span>
+                              )}
                             </div>
                             <div className="flex items-center gap-0.5">
                               <button
@@ -2477,7 +3134,22 @@ export default function SaaShortsTab({
                                 </div>
                               </div>
                               <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                <span>Что в кадре</span>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span>Что в кадре</span>
+                                  {/* Пустая сцена = случайная картинка: промпт для
+                                      видео-модели строится именно отсюда. */}
+                                  <button
+                                    type="button"
+                                    onClick={() => fillShotDetails([shot.shot_number])}
+                                    disabled={fillingShots.includes(shot.shot_number)}
+                                    className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200 disabled:opacity-50"
+                                    title="Заполнить сцену, камеру и действие по реплике (Gemini, бесплатно)"
+                                  >
+                                    {fillingShots.includes(shot.shot_number)
+                                      ? (<><Loader2 size={11} className="animate-spin" /> Заполняю…</>)
+                                      : (<><Sparkles size={11} /> Заполнить ИИ</>)}
+                                  </button>
+                                </div>
                                 <textarea
                                   className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
                                   value={shot.scene || ''}
@@ -2608,6 +3280,68 @@ export default function SaaShortsTab({
                   >
                     <Plus size={16} /> Добавить кадр
                   </button>
+
+                  {/* Реплики исходного сценария, которых нет ни в одном кадре —
+                      для старых роликов это всё, что уцелело от удалённых кадров. */}
+                  {leftoverNarration.length > 0 && (
+                    <details className="rounded-xl border border-white/10 bg-black/20">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200">
+                        Текст сценария вне кадров ({leftoverNarration.length}) — можно вернуть кадром
+                      </summary>
+                      <div className="space-y-2 border-t border-white/10 p-3">
+                        {leftoverNarration.map((sentence, i) => (
+                          <div key={i} className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-2">
+                            <p className="min-w-0 flex-1 text-xs text-zinc-300">{sentence}</p>
+                            <button
+                              type="button"
+                              onClick={() => addShotWithSpeech(sentence)}
+                              className="shrink-0 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                            >
+                              Добавить кадром
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+
+                  {/* Удалённые кадры: текст никуда не девается, кадр возвращается
+                      одной кнопкой. Уезжает в метаданные ролика вместе с раскадровкой. */}
+                  {(scripts[selectedScript].shots_archived || []).length > 0 && (
+                    <details className="rounded-xl border border-white/10 bg-black/20">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200">
+                        Удалённые кадры ({(scripts[selectedScript].shots_archived || []).length}) — текст сохранён, можно вернуть
+                      </summary>
+                      <div className="space-y-2 border-t border-white/10 p-3">
+                        {(scripts[selectedScript].shots_archived || []).map((shot, i) => (
+                          <div key={i} className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-2">
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-xs text-zinc-300">{shot.speech || shot.scene || 'Пустой кадр'}</p>
+                              {shot.scene && shot.speech && (
+                                <p className="truncate text-[10px] text-zinc-600">{shot.scene}</p>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => restoreArchivedShot(i)}
+                              className="shrink-0 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                            >
+                              Вернуть
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => dropArchivedShot(i)}
+                              aria-label="Забыть кадр"
+                              title="Забыть окончательно"
+                              className="shrink-0 rounded-md p-1 text-zinc-600 transition-colors hover:text-red-300"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
 
@@ -2631,359 +3365,6 @@ export default function SaaShortsTab({
                         <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
                       </button>
                     ))}
-                  </div>
-                </div>
-              )}
-
-              {/* TTS Provider */}
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                  <Volume2 size={14} /> TTS Provider
-                </label>
-                <div className="grid sm:grid-cols-3 gap-2">
-                  {TTS_PROVIDER_OPTIONS.map((option) => (
-                    <button
-                      key={option.id}
-                      onClick={() => setTtsProvider(option.id)}
-                      className={`p-3 rounded-lg border text-left transition-all ${
-                        ttsProvider === option.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="text-sm font-semibold">{option.label}</div>
-                      <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
-                    </button>
-                  ))}
-                </div>
-                {ttsProvider === 'auto' && (
-                  <p className="text-[10px] text-zinc-500 mt-2">
-                    Tries ElevenLabs first. If a library voice requires a paid plan or fails, generation continues with fal MiniMax.
-                  </p>
-                )}
-                {ttsProvider === 'fal_minimax' && (
-                  <p className="text-[10px] text-zinc-500 mt-2">
-                    Uses fal.ai balance for voiceover. ElevenLabs key is not required in this mode.
-                  </p>
-                )}
-              </div>
-
-              {(ttsProvider === 'auto' || ttsProvider === 'fal_minimax') && (
-                <div>
-                  <label className="block text-sm font-medium text-zinc-300 mb-2">
-                    fal MiniMax fallback voice
-                  </label>
-                  <OptionPicker
-                    value={minimaxVoice}
-                    onChange={setMinimaxVoice}
-                    options={(MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en).map((voice) => ({
-                      value: voice.id,
-                      label: `${voice.name} - ${voice.desc}`,
-                      name: voice.name,
-                      desc: voice.desc,
-                    }))}
-                    renderOption={(option) => (
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold truncate">{option.name}</div>
-                          <div className="text-[10px] text-zinc-500 truncate">{option.desc}</div>
-                        </div>
-                        {option.value === minimaxVoice && <Check size={14} className="text-violet-300 shrink-0" />}
-                      </div>
-                    )}
-                  />
-                  <p className="text-[10px] text-zinc-600 mt-1">
-                    Used immediately in fal MiniMax mode, or only if ElevenLabs fails in Auto fallback mode.
-                  </p>
-                </div>
-              )}
-
-              {/* Настройки аватара: пол, озвучка, загрузка — спрятаны в модалку,
-                  чтобы блок выбора аватара оставался чистым (только сетка + кнопка). */}
-              {avatarSettingsOpen && (
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-                  onClick={() => setAvatarSettingsOpen(false)}
-                >
-                  <div
-                    className="glass-panel max-h-[85vh] w-full max-w-lg space-y-5 overflow-y-auto p-5 custom-scrollbar"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    <div className="flex items-center justify-between">
-                      <h3 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
-                        <Settings2 size={15} /> Настройки аватара
-                      </h3>
-                      <button
-                        type="button"
-                        onClick={() => setAvatarSettingsOpen(false)}
-                        className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-200"
-                        aria-label="Закрыть"
-                      >
-                        <X size={16} />
-                      </button>
-                    </div>
-
-                    {/* Пол актёра */}
-                    <div>
-                      <label className="mb-2 block text-sm font-medium text-zinc-300">Пол актёра</label>
-                      <div className="flex items-center gap-3">
-                        <div className="flex gap-1 rounded-lg bg-white/5 p-1">
-                          {[
-                            { id: 'female', label: '👩 Женщина' },
-                            { id: 'male', label: '👨 Мужчина' },
-                          ].map((g) => (
-                            <button
-                              key={g.id}
-                              type="button"
-                              onClick={() => setActorGender(g.id)}
-                              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                                actorGender === g.id
-                                  ? 'bg-violet-500/25 text-violet-200'
-                                  : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
-                              }`}
-                            >
-                              {g.label}
-                            </button>
-                          ))}
-                        </div>
-                        <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
-                      </div>
-                    </div>
-
-                    {/* Загрузить свой аватар */}
-                    <div>
-                      <label className="mb-2 block text-sm font-medium text-zinc-300">Загрузить свой аватар</label>
-                      <div className="flex items-center gap-3">
-                        <label className="flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-white/20 bg-white/5 px-4 py-3 text-sm text-zinc-400 transition-colors hover:border-white/30 hover:bg-white/10">
-                          <Upload size={14} />
-                          <span>Загрузить и сохранить аватар</span>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            className="hidden"
-                            onChange={async (e) => {
-                              const file = e.target.files?.[0];
-                              await handleActorUpload(file);
-                              e.target.value = '';
-                            }}
-                          />
-                        </label>
-                        {uploadedActorPreview && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (uploadedActorPreview.serverUrl) {
-                                setSelectedActor(uploadedActorPreview.serverUrl);
-                              }
-                            }}
-                            className={`relative h-20 w-16 flex-shrink-0 overflow-hidden rounded-lg border-2 transition-all ${
-                              selectedActor === uploadedActorPreview.serverUrl
-                                ? 'border-violet-500 ring-2 ring-violet-500/30'
-                                : 'border-white/20 hover:border-white/40'
-                            }`}
-                          >
-                            <img src={uploadedActorPreview.localPreview} alt="Uploaded" className="h-full w-full object-cover" />
-                            {selectedActor === uploadedActorPreview.serverUrl && (
-                              <div className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-violet-500">
-                                <Check size={8} className="text-white" />
-                              </div>
-                            )}
-                            {!uploadedActorPreview.serverUrl && (
-                              <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                                <Loader2 size={12} className="animate-spin text-white" />
-                              </div>
-                            )}
-                          </button>
-                        )}
-                      </div>
-                      {actorUploadStatus && (
-                        <p className={`mt-2 text-[10px] ${actorUploadStatus.toLowerCase().includes('fail') ? 'text-red-300' : 'text-zinc-500'}`}>
-                          {actorUploadStatus}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Voice Selection */}
-                    {ttsProvider !== 'fal_minimax' && (() => {
-                const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
-                return (
-                <div>
-                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                    <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
-                  </label>
-                  {boundVoice?.voice_id ? (
-                    // Голос привязан к аватару — бэкенд использует именно его,
-                    // поэтому ручной выбор здесь скрыт, чтобы не вводить в заблуждение.
-                    <div className="mb-2 flex items-start gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
-                      <Volume2 size={12} className="mt-0.5 shrink-0" />
-                      <span>Аватар привязан к голосу <b>{boundVoice.voice_name || boundVoice.voice_id}</b> — он и будет использован для ролика. Сменить можно во вкладке «Аватары».</span>
-                    </div>
-                  ) : (
-                  <>
-                {(() => {
-                  // Filter voices by language/accent
-                  const filtered = voices.length > 0
-                    ? voices.filter((v) => {
-                        return voiceVisibleForLanguage(v, language, actorGender);
-                      })
-                      .sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language))
-                    : [];
-                  const hasLanguageVoice = filtered.some((v) => voiceLanguageScore(v, language) === 0);
-
-                  if (filtered.length > 0) {
-                    return (
-                      <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
-                        {filtered.map((v) => (
-                          <div
-                            key={v.voice_id}
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => setSelectedVoice(v.voice_id)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                setSelectedVoice(v.voice_id);
-                              }
-                            }}
-                            className={`w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-all ${
-                              selectedVoice === v.voice_id
-                                ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                                : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                            }`}
-                          >
-                            <div className="flex-1 min-w-0">
-                              <div className="text-sm font-medium truncate">{v.name}</div>
-                              <div className="text-[10px] text-zinc-500">
-                                {[voiceLanguageSummary(v), v.labels?.accent, v.labels?.gender, v.category].filter(Boolean).join(' · ')}
-                              </div>
-                              {language === 'ru' && (
-                                <span className={`inline-flex mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${
-                                  voiceLanguageScore(v, language) === 0
-                                    ? 'bg-green-500/15 text-green-300'
-                                    : 'bg-amber-500/15 text-amber-300'
-                                }`}>
-                                  {voiceFitLabel(v, language)}
-                                </span>
-                              )}
-                            </div>
-                            {v.preview_url && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); new Audio(v.preview_url).play(); }}
-                                className="shrink-0 w-7 h-7 rounded-full bg-white/10 hover:bg-violet-500/30 flex items-center justify-center transition-colors"
-                                title="Preview voice"
-                              >
-                                <Volume2 size={12} />
-                              </button>
-                            )}
-                            {selectedVoice === v.voice_id && <Check size={14} className="text-violet-400 shrink-0" />}
-                          </div>
-                        ))}
-                        {language === 'ru' && !hasLanguageVoice && (
-                          <p className="text-[10px] text-amber-400/80 pt-1">
-                            No Russian-accent ElevenLabs voice found. Add or select a Russian voice for natural Russian speech.
-                          </p>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  // Fallback defaults by gender + language
-                  const defaults = {
-                    'en-female': [
-                      { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calm)' },
-                      { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (soft)' },
-                    ],
-                    'en-male': [
-                      { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confident)' },
-                      { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh (deep)' },
-                      { id: 'yoZ06aMxZJJ28mfd3POQ', name: 'Sam (raspy)' },
-                    ],
-                    'es-female': [
-                      { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (suave)' },
-                      { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calmada)' },
-                    ],
-                    'es-male': [
-                      { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (cálido)' },
-                      { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
-                    ],
-                  };
-                  defaults['ru-female'] = [
-                    { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (multilingual fallback)' },
-                    { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (multilingual fallback)' },
-                  ];
-                  defaults['ru-male'] = [
-                    { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (multilingual fallback)' },
-                    { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (multilingual fallback)' },
-                  ];
-                  const key = `${language}-${actorGender}`;
-                  const opts = defaults[key] || defaults['en-female'];
-                  return (
-                    <OptionPicker
-                      value={selectedVoice}
-                      onChange={setSelectedVoice}
-                      options={opts.map((o) => ({ value: o.id, label: o.name }))}
-                    />
-                  );
-                })()}
-                {(() => {
-                  if (language !== 'ru' || !selectedVoice) return null;
-                  const selectedVoiceMeta = voices.find((v) => v.voice_id === selectedVoice);
-
-                  if (!selectedVoiceMeta) {
-                    return (
-                      <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
-                        Custom voice ID selected. Make sure this ElevenLabs voice is Russian or Russian-accented before generating.
-                      </div>
-                    );
-                  }
-
-                  const selectedScore = voiceLanguageScore(selectedVoiceMeta, language);
-                  if (selectedScore === 0) {
-                    return (
-                      <div className="mt-2 p-2.5 rounded-lg border border-green-500/20 bg-green-500/10 text-[11px] text-green-200">
-                        Selected voice looks Russian-compatible.
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
-                      Selected voice looks non-Russian ({selectedVoiceMeta.labels?.accent || 'unknown accent'}). For natural Russian speech, paste a Russian ElevenLabs voice ID below or add a Russian voice in ElevenLabs.
-                    </div>
-                  );
-                })()}
-                <div className="mt-3">
-                  <label className="block text-[11px] font-medium text-zinc-400 mb-1">
-                    Custom ElevenLabs voice ID
-                  </label>
-                  <input
-                    value={selectedVoice}
-                    onChange={(e) => setSelectedVoice(e.target.value.trim())}
-                    className="input-field text-xs font-mono"
-                    placeholder="Paste Russian voice_id from ElevenLabs..."
-                  />
-                  <p className="text-[10px] text-zinc-600 mt-1">
-                    Use this if your Russian voice exists in ElevenLabs but does not appear in the filtered list.
-                  </p>
-                </div>
-                <p className="text-[10px] text-zinc-600 mt-1">
-                  {language === 'es'
-                    ? `Voces ${actorGender === 'female' ? 'femeninas' : 'masculinas'} · Todas hablan español con modelo multilingual · Click altavoz para preview`
-                    : `${actorGender === 'female' ? 'Female' : 'Male'} voices · Click speaker to preview`}
-                </p>
-                  </>
-                  )}
-                </div>
-                );
-              })()}
-
-                    <button
-                      type="button"
-                      onClick={() => setAvatarSettingsOpen(false)}
-                      className="btn-primary w-full py-2.5 text-sm"
-                    >
-                      Готово
-                    </button>
                   </div>
                 </div>
               )}
@@ -3110,94 +3491,6 @@ export default function SaaShortsTab({
                 )}
               </div>
               )}
-
-              {/* Actor Selection: Gallery + Generate New */}
-              <div className={selectedHeadTemplate ? 'opacity-50 pointer-events-none' : ''}>
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
-                    <User size={14} /> Аватар проекта {storyboardSelected && <span className="text-zinc-600">(необязательно)</span>}
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => setAvatarSettingsOpen(true)}
-                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
-                  >
-                    <Settings2 size={13} /> Настройки аватара
-                  </button>
-                </div>
-                <p className="text-xs text-zinc-500 mb-3">
-                  Аватар задаёт лицо говорящего в кадре — оно берётся из фото, а не из текста.
-                  Без выбранного аватара система придумает случайного человека, и в каждом ролике он будет
-                  разным. Для постоянного персонажа проекта выбери или загрузи аватар. Пол, озвучку и
-                  загрузку фото настрой в «Настройках аватара».
-                </p>
-
-                <div className="space-y-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-xs font-semibold text-zinc-300">Сохранённые аватары ({actorGallery.length})</p>
-                      {selectedActor && (
-                        <button
-                          type="button"
-                          onClick={() => setSelectedActor(null)}
-                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
-                        >
-                          Сбросить выбор
-                        </button>
-                      )}
-                    </div>
-                    {loadingGallery ? (
-                      <p className="text-xs text-zinc-500 flex items-center gap-1">
-                        <Loader2 size={12} className="animate-spin" /> Загружаю сохранённые аватары...
-                      </p>
-                    ) : actorGallery.length > 0 ? (
-                      <div className="grid grid-cols-4 sm:grid-cols-6 gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
-                        {actorGallery.map((img, i) => (
-                          <button
-                            key={img.url}
-                            type="button"
-                            onClick={() => {
-                              setSelectedActor(img.url);
-                              // Avatar carries its own bound voice — apply it.
-                              if (img.voice?.voice_id) setSelectedVoice(img.voice.voice_id);
-                            }}
-                            className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
-                              selectedActor === img.url
-                                ? 'border-violet-500 ring-2 ring-violet-500/30 scale-[1.02]'
-                                : 'border-white/10 hover:border-white/30'
-                            }`}
-                            title={
-                              img.voice?.voice_name
-                                ? `${img.description || `Аватар ${i + 1}`} · голос: ${img.voice.voice_name}`
-                                : (img.description || `Аватар ${i + 1}`)
-                            }
-                          >
-                            <img src={img.url} alt={`Actor ${i + 1}`} className="w-full h-full object-cover" />
-                            {img.voice?.voice_id && (
-                              <span className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-0.5 bg-violet-600/80 py-0.5 text-[8px] font-semibold text-white">
-                                <Volume2 size={8} />голос
-                              </span>
-                            )}
-                            {selectedActor === img.url && (
-                              <div className="absolute top-1 right-1 w-5 h-5 bg-violet-500 rounded-full flex items-center justify-center shadow-lg">
-                                <Check size={10} className="text-white" />
-                              </div>
-                            )}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="p-3 rounded-xl border border-dashed border-white/15 bg-white/5 text-xs text-zinc-500">
-                        В галерее пока нет аватаров. Открой «Настройки аватара», чтобы загрузить своё фото.
-                      </div>
-                    )}
-                  </div>
-
-                {!selectedActor && (
-                  <p className="text-xs text-amber-400 mt-3 flex items-center gap-1">
-                    <AlertCircle size={12} /> Выбери или загрузи аватара, чтобы продолжить
-                  </p>
-                )}
-              </div>
 
               {false && (
               <div>
@@ -3483,7 +3776,7 @@ export default function SaaShortsTab({
                 {generating ? (
                   <><Loader2 size={14} className="animate-spin" /> Генерирую...</>
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
-                  <><User size={14} /> Сначала выбери актёра</>
+                  <><User size={14} /> Выбери аватара на шаге «Setup»</>
                 ) : storyboardSelected ? (
                   <><Film size={14} /> Сгенерировать видео ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : selectedHeadTemplate ? (
@@ -3693,17 +3986,23 @@ export default function SaaShortsTab({
                     <p className="text-xs text-zinc-500">{genResult.duration?.toFixed(1)}s &middot; 9:16 vertical</p>
                   </div>
 
+                  {/* Сюда падают и предупреждения о длительностях липсинка, и
+                      визуальные замечания vision-QC по конкретным клипам —
+                      поэтому шапка нейтральная, а не «про talking-head». */}
                   {genResult.quality_warnings?.length > 0 && (
                     <div className="p-3 bg-amber-500/10 rounded-lg border border-amber-500/25 space-y-2">
                       <div className="flex items-center gap-2 text-xs font-semibold text-amber-200">
                         <AlertCircle size={14} />
-                        Проверь синхронизацию talking-head
+                        Замечания автопроверки
                       </div>
                       <div className="space-y-1">
                         {genResult.quality_warnings.map((warning, i) => (
                           <p key={i} className="text-xs text-amber-100/80">{warning}</p>
                         ))}
                       </div>
+                      <p className="text-[11px] text-amber-100/50">
+                        Это подсказки ИИ, а не блокировка: решай сам, стоит ли перегенерить кадр.
+                      </p>
                     </div>
                   )}
 

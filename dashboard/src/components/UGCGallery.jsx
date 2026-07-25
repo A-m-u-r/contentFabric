@@ -13,6 +13,7 @@ import {
   X,
   Wand2,
   Upload,
+  Pencil,
 } from 'lucide-react';
 import { getApiUrl } from '../config';
 
@@ -63,7 +64,11 @@ function buildVoiceOptions(voices) {
   return options;
 }
 
-export default function UGCGallery({ falKey, authToken, usePlatformKeys = false }) {
+// Ключ, через который раскадровка готового ролика передаётся во вкладку
+// «AI Shorts» (тот же приём, что и с темой из контент-плана).
+const PENDING_STORYBOARD_KEY = 'saasshorts_pending_storyboard';
+
+export default function UGCGallery({ falKey, authToken, usePlatformKeys = false, onEditStoryboard = null }) {
   const [tab, setTab] = useState('videos');
   const [videos, setVideos] = useState([]);
   const [avatars, setAvatars] = useState([]);
@@ -630,6 +635,27 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false 
           onModelChange={setLipSyncModel}
           onLipSync={handleLipSync}
           onSaveHeadTemplate={handleSaveHeadTemplate}
+          onEditStoryboard={(video) => {
+            try {
+              localStorage.setItem(PENDING_STORYBOARD_KEY, JSON.stringify({
+                video_id: video.video_id,
+                title: video.title,
+                caption: video.caption,
+                hashtags: video.hashtags,
+                full_narration: video.full_narration,
+                actor_description: video.actor_description,
+                language: video.language,
+                shots: video.shots || [],
+                shots_archived: video.shots_archived || [],
+                storyboard_generation_mode: video.storyboard_generation_mode,
+              }));
+            } catch (e) {
+              console.warn('Не удалось передать раскадровку', e);
+              return;
+            }
+            setSelectedVideo(null);
+            onEditStoryboard?.();
+          }}
         />
       )}
     </div>
@@ -799,6 +825,7 @@ function VideoActionModal({
   onModelChange,
   onLipSync,
   onSaveHeadTemplate,
+  onEditStoryboard,
 }) {
   const caption = video.caption || '';
   const hashtags = (video.hashtags || []).join(' ');
@@ -868,6 +895,17 @@ function VideoActionModal({
                 <ExternalLink size={15} /> Открыть
               </a>
             </div>
+            {/* Раскадровка сохраняется вместе с роликом — её можно открыть в
+                редакторе, доснять кадры и пересобрать видео. */}
+            {(video.shots || []).length > 0 && onEditStoryboard && (
+              <button
+                type="button"
+                onClick={() => onEditStoryboard(video)}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-sm font-semibold text-violet-200 transition-colors hover:bg-violet-500/20"
+              >
+                <Pencil size={15} /> Редактировать раскадровку ({(video.shots || []).length} кадр.)
+              </button>
+            )}
             {versions.length > 0 && (
               <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 space-y-2">
                 <div className="flex items-center justify-between gap-2">

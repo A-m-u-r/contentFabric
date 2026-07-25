@@ -19,7 +19,7 @@ import tempfile
 import zipfile
 from urllib.parse import urlparse
 from dotenv import load_dotenv
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -2968,6 +2968,7 @@ from saasshorts import (
     analyze_saas,
     generate_scripts,
     generate_content_plan,
+    fill_storyboard_shot_details,
     build_custom_script,
     GeminiTemporaryError,
     generate_full_video,
@@ -3180,6 +3181,58 @@ async def saasshorts_content_plan(
             ),
         )
         return {"items": items}
+    except GeminiTemporaryError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaaSShotFillRequest(BaseModel):
+    script: Dict[str, Any]
+    shots: List[Dict[str, Any]]
+    language: str = "ru"
+    actor_gender: str = "female"
+    text_model: str = "fast"
+    use_platform_keys: bool = False
+
+
+@app.post("/api/saasshorts/storyboard-shot-fill")
+async def saasshorts_storyboard_shot_fill(
+    req: SaaSShotFillRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Fill scene / camera / action / prompt for shots that only carry a line.
+
+    Text-only Gemini call: no fal.ai, nothing paid. A restored or hand-added shot
+    otherwise reaches the video model with an empty scene and renders garbage.
+    """
+    user = get_user_from_authorization(authorization)
+    try:
+        gemini_key = resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
+    if not req.shots:
+        raise HTTPException(status_code=400, detail="No shots to fill")
+
+    try:
+        loop = asyncio.get_event_loop()
+        shots = await loop.run_in_executor(
+            None,
+            lambda: fill_storyboard_shot_details(
+                req.script,
+                req.shots,
+                gemini_key,
+                text_model=req.text_model,
+                language=req.language,
+                actor_gender=req.actor_gender,
+            ),
+        )
+        return {"shots": shots}
     except GeminiTemporaryError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -3453,6 +3506,22 @@ def resolve_avatar_bound_voice(selected_actor_url: Optional[str]) -> Optional[di
     if (binding.get("provider") or "elevenlabs") != "elevenlabs":
         return None
     return binding
+
+
+def effective_voice_for_request(request_voice_id: Optional[str], bound: Optional[dict]) -> tuple:
+    """Pick the voice for a generation: the avatar binding is a DEFAULT, not a lock.
+
+    It fills in only when the caller sent no voice at all (API calls, retries,
+    restored prefs). An explicit pick always wins — overriding it made the voice
+    picker in the UI a lie: you chose one voice and the video spoke in another.
+    Returns (voice_id, source) where source is "request", "bound" or "override".
+    """
+    picked = (request_voice_id or "").strip()
+    if not bound or not bound.get("voice_id"):
+        return (picked or request_voice_id), "request"
+    if not picked:
+        return bound["voice_id"], "bound"
+    return picked, ("override" if picked != bound["voice_id"] else "request")
 
 
 def _safe_output_subpath(rel_url: Optional[str]) -> Optional[str]:
@@ -4210,17 +4279,17 @@ async def saasshorts_generate(
             if src and os.path.exists(src):
                 selected_actor_path = src
 
-    # A voice bound to the selected avatar wins over the request's ElevenLabs
-    # voice, so "attach a voice to an avatar" holds even for retries / API calls
-    # / restored prefs where the UI never re-applied it.
-    effective_voice_id = req.voice_id
     _bound = resolve_avatar_bound_voice(req.selected_actor_url)
+    effective_voice_id, _voice_source = effective_voice_for_request(req.voice_id, _bound)
     if _bound:
-        if _bound["voice_id"] != effective_voice_id:
+        _bound_name = _bound.get("voice_name") or _bound["voice_id"]
+        if _voice_source == "bound":
+            saas_jobs[job_id]["logs"].append(f"🔗 Using voice bound to avatar ({_bound_name}).")
+        elif _voice_source == "override":
+            # Voice drift used to be undebuggable after the fact — say it plainly.
             saas_jobs[job_id]["logs"].append(
-                f"🔗 Using voice bound to avatar ({_bound.get('voice_name') or _bound['voice_id']})."
+                f"🎙️ Voice picked manually ({effective_voice_id}); avatar binding ({_bound_name}) not applied."
             )
-        effective_voice_id = _bound["voice_id"]
 
     reusable_head = None
     if req.reusable_head_template_id:
@@ -4342,7 +4411,12 @@ async def saasshorts_generate(
                         "segments": req.script.get("segments", []),
                         "script_format": req.script.get("format") or req.script.get("script_format") or "ugc",
                         "shots": result.get("storyboard_shots") or req.script.get("shots", []),
+                        # Shots the user cut before rendering: kept verbatim so the
+                        # storyboard can be reopened from the gallery with their
+                        # text intact and a cut shot put back without retyping it.
+                        "shots_archived": req.script.get("shots_archived", []),
                         "storyboard_generation_mode": result.get("storyboard_generation_mode"),
+                        "job_id": job_id,
                         "cost_estimate": result.get("cost_estimate", {}),
                         "owner_user_id": owner_user_id or "",
                     }

@@ -153,6 +153,37 @@ class AvatarVoiceBindingTests(unittest.TestCase):
         self.assertIsNone(app.resolve_avatar_bound_voice("/videos/actor_uploads/m.png"))
 
 
+class EffectiveVoiceForRequestTests(unittest.TestCase):
+    """Привязанный к аватару голос — дефолт, а не замок.
+
+    Раньше он перебивал ручной выбор: юзер выбирал в пикере один голос, а
+    ролик говорил другим, и сам пикер превращался в обманку.
+    """
+
+    BOUND = {"voice_id": "victoria", "voice_name": "Victoria"}
+
+    def test_manual_pick_wins_over_binding(self):
+        voice, source = app.effective_voice_for_request("vika", self.BOUND)
+        self.assertEqual(voice, "vika")
+        self.assertEqual(source, "override")
+
+    def test_binding_fills_in_when_no_voice_sent(self):
+        for empty in (None, "", "   "):
+            voice, source = app.effective_voice_for_request(empty, self.BOUND)
+            self.assertEqual(voice, "victoria")
+            self.assertEqual(source, "bound")
+
+    def test_same_voice_is_not_reported_as_override(self):
+        _, source = app.effective_voice_for_request("victoria", self.BOUND)
+        self.assertEqual(source, "request")
+
+    def test_no_binding_keeps_the_request_voice(self):
+        voice, source = app.effective_voice_for_request("vika", None)
+        self.assertEqual(voice, "vika")
+        self.assertEqual(source, "request")
+        self.assertEqual(app.effective_voice_for_request(None, None), (None, "request"))
+
+
 class SafeOutputSubpathTests(unittest.TestCase):
     """A client-supplied /videos/ reference must never resolve outside
     OUTPUT_DIR (path-traversal guard for the selected-actor image)."""

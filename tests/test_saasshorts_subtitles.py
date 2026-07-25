@@ -1,17 +1,32 @@
+import array
+import math
 import os
 import tempfile
 import unittest
+import wave
 from unittest.mock import patch
 
+import saasshorts
 from saasshorts import (
     _align_asr_words_to_script,
     _final_audio_filter_parts,
+    _loudnorm_filter,
     _pick_background_music,
+    _snap_captions_to_speech,
     _strip_pictographs,
     _subtitle_filter,
     composite_storyboard_video,
     generate_storyboard_ass_subtitles,
 )
+
+
+MEASURED = {
+    "input_i": "-15.49",
+    "input_tp": "-0.90",
+    "input_lra": "3.20",
+    "input_thresh": "-25.60",
+    "target_offset": "0.30",
+}
 
 
 def _w(word, start, end):
@@ -153,16 +168,133 @@ class BackgroundMusicTest(unittest.TestCase):
             self.assertIsNone(_pick_background_music("same_title"))
 
     def test_final_audio_chain_with_music_ducks_and_normalizes(self):
-        parts = ";".join(_final_audio_filter_parts("2", "3", 0.16))
+        parts = ";".join(_final_audio_filter_parts("2", "3", 1.0, music_gain_db=-8.6))
         self.assertIn("sidechaincompress", parts)
         self.assertIn("normalize=0", parts)
         self.assertIn("loudnorm=I=-14", parts)
         self.assertIn("[aout]", parts)
 
+    def test_music_bed_is_normalized_and_ducking_is_gentle(self):
+        # Подложку не слышно было из-за слепого volume=0.16 поверх и без того
+        # тихого трека (-23.7 dBFS) плюс даккинг ratio 12 / release 500ms,
+        # который в почти сплошной речи не давал беду подняться вообще.
+        parts = ";".join(_final_audio_filter_parts("2", "3", 1.0, music_gain_db=-8.6))
+        self.assertIn("volume=-8.60dB", parts)
+        self.assertIn("ratio=6", parts)
+        self.assertNotIn("ratio=12", parts)
+        self.assertNotIn("release=500", parts)
+
+    def test_music_gain_targets_a_fixed_level(self):
+        with patch("saasshorts.subprocess.run") as run_mock:
+            run_mock.return_value.stderr = "[Parsed_volumedetect_0 @ 0x1] mean_volume: -23.4 dB"
+            gain = saasshorts._music_bed_gain_db("/tmp/some-bed.mp3", target_dbfs=-32.0)
+        self.assertAlmostEqual(gain, -8.6, places=2)
+
+    def test_unmeasurable_track_is_left_alone(self):
+        with patch("saasshorts.subprocess.run", side_effect=OSError("no ffmpeg")):
+            self.assertEqual(saasshorts._music_bed_gain_db("/tmp/broken-bed.mp3"), 0.0)
+
     def test_final_audio_chain_without_music_only_normalizes(self):
-        parts = ";".join(_final_audio_filter_parts("2", None, 0.16))
+        parts = ";".join(_final_audio_filter_parts("2", None, 1.0))
         self.assertNotIn("sidechaincompress", parts)
         self.assertIn("loudnorm=I=-14", parts)
+
+
+class TwoPassLoudnormTest(unittest.TestCase):
+    """Однопроходный loudnorm давит и без того узкую динамику TTS-речи."""
+
+    def test_measured_values_switch_loudnorm_to_linear_gain(self):
+        flt = _loudnorm_filter(MEASURED)
+        self.assertIn("loudnorm=I=-14:TP=-1.5:LRA=11", flt)
+        self.assertIn("measured_I=-15.49", flt)
+        self.assertIn("measured_thresh=-25.60", flt)
+        self.assertIn("offset=0.30", flt)
+        self.assertIn("linear=true", flt)
+
+    def test_without_measurements_stays_one_pass(self):
+        flt = _loudnorm_filter(None)
+        self.assertNotIn("linear=true", flt)
+        self.assertNotIn("measured_I", flt)
+
+    def test_measure_pass_asks_ffmpeg_for_json(self):
+        parts = ";".join(_final_audio_filter_parts("2", None, 0.16, print_json=True))
+        self.assertIn("print_format=json", parts)
+
+    @patch("saasshorts.subprocess.run")
+    @patch("saasshorts._get_media_duration", return_value=5.0)
+    @patch("saasshorts._measure_final_loudness", return_value=MEASURED)
+    def test_composite_applies_the_measured_pass(self, _measure, _dur, run_mock):
+        composite_storyboard_video(
+            [{"path": "/tmp/a.mp4", "duration": 5.0}],
+            "/tmp/voice.mp3", "/tmp/subs.ass", "/tmp/out.mp4",
+        )
+        filter_complex = run_mock.call_args[0][0][
+            run_mock.call_args[0][0].index("-filter_complex") + 1
+        ]
+        self.assertIn("linear=true", filter_complex)
+
+    @patch("saasshorts.subprocess.run")
+    @patch("saasshorts._get_media_duration", return_value=5.0)
+    @patch("saasshorts._measure_final_loudness", return_value=None)
+    def test_failed_measurement_falls_back_to_one_pass(self, _measure, _dur, run_mock):
+        composite_storyboard_video(
+            [{"path": "/tmp/a.mp4", "duration": 5.0}],
+            "/tmp/voice.mp3", "/tmp/subs.ass", "/tmp/out.mp4",
+        )
+        filter_complex = run_mock.call_args[0][0][
+            run_mock.call_args[0][0].index("-filter_complex") + 1
+        ]
+        self.assertIn("loudnorm=I=-14", filter_complex)
+        self.assertNotIn("linear=true", filter_complex)
+
+
+def _write_tone_silence_tone(path, sample_rate=16000):
+    """3s: тон, секунда тишины, снова тон — модель паузы от тега [sighs]."""
+    frames = array.array("h")
+    for i in range(sample_rate * 3):
+        t = i / sample_rate
+        voiced = t < 1.0 or t >= 2.0
+        frames.append(int(12000 * math.sin(2 * math.pi * 220 * t)) if voiced else 0)
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(frames.tobytes())
+
+
+class SnapCaptionsToSpeechTest(unittest.TestCase):
+    """Плашка не должна появляться раньше, чем слышно слово."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.audio = os.path.join(self.tmp.name, "voice.wav")
+        _write_tone_silence_tone(self.audio)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_caption_starting_in_silence_waits_for_the_voice(self):
+        # Whisper отдал слову старт 1.2с, а звук возвращается только на 2.0с.
+        chunks = [{"text": "ДЕЛАЮТ ТЕБЯ", "start": 1.2, "end": 2.8}]
+        moved = _snap_captions_to_speech(chunks, self.audio)
+        self.assertEqual(moved, 1)
+        self.assertAlmostEqual(chunks[0]["start"], 1.88, delta=0.06)
+
+    def test_caption_already_on_speech_is_left_alone(self):
+        chunks = [{"text": "ТАК, СТОП", "start": 0.3, "end": 0.9}]
+        self.assertEqual(_snap_captions_to_speech(chunks, self.audio), 0)
+        self.assertEqual(chunks[0]["start"], 0.3)
+
+    def test_caption_is_never_pushed_past_its_own_end(self):
+        chunks = [{"text": "ХВОСТ", "start": 1.2, "end": 1.3}]
+        self.assertEqual(_snap_captions_to_speech(chunks, self.audio), 0)
+        self.assertEqual(chunks[0]["start"], 1.2)
+
+    def test_unreadable_audio_leaves_timings_untouched(self):
+        chunks = [{"text": "ЧТО-ТО", "start": 1.2, "end": 2.8}]
+        with patch("saasshorts._speech_onset_mask", return_value=None):
+            self.assertEqual(_snap_captions_to_speech(chunks, self.audio), 0)
+        self.assertEqual(chunks[0]["start"], 1.2)
 
 
 class CompositeStoryboardAudioTest(unittest.TestCase):

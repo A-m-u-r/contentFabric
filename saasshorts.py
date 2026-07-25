@@ -517,13 +517,29 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
     return analysis
 
 
+def _repair_gemini_json(text: str) -> str:
+    """Fix the JSON glitches Gemini emits on large batches.
+
+    Two are common and safe to auto-correct because valid JSON strings can
+    contain neither a raw newline nor an unescaped quote:
+      • a missing comma between two values on adjacent lines — a value-ender
+        (``}`` ``]`` ``"``) on one line, a value-starter (``"`` ``{`` ``[``) on
+        the next (the "Expecting ',' delimiter" error);
+      • a trailing comma right before a closing ``}``/``]``.
+    """
+    text = re.sub(r'([}\]"])[ \t]*\r?\n(\s*["{\[])', r'\1,\n\2', text)
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+    return text
+
+
 def _salvage_json_array(text: str) -> list:
-    """Best-effort parse of a top-level JSON array whose tail got truncated.
+    """Best-effort parse of a top-level JSON array that is malformed or cut off.
 
     Gemini can hit its output token cap mid-string on large multi-script
-    batches, leaving an unterminated string/object at the end. Rather than
-    fail the whole request, keep the objects that closed cleanly before the
-    cut and drop the trailing partial one.
+    batches (unterminated tail), or drop a comma inside one object. We scan for
+    every top-level ``{...}`` span and parse each independently — repairing it
+    first and skipping the ones that still won't parse — so a single broken
+    script never discards the ones that came out clean.
     """
     depth = 0
     in_string = False
@@ -550,7 +566,17 @@ def _salvage_json_array(text: str) -> list:
             if depth == 0 and obj_start is not None:
                 spans.append((obj_start, i + 1))
                 obj_start = None
-    return [json.loads(text[start:end]) for start, end in spans]
+    salvaged = []
+    for obj_start, obj_end in spans:
+        chunk = text[obj_start:obj_end]
+        try:
+            salvaged.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            try:
+                salvaged.append(json.loads(_repair_gemini_json(chunk)))
+            except json.JSONDecodeError:
+                continue  # one unrecoverable object must not drop the rest
+    return salvaged
 
 
 def generate_scripts(
@@ -735,16 +761,25 @@ RULES:
         try:
             scripts = json.loads(text)
         except json.JSONDecodeError as e:
-            # The rfind("]") above can land on a nested array's closer (e.g. a
-            # shot list) rather than the outer one, truncating trailing
-            # complete scripts — salvage from the unsliced tail instead.
-            scripts = _salvage_json_array(unsliced) if start != -1 else []
+            # Gemini drops a comma between values or truncates the tail on big
+            # batches. Repair the whole array first (keeps every script); if it
+            # still won't parse, salvage the objects that closed cleanly — the
+            # rfind("]") above can also land on a nested shot list's closer.
+            try:
+                scripts = json.loads(_repair_gemini_json(text))
+            except json.JSONDecodeError:
+                scripts = _salvage_json_array(unsliced) if start != -1 else []
+            if isinstance(scripts, dict):
+                scripts = [scripts]
             if not scripts:
                 raise Exception(f"Failed to parse storyboard scripts JSON: {e}\nRaw: {text[:500]}")
-            print(
-                f"[SaaSShorts] ⚠️ Gemini response truncated (likely hit the output cap) — "
-                f"recovered {len(scripts)}/{num_scripts} complete script(s)."
-            )
+            if len(scripts) < num_scripts:
+                print(
+                    f"[SaaSShorts] ⚠️ Malformed Gemini JSON — recovered "
+                    f"{len(scripts)}/{num_scripts} storyboard script(s)."
+                )
+            else:
+                print(f"[SaaSShorts] ⚠️ Repaired malformed Gemini JSON ({len(scripts)} script(s)).")
 
         for script in scripts:
             script["format"] = "storyboard_v3"
@@ -901,16 +936,25 @@ RULES:
     try:
         scripts = json.loads(text)
     except json.JSONDecodeError as e:
-        # The rfind("]") above can land on a nested array's closer (e.g. a
-        # b-roll segment list) rather than the outer one, truncating trailing
-        # complete scripts — salvage from the unsliced tail instead.
-        scripts = _salvage_json_array(unsliced) if start != -1 else []
+        # Gemini drops a comma between values or truncates the tail on big
+        # batches. Repair the whole array first (keeps every script); if it
+        # still won't parse, salvage the objects that closed cleanly — the
+        # rfind("]") above can also land on a nested segment list's closer.
+        try:
+            scripts = json.loads(_repair_gemini_json(text))
+        except json.JSONDecodeError:
+            scripts = _salvage_json_array(unsliced) if start != -1 else []
+        if isinstance(scripts, dict):
+            scripts = [scripts]
         if not scripts:
             raise Exception(f"Failed to parse scripts JSON: {e}\nRaw: {text[:500]}")
-        print(
-            f"[SaaSShorts] ⚠️ Gemini response truncated (likely hit the output cap) — "
-            f"recovered {len(scripts)}/{num_scripts} complete script(s)."
-        )
+        if len(scripts) < num_scripts:
+            print(
+                f"[SaaSShorts] ⚠️ Malformed Gemini JSON — recovered "
+                f"{len(scripts)}/{num_scripts} complete script(s)."
+            )
+        else:
+            print(f"[SaaSShorts] ⚠️ Repaired malformed Gemini JSON ({len(scripts)} script(s)).")
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
     return scripts
@@ -2258,6 +2302,135 @@ def _rebuild_prompts_from_scene(
         log(f"  ⚠️ Не удалось перестроить промпты из «Что в кадре» ({e}); оставляю прежние.")
 
 
+_SHOT_FILL_FIELDS = ("scene", "camera", "actor_action", "role", "emotion", "transition", "visual_type")
+
+
+def fill_storyboard_shot_details(
+    script: dict,
+    shots: list,
+    gemini_key: str,
+    text_model: str = "fast",
+    language: str = "ru",
+    actor_gender: str = "female",
+) -> list:
+    """Fill in scene / camera / action / prompt for shots that only carry speech.
+
+    A shot restored from the archive (or added by hand) has a line and nothing
+    else. The video model never sees the speech — it renders `generation_prompt`,
+    built from the scene — so an empty shot produces a random picture. This asks
+    Gemini for the missing fields only, in the context of the neighbouring shots,
+    so the restored shot matches the rest of the storyboard.
+    """
+    targets = [s for s in shots if (s.get("speech") or "").strip() or (s.get("scene") or "").strip()]
+    if not targets or not gemini_key:
+        return shots
+
+    from google import genai
+    from google.genai import types
+
+    lang_name = {"ru": "Russian", "es": "Spanish"}.get(language, "English")
+    context = [
+        {
+            "shot_number": s.get("shot_number"),
+            "speech": (s.get("speech") or "").strip(),
+            "scene": (s.get("scene") or "").strip(),
+            "visual_type": s.get("visual_type") or "",
+        }
+        for s in shots
+    ]
+    payload = [
+        {
+            "shot_number": s.get("shot_number"),
+            "speech": (s.get("speech") or "").strip(),
+            "scene": (s.get("scene") or "").strip(),
+            "camera": (s.get("camera") or "").strip(),
+            "actor_action": (s.get("actor_action") or s.get("action") or "").strip(),
+        }
+        for s in targets
+    ]
+    prompt = f"""You are a storyboard director for vertical UGC ads (9:16).
+
+Video: "{script.get('title') or ''}"
+Topic: {script.get('_video_topic') or script.get('topic') or ''}
+Actor: {script.get('actor_description') or f'a consistent {actor_gender} person, same in every shot'}
+
+Full storyboard for context (already existing shots):
+{json.dumps(context, ensure_ascii=False, indent=1)}
+
+Fill in the MISSING production fields for these shots (keep any value that is
+already filled in — only replace empty ones):
+{json.dumps(payload, ensure_ascii=False, indent=1)}
+
+RULES:
+- scene, camera, actor_action must be written in {lang_name} — the user reads them in the app.
+- visual_type: "talking" (the actor speaks to camera, lips visible) or "broll"
+  (insert shot over the voiceover: close-ups of objects, food, hands — strictly NO
+  faces and NO people). Prefer "talking" for lines that carry the argument, "broll"
+  for lines that describe a thing or a result. Never put two "broll" shots in a row
+  given the surrounding storyboard.
+- In "talking" shots the actor holds a steady selfie pose: subtle expressions and
+  small head movement only. No exercising, walking, drinking or big gestures —
+  motion breaks lip-sync.
+- Every shot must be visually distinct from its neighbours in the storyboard above.
+- role: one of hook, problem, explanation, solution, proof, cta.
+- emotion: one of excited, warm, confident, calm, urgent, playful.
+- transition: "cut" or "smooth_0.3s".
+- No readable text anywhere: no labels, signs, numbers, stickers, no phone/laptop
+  screens facing camera — video models render text as garbage glyphs.
+- generation_prompt MUST be English and fully describe scene, action and camera on
+  its own: vertical 9:16, realistic UGC ad, same actor, natural light, no burned-in
+  text, no watermark. For "broll" add: no people, no faces.
+
+Return ONLY a JSON array:
+[{{"shot_number": <n>, "scene": "...", "camera": "...", "actor_action": "...",
+  "role": "...", "emotion": "...", "transition": "...", "visual_type": "...",
+  "overlay_text": "...", "generation_prompt": "..."}}]"""
+
+    client = genai.Client(api_key=gemini_key)
+    resp = _generate_gemini_content(
+        client,
+        contents=[prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json", max_output_tokens=8192
+        ),
+        text_model=text_model,
+    )
+    text = (resp.text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    filled = json.loads(_repair_gemini_json(text))
+    by_number = {}
+    for item in filled if isinstance(filled, list) else []:
+        try:
+            by_number[int(item.get("shot_number"))] = item
+        except (TypeError, ValueError):
+            continue
+
+    out = []
+    for index, shot in enumerate(targets, start=1):
+        item = by_number.get(shot.get("shot_number")) or by_number.get(index) or {}
+        merged = dict(shot)
+        for field in _SHOT_FILL_FIELDS:
+            value = (item.get(field) or "").strip()
+            if value and not (merged.get(field) or "").strip():
+                merged[field] = value
+        if merged.get("actor_action") and not (merged.get("action") or "").strip():
+            merged["action"] = merged["actor_action"]
+        if not (merged.get("overlay_text") or "").strip():
+            merged["overlay_text"] = (item.get("overlay_text") or "").strip()
+        # The prompt is what the video model actually renders — always (re)build it
+        # through the shared builder so the guardrails stay attached.
+        if not merged.get("prompt_manual"):
+            merged["generation_prompt"] = _build_storyboard_generation_prompt(
+                {**merged, "generation_prompt": (item.get("generation_prompt") or "").strip()
+                 or merged.get("generation_prompt") or ""}
+            )
+            merged["_prompt_source_scene"] = (merged.get("scene") or "").strip()
+        out.append(merged)
+    return out
+
+
 def normalize_storyboard_shots(script: dict) -> list:
     """Normalize shot dictionaries for Kling V3 generation and UI edits."""
     raw_shots = script.get("shots") or []
@@ -2711,6 +2884,33 @@ SYNC_LIPSYNC_MODES = {"cut_off", "loop", "bounce", "silence", "remap"}
 
 def _nonempty(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def _looks_blank(path: str, *, dark_threshold: float = 8.0, flat_std_threshold: float = 3.0) -> bool:
+    """True if the image is effectively empty — near-black or one flat color.
+
+    Flux occasionally returns a solid black (or otherwise uniform) PNG when its
+    moderation trips or a generation fails. The file is a valid non-empty PNG, so
+    `_nonempty` passes, but it renders as a black square in the storyboard. Catch
+    it by pixel statistics: a near-zero mean means near-black; a near-zero std
+    means a single flat color with no detail. A real photo — even a dim one —
+    keeps plenty of variance, so this stays conservative to avoid false rejects.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((64, 64))  # stats are scale-invariant; downscale for speed
+            arr = np.asarray(im, dtype="float32")
+        if arr.size == 0:
+            return True
+        return float(arr.mean()) < dark_threshold or float(arr.std()) < flat_std_threshold
+    except Exception:
+        # If we can't inspect it, don't block: a questionable frame beats a false
+        # reject that would kill a perfectly good generation.
+        return False
 
 
 def _newest_existing(paths: List[str]) -> Optional[str]:
@@ -3798,6 +3998,68 @@ def _chunk_caption_words(words: list, max_words: int) -> list:
     return chunks
 
 
+def _speech_onset_mask(audio_path: str, hop: float = 0.01) -> Optional[list]:
+    """Per-`hop` map of "is there voice here", straight from frame energy."""
+    try:
+        import numpy as np
+
+        sample_rate = 16000
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", audio_path, "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "-"],
+            capture_output=True, check=True,
+        ).stdout
+        samples = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+        frame = int(sample_rate * hop)
+        count = len(samples) // frame
+        if count < 2:
+            return None
+        rms = np.sqrt((samples[:count * frame].reshape(count, frame) ** 2).mean(axis=1))
+        peak = float(rms.max())
+        if peak <= 0:
+            return None
+        # 6% of the loudest frame ≈ 24 dB below peak: quiet consonants stay in,
+        # the breathy [sighs] tag of a real job (-40 dB) stays out.
+        return (rms > max(peak * 0.06, 1e-4)).tolist()
+    except Exception:
+        return None
+
+
+def _snap_captions_to_speech(
+    chunks: list,
+    audio_path: str,
+    max_lead: float = 0.12,
+    max_shift: float = 1.5,
+) -> int:
+    """Never let a caption appear before its words are audible.
+
+    Whisper hands the silence in front of a word to that word, so after a long
+    pause — an `[sighs]` tag renders as a ~1s breath — the caption pops up half
+    a second early and then hangs there over silence. On screen that reads as
+    the audio drifting away from the picture. Captions that already sit on
+    speech are left alone, and a caption is never pushed past its own end.
+    """
+    voiced = _speech_onset_mask(audio_path)
+    if not voiced:
+        return 0
+    hop = 0.01
+    moved = 0
+    for chunk in chunks:
+        start = float(chunk["start"])
+        end = float(chunk["end"])
+        index = int(start / hop)
+        if index >= len(voiced) or voiced[index]:
+            continue
+        limit = min(len(voiced), int((start + max_shift) / hop) + 1)
+        onset = next((i for i in range(index, limit) if voiced[i]), None)
+        if onset is None:
+            continue
+        new_start = min(max(start, onset * hop - max_lead), end - 0.15)
+        if new_start - start > 0.05:
+            chunk["start"] = new_start
+            moved += 1
+    return moved
+
+
 def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3, words: Optional[list] = None) -> str:
     """
     Generate TikTok-style ASS subtitles from audio using Whisper transcription.
@@ -3881,6 +4143,10 @@ def generate_storyboard_ass_subtitles(
             "start": group[0]["start"],
             "end": group[-1]["end"],
         })
+
+    snapped = _snap_captions_to_speech(chunks, audio_path)
+    if snapped:
+        print(f"[SaaSShorts] Captions snapped to speech onset: {snapped}")
 
     ass_content = """[Script Info]
 Title: Storyboard Reels Caption Preset
@@ -4007,7 +4273,8 @@ def composite_video(
     jump_cut_words: Optional[List[Dict]] = None,
     punch_in: bool = True,
     music_path: Optional[str] = None,
-    music_volume: float = 0.16,
+    # Бед нормализуется к _MUSIC_BED_DBFS, так что это просто подстройка сверху.
+    music_volume: float = 1.0,
 ) -> str:
     """
     Composite talking head + b-roll inserts + subtitles into final video.
@@ -4069,12 +4336,21 @@ def composite_video(
     if len(shots) == 1 and shots[0]["type"] == "th":
         # Single continuous take: video chain is trivial, audio still gets the mix
         music_idx = "1" if music_path else None
-        audio_parts = _final_audio_filter_parts("0", music_idx, music_volume)
+        music_gain_db = _music_bed_gain_db(music_path) if music_path else 0.0
+        simple_inputs = [
+            "-i", talking_head_path,
+            *(["-stream_loop", "-1", "-i", music_path] if music_path else []),
+        ]
+        measured = _measure_final_loudness(
+            simple_inputs, "0", music_idx, music_volume, music_gain_db=music_gain_db,
+        )
+        audio_parts = _final_audio_filter_parts(
+            "0", music_idx, music_volume, measured, music_gain_db=music_gain_db,
+        )
         filter_parts = [f"[0:v]{norm},{sub_filter}[finalv]"] + audio_parts
         cmd = [
             "ffmpeg", "-y",
-            "-i", talking_head_path,
-            *(["-stream_loop", "-1", "-i", music_path] if music_path else []),
+            *simple_inputs,
             "-filter_complex", ";".join(filter_parts),
             "-map", "[finalv]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
@@ -4112,7 +4388,12 @@ def composite_video(
 
     filter_parts.append(f"{''.join(concat_parts)}concat=n={len(shots)}:v=1:a=0[outv]")
     filter_parts.append(f"[outv]{sub_filter}[finalv]")
-    filter_parts.extend(_final_audio_filter_parts("0", music_idx, music_volume))
+    music_gain_db = _music_bed_gain_db(music_path) if music_path else 0.0
+    filter_parts.extend(_final_audio_filter_parts(
+        "0", music_idx, music_volume,
+        _measure_final_loudness(inputs, "0", music_idx, music_volume, music_gain_db=music_gain_db),
+        music_gain_db=music_gain_db,
+    ))
 
     cmd = [
         "ffmpeg", "-y",
@@ -4357,7 +4638,12 @@ def review_clip_quality(
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", clip_path,
-            "-vf", f"fps={fps:.4f},scale=360:-2,tile=2x2",
+            # 540px per tile — a 1080x1920 grid, i.e. one full vertical frame
+            # worth of pixels. The old 360px halved a 720px Kling clip and made
+            # Gemini judge fingers and cutlery on mush; sending the clip's full
+            # resolution instead would roughly quadruple the image tokens
+            # (Gemini bills them in ~768px tiles) for detail nobody reads.
+            "-vf", f"fps={fps:.4f},scale='min(iw,540)':-2,tile=2x2",
             "-frames:v", "1", "-q:v", "4", grid_path,
         ],
         check=True, capture_output=True,
@@ -4372,12 +4658,18 @@ def review_clip_quality(
     )
     prompt = (
         "You are a QC reviewer for AI-generated vertical video ads. The image is a 2x2 grid of "
-        "frames from ONE clip, in time order. Report ONLY defects severe enough that the ad "
-        "cannot be published — a casual viewer would immediately notice something is wrong:\n"
+        "frames from ONE clip, in time order. These are freeze-frames of moving footage that "
+        "plays for a few seconds on a phone: motion blur, soft focus, half-visible props and "
+        "awkward mid-motion poses are normal and are NOT defects.\n"
+        "Report ONLY defects severe enough that the ad cannot be published — a casual viewer "
+        "would notice within a second, at normal playback speed, without pausing:\n"
         f"{person_rule}\n"
         "- garbled glyph-like pseudo-text on screens, labels or documents\n"
-        "- deformed hands, extra or missing fingers, extra limbs, impossible object geometry\n"
-        "Do NOT report clothing wrinkles, lighting, blur, styling or other cosmetic nitpicks.\n"
+        "- badly deformed hands or limbs: extra, missing or fused fingers, an impossible arm\n"
+        "Do NOT report the shape of small props, cutlery, utensils, food or other objects — "
+        "uneven fork tines or a slightly odd grip do not matter. Do NOT report clothing "
+        "wrinkles, lighting, blur, styling or other cosmetic nitpicks. If you had to zoom in "
+        "or study the frame to find it, it is not a defect.\n"
         'Reply with JSON only: {"issues": ["короткое описание проблемы по-русски", ...]}. '
         'If the clip is publishable, reply {"issues": []}.'
     )
@@ -4440,24 +4732,135 @@ def _pick_background_music(seed: str) -> Optional[str]:
     return os.path.join(_MUSIC_DIR, tracks[digest % len(tracks)])
 
 
-def _final_audio_filter_parts(voice_input: str, music_input: Optional[str], music_volume: float) -> list:
+_LOUDNORM_TARGET = "loudnorm=I=-14:TP=-1.5:LRA=11"
+_LOUDNORM_MEASURED_KEYS = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+
+# Куда ставим музыкальную подложку по громкости (RMS, dBFS). Голос в финальном
+# миксе живёт около -15 dBFS, так что -32 держит бед примерно на 17 dB ниже —
+# слышно в паузах, не мешает речи.
+_MUSIC_BED_DBFS = -32.0
+_music_gain_cache: dict = {}
+
+
+def _music_bed_gain_db(music_path: str, target_dbfs: float = _MUSIC_BED_DBFS) -> float:
+    """Gain that puts ANY bed track at a predictable level under the voiceover.
+
+    A flat `volume=0.16` assumed a normally mastered bed. Our generated track
+    sits at -23.7 dBFS, so it got attenuated twice and landed ~25 dB below the
+    voice — mixed in, but inaudible on a phone (the user never heard it).
+    Measuring the track and normalizing to a target fixes the whole class of
+    bug: swap the track and the bed still sits where it should.
+    """
+    if music_path in _music_gain_cache:
+        return _music_gain_cache[music_path]
+    gain = 0.0
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", music_path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=120,
+        )
+        match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB", proc.stderr or "")
+        if match:
+            gain = target_dbfs - float(match.group(1))
+    except Exception:
+        gain = 0.0
+    _music_gain_cache[music_path] = gain
+    return gain
+
+
+def _loudnorm_filter(measured: Optional[dict] = None, print_json: bool = False) -> str:
+    """The final loudness stage, in one-pass or two-pass form.
+
+    One-pass loudnorm normalizes frame by frame: it rides the gain inside the
+    take, squeezes what little dynamic range a TTS voice has left (a real job
+    went LRA 3.2 -> 2.3) and overshoots the true-peak ceiling. That flat,
+    uniformly loud delivery is a chunk of what reads as "AI voice". Given the
+    measurements from a first pass, loudnorm instead applies ONE linear gain to
+    the whole track — same -14 LUFS, prosody intact.
+    """
+    parts = [_LOUDNORM_TARGET]
+    if measured:
+        parts.append(
+            f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+            f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+            f"offset={measured['target_offset']}:linear=true"
+        )
+    if print_json:
+        parts.append("print_format=json")
+    return ":".join(parts)
+
+
+def _final_audio_filter_parts(
+    voice_input: str,
+    music_input: Optional[str],
+    music_volume: float,
+    measured: Optional[dict] = None,
+    print_json: bool = False,
+    music_gain_db: float = 0.0,
+) -> list:
     """
     Build the final-mix audio chain: voiceover (+ optional ducked music bed),
     normalized to -14 LUFS — what TikTok/Reels normalize to anyway, so the
     platform doesn't re-compress our mix unpredictably.
+
+    `music_gain_db` comes from `_music_bed_gain_db` and puts the bed at a known
+    level whatever the track; `music_volume` is a plain trim on top of that.
     """
     parts = []
     if music_input:
         parts.append(f"[{voice_input}:a]aresample=48000,asplit=2[vo][vosc]")
-        parts.append(f"[{music_input}:a]aresample=48000,volume={music_volume}[mus]")
-        # Music is the main input, voice the sidechain: the bed dips whenever she speaks.
-        parts.append("[mus][vosc]sidechaincompress=threshold=0.02:ratio=12:attack=25:release=500[duck]")
+        # Normalize the bed to a known level first, then apply the (optional) trim.
+        parts.append(
+            f"[{music_input}:a]aresample=48000,volume={music_gain_db:.2f}dB,volume={music_volume}[mus]"
+        )
+        # Music is the main input, voice the sidechain: the bed dips whenever she
+        # speaks. Ratio 12 with a 500ms release buried the bed for the whole clip —
+        # a reel is nearly wall-to-wall speech, so the bed never came back up.
+        parts.append("[mus][vosc]sidechaincompress=threshold=0.05:ratio=6:attack=20:release=300[duck]")
         parts.append("[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mix]")
         mix_src = "[mix]"
     else:
         mix_src = f"[{voice_input}:a]"
-    parts.append(f"{mix_src}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]")
+    parts.append(f"{mix_src}{_loudnorm_filter(measured, print_json)},aresample=48000[aout]")
     return parts
+
+
+def _measure_final_loudness(
+    inputs: list,
+    voice_input: str,
+    music_input: Optional[str],
+    music_volume: float,
+    log: Callable[[str], None] = print,
+    music_gain_db: float = 0.0,
+) -> Optional[dict]:
+    """Pass 1 of the two-pass loudnorm: measure the finished mix, decode only.
+
+    Runs the exact audio graph of the real render against `-f null`, so the
+    numbers describe the mix that will actually be encoded (music bed and
+    ducking included). Returns None on any trouble — the caller then falls back
+    to one-pass, which is worse for dynamics but never fails the render.
+    """
+    parts = _final_audio_filter_parts(
+        voice_input, music_input, music_volume, print_json=True, music_gain_db=music_gain_db,
+    )
+    cmd = [
+        "ffmpeg", "-y", *inputs,
+        "-filter_complex", ";".join(parts),
+        "-map", "[aout]", "-vn", "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)
+        stderr = proc.stderr or ""
+        measured = json.loads(stderr[stderr.rindex("{"):stderr.rindex("}") + 1])
+        # A silent or unmeasurable track reports -inf/nan; feeding that back to
+        # loudnorm makes it bail out mid-render.
+        for key in _LOUDNORM_MEASURED_KEYS:
+            if not math.isfinite(float(measured[key])):
+                raise ValueError(f"{key}={measured[key]}")
+        return {key: measured[key] for key in _LOUDNORM_MEASURED_KEYS}
+    except Exception as error:
+        log(f"  ⚠️ Loudness measurement failed, falling back to one-pass: {error}")
+        return None
 
 
 def composite_storyboard_video(
@@ -4466,7 +4869,8 @@ def composite_storyboard_video(
     srt_path: str,
     output_path: str,
     music_path: Optional[str] = None,
-    music_volume: float = 0.16,
+    # Бед нормализуется к _MUSIC_BED_DBFS, так что это просто подстройка сверху.
+    music_volume: float = 1.0,
 ) -> str:
     """Concatenate Kling V3 storyboard clips and lay the voiceover/subtitles on top."""
     if not clips:
@@ -4513,10 +4917,17 @@ def composite_storyboard_video(
         concat_parts.append(f"[v{index}]")
     filter_parts.append(f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0[vout]")
     filter_parts.append(f"[vout]{sub_filter}[finalv]")
+    voice_input = str(len(clips))
+    music_input = str(len(clips) + 1) if music_path else None
+    music_gain_db = _music_bed_gain_db(music_path) if music_path else 0.0
     filter_parts.extend(_final_audio_filter_parts(
-        str(len(clips)),
-        str(len(clips) + 1) if music_path else None,
+        voice_input,
+        music_input,
         music_volume,
+        _measure_final_loudness(
+            inputs, voice_input, music_input, music_volume, music_gain_db=music_gain_db,
+        ),
+        music_gain_db=music_gain_db,
     ))
 
     cmd = [
@@ -4869,6 +5280,15 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
             resp.raise_for_status()
             with open(output_path, "wb") as f:
                 f.write(resp.content)
+        if _looks_blank(output_path):
+            log("  ⚠️ B-roll reference frame came back blank/black; discarding")
+            for stale in (output_path, f"{output_path}.fal_url.txt"):
+                try:
+                    if os.path.exists(stale):
+                        os.remove(stale)
+                except OSError:
+                    pass
+            return ""
         with open(prompt_sidecar, "w", encoding="utf-8") as f:
             f.write(prompt)
         return output_path
@@ -4946,6 +5366,15 @@ def _avatar_reference_image(
             resp.raise_for_status()
             with open(output_path, "wb") as f:
                 f.write(resp.content)
+        if _looks_blank(output_path):
+            log("  ⚠️ Avatar reference frame came back blank/black; discarding")
+            for stale in (output_path, f"{output_path}.fal_url.txt"):
+                try:
+                    if os.path.exists(stale):
+                        os.remove(stale)
+                except OSError:
+                    pass
+            return ""
         with open(prompt_sidecar, "w", encoding="utf-8") as f:
             f.write(prompt)
         return output_path
@@ -5234,6 +5663,26 @@ def _attach_shot_previews(
             log(f"  ⚠️ Кадр {shot.get('shot_number', i + 1)}: превью не извлечено ({e}).")
 
 
+def _existing_shot_frame(shot: dict, output_root: str) -> str:
+    """Path of a start frame this shot already has (possibly from an earlier job).
+
+    A storyboard reopened from the gallery carries frames that were paid for in
+    the job that rendered the video; their files live on under `output/<job>/`.
+    """
+    candidates = []
+    stored = (shot.get("image_path") or "").strip()
+    if stored:
+        candidates.append(stored)
+    for key in ("local_url", "image_url", "preview_frame_url"):
+        url = (shot.get(key) or "").strip()
+        if url.startswith("/videos/"):
+            candidates.append(os.path.join(output_root, url[len("/videos/"):]))
+    for path in candidates:
+        if _nonempty(path) and not _looks_blank(path):
+            return path
+    return ""
+
+
 def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=print):
     """Generate just the per-shot Flux start frames — no paid Kling video.
 
@@ -5263,11 +5712,26 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
             fallback_actor["path"] = path
         return fallback_actor["path"]
 
+    output_root = os.path.dirname(output_dir.rstrip("/\\")) or "output"
+
     made = 0
+    reused = 0
     for shot in shots:
         num = shot.get("shot_number")
         if only is not None and num != only:
             continue
+        if only is None:
+            # Reopened storyboard: this shot already carries a frame (or a
+            # rendered clip) from an earlier job. Drawing it again is a fresh
+            # Flux charge for a picture the user already paid for — skip it.
+            # Per-shot "перегенерить" still forces a redraw.
+            existing = _existing_shot_frame(shot, output_root)
+            if shot.get("clip_url") or existing:
+                if existing:
+                    shot.setdefault("preview_frame_url", shot.get("local_url") or "")
+                log(f"[кадры] Кадр {num}: уже есть — пропускаю.")
+                reused += 1
+                continue
         frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
         if only is not None:
             # Explicit per-shot regenerate: drop the cached frame so a new one is drawn.
@@ -5292,7 +5756,7 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
         else:
             log(f"  ⚠️ Кадр {num}: не удалось сгенерировать.")
 
-    log(f"[кадры] Готово: {made} кадр(ов).")
+    log(f"[кадры] Готово: {made} кадр(ов)." + (f" Пропущено готовых: {reused}." if reused else ""))
     cost = round(made * 0.05, 2)
     return {
         "video_path": "",

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -15,6 +16,187 @@ from saasshorts import (
     normalize_storyboard_shots,
     split_storyboard_shots,
 )
+
+
+class SaaSGeminiJsonRecoveryTests(unittest.TestCase):
+    def test_repair_recovers_missing_comma_between_values(self):
+        # The exact failure users hit: "Expecting ',' delimiter" — a dropped
+        # comma between two objects (and two fields) on adjacent lines.
+        bad_array = '[\n  {"a": 1, "n": "x"}\n  {"b": 2}\n]'
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(bad_array)
+        self.assertEqual(
+            json.loads(saasshorts._repair_gemini_json(bad_array)),
+            [{"a": 1, "n": "x"}, {"b": 2}],
+        )
+        bad_fields = '{\n  "a": "x"\n  "b": "y"\n}'
+        self.assertEqual(
+            json.loads(saasshorts._repair_gemini_json(bad_fields)),
+            {"a": "x", "b": "y"},
+        )
+
+    def test_repair_strips_trailing_comma(self):
+        self.assertEqual(json.loads(saasshorts._repair_gemini_json('[{"a":1},]')), [{"a": 1}])
+
+    def test_salvage_keeps_clean_objects_and_skips_broken_ones(self):
+        # Truncated tail: keep every object that closed cleanly.
+        truncated = '[{"a":1},{"b":2},{"c": "unterminated'
+        self.assertEqual(saasshorts._salvage_json_array(truncated), [{"a": 1}, {"b": 2}])
+        # One irreparable object in the middle must not drop its neighbours.
+        mixed = '[{"a":1}\n{"b":2 "c":3}\n{"d":4}]'
+        self.assertEqual(saasshorts._salvage_json_array(mixed), [{"a": 1}, {"d": 4}])
+
+
+class SaaSFillShotDetailsTests(unittest.TestCase):
+    """Восстановленный кадр несёт только реплику — сцену/камеру дозаполняет ИИ."""
+
+    SCRIPT = {"title": "Диеты после 30", "actor_description": "a woman in her 30s"}
+
+    def _fill(self, shots, reply):
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                pass
+
+        with patch("google.genai.Client", FakeClient), \
+             patch("saasshorts._generate_gemini_content",
+                   return_value=SimpleNamespace(text=json.dumps(reply, ensure_ascii=False))):
+            return saasshorts.fill_storyboard_shot_details(self.SCRIPT, shots, "key")
+
+    def test_missing_fields_are_filled_and_prompt_built(self):
+        shots = [{"shot_number": 3, "speech": "Кортизол растет, метаболизм падает."}]
+        out = self._fill(shots, [{
+            "shot_number": 3,
+            "scene": "Светлая кухня, героиня у окна.",
+            "camera": "Средний план, лёгкое приближение.",
+            "actor_action": "Смотрит в камеру и объясняет.",
+            "role": "explanation",
+            "emotion": "confident",
+            "transition": "cut",
+            "visual_type": "talking",
+            "generation_prompt": "a woman explains to camera in a bright kitchen",
+        }])
+        self.assertEqual(out[0]["scene"], "Светлая кухня, героиня у окна.")
+        self.assertEqual(out[0]["camera"], "Средний план, лёгкое приближение.")
+        self.assertEqual(out[0]["visual_type"], "talking")
+        # Действие дублируется в legacy-поле, которое читает генерация.
+        self.assertEqual(out[0]["action"], out[0]["actor_action"])
+        # Промпт проходит через общий билдер — гардрейлы на месте.
+        self.assertIn("vertical 9:16", out[0]["generation_prompt"])
+        self.assertIn("no burned-in text", out[0]["generation_prompt"])
+        self.assertEqual(out[0]["_prompt_source_scene"], out[0]["scene"])
+
+    def test_existing_values_are_not_overwritten(self):
+        shots = [{
+            "shot_number": 1,
+            "speech": "Так, стоп.",
+            "scene": "Моя сцена",
+            "camera": "Моя камера",
+        }]
+        out = self._fill(shots, [{
+            "shot_number": 1, "scene": "ИИ сцена", "camera": "ИИ камера",
+            "actor_action": "действие", "generation_prompt": "prompt",
+        }])
+        self.assertEqual(out[0]["scene"], "Моя сцена")
+        self.assertEqual(out[0]["camera"], "Моя камера")
+        self.assertEqual(out[0]["actor_action"], "действие")
+
+    def test_hand_pinned_prompt_is_left_alone(self):
+        shots = [{"shot_number": 1, "speech": "Реплика", "prompt_manual": True,
+                  "generation_prompt": "my own prompt"}]
+        out = self._fill(shots, [{"shot_number": 1, "scene": "сцена",
+                                  "generation_prompt": "ai prompt"}])
+        self.assertEqual(out[0]["generation_prompt"], "my own prompt")
+
+    def test_without_a_key_shots_come_back_untouched(self):
+        shots = [{"shot_number": 1, "speech": "Реплика"}]
+        self.assertIs(saasshorts.fill_storyboard_shot_details({}, shots, ""), shots)
+
+
+class SaaSExistingShotFrameTests(unittest.TestCase):
+    """Кадр, за который уже заплатили, не должен генериться заново."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.job = os.path.join(self.root, "saas_old")
+        os.makedirs(self.job)
+        self.frame = os.path.join(self.job, "frame_01.png")
+        from PIL import Image
+        import numpy as np
+        rng = np.random.default_rng(7)
+        Image.fromarray(rng.integers(0, 256, (64, 36, 3), dtype="uint8"), "RGB").save(self.frame)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_frame_found_via_stored_path(self):
+        found = saasshorts._existing_shot_frame({"image_path": self.frame}, self.root)
+        self.assertEqual(found, self.frame)
+
+    def test_frame_found_via_videos_url_of_an_earlier_job(self):
+        shot = {"local_url": "/videos/saas_old/frame_01.png"}
+        self.assertEqual(saasshorts._existing_shot_frame(shot, self.root), self.frame)
+
+    def test_missing_or_blank_frame_is_not_reused(self):
+        self.assertEqual(saasshorts._existing_shot_frame({"image_path": "/nope.png"}, self.root), "")
+        blank = os.path.join(self.job, "blank.png")
+        from PIL import Image
+        import numpy as np
+        Image.fromarray(np.zeros((64, 36, 3), dtype="uint8"), "RGB").save(blank)
+        self.assertEqual(saasshorts._existing_shot_frame({"image_path": blank}, self.root), "")
+
+    def test_shot_without_any_frame_reference(self):
+        self.assertEqual(saasshorts._existing_shot_frame({"speech": "привет"}, self.root), "")
+
+
+class SaaSBlankFrameGuardTests(unittest.TestCase):
+    """A blank/black Flux frame must be rejected, not shown as a valid shot."""
+
+    def _write_png(self, path, arr):
+        from PIL import Image
+        import numpy as np
+
+        Image.fromarray(np.asarray(arr, dtype="uint8"), "RGB").save(path)
+
+    def test_solid_black_frame_is_blank(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "black.png")
+            self._write_png(path, np.zeros((128, 72, 3)))
+            self.assertTrue(saasshorts._looks_blank(path))
+
+    def test_flat_color_frame_is_blank(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "flat.png")
+            self._write_png(path, np.full((128, 72, 3), 130))  # uniform mid-gray
+            self.assertTrue(saasshorts._looks_blank(path))
+
+    def test_detailed_frame_is_not_blank(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "noise.png")
+            rng = np.random.default_rng(0)
+            self._write_png(path, rng.integers(0, 256, size=(128, 72, 3)))
+            self.assertFalse(saasshorts._looks_blank(path))
+
+    def test_dim_but_real_frame_is_not_rejected(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dim.png")
+            # Dark scene that still has real detail (variance) — must survive.
+            rng = np.random.default_rng(1)
+            self._write_png(path, rng.integers(0, 60, size=(128, 72, 3)))
+            self.assertFalse(saasshorts._looks_blank(path))
+
+    def test_missing_file_does_not_crash_and_is_not_blank(self):
+        self.assertFalse(saasshorts._looks_blank("/nonexistent/frame.png"))
 
 
 class SaaSStoryboardTests(unittest.TestCase):

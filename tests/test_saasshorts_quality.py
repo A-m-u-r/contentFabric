@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from saasshorts import (
@@ -82,6 +83,57 @@ class ReviewClipQualityTest(unittest.TestCase):
             with patch("saasshorts.subprocess.run", side_effect=AssertionError("must not run ffmpeg")):
                 issues = review_clip_quality(clip, {"visual_type": "broll"}, "fake-key")
         self.assertEqual(issues, ["кэшированная проблема"])
+
+
+class ReviewGridAndPromptTest(unittest.TestCase):
+    """Ложные срабатывания QC: полкадра разрешения + придирки к предметам."""
+
+    def _review(self):
+        captured = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "clip.mp4")
+            open(clip, "wb").close()
+
+            def fake_ffmpeg(cmd, **kwargs):
+                with open(f"{clip}.review.jpg", "wb") as f:
+                    f.write(b"fake-jpeg")
+                captured["cmd"] = cmd
+                return None
+
+            class FakeModels:
+                def generate_content(self, model, contents):
+                    captured["prompt"] = contents[-1]
+                    return SimpleNamespace(text='{"issues": []}')
+
+            class FakeClient:
+                def __init__(self, api_key=None):
+                    self.models = FakeModels()
+
+            with patch("saasshorts.subprocess.run", side_effect=fake_ffmpeg), \
+                 patch("saasshorts._get_media_duration", return_value=4.0), \
+                 patch("google.genai.Client", FakeClient):
+                captured["issues"] = review_clip_quality(
+                    clip, {"visual_type": "broll"}, "key", log=lambda *_: None
+                )
+        return captured
+
+    def test_grid_is_compressed_but_not_halved(self):
+        captured = self._review()
+        self.assertEqual(captured["issues"], [])
+        # Раньше было scale=360:-2 — вдвое меньше 720px-клипа Kling, и Gemini
+        # судил геометрию пальцев и зубцов вилки по мылу. Полное разрешение
+        # слать тоже не нужно: токены картинки считаются по ~768px-тайлам.
+        self.assertIn("scale='min(iw,540)'", " ".join(captured["cmd"]))
+        self.assertNotIn("scale=360", " ".join(captured["cmd"]))
+
+    def test_prompt_excludes_props_and_freeze_frame_artifacts(self):
+        prompt = self._review()["prompt"]
+        self.assertIn("cutlery", prompt)
+        self.assertIn("freeze-frames", prompt)
+        self.assertIn("zoom in", prompt)
+        # Люди в b-roll и псевдотекст по-прежнему ловим.
+        self.assertIn("no people", prompt)
+        self.assertIn("pseudo-text", prompt)
 
 
 class BrollReferenceImageTest(unittest.TestCase):

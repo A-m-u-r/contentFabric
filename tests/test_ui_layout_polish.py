@@ -82,18 +82,135 @@ class UILayoutPolishTests(unittest.TestCase):
         # Кадры генерируются/перегенерируются на шаге 2 без платного видео.
         self.assertIn("handleGenerateFrames", tab)
         self.assertIn("frames_only: true", tab)
-        self.assertIn("Сгенерить кадры", tab)
+        # Массовая кнопка платит только за недостающие кадры (готовые из
+        # переоткрытой раскадровки уже оплачены в прошлой задаче).
+        self.assertIn("Сгенерить недостающие", tab)
+        self.assertIn("missingFrameCount", tab)
         self.assertIn("Перегенерить", tab)
 
-    def test_avatar_settings_are_tucked_into_a_modal(self):
+    def test_avatar_and_voice_selection_live_on_setup_step(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        # Блок аватара — только сетка + кнопка «Настройки аватара»; пол/озвучка/
-        # загрузка живут в модалке.
-        self.assertIn("avatarSettingsOpen", tab)
-        self.assertIn("Настройки аватара", tab)
-        # Табы «Сохранённые / Загрузить» убраны из основного блока.
+        # Аватар + голос выбираются на шаге Setup (ДО платного превью кадров),
+        # а не на шаге раскадровки. Модалка «Настройки аватара» убрана —
+        # пол/загрузка/озвучка видны прямо в блоке ведущего.
+        self.assertIn('data-section="presenter-section"', tab)
+        self.assertIn("Движок озвучки", tab)
+        self.assertIn("Голос озвучки", tab)
+        self.assertIn("Аватар проекта", tab)
+        self.assertIn("Сохранённые аватары", tab)
+        # Раскладка модалки удалена вместе с её состоянием.
+        self.assertNotIn("avatarSettingsOpen", tab)
         self.assertNotIn("setActorSource", tab)
+        # Блок ведущего живёт в Setup — до раздела анализа (шаг 1).
+        self.assertLess(tab.index('data-section="presenter-section"'), tab.index("Step 1: Analysis Results"))
+        # …и после выбора видео-модели, но до перехода к раскадровке (шаг 2).
+        self.assertLess(tab.index('data-section="video-mode-section"'), tab.index('data-section="presenter-section"'))
+        self.assertLess(tab.index('data-section="presenter-section"'), tab.index("── Step 2: Configure"))
+
+    def test_selected_voice_does_not_drift_between_generations(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Голос не должен «плавать»: раньше эффект брал ПЕРВЫЙ подходящий голос из
+        # ElevenLabs-библиотеки (порядок библиотеки → разный голос между прогонами).
+        # Теперь — детерминированный дефолт языка + ручной выбор не затирается.
+        self.assertNotIn("sortVoicesForLanguage", tab)
+        self.assertNotIn("const matchingVoice = sortVoicesForLanguage", tab)
+        # Victoria остаётся утверждённым русским дефолтом.
+        self.assertIn("D5RRIJYa9pFwxiSpbGbR", tab)
+        # Ручной выбор уважается (не сбрасываем на смене пола/ремаунте).
+        self.assertIn("уважаем ручной выбор", tab)
+
+    def test_generated_frames_are_persisted_so_they_survive_reload(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # `scripts` перезагружаются из localStorage-кеша на маунте (loadCache),
+        # поэтому мерж сгенерённых кадров ОБЯЗАН писать кеш — иначе после reload
+        # preview_frame_url теряются и все превью «пропадают».
+        apply = tab[tab.index("const applyGeneratedShots"):]
+        apply = apply[:apply.index("\n  };")]
+        self.assertIn("persistScripts(next)", apply)
+        self.assertIn("preview_frame_url", apply)
+
+    def test_quality_warnings_header_is_not_talking_head_specific(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # В `quality_warnings` падают и замечания vision-QC по b-roll-клипам
+        # («Клип 2: деформация кисти»), поэтому шапка про синхронизацию
+        # talking-head врала по смыслу.
+        self.assertNotIn("Проверь синхронизацию talking-head", tab)
+        self.assertIn("Замечания автопроверки", tab)
+        self.assertIn("а не блокировка", tab)
+
+    def test_presenter_block_collapses_into_one_summary_row(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Юзер терялся в блоке ведущего: пол, 9 плиток аватаров, загрузка,
+        # движок озвучки, список голосов и ручной ID лежали одной простынёй.
+        self.assertIn("avatarPickerOpen", tab)
+        self.assertIn("voicePickerOpen", tab)
+        self.assertIn("Сменить аватар", tab)
+        self.assertIn("Сменить голос", tab)
+        self.assertIn("selectedVoiceLabel", tab)
+        self.assertIn("Ввести ID голоса вручную", tab)
+        # Английские огрызки в русском UI убраны.
+        self.assertNotIn("Custom ElevenLabs voice ID", tab)
+        self.assertNotIn("Selected voice looks Russian-compatible", tab)
+
+    def test_deleted_shots_are_archived_not_lost(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Удалённый кадр уносил с собой сгенерённый текст — вернуть было нечем.
+        self.assertIn("shots_archived", tab)
+        self.assertIn("restoreArchivedShot", tab)
+        self.assertIn("Удалённые кадры", tab)
+        # Undo должен откатывать и архив, иначе кадр задвоится.
+        undo = tab[tab.index("const undoShotChange"):]
+        self.assertIn("shots_archived: entry.archived", undo[:undo.index("\n  };")])
+
+    def test_storyboard_of_a_finished_video_reopens_from_the_gallery(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        gallery = UGC_GALLERY.read_text(encoding="utf-8")
+
+        self.assertIn("saasshorts_pending_storyboard", tab)
+        self.assertIn("saasshorts_pending_storyboard", gallery)
+        self.assertIn("Редактировать раскадровку", gallery)
+        # Кадры, которые уже стоили денег, помечены в редакторе.
+        self.assertIn("Кадр готов", tab)
+        self.assertIn("Без кадра", tab)
+        # Ключ читается в инициализаторе состояния: StrictMode гоняет
+        # mount-эффекты дважды и «прочитал-и-удалил» потерял бы значение.
+        self.assertIn("const [pendingStoryboard] = useState(() => {", tab)
+        # Для роликов, снятых ДО архива удалённых кадров, единственная копия
+        # вырезанного текста — full_narration; предлагаем вернуть его кадром.
+        self.assertIn("leftoverNarration", tab)
+        self.assertIn("Текст сценария вне кадров", tab)
+        self.assertIn("addShotWithSpeech", tab)
+
+    def test_restored_shots_get_scene_and_camera_filled_by_ai(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Кадр из архива несёт только реплику. Видео-модель читает промпт,
+        # собранный из «Что в кадре», поэтому пустой кадр = случайная картинка.
+        self.assertIn("/api/saasshorts/storyboard-shot-fill", tab)
+        self.assertIn("fillShotDetails", tab)
+        self.assertIn("Заполнить ИИ", tab)
+        self.assertIn("emptyShotNumbers", tab)
+        # Добавление кадра из остатка сценария сразу дозаполняет его.
+        add = tab[tab.index("const addShotWithSpeech"):]
+        self.assertIn("fillShotDetails", add[:add.index("\n  };")])
+
+    def test_storyboard_duration_estimate_tracks_voiceover_not_a_flat_floor(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Длина ролика = длина озвучки (бэкенд режет `-shortest`), поэтому оценка
+        # секунд не должна иметь плоского пола в 12с, который задваивал смету
+        # коротких сценариев (~5с речи показывались как «~12 сек»).
+        self.assertNotIn("Math.max(12, Math.min(75, Math.round(words / 2.5)))", tab)
+        # Учитываем паузы/теги, чтобы оценка держалась не НИЖЕ реального аудио.
+        self.assertIn("tags * 0.8 + pauses * 0.4", tab)
+        # И явно поясняем, что видео не длиннее речи.
+        self.assertIn("видео не длиннее речи", tab)
 
     def test_ai_shorts_exposes_ai_storyboard_format_selector_in_setup(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
