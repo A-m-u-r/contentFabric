@@ -162,6 +162,21 @@ def init_auth_db() -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_workspaces (
+                user_id TEXT NOT NULL,
+                business_profile_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, business_profile_id, item_id)
+            )
+            """
+        )
 
 
 def _normalize_email(email: str) -> str:
@@ -474,6 +489,126 @@ def delete_business_profile(user_id: str, profile_id: str) -> bool:
     return cursor.rowcount > 0
 
 
+CONTENT_WORKSPACE_STAGES = {"not_started", "script", "frames", "video", "failed"}
+CONTENT_WORKSPACE_MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
+
+
+def _content_workspace_snapshot_json(revision: int, stage: str, snapshot: Dict[str, Any]) -> str:
+    if revision < 1:
+        raise ValueError("Workspace revision must be at least 1")
+    if stage not in CONTENT_WORKSPACE_STAGES:
+        raise ValueError("Unsupported workspace stage")
+    try:
+        snapshot_json = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        raise ValueError("Workspace snapshot must be JSON serializable") from e
+    if len(snapshot_json.encode("utf-8")) > CONTENT_WORKSPACE_MAX_SNAPSHOT_BYTES:
+        raise ValueError("Workspace snapshot must not exceed 2 MiB")
+    return snapshot_json
+
+
+def _content_workspace(row, include_snapshot: bool = True) -> Optional[dict]:
+    if not row:
+        return None
+    workspace = {
+        "item_id": row["item_id"],
+        "revision": row["revision"],
+        "stage": row["stage"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if include_snapshot:
+        workspace["snapshot"] = json.loads(row["snapshot_json"])
+    return workspace
+
+
+def save_content_workspace(
+    user_id: str,
+    profile_id: str,
+    item_id: str,
+    revision: int,
+    stage: str,
+    snapshot: Dict[str, Any],
+) -> dict:
+    snapshot_json = _content_workspace_snapshot_json(revision, stage, snapshot)
+    now = _utc_now()
+    with _auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO content_workspaces (
+                user_id, business_profile_id, item_id, revision, stage, snapshot_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, business_profile_id, item_id) DO UPDATE SET
+                revision = excluded.revision,
+                stage = excluded.stage,
+                snapshot_json = excluded.snapshot_json,
+                updated_at = excluded.updated_at
+            WHERE excluded.revision >= content_workspaces.revision
+            """,
+            (user_id, profile_id, item_id, revision, stage, snapshot_json, now, now),
+        )
+        row = conn.execute(
+            """
+            SELECT * FROM content_workspaces
+            WHERE user_id = ? AND business_profile_id = ? AND item_id = ?
+            """,
+            (user_id, profile_id, item_id),
+        ).fetchone()
+    return _content_workspace(row)
+
+
+def get_content_workspace(user_id: str, profile_id: str, item_id: str) -> Optional[dict]:
+    with _auth_db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM content_workspaces
+            WHERE user_id = ? AND business_profile_id = ? AND item_id = ?
+            """,
+            (user_id, profile_id, item_id),
+        ).fetchone()
+    return _content_workspace(row)
+
+
+def list_content_workspace_summaries(user_id: str, profile_id: str) -> List[dict]:
+    with _auth_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM content_workspaces
+            WHERE user_id = ? AND business_profile_id = ?
+            ORDER BY updated_at DESC, item_id ASC
+            """,
+            (user_id, profile_id),
+        ).fetchall()
+    return [_content_workspace(row, include_snapshot=False) for row in rows]
+
+
+def delete_content_workspace(user_id: str, profile_id: str, item_id: str) -> bool:
+    with _auth_db() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM content_workspaces
+            WHERE user_id = ? AND business_profile_id = ? AND item_id = ?
+            """,
+            (user_id, profile_id, item_id),
+        )
+    return cursor.rowcount > 0
+
+
+def _user_owns_business_profile(user_id: str, profile_id: str) -> bool:
+    with _auth_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM business_profiles WHERE id = ? AND user_id = ?",
+            (profile_id, user_id),
+        ).fetchone()
+    return row is not None
+
+
+def _require_owned_business_profile(user_id: str, profile_id: str) -> None:
+    if not _user_owns_business_profile(user_id, profile_id):
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+
 def _metadata_json_paths_for_legacy_claim() -> List[str]:
     paths = []
     paths.extend(glob.glob(os.path.join(OUTPUT_DIR, "saas_*", "gallery_metadata.json")))
@@ -748,6 +883,12 @@ class BusinessProfileRequest(BaseModel):
     style: str = "ugc"
     language: str = "ru"
     actor_gender: str = "female"
+
+
+class ContentWorkspaceRequest(BaseModel):
+    revision: int
+    stage: str = "not_started"
+    snapshot: Dict[str, Any]
 
 
 class AdminSubscriptionRequest(BaseModel):
@@ -1037,6 +1178,59 @@ async def user_delete_business_profile(
     user = require_user_from_authorization(authorization)
     delete_business_profile(user["id"], profile_id)
     return {"profiles": list_business_profiles(user["id"])}
+
+
+@app.get("/api/user/content-workspaces")
+async def user_content_workspace_summaries(
+    profile_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    return {"workspaces": list_content_workspace_summaries(user["id"], profile_id)}
+
+
+@app.get("/api/user/content-workspaces/{profile_id}/{item_id}")
+async def user_content_workspace(
+    profile_id: str,
+    item_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    workspace = get_content_workspace(user["id"], profile_id, item_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Content workspace not found")
+    return {"workspace": workspace}
+
+
+@app.put("/api/user/content-workspaces/{profile_id}/{item_id}")
+async def user_save_content_workspace(
+    profile_id: str,
+    item_id: str,
+    req: ContentWorkspaceRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    try:
+        workspace = save_content_workspace(
+            user["id"], profile_id, item_id, req.revision, req.stage, req.snapshot,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"workspace": workspace}
+
+
+@app.delete("/api/user/content-workspaces/{profile_id}/{item_id}")
+async def user_delete_content_workspace(
+    profile_id: str,
+    item_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    return {"deleted": delete_content_workspace(user["id"], profile_id, item_id)}
 
 
 @app.post("/api/user/claim-legacy-assets")
