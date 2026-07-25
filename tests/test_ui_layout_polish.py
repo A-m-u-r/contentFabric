@@ -31,6 +31,19 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("video", workspaces)
         self.assertIn("failed", workspaces)
 
+    def test_content_plan_workspace_helpers_preserve_numeric_ids_and_prioritize_failures(self):
+        workspaces = CONTENT_PLAN_WORKSPACES.read_text(encoding="utf-8")
+        tab = CONTENT_PLAN.read_text(encoding="utf-8")
+
+        self.assertIn("typeof item?.item_id === 'number'", workspaces)
+        self.assertIn("item_id: String(item.item_id)", workspaces)
+        self.assertIn("snapshot?.scripts?.some((script) => hasFrameUrl(script?.shots))", workspaces)
+        self.assertIn("const existingItem = items.find((item) => item.item_id === key);", tab)
+        self.assertLess(
+            workspaces.index("if (hasFailedGeneration(snapshot))"),
+            workspaces.index("if (\n    hasText(snapshot?.result?.video_url)"),
+        )
+
     def test_content_plan_uses_item_scoped_identity_and_workspace_hydration(self):
         tab = CONTENT_PLAN.read_text(encoding="utf-8")
 
@@ -43,11 +56,22 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("chooseNewestWorkspace(localWorkspace, remoteWorkspace)", tab)
         self.assertIn("setOpeningItemId(item.item_id)", tab)
         self.assertIn("openingItemId === item.item_id", tab)
-        self.assertIn("РќРµ РЅР°С‡Р°С‚", tab)
-        self.assertIn("РЎС†РµРЅР°СЂРёР№", tab)
-        self.assertIn("РљР°РґСЂС‹", tab)
-        self.assertIn("Р’РёРґРµРѕ", tab)
-        self.assertIn("РћС€РёР±РєР°", tab)
+        self.assertIn("Не начат", tab)
+        self.assertIn("Сценарий", tab)
+        self.assertIn("Кадры", tab)
+        self.assertIn("Видео", tab)
+        self.assertIn("Ошибка", tab)
+
+    def test_content_plan_merges_local_workspace_badges_and_uses_utf8_russian_labels(self):
+        tab = CONTENT_PLAN.read_text(encoding="utf-8")
+
+        self.assertIn("const localWorkspace = loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item });", tab)
+        self.assertIn("chooseNewestWorkspace(localWorkspace, workspaceSummaries[item.item_id])", tab)
+        self.assertIn("not_started: 'Не начат'", tab)
+        self.assertIn("script: 'Сценарий'", tab)
+        self.assertIn("frames: 'Кадры'", tab)
+        self.assertIn("video: 'Видео'", tab)
+        self.assertIn("failed: 'Ошибка'", tab)
 
     def test_content_plan_sets_structured_pending_context_without_removing_legacy_topic(self):
         profiles = BUSINESS_PROFILES.read_text(encoding="utf-8")

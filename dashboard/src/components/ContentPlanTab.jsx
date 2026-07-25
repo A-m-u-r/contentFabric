@@ -35,11 +35,11 @@ const GOAL_STYLES = {
 };
 
 const WORKSPACE_STAGE_LABELS = {
-  not_started: 'РќРµ РЅР°С‡Р°С‚',
-  script: 'РЎС†РµРЅР°СЂРёР№',
-  frames: 'РљР°РґСЂС‹',
-  video: 'Р’РёРґРµРѕ',
-  failed: 'РћС€РёР±РєР°',
+  not_started: 'Не начат',
+  script: 'Сценарий',
+  frames: 'Кадры',
+  video: 'Видео',
+  failed: 'Ошибка',
 };
 
 function loadPlan(id) {
@@ -63,7 +63,8 @@ function upgradePlan(plan) {
   const items = ensurePlanItemIds(plan.items);
   const itemIdsChanged = items.some((item, index) => item !== plan.items[index]);
   const done = Object.entries(plan.done || {}).reduce((next, [key, value]) => {
-    const item = Number.isInteger(Number(key)) ? items[Number(key)] : null;
+    const existingItem = items.find((item) => item.item_id === key);
+    const item = existingItem || (Number.isInteger(Number(key)) ? items[Number(key)] : null);
     next[item?.item_id || key] = value;
     return next;
   }, {});
@@ -348,7 +349,8 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                   {plan.items.map((item) => {
                     const done = Boolean(plan.done?.[item.item_id]);
                     const goalClass = GOAL_STYLES[item.goal] || 'bg-white/5 text-zinc-400 border-white/10';
-                    const workspace = workspaceSummaries[item.item_id];
+                    const localWorkspace = loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item });
+                    const workspace = chooseNewestWorkspace(localWorkspace, workspaceSummaries[item.item_id]);
                     const stage = workspace ? workspaceStage(workspace) : null;
                     return (
                       <div

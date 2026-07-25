@@ -4,7 +4,7 @@ const WORKSPACE_STAGES = new Set(['not_started', 'script', 'frames', 'video', 'f
 function contextIds(context) {
   return {
     profileId: String(context?.profileId || ''),
-    itemId: String(context?.itemId || context?.item?.item_id || ''),
+    itemId: String(context?.itemId ?? context?.item?.item_id ?? ''),
   };
 }
 
@@ -15,11 +15,13 @@ function generatedItemId() {
 
 export function ensurePlanItemIds(items) {
   if (!Array.isArray(items)) return [];
-  return items.map((item) => (
-    typeof item?.item_id === 'string' && item.item_id.trim()
-      ? item
-      : { ...item, item_id: generatedItemId() }
-  ));
+  return items.map((item) => {
+    if (typeof item?.item_id === 'string' && item.item_id.trim()) return item;
+    if (typeof item?.item_id === 'number' && Number.isFinite(item.item_id)) {
+      return { ...item, item_id: String(item.item_id) };
+    }
+    return { ...item, item_id: generatedItemId() };
+  });
 }
 
 export function workspaceStorageKey(context) {
@@ -50,9 +52,20 @@ function hasFrameUrl(shots) {
   ));
 }
 
+function hasFailedGeneration(snapshot) {
+  return (
+    snapshot?.failed_generation === true
+    || snapshot?.generation_failed === true
+    || snapshot?.generation?.status === 'failed'
+    || snapshot?.status === 'failed'
+  );
+}
+
 export function workspaceStage(snapshot) {
   const explicitStage = snapshot?.stage;
   if (WORKSPACE_STAGES.has(explicitStage)) return explicitStage;
+
+  if (hasFailedGeneration(snapshot)) return 'failed';
 
   if (
     hasText(snapshot?.result?.video_url)
@@ -61,18 +74,17 @@ export function workspaceStage(snapshot) {
     || hasText(snapshot?.videoUrl)
     || hasText(snapshot?.result_url)
   ) return 'video';
-  if (hasFrameUrl(snapshot?.shots) || hasFrameUrl(snapshot?.generated_shots) || hasFrameUrl(snapshot?.frames)) return 'frames';
+  if (
+    hasFrameUrl(snapshot?.shots)
+    || hasFrameUrl(snapshot?.generated_shots)
+    || hasFrameUrl(snapshot?.frames)
+    || (Array.isArray(snapshot?.scripts) && snapshot?.scripts?.some((script) => hasFrameUrl(script?.shots)))
+  ) return 'frames';
   if (
     (Array.isArray(snapshot?.scripts) && snapshot.scripts.length > 0)
     || hasText(snapshot?.script)
     || hasText(snapshot?.full_narration)
   ) return 'script';
-  if (
-    snapshot?.failed_generation === true
-    || snapshot?.generation_failed === true
-    || snapshot?.generation?.status === 'failed'
-    || snapshot?.status === 'failed'
-  ) return 'failed';
   return 'not_started';
 }
 
