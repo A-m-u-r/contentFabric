@@ -751,6 +751,7 @@ def refine_storyboard_broll_alignment(
     scripts: list,
     gemini_key: str,
     text_model: Optional[str] = None,
+    language: str = "en",
 ) -> list:
     """Make one non-blocking semantic review pass over generated B-roll shots.
 
@@ -793,8 +794,11 @@ def refine_storyboard_broll_alignment(
     if not candidates:
         return scripts
 
+    target_language = {"ru": "Russian", "es": "Spanish"}.get(language, "English")
     prompt = f"""You are the final semantic storyboard reviewer for vertical 9:16 UGC ads.
 Review every B-roll shot below in one batch. The exact `speech` is the source of truth.
+Target UI language: {target_language}. Write scene, camera, and actor_action only in
+{target_language}. Write generation_prompt only in English.
 
 Keep the visual only when it directly demonstrates the spoken claim or uses one immediately
 understandable visual analogy. Reject generic niche filler unrelated to the nouns, action, or
@@ -856,7 +860,10 @@ Return ONLY a JSON array:
         for candidate in candidates
     }
     for decision in decisions:
-        if not isinstance(decision, dict) or (decision.get("decision") or "").strip().lower() != "replace":
+        if not isinstance(decision, dict):
+            continue
+        decision_name = decision.get("decision")
+        if not isinstance(decision_name, str) or decision_name.strip().lower() != "replace":
             continue
         try:
             script_index = int(decision.get("script_index"))
@@ -865,16 +872,27 @@ Return ONLY a JSON array:
         shot_number = str(decision.get("shot_number", ""))
         if (script_index, shot_number) not in candidates_by_key:
             continue
-        scene = (decision.get("scene") or "").strip()
-        generation_prompt = (decision.get("generation_prompt") or "").strip()
+        raw_scene = decision.get("scene")
+        raw_generation_prompt = decision.get("generation_prompt")
+        raw_camera = decision.get("camera", "")
+        raw_actor_action = decision.get("actor_action", "")
+        if (
+            not isinstance(raw_scene, str)
+            or not isinstance(raw_generation_prompt, str)
+            or not isinstance(raw_camera, str)
+            or not isinstance(raw_actor_action, str)
+        ):
+            continue
+        scene = raw_scene.strip()
+        generation_prompt = raw_generation_prompt.strip()
         if not scene or not generation_prompt:
             continue
         shots = scripts[script_index]["shots"]
         shot = next((item for item in shots if str(item.get("shot_number")) == shot_number), None)
         if not isinstance(shot, dict) or not _is_broll_shot(shot) or shot.get("prompt_manual"):
             continue
-        camera = (decision.get("camera") or "").strip()
-        actor_action = (decision.get("actor_action") or "").strip()
+        camera = raw_camera.strip()
+        actor_action = raw_actor_action.strip()
         shot["scene"] = scene
         if camera:
             shot["camera"] = camera
@@ -1236,7 +1254,12 @@ RULES:
             for shot in script["shots"]:
                 shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
             _finalize_generated_script(script)
-        refine_storyboard_broll_alignment(scripts, gemini_key, text_model=text_model)
+        refine_storyboard_broll_alignment(
+            scripts,
+            gemini_key,
+            text_model=text_model,
+            language=language,
+        )
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 

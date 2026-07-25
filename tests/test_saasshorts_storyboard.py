@@ -95,7 +95,7 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
             ],
         }]
 
-    def _refine(self, scripts, reply):
+    def _refine(self, scripts, reply, language=None):
         from types import SimpleNamespace
 
         class FakeClient:
@@ -106,7 +106,8 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
              patch("saasshorts._generate_gemini_content", return_value=SimpleNamespace(
                  text=json.dumps(reply)
              )) as generate:
-            result = saasshorts.refine_storyboard_broll_alignment(scripts, "key")
+            kwargs = {"language": language} if language is not None else {}
+            result = saasshorts.refine_storyboard_broll_alignment(scripts, "key", **kwargs)
         return result, generate
 
     def test_replaces_unrelated_avocado_with_speech_grounded_visual(self):
@@ -173,6 +174,78 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
 
         self.assertEqual(result, before)
 
+    def test_invalid_field_types_are_ignored_while_a_valid_sibling_is_applied(self):
+        scripts = self._scripts_with_broll()
+        scripts[0]["shots"].append({
+            "shot_number": 4, "visual_type": "broll", "role": "proof",
+            "scene": "Generic scale", "camera": "close-up", "actor_action": "needle moves",
+            "speech": "The change is gradual, not a sudden collapse.",
+            "overlay_text": "Gradual change", "start": 9, "end": 12,
+            "generation_prompt": "a generic bathroom scale",
+        })
+        invalid_before = dict(scripts[0]["shots"][1])
+
+        result, _ = self._refine(scripts, [
+            {
+                "script_index": 0, "shot_number": 2, "decision": "replace",
+                "scene": {"unexpected": "object"},
+                "camera": ["unexpected", "array"],
+                "actor_action": 42,
+                "generation_prompt": ["not", "a", "string"],
+            },
+            {
+                "script_index": 0, "shot_number": 4, "decision": "replace",
+                "scene": "The same pendulum loses speed almost imperceptibly.",
+                "camera": "Locked medium close-up.",
+                "actor_action": "The pendulum continues moving at a subtly slower pace.",
+                "generation_prompt": "vertical 9:16 realistic UGC b-roll, one pendulum gradually slowing, locked medium close-up, natural light, no readable text, no watermark",
+            },
+        ])
+
+        self.assertEqual(result[0]["shots"][1], invalid_before)
+        self.assertIn("pendulum gradually slowing", result[0]["shots"][3]["generation_prompt"])
+        self.assertEqual(
+            result[0]["shots"][3]["action"],
+            "The pendulum continues moving at a subtly slower pace.",
+        )
+
+    def test_russian_ui_fields_are_requested_while_generation_prompt_stays_english(self):
+        scripts = self._scripts_with_broll()
+        result, generate = self._refine(scripts, [{
+            "script_index": 0, "shot_number": 2, "decision": "replace",
+            "scene": "Один человек идёт по одной дорожке в разные периоды жизни.",
+            "camera": "Средний план сбоку, плавное сопровождение.",
+            "actor_action": "Человек со спины продолжает идти, постепенно замедляя шаг.",
+            "generation_prompt": "vertical 9:16 realistic UGC b-roll, faceless person seen from behind gradually slowing their walking pace, side tracking shot, natural light, no readable text, no watermark",
+        }], language="ru")
+
+        request = generate.call_args.kwargs["contents"][0]
+        self.assertIn("Target UI language: Russian", request)
+        shot = result[0]["shots"][1]
+        self.assertEqual(shot["scene"], "Один человек идёт по одной дорожке в разные периоды жизни.")
+        self.assertEqual(shot["camera"], "Средний план сбоку, плавное сопровождение.")
+        self.assertEqual(
+            shot["actor_action"],
+            "Человек со спины продолжает идти, постепенно замедляя шаг.",
+        )
+        self.assertIn("faceless person seen from behind", shot["generation_prompt"])
+
+    def test_multiple_broll_candidates_share_one_model_request(self):
+        scripts = self._scripts_with_broll()
+        second_script = self._scripts_with_broll()[0]
+        second_script["shots"][1]["speech"] = "Stress can also change the rhythm of appetite."
+        scripts.append(second_script)
+
+        _, generate = self._refine(scripts, [
+            {"script_index": 0, "shot_number": 2, "decision": "keep"},
+            {"script_index": 1, "shot_number": 2, "decision": "keep"},
+        ])
+
+        self.assertEqual(generate.call_count, 1)
+        request = generate.call_args.kwargs["contents"][0]
+        self.assertIn("Our metabolism naturally slows by a few percent every ten years.", request)
+        self.assertIn("Stress can also change the rhythm of appetite.", request)
+
     def test_no_broll_or_key_makes_zero_model_calls(self):
         scripts = self._scripts_with_broll()
         scripts[0]["shots"][1]["visual_type"] = "talking"
@@ -198,9 +271,10 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
              patch("builtins.print"):
             saasshorts.generate_scripts(
                 analysis={"product_name": "Test"}, gemini_key="key", num_scripts=1,
-                script_format="storyboard_v3", language="en",
+                script_format="storyboard_v3", language="ru",
             )
         refine.assert_called_once()
+        self.assertEqual(refine.call_args.kwargs["language"], "ru")
 
     def test_storyboard_prompt_no_longer_bans_all_people_from_broll(self):
         source = saasshorts.generate_scripts.__code__.co_consts
