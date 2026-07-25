@@ -749,7 +749,8 @@ def _finalize_generated_script(script: dict) -> dict:
 
 def _normalized_hook_text(text: str) -> str:
     without_tags = re.sub(r"\[[^\]]+\]", " ", text or "")
-    words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", without_tags, flags=re.UNICODE)
+    separated = re.sub(r"[-‐‑‒–—―]+", " ", without_tags)
+    words = re.findall(r"[^\W_]+(?:'[^\W_]+)*", separated, flags=re.UNICODE)
     return " ".join(words).casefold()
 
 
@@ -770,24 +771,45 @@ def _hook_opening(script: dict, words: int = 3) -> str:
 
 _CANNED_HOOK_OPENINGS = (
     "stop stop stop",
-    "stop",
     "okay listen",
+    "okay so",
     "all right enough",
     "hey everyone",
     "hey",
     "hello everyone",
     "hello",
     "hi",
+    "watch until the end",
+    "wait until the end",
     "hola a todos",
     "hola",
     "buenas a todos",
+    "mira hasta el final",
+    "espera hasta el final",
+    "quédate hasta el final",
     "\u043f\u0440\u0438\u0432\u0435\u0442 \u0432\u0441\u0435\u043c",
     "\u0432\u0441\u0435\u043c \u043f\u0440\u0438\u0432\u0435\u0442",
     "\u0442\u0430\u043a \u0441\u043b\u0443\u0448\u0430\u0439",
     "\u0432\u0441\u0435 \u0445\u0432\u0430\u0442\u0438\u0442",
     "\u0432\u0441\u0451 \u0445\u0432\u0430\u0442\u0438\u0442",
     "\u0441\u0442\u043e\u043f \u0441\u0442\u043e\u043f \u0441\u0442\u043e\u043f",
+    "\u0434\u043e\u0441\u043c\u043e\u0442\u0440\u0438 \u0434\u043e \u043a\u043e\u043d\u0446\u0430",
+    "\u0441\u043c\u043e\u0442\u0440\u0438 \u0434\u043e \u043a\u043e\u043d\u0446\u0430",
 )
+
+_HOOK_TYPES = frozenset((
+    "result_first",
+    "mistake_prohibition",
+    "counterintuitive_claim",
+    "data_point",
+    "pain_question",
+    "personal_confession_demo",
+    "open_loop",
+))
+
+
+def _starts_with_hook_phrase(text: str, phrase: str) -> bool:
+    return bool(re.match(rf"^{re.escape(phrase)}(?:\s|$)", text))
 
 
 def _topic_supplied_hook(topic: Optional[str]) -> str:
@@ -801,14 +823,27 @@ def _validate_script_batch_hooks(scripts: list, supplied_hook: str = "") -> list
     seen = {}
     for index, script in enumerate(scripts, start=1):
         opening = _hook_opening(script)
+        full_hook = _normalized_hook_text(_script_hook_text(script))
         if not opening:
             continue
-        if any(opening.startswith(canned) for canned in _CANNED_HOOK_OPENINGS):
+        if any(_starts_with_hook_phrase(full_hook, canned) for canned in _CANNED_HOOK_OPENINGS):
             issues.append(f"script {index} uses a canned filler opening: {opening}")
         if opening in seen:
             issues.append(f"scripts {seen[opening]} and {index} repeat opening: {opening}")
         else:
             seen[opening] = index
+
+    if len(scripts) > 1:
+        seen_types = {}
+        for index, script in enumerate(scripts, start=1):
+            hook_type = (script.get("hook_type") or "").strip().casefold()
+            if hook_type not in _HOOK_TYPES:
+                issues.append(f"script {index} has missing or unsupported hook_type")
+                continue
+            if hook_type in seen_types:
+                issues.append(f"scripts {seen_types[hook_type]} and {index} repeat hook_type: {hook_type}")
+            else:
+                seen_types[hook_type] = index
 
     required_opening = _normalized_hook_text(supplied_hook)
     first_opening = _normalized_hook_text(_script_hook_text(scripts[0])) if scripts else ""
@@ -919,7 +954,7 @@ def generate_scripts(
         lang_instructions = """
 LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in SPANISH (Spain/Latin America).
 Use natural casual Spanish like a real person would speak on TikTok. Contractions, slang OK.
-Examples of Spanish UGC hooks: "Tío, no me puedo creer que nadie me haya dicho esto antes...", "Si usas Excel para esto, necesitas ver esto YA", "Os voy a enseñar algo que me ha cambiado la vida..."
+Examples of Spanish UGC hooks: "Tres campos de factura evitan este error", "Deja de aprobar facturas sin esta regla", "Este dato revela dónde se pierde el margen"
 """
     elif language == "ru":
         lang_instructions = """
@@ -938,7 +973,7 @@ SPEECH STYLE (critical — the speech/narration text goes straight to TTS and mu
         lang_instructions = """
 LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in ENGLISH.
 Use natural casual American English like a real person on TikTok. Contractions, slang OK.
-Examples of English UGC hooks: "Okay so I just found this tool and...", "Stop doing this manually, there's a better way", "I can't believe nobody told me about this sooner..."
+Examples of English UGC hooks: "Three invoice fields prevent this approval error", "Stop approving invoices manually when cash flow is tight", "This dashboard metric exposes the leak"
 """
 
     topic_instructions = ""
@@ -959,7 +994,7 @@ Every generated script MUST focus on this exact topic. Do not drift into generic
 HOOK REQUIREMENTS:
 - Start with a topic-specific claim, mistake, question, result, data point, confession, demo, or open loop. Never put filler before the actual claim.
 - Do not use greetings, "watch until the end" filler, or canned openings such as "stop stop stop", "okay listen", or "all right enough".
-- Use one hook type per script from: result-first, specific mistake/prohibition, counterintuitive claim, concrete data point, exact pain question, personal confession/demo, open loop.
+- Every script MUST include `hook_type` with exactly one of: result_first, mistake_prohibition, counterintuitive_claim, data_point, pain_question, personal_confession_demo, open_loop.
 - Every script in this batch MUST use a different hook type and a different first-three-word opening.
 - The first spoken words must carry topic-specific meaning, not a generic pattern interrupt.{supplied_hook_instruction}
 """
@@ -979,6 +1014,7 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
 [
   {{
     "title": "Short internal title",
+    "hook_type": "result_first",
     "format": "storyboard_v3",
     "style": "{style}",
     "duration_seconds": 18,
@@ -1091,6 +1127,7 @@ Return a JSON array:
 [
     {{
         "title": "Short internal title",
+        "hook_type": "result_first",
         "style": "{style}",
         "duration_seconds": 21,
         "target_platform": "tiktok",

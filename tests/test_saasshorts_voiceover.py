@@ -344,8 +344,8 @@ class ScriptDurationAndHookTests(unittest.TestCase):
 
     def test_duplicate_openings_request_one_retry_and_return_diverse_batch(self):
         responses = iter([
-            MagicMock(text='[{"segments":[{"narration":"Exact pain question now"}]},{"segments":[{"narration":"Exact pain question later"}]}]'),
-            MagicMock(text='[{"segments":[{"narration":"Specific mistake costs money"}]},{"segments":[{"narration":"Three data points prove it"}]}]'),
+            MagicMock(text='[{"hook_type":"pain_question","segments":[{"narration":"Exact pain question now"}]},{"hook_type":"data_point","segments":[{"narration":"Exact pain question later"}]}]'),
+            MagicMock(text='[{"hook_type":"mistake_prohibition","segments":[{"narration":"Specific mistake costs money"}]},{"hook_type":"data_point","segments":[{"narration":"Three data points prove it"}]}]'),
         ])
         calls = 0
 
@@ -366,7 +366,7 @@ class ScriptDurationAndHookTests(unittest.TestCase):
         self.assertEqual(_hook_opening(scripts[0]), "specific mistake costs")
 
     def test_diverse_openings_accept_first_batch_without_retry(self):
-        response = MagicMock(text='[{"segments":[{"narration":"Specific mistake costs money"}]},{"segments":[{"narration":"Three data points prove it"}]}]')
+        response = MagicMock(text='[{"hook_type":"mistake_prohibition","segments":[{"narration":"Specific mistake costs money"}]},{"hook_type":"data_point","segments":[{"narration":"Three data points prove it"}]}]')
         ask = MagicMock(return_value=response)
 
         scripts = _request_gemini_script_batch(
@@ -400,13 +400,59 @@ class ScriptDurationAndHookTests(unittest.TestCase):
 
     def test_supplied_hook_must_be_the_first_script_opening(self):
         scripts = [
-            {"segments": [{"narration": "[sighs] First claim is specific"}]},
-            {"segments": [{"narration": "Three data points prove it"}]},
+            {"hook_type": "result_first", "segments": [{"narration": "[sighs] First claim is specific"}]},
+            {"hook_type": "data_point", "segments": [{"narration": "Three data points prove it"}]},
         ]
 
         self.assertEqual(_validate_script_batch_hooks(scripts, supplied_hook="First claim"), [])
         scripts[0]["segments"][0]["narration"] = "A different opening entirely"
         self.assertTrue(_validate_script_batch_hooks(scripts, supplied_hook="First claim"))
+
+    def test_duplicate_hook_type_requests_one_retry(self):
+        responses = iter([
+            MagicMock(text='[{"hook_type":"result_first","segments":[{"narration":"Revenue doubled after this"}]},{"hook_type":"result_first","segments":[{"narration":"Invoices clear faster now"}]}]'),
+            MagicMock(text='[{"hook_type":"result_first","segments":[{"narration":"Revenue doubled after this"}]},{"hook_type":"mistake_prohibition","segments":[{"narration":"Stop approving invoices manually"}]}]'),
+        ])
+        ask = MagicMock(side_effect=lambda: next(responses))
+
+        scripts = _request_gemini_script_batch(
+            ask,
+            num_scripts=2,
+            require_shots=False,
+            label="script",
+            batch_validator=_validate_script_batch_hooks,
+        )
+
+        self.assertEqual(ask.call_count, 2)
+        self.assertEqual([script["hook_type"] for script in scripts], ["result_first", "mistake_prohibition"])
+
+    def test_distinct_supported_hook_types_accept_first_batch(self):
+        ask = MagicMock(return_value=MagicMock(text='[{"hook_type":"result_first","segments":[{"narration":"Revenue doubled after this"}]},{"hook_type":"data_point","segments":[{"narration":"Three numbers expose the leak"}]}]'))
+
+        scripts = _request_gemini_script_batch(
+            ask,
+            num_scripts=2,
+            require_shots=False,
+            label="script",
+            batch_validator=_validate_script_batch_hooks,
+        )
+
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(len(scripts), 2)
+
+    def test_substantive_stop_prohibition_is_not_canned_filler(self):
+        scripts = [{"segments": [{"narration": "Stop approving invoices manually"}]}]
+        self.assertEqual(_validate_script_batch_hooks(scripts), [])
+
+    def test_filler_phrases_and_hyphenated_stop_repetition_are_rejected(self):
+        for narration in (
+            "Watch until the end to learn why",
+            "Досмотри до конца, это важно",
+            "Стоп-стоп-стоп, ты теряешь деньги",
+        ):
+            with self.subTest(narration=narration):
+                issues = _validate_script_batch_hooks([{"segments": [{"narration": narration}]}])
+                self.assertTrue(issues)
 
 
 class PurgeDerivedAssetsTests(unittest.TestCase):
