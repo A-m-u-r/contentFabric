@@ -455,6 +455,12 @@ class UILayoutPolishTests(unittest.TestCase):
         # И явно поясняем, что видео не длиннее речи.
         self.assertIn("видео не длиннее речи", tab)
 
+    def test_script_cards_always_show_narration_derived_duration(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertNotIn("script.duration_seconds || estimateStoryboardSeconds", tab)
+        self.assertIn("estimateStoryboardSeconds(script, script.full_narration || '')", tab)
+
     def test_ai_shorts_exposes_ai_storyboard_format_selector_in_setup(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 

@@ -11,11 +11,17 @@ from saasshorts import (
     _avatar_scene_prompt,
     _broll_slice_shot,
     _elevenlabs_voice_for,
+    _estimate_speech_duration,
+    _finalize_generated_script,
+    _hook_opening,
     _is_broll_shot,
     _pick_caption_highlight_word,
     _purge_voiceover_derived_assets,
+    _request_gemini_script_batch,
     _salvage_json_array,
+    _script_spoken_text,
     _strip_audio_tags,
+    _validate_script_batch_hooks,
     generate_voiceover,
 )
 
@@ -290,6 +296,117 @@ class CaptionHighlightTests(unittest.TestCase):
     def test_falls_back_to_longest_heavy_word(self):
         word = _pick_caption_highlight_word("каждый понедельник заново")
         self.assertEqual(word, "ПОНЕДЕЛЬНИК")
+
+
+class ScriptDurationAndHookTests(unittest.TestCase):
+    def test_estimate_ignores_audio_tag_words_and_counts_tag_pause_time(self):
+        text = "[sighs] one two three four five six seven eight nine ten eleven ... [whispers]"
+        self.assertEqual(_estimate_speech_duration(text), 7)
+
+    def test_storyboard_narration_overwrites_stale_llm_duration(self):
+        script = {
+            "duration_seconds": 88,
+            "full_narration": "stale narration",
+            "shots": [
+                {"speech": "one two three four five six seven eight nine ten eleven"},
+                {"speech": "twelve thirteen"},
+            ],
+        }
+
+        _finalize_generated_script(script)
+
+        self.assertEqual(script["full_narration"], "one two three four five six seven eight nine ten eleven twelve thirteen")
+        self.assertEqual(script["duration_seconds"], 6)
+        self.assertEqual(script["duration_source"], "narration_estimate")
+
+    def test_segment_narration_overwrites_stale_llm_duration(self):
+        script = {
+            "duration_seconds": 18,
+            "full_narration": "stale narration",
+            "segments": [{"narration": "one two three four five six seven eight nine ten eleven twelve thirteen"}],
+        }
+
+        _finalize_generated_script(script)
+
+        self.assertEqual(script["full_narration"], "one two three four five six seven eight nine ten eleven twelve thirteen")
+        self.assertEqual(script["duration_seconds"], 6)
+        self.assertEqual(script["duration_source"], "narration_estimate")
+
+    def test_script_spoken_text_prefers_storyboard_then_legacy_segments(self):
+        self.assertEqual(
+            _script_spoken_text({"shots": [{"speech": "First"}, {"speech": "Second"}], "full_narration": "stale"}),
+            "First Second",
+        )
+        self.assertEqual(
+            _script_spoken_text({"segments": [{"narration": "First"}, {"narration": "Second"}], "full_narration": "stale"}),
+            "First Second",
+        )
+
+    def test_duplicate_openings_request_one_retry_and_return_diverse_batch(self):
+        responses = iter([
+            MagicMock(text='[{"segments":[{"narration":"Exact pain question now"}]},{"segments":[{"narration":"Exact pain question later"}]}]'),
+            MagicMock(text='[{"segments":[{"narration":"Specific mistake costs money"}]},{"segments":[{"narration":"Three data points prove it"}]}]'),
+        ])
+        calls = 0
+
+        def ask():
+            nonlocal calls
+            calls += 1
+            return next(responses)
+
+        scripts = _request_gemini_script_batch(
+            ask,
+            num_scripts=2,
+            require_shots=False,
+            label="script",
+            batch_validator=_validate_script_batch_hooks,
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(_hook_opening(scripts[0]), "specific mistake costs")
+
+    def test_diverse_openings_accept_first_batch_without_retry(self):
+        response = MagicMock(text='[{"segments":[{"narration":"Specific mistake costs money"}]},{"segments":[{"narration":"Three data points prove it"}]}]')
+        ask = MagicMock(return_value=response)
+
+        scripts = _request_gemini_script_batch(
+            ask,
+            num_scripts=2,
+            require_shots=False,
+            label="script",
+            batch_validator=_validate_script_batch_hooks,
+        )
+
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(len(scripts), 2)
+
+    def test_canned_preamble_requests_one_retry(self):
+        responses = iter([
+            MagicMock(text='[{"segments":[{"narration":"Stop stop stop, this costs you money"}]}]'),
+            MagicMock(text='[{"segments":[{"narration":"Specific mistake costs money"}]}]'),
+        ])
+        ask = MagicMock(side_effect=lambda: next(responses))
+
+        scripts = _request_gemini_script_batch(
+            ask,
+            num_scripts=1,
+            require_shots=False,
+            label="script",
+            batch_validator=_validate_script_batch_hooks,
+        )
+
+        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(_hook_opening(scripts[0]), "specific mistake costs")
+
+    def test_supplied_hook_must_be_the_first_script_opening(self):
+        scripts = [
+            {"segments": [{"narration": "[sighs] First claim is specific"}]},
+            {"segments": [{"narration": "Three data points prove it"}]},
+        ]
+
+        self.assertEqual(_validate_script_batch_hooks(scripts, supplied_hook="First claim"), [])
+        scripts[0]["segments"][0]["narration"] = "A different opening entirely"
+        self.assertTrue(_validate_script_batch_hooks(scripts, supplied_hook="First claim"))
 
 
 class PurgeDerivedAssetsTests(unittest.TestCase):

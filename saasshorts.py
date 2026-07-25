@@ -681,15 +681,16 @@ def _parse_gemini_script_array(raw: str) -> tuple:
     return salvaged, _JSON_SALVAGED if salvaged else _JSON_CLEAN
 
 
-def _script_batch_quality(scripts: list, note: str) -> tuple:
+def _script_batch_quality(scripts: list, note: str, issues=()) -> tuple:
     """Rank two answers to the same request: a clean parse beats a patched one.
 
     An empty batch ranks below everything — an answer that parsed perfectly and
     carried nothing is worse than a cut-off one we salvaged shots from.
     """
     if not scripts:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     return (
+        2 if not issues else 1,
         2 if note in (_JSON_CLEAN, _JSON_REPAIRED) else 1,
         len(scripts),
         sum(len(script.get("shots") or ()) for script in scripts),
@@ -722,7 +723,101 @@ def _describe_gemini_json_failure(raw: str, response=None) -> str:
     return f"no script objects in the answer ({len(text)} chars,{reason})\nRaw: {text[:500]}"
 
 
-def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, label: str) -> list:
+def _script_spoken_text(script: dict) -> str:
+    """Return the narration source that actually reaches the voiceover."""
+    for collection_key, text_key in (("shots", "speech"), ("segments", "narration")):
+        collection = script.get(collection_key)
+        if isinstance(collection, list):
+            spoken = " ".join(
+                (item.get(text_key) or "").strip()
+                for item in collection
+                if isinstance(item, dict) and (item.get(text_key) or "").strip()
+            ).strip()
+            if spoken:
+                return spoken
+    return (script.get("full_narration") or "").strip()
+
+
+def _finalize_generated_script(script: dict) -> dict:
+    """Replace unreliable generated metadata with narration-derived values."""
+    narration = _script_spoken_text(script)
+    script["full_narration"] = narration
+    script["duration_seconds"] = _estimate_speech_duration(narration)
+    script["duration_source"] = "narration_estimate"
+    return script
+
+
+def _normalized_hook_text(text: str) -> str:
+    without_tags = re.sub(r"\[[^\]]+\]", " ", text or "")
+    words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", without_tags, flags=re.UNICODE)
+    return " ".join(words).casefold()
+
+
+def _script_hook_text(script: dict) -> str:
+    """Return the first spoken narration field, before any fallback narration."""
+    for collection_key, text_key in (("shots", "speech"), ("segments", "narration")):
+        collection = script.get(collection_key)
+        if isinstance(collection, list):
+            for item in collection:
+                if isinstance(item, dict) and (item.get(text_key) or "").strip():
+                    return (item.get(text_key) or "").strip()
+    return (script.get("full_narration") or "").strip()
+
+
+def _hook_opening(script: dict, words: int = 3) -> str:
+    return " ".join(_normalized_hook_text(_script_hook_text(script)).split()[:words])
+
+
+_CANNED_HOOK_OPENINGS = (
+    "stop stop stop",
+    "stop",
+    "okay listen",
+    "all right enough",
+    "hey everyone",
+    "hey",
+    "hello everyone",
+    "hello",
+    "hi",
+    "hola a todos",
+    "hola",
+    "buenas a todos",
+    "\u043f\u0440\u0438\u0432\u0435\u0442 \u0432\u0441\u0435\u043c",
+    "\u0432\u0441\u0435\u043c \u043f\u0440\u0438\u0432\u0435\u0442",
+    "\u0442\u0430\u043a \u0441\u043b\u0443\u0448\u0430\u0439",
+    "\u0432\u0441\u0435 \u0445\u0432\u0430\u0442\u0438\u0442",
+    "\u0432\u0441\u0451 \u0445\u0432\u0430\u0442\u0438\u0442",
+    "\u0441\u0442\u043e\u043f \u0441\u0442\u043e\u043f \u0441\u0442\u043e\u043f",
+)
+
+
+def _topic_supplied_hook(topic: Optional[str]) -> str:
+    match = re.search(r"(?im)^\s*(?:Hook|\u0425\u0443\u043a)\s*:\s*(.+?)\s*$", topic or "")
+    return match.group(1).strip() if match else ""
+
+
+def _validate_script_batch_hooks(scripts: list, supplied_hook: str = "") -> list:
+    """Return hook-quality issues while allowing the caller to salvage a batch."""
+    issues = []
+    seen = {}
+    for index, script in enumerate(scripts, start=1):
+        opening = _hook_opening(script)
+        if not opening:
+            continue
+        if any(opening.startswith(canned) for canned in _CANNED_HOOK_OPENINGS):
+            issues.append(f"script {index} uses a canned filler opening: {opening}")
+        if opening in seen:
+            issues.append(f"scripts {seen[opening]} and {index} repeat opening: {opening}")
+        else:
+            seen[opening] = index
+
+    required_opening = _normalized_hook_text(supplied_hook)
+    first_opening = _normalized_hook_text(_script_hook_text(scripts[0])) if scripts else ""
+    if required_opening and not first_opening.startswith(required_opening):
+        issues.append("script 1 does not start directly with the supplied hook")
+    return issues
+
+
+def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, label: str, batch_validator=None) -> list:
     """Ask Gemini for a batch of scripts and hand back the ones that parsed.
 
     A dropped comma is patched in place and costs nothing. An answer cut off
@@ -741,18 +836,19 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
         scripts, note = _parse_gemini_script_array(response.text or "")
         if require_shots:
             scripts = [script for script in scripts if script.get("shots")]
-        if best is None or _script_batch_quality(scripts, note) > _script_batch_quality(best[0], best[1]):
-            best = (scripts, note, response)
-        if scripts and note not in (_JSON_TRUNCATED, _JSON_SALVAGED):
+        issues = tuple(batch_validator(scripts)) if scripts and batch_validator else ()
+        if best is None or _script_batch_quality(scripts, note, issues) > _script_batch_quality(best[0], best[1], best[3]):
+            best = (scripts, note, response, issues)
+        if scripts and not issues and note not in (_JSON_TRUNCATED, _JSON_SALVAGED):
             break
-        if attempt == 0:
+        if attempt == 0 and not issues:
             print(
-                f"[SaaSShorts] ⚠️ Incomplete {label} answer "
+                f"[SaaSShorts] Incomplete {label} answer "
                 f"({note or 'nothing parsed'}, finish_reason={_gemini_finish_reason(response)}) "
-                f"— asking Gemini once more."
+                "- asking Gemini once more."
             )
 
-    scripts, note, response = best
+    scripts, note, response, issues = best
     if not scripts:
         # The diagnostic belongs in the log, not on the user's screen: it is
         # kilobytes of JSON, and all they can act on is "try again".
@@ -764,7 +860,7 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
             f"Gemini returned a broken {label} answer twice in a row. Please try generating again."
         )
     if note:
-        print(f"[SaaSShorts] ⚠️ {note} — kept {len(scripts)}/{num_scripts} {label}(s).")
+        print(f"[SaaSShorts] {note} - kept {len(scripts)}/{num_scripts} {label}(s).")
     return scripts
 
 
@@ -832,7 +928,6 @@ Use natural casual Russian like a real person would speak in Reels/TikTok. Keep 
 Examples of Russian UGC hooks: "Ты срываешься вечером не потому, что слабая", "Хватит начинать заново каждый понедельник", "Вот что съесть в 17:00, чтобы вечером не снести холодильник".
 
 SPEECH STYLE (critical — the speech/narration text goes straight to TTS and must sound like LIVE spoken Russian, not written copy):
-- The very first spoken line MUST open with a 1-3 word pattern-interrupt before the main hook: "Стоп-стоп-стоп.", "Так, слушай.", "Всё, хватит.".
 - Short punchy sentences. Fragments are fine ("Это не работает. Вообще.").
 - Mark natural pauses and hesitations with ellipses "…" and dashes "—": "а сладкое… ну, это самый быстрый путь".
 - Ask the viewer rhetorical questions: "Знакомо?", "Когда? Где?".
@@ -855,11 +950,26 @@ CURRENT VIDEO TOPIC:
 Every generated script MUST focus on this exact topic. Do not drift into generic product promotion.
 """
 
+    supplied_hook = _topic_supplied_hook(topic)
+    supplied_hook_instruction = (
+        f'\nThe topic contains a supplied hook: "{supplied_hook}". Script 1 MUST start directly with it; a leading audio tag is allowed.\n'
+        if supplied_hook else ""
+    )
+    hook_instructions = f"""
+HOOK REQUIREMENTS:
+- Start with a topic-specific claim, mistake, question, result, data point, confession, demo, or open loop. Never put filler before the actual claim.
+- Do not use greetings, "watch until the end" filler, or canned openings such as "stop stop stop", "okay listen", or "all right enough".
+- Use one hook type per script from: result-first, specific mistake/prohibition, counterintuitive claim, concrete data point, exact pain question, personal confession/demo, open loop.
+- Every script in this batch MUST use a different hook type and a different first-three-word opening.
+- The first spoken words must carry topic-specific meaning, not a generic pattern interrupt.{supplied_hook_instruction}
+"""
+
     if script_format == "storyboard_v3":
         prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
 Generate {num_scripts} storyboard-based video scripts for this product/business.
 {lang_instructions}
 {topic_instructions}
+{hook_instructions}
 PRODUCT ANALYSIS:
 {json.dumps(analysis, indent=2)}
 
@@ -936,6 +1046,7 @@ RULES:
             num_scripts=num_scripts,
             require_shots=True,  # a script without shots is nothing to storyboard
             label="storyboard script",
+            batch_validator=lambda batch: _validate_script_batch_hooks(batch, supplied_hook=supplied_hook),
         )
 
         for script in scripts:
@@ -946,8 +1057,7 @@ RULES:
             # edits «Что в кадре», the prompt is rebuilt from the new scene.
             for shot in script["shots"]:
                 shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
-            if not script.get("full_narration"):
-                script["full_narration"] = " ".join(shot.get("speech", "") for shot in script["shots"]).strip()
+            _finalize_generated_script(script)
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 
@@ -955,6 +1065,7 @@ RULES:
 Generate {num_scripts} video scripts to promote this product/business.
 {lang_instructions}
 {topic_instructions}
+{hook_instructions}
 PRODUCT ANALYSIS:
 {json.dumps(analysis, indent=2)}
 
@@ -1079,7 +1190,11 @@ RULES:
         num_scripts=num_scripts,
         require_shots=False,
         label="script",
+        batch_validator=lambda batch: _validate_script_batch_hooks(batch, supplied_hook=supplied_hook),
     )
+
+    for script in scripts:
+        _finalize_generated_script(script)
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
     return scripts
@@ -1140,6 +1255,9 @@ RULES:
 - goal must be exactly one of: прогрев, вовлечение, доверие, продажа.
 - format_hint: "ugc" for talking-head style items, "storyboard_v3" for items that need scene variety.
 - Hooks must be specific to this business, no generic clickbait.
+- Hooks must start with the actual claim, not a greeting, "watch until the end" filler, or canned preamble.
+- Across the plan, vary hook taxonomy: result-first, specific mistake/prohibition, counterintuitive claim, concrete data point, exact pain question, personal confession/demo, and open loop.
+- Across the plan, vary the first three spoken words of every hook.
 - Do NOT invent product features that are not in the description."""
 
     response = _generate_gemini_content(
@@ -1198,10 +1316,16 @@ RULES:
 
 
 def _estimate_speech_duration(text: str) -> int:
-    """Rough speech duration for UI/timing metadata."""
-    words = [w for w in re.split(r"\s+", text.strip()) if w]
-    # UGC-style narration averages about 2.4-2.7 words/sec.
-    return max(12, min(75, round(len(words) / 2.5)))
+    """Estimate spoken duration from narration, pauses, and audio directions."""
+    raw = text or ""
+    tags = re.findall(r"\[[^\]]+\]", raw)
+    spoken = re.sub(r"\[[^\]]+\]", " ", raw).strip()
+    words = [word for word in re.split(r"\s+", spoken) if word]
+    pauses = len(re.findall(r"\.{3}|…|—", raw))
+    if not words and not tags:
+        return 0
+    seconds = len(words) / 2.2 + len(tags) * 0.8 + pauses * 0.4
+    return max(5, min(90, round(seconds)))
 
 
 def _split_text_for_segments(text: str, parts: int = 5) -> list:

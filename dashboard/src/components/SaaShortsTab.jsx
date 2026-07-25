@@ -287,9 +287,10 @@ function estimateSpeechSeconds(text) {
   // Прежний плоский пол 12с задваивал смету коротких сценариев: ролик на ~5с речи
   // показывал «~12 сек» и удвоенную стоимость.
   const raw = text || '';
-  const words = raw.trim().split(/\s+/).filter(Boolean).length;
-  if (!words) return 0;
   const tags = (raw.match(/\[[^\]]+\]/g) || []).length;
+  const spoken = raw.replace(/\[[^\]]+\]/g, ' ').trim();
+  const words = spoken ? spoken.split(/\s+/).filter(Boolean).length : 0;
+  if (!words && !tags) return 0;
   const pauses = (raw.match(/\.{3}|…|—/g) || []).length;
   const seconds = words / 2.2 + tags * 0.8 + pauses * 0.4;
   return Math.max(5, Math.min(90, Math.round(seconds)));
@@ -3145,7 +3146,7 @@ export default function SaaShortsTab({
                           <h3 className="text-sm font-semibold text-zinc-200">{script.title}</h3>
                           <span className="text-[10px] text-zinc-500">
                             {[
-                              `${script.duration_seconds || estimateStoryboardSeconds(script)} сек`,
+                              `≈${estimateStoryboardSeconds(script, script.full_narration || '')} сек`,
                               script.style,
                               script.target_platform,
                             ].filter(Boolean).join(' · ')}
