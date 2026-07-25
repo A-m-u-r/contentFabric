@@ -68,6 +68,13 @@ function buildVoiceOptions(voices) {
 // «AI Shorts» (тот же приём, что и с темой из контент-плана).
 const PENDING_STORYBOARD_KEY = 'saasshorts_pending_storyboard';
 
+// Ролики до появления job_id в метаданных: id джоба лежит в самом URL видео
+// (/videos/saas_<job_id>/файл.mp4).
+function jobIdFromVideoUrl(videoUrl) {
+  const match = /\/videos\/saas_([0-9a-fA-F-]{36})\//.exec(videoUrl || '');
+  return match ? match[1] : '';
+}
+
 export default function UGCGallery({ falKey, authToken, usePlatformKeys = false, onEditStoryboard = null }) {
   const [tab, setTab] = useState('videos');
   const [videos, setVideos] = useState([]);
@@ -639,6 +646,9 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
             try {
               localStorage.setItem(PENDING_STORYBOARD_KEY, JSON.stringify({
                 video_id: video.video_id,
+                // Джоб, в котором лежат оплаченные клипы и кадры: пересъёмка
+                // берёт из него всё, что пользователь не менял.
+                job_id: video.job_id || jobIdFromVideoUrl(video.video_url),
                 title: video.title,
                 caption: video.caption,
                 hashtags: video.hashtags,

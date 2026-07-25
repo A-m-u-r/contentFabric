@@ -71,5 +71,61 @@ class GalleryLipSyncTests(unittest.TestCase):
         app.OUTPUT_DIR = old_output_dir
 
 
+class StoryboardReshootSourceTests(unittest.TestCase):
+    """Пересъёмка тянет файлы из чужого джоба — значит, нужен тот же контроль доступа."""
+
+    JOB_ID = "26269938-a4b3-4f41-bc29-b34722375e45"
+
+    def _job_dir(self, tmp, meta=None):
+        job_dir = os.path.join(tmp, f"saas_{self.JOB_ID}")
+        os.makedirs(job_dir, exist_ok=True)
+        if meta is not None:
+            with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+        return job_dir
+
+    def test_rejects_an_id_that_is_not_a_uuid(self):
+        # id становится именем каталога: "../" увёл бы запись за пределы output.
+        with self.assertRaises(app.HTTPException) as raised:
+            app._owned_saas_job_dir("../etc", None, "source_job_id")
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_missing_job_dir_returns_none_instead_of_failing(self):
+        old_output_dir = app.OUTPUT_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            app.OUTPUT_DIR = tmp
+            self.assertIsNone(app._owned_saas_job_dir(self.JOB_ID, None, "source_job_id"))
+        app.OUTPUT_DIR = old_output_dir
+
+    def test_another_users_job_is_not_reachable(self):
+        old_output_dir = app.OUTPUT_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            app.OUTPUT_DIR = tmp
+            self._job_dir(tmp, {"title": "Чужой ролик", "owner_user_id": "user_a"})
+            with self.assertRaises(app.HTTPException) as raised:
+                app._owned_saas_job_dir(self.JOB_ID, {"id": "user_b"}, "source_job_id")
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(
+                app._owned_saas_job_dir(self.JOB_ID, {"id": "user_a"}, "source_job_id"),
+                os.path.join(tmp, f"saas_{self.JOB_ID}"),
+            )
+        app.OUTPUT_DIR = old_output_dir
+
+    def test_slug_comes_from_the_title_and_falls_back_to_the_rendered_file(self):
+        old_output_dir = app.OUTPUT_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            app.OUTPUT_DIR = tmp
+            job_dir = self._job_dir(tmp, {"title": "Моя форма 30+"})
+            with open(os.path.join(job_dir, "moya_forma_30_storyboard_final.mp4"), "wb") as f:
+                f.write(b"cut")
+            self.assertEqual(app._storyboard_slug_of_job(job_dir), app.storyboard_title_slug("Моя форма 30+"))
+
+            # Джоб без метаданных: слаг читаем с диска, иначе перенос промахнётся
+            # мимо кэша и пользователь заплатит за уже снятые кадры.
+            os.remove(os.path.join(job_dir, "gallery_metadata.json"))
+            self.assertEqual(app._storyboard_slug_of_job(job_dir), "moya_forma_30")
+        app.OUTPUT_DIR = old_output_dir
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ import math
 import time
 import difflib
 import hashlib
+import shutil
 import subprocess
 import httpx
 import textwrap
@@ -532,6 +533,45 @@ def _repair_gemini_json(text: str) -> str:
     return text
 
 
+def _close_truncated_json(text: str) -> str:
+    """Close the brackets a cut-off answer left open.
+
+    Gemini stops mid-object when it runs out of output budget (its cap counts
+    thinking tokens, so a long storyboard batch can end mid-word). Rewind to the
+    last container that closed cleanly and shut everything still open, so the
+    shots that made it through survive instead of the whole batch failing.
+    Returns "" when nothing complete came through.
+    """
+    stack = []
+    in_string = False
+    escape = False
+    cut = None
+    cut_stack = None
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            stack.append("]" if ch == "[" else "}")
+        elif ch in "]}":
+            if stack:
+                stack.pop()
+            if stack:  # a nested container closed: everything up to here is whole
+                cut, cut_stack = i + 1, list(stack)
+    if not stack:
+        return text  # nothing left open — the text is complete as it is
+    if cut is None:
+        return ""
+    return text[:cut] + "".join(reversed(cut_stack))
+
+
 def _salvage_json_array(text: str) -> list:
     """Best-effort parse of a top-level JSON array that is malformed or cut off.
 
@@ -539,7 +579,9 @@ def _salvage_json_array(text: str) -> list:
     batches (unterminated tail), or drop a comma inside one object. We scan for
     every top-level ``{...}`` span and parse each independently — repairing it
     first and skipping the ones that still won't parse — so a single broken
-    script never discards the ones that came out clean.
+    script never discards the ones that came out clean. The cut-off object at
+    the tail is closed and kept too: with one script requested it is the only
+    one there is.
     """
     depth = 0
     in_string = False
@@ -566,17 +608,164 @@ def _salvage_json_array(text: str) -> list:
             if depth == 0 and obj_start is not None:
                 spans.append((obj_start, i + 1))
                 obj_start = None
+    if obj_start is not None:
+        spans.append((obj_start, len(text)))  # never closed: closed below
     salvaged = []
     for obj_start, obj_end in spans:
         chunk = text[obj_start:obj_end]
-        try:
-            salvaged.append(json.loads(chunk))
-        except json.JSONDecodeError:
+        for candidate in (chunk, _repair_gemini_json(chunk), _close_truncated_json(chunk)):
+            if not candidate:
+                continue
             try:
-                salvaged.append(json.loads(_repair_gemini_json(chunk)))
+                salvaged.append(json.loads(candidate))
             except json.JSONDecodeError:
                 continue  # one unrecoverable object must not drop the rest
+            break
     return salvaged
+
+
+# What had to be done to Gemini's answer before it parsed. The last two mean
+# content was lost, which is worth another request; the first two are free.
+_JSON_CLEAN = ""
+_JSON_REPAIRED = "repaired malformed JSON"
+_JSON_TRUNCATED = "answer was cut off — closed the open brackets"
+_JSON_SALVAGED = "salvaged the objects that closed cleanly"
+
+
+def _clean_gemini_json_array(raw: str) -> tuple:
+    """Strip the code fence and slice down to the top-level array.
+
+    Returns ``(sliced, unsliced)`` — the second keeps everything after the last
+    ``]``, because on a truncated answer that closer belongs to a nested list
+    and the scripts after it are still salvageable.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    start = text.find("[")
+    end = text.rfind("]")
+    unsliced = text[start:] if start != -1 else text
+    if start != -1 and end != -1:
+        text = text[start : end + 1]
+    return text, unsliced
+
+
+def _parse_gemini_script_array(raw: str) -> tuple:
+    """Parse Gemini's array of scripts, repairing the ways it breaks in practice.
+
+    Returns ``(scripts, note)``; the note is one of the ``_JSON_*`` constants and
+    says what had to be fixed, so the caller can tell a free repair from a
+    request that lost content.
+    """
+    text, unsliced = _clean_gemini_json_array(raw)
+    repaired = _repair_gemini_json(text)
+    attempts = (
+        (_JSON_CLEAN, text),
+        (_JSON_REPAIRED, repaired),
+        (_JSON_TRUNCATED, _close_truncated_json(repaired)),
+    )
+    for note, candidate in attempts:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        scripts = [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+        if scripts:
+            return scripts, note
+    salvaged = [item for item in _salvage_json_array(unsliced) if isinstance(item, dict)]
+    return salvaged, _JSON_SALVAGED if salvaged else _JSON_CLEAN
+
+
+def _script_batch_quality(scripts: list, note: str) -> tuple:
+    """Rank two answers to the same request: a clean parse beats a patched one.
+
+    An empty batch ranks below everything — an answer that parsed perfectly and
+    carried nothing is worse than a cut-off one we salvaged shots from.
+    """
+    if not scripts:
+        return (0, 0, 0)
+    return (
+        2 if note in (_JSON_CLEAN, _JSON_REPAIRED) else 1,
+        len(scripts),
+        sum(len(script.get("shots") or ()) for script in scripts),
+    )
+
+
+def _gemini_finish_reason(response) -> str:
+    """MAX_TOKENS here means the answer was cut off, not that the model failed."""
+    try:
+        return str(response.candidates[0].finish_reason)
+    except Exception:
+        return "unknown"
+
+
+def _describe_gemini_json_failure(raw: str, response=None) -> str:
+    """Point at the character that broke the parse — the head of the answer never shows it."""
+    text, _ = _clean_gemini_json_array(raw)
+    reason = f" finish_reason={_gemini_finish_reason(response)}" if response is not None else ""
+    if not text:
+        return f"empty answer{reason}"
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as error:
+        span = 200
+        if error.pos >= len(text):
+            where = f"...{text[-span:]} <<< ANSWER ENDS HERE"
+        else:
+            where = f"...{text[max(0, error.pos - span):error.pos]} >>>HERE>>> {text[error.pos:error.pos + span]}..."
+        return f"{error} ({len(text)} chars,{reason})\n{where}"
+    return f"no script objects in the answer ({len(text)} chars,{reason})\nRaw: {text[:500]}"
+
+
+def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, label: str) -> list:
+    """Ask Gemini for a batch of scripts and hand back the ones that parsed.
+
+    A dropped comma is patched in place and costs nothing. An answer cut off
+    mid-object is different: it silently drops shots the user is about to pay to
+    render, so it is worth one more request — we keep whichever attempt came out
+    better rather than trusting the retry blindly.
+    """
+    best = None
+    for attempt in range(2):
+        try:
+            response = ask()
+        except Exception:
+            if best is None:
+                raise  # nothing to fall back on — the caller must see the failure
+            break  # the extra request failed; keep what the first answer gave us
+        scripts, note = _parse_gemini_script_array(response.text or "")
+        if require_shots:
+            scripts = [script for script in scripts if script.get("shots")]
+        if best is None or _script_batch_quality(scripts, note) > _script_batch_quality(best[0], best[1]):
+            best = (scripts, note, response)
+        if scripts and note not in (_JSON_TRUNCATED, _JSON_SALVAGED):
+            break
+        if attempt == 0:
+            print(
+                f"[SaaSShorts] ⚠️ Incomplete {label} answer "
+                f"({note or 'nothing parsed'}, finish_reason={_gemini_finish_reason(response)}) "
+                f"— asking Gemini once more."
+            )
+
+    scripts, note, response = best
+    if not scripts:
+        # The diagnostic belongs in the log, not on the user's screen: it is
+        # kilobytes of JSON, and all they can act on is "try again".
+        print(
+            f"[SaaSShorts] ❌ Unparseable {label} answer: "
+            f"{_describe_gemini_json_failure(response.text or '', response)}"
+        )
+        raise Exception(
+            f"Gemini returned a broken {label} answer twice in a row. Please try generating again."
+        )
+    if note:
+        print(f"[SaaSShorts] ⚠️ {note} — kept {len(scripts)}/{num_scripts} {label}(s).")
+    return scripts
 
 
 def generate_scripts(
@@ -733,53 +922,21 @@ RULES:
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
 - Avoid laptops, monitors, headset, microphones, studio AI background unless the product explicitly needs them.
 """
-        response = _generate_gemini_content(
-            client,
-            contents=[prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                max_output_tokens=32768,
-            ),
-            text_model=text_model,
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            max_output_tokens=32768,
         )
-
-        raw = response.text
-        if not raw:
-            raise Exception("Gemini returned empty response for storyboard script generation")
-
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-
-        start = text.find("[")
-        end = text.rfind("]")
-        unsliced = text[start:] if start != -1 else text
-        if start != -1 and end != -1:
-            text = text[start : end + 1]
-
-        try:
-            scripts = json.loads(text)
-        except json.JSONDecodeError as e:
-            # Gemini drops a comma between values or truncates the tail on big
-            # batches. Repair the whole array first (keeps every script); if it
-            # still won't parse, salvage the objects that closed cleanly — the
-            # rfind("]") above can also land on a nested shot list's closer.
-            try:
-                scripts = json.loads(_repair_gemini_json(text))
-            except json.JSONDecodeError:
-                scripts = _salvage_json_array(unsliced) if start != -1 else []
-            if isinstance(scripts, dict):
-                scripts = [scripts]
-            if not scripts:
-                raise Exception(f"Failed to parse storyboard scripts JSON: {e}\nRaw: {text[:500]}")
-            if len(scripts) < num_scripts:
-                print(
-                    f"[SaaSShorts] ⚠️ Malformed Gemini JSON — recovered "
-                    f"{len(scripts)}/{num_scripts} storyboard script(s)."
-                )
-            else:
-                print(f"[SaaSShorts] ⚠️ Repaired malformed Gemini JSON ({len(scripts)} script(s)).")
+        scripts = _request_gemini_script_batch(
+            lambda: _generate_gemini_content(
+                client,
+                contents=[prompt],
+                config=config,
+                text_model=text_model,
+            ),
+            num_scripts=num_scripts,
+            require_shots=True,  # a script without shots is nothing to storyboard
+            label="storyboard script",
+        )
 
         for script in scripts:
             script["format"] = "storyboard_v3"
@@ -908,53 +1065,21 @@ RULES:
 - Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
 - Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
 
-    response = _generate_gemini_content(
-        client,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=32768,
-        ),
-        text_model=text_model,
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        max_output_tokens=32768,
     )
-
-    raw = response.text
-    if not raw:
-        raise Exception("Gemini returned empty response for script generation")
-
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
-
-    start = text.find("[")
-    end = text.rfind("]")
-    unsliced = text[start:] if start != -1 else text
-    if start != -1 and end != -1:
-        text = text[start : end + 1]
-
-    try:
-        scripts = json.loads(text)
-    except json.JSONDecodeError as e:
-        # Gemini drops a comma between values or truncates the tail on big
-        # batches. Repair the whole array first (keeps every script); if it
-        # still won't parse, salvage the objects that closed cleanly — the
-        # rfind("]") above can also land on a nested segment list's closer.
-        try:
-            scripts = json.loads(_repair_gemini_json(text))
-        except json.JSONDecodeError:
-            scripts = _salvage_json_array(unsliced) if start != -1 else []
-        if isinstance(scripts, dict):
-            scripts = [scripts]
-        if not scripts:
-            raise Exception(f"Failed to parse scripts JSON: {e}\nRaw: {text[:500]}")
-        if len(scripts) < num_scripts:
-            print(
-                f"[SaaSShorts] ⚠️ Malformed Gemini JSON — recovered "
-                f"{len(scripts)}/{num_scripts} complete script(s)."
-            )
-        else:
-            print(f"[SaaSShorts] ⚠️ Repaired malformed Gemini JSON ({len(scripts)} script(s)).")
+    scripts = _request_gemini_script_batch(
+        lambda: _generate_gemini_content(
+            client,
+            contents=[prompt],
+            config=config,
+            text_model=text_model,
+        ),
+        num_scripts=num_scripts,
+        require_shots=False,
+        label="script",
+    )
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
     return scripts
@@ -5584,6 +5709,7 @@ def generate_sliced_avatar_clips(
             "duration": job["slice"]["end"] - job["slice"]["start"],
             "shot": job["slice"]["shot"],
             "audio_slice": job["audio"],
+            "reference_image": job["image"],
             "start": job["slice"]["start"],
             "end": job["slice"]["end"],
         }
@@ -5614,6 +5740,144 @@ def _purge_voiceover_derived_assets(output_dir: str, title_slug: str) -> None:
                     pass
 
 
+def storyboard_title_slug(title: str) -> str:
+    """Filename prefix every artifact of a storyboard job shares."""
+    return re.sub(r"[^a-z0-9]+", "_", (title or "storyboard").lower())[:30] or "storyboard"
+
+
+# The finished cut and the gallery record belong to the job that produced them:
+# carrying them into a new job would overwrite one version with another.
+_ADOPT_SKIP_NAMES = ("gallery_metadata.json",)
+
+
+def _is_finished_cut(name: str) -> bool:
+    """True for a job's rendered video, including its lip-synced versions."""
+    return name.endswith(".mp4") and "_final" in name
+
+
+def adopt_job_artifacts(
+    source_dir: str,
+    output_dir: str,
+    source_slug: str = "",
+    target_slug: str = "",
+    log: Callable[[str], None] = print,
+) -> int:
+    """Carry a finished job's paid artifacts into a fresh job dir.
+
+    Re-opening a storyboard to change one shot used to re-render — and re-charge
+    for — every shot, because the caches (clips, reference frames, voiceover)
+    live next to the job's output. Copying them over lets the normal
+    prompt-aware cache checks hit, so only the shots the user actually edited
+    are generated again. The previous cut stays where it is, so both versions
+    remain playable.
+    """
+    if not (source_dir and os.path.isdir(source_dir)):
+        return 0
+    source_dir = os.path.abspath(source_dir)
+    output_dir = os.path.abspath(output_dir)
+    if source_dir == output_dir:
+        return 0
+    os.makedirs(output_dir, exist_ok=True)
+
+    copied = 0
+    for name in sorted(os.listdir(source_dir)):
+        src = os.path.join(source_dir, name)
+        if not os.path.isfile(src):
+            continue
+        if name in _ADOPT_SKIP_NAMES or _is_finished_cut(name):
+            continue
+        target_name = name
+        if source_slug and target_slug and source_slug != target_slug and name.startswith(source_slug):
+            # The title (and with it every filename) may have been edited since.
+            target_name = target_slug + name[len(source_slug):]
+        dst = os.path.join(output_dir, target_name)
+        if os.path.exists(dst):
+            continue
+        try:
+            shutil.copy2(src, dst)
+            copied += 1
+        except OSError as e:
+            log(f"  ⚠️ Файл {name} из прошлого рендера не скопирован: {e}")
+    if copied:
+        log(f"[кадры] Взял {copied} файл(ов) из прошлого рендера — платим только за изменённые кадры.")
+    return copied
+
+
+_SHOT_ARTIFACT_URL_KEYS = ("clip_url", "preview_frame_url", "local_url", "image_url")
+
+
+def _shot_artifact_basenames(shot: dict) -> list:
+    """Files this shot's rendered clip/frame is made of, by basename."""
+    names = []
+    for name in shot.get("_render_files") or []:
+        if isinstance(name, str) and name.strip():
+            names.append(os.path.basename(name.strip()))
+    for key in (*_SHOT_ARTIFACT_URL_KEYS, "image_path"):
+        value = (shot.get(key) or "").strip()
+        if value:
+            names.append(os.path.basename(value.split("?")[0]))
+    return [name for name in dict.fromkeys(names) if name]
+
+
+def forget_shot_artifacts(
+    output_dir: str,
+    shots: list,
+    shot_numbers,
+    log: Callable[[str], None] = print,
+) -> list:
+    """Drop the cached clip and frame of the shots the user wants re-rendered.
+
+    A shot whose text did not change is served from cache, so per-shot
+    «перегенерить» is the only way to ask for another take. Besides the files it
+    clears the URLs the shot carries, otherwise the copies still sitting in the
+    previous job's directory would be picked up as an existing frame.
+    """
+    wanted = set()
+    for number in shot_numbers or []:
+        try:
+            wanted.add(int(number))
+        except (TypeError, ValueError):
+            continue
+    if not wanted:
+        return []
+
+    removed = []
+    for index, shot in enumerate(shots or [], start=1):
+        if not isinstance(shot, dict):
+            continue
+        try:
+            number = int(shot.get("shot_number") or index)
+        except (TypeError, ValueError):
+            number = index
+        if number not in wanted:
+            continue
+        for base in _shot_artifact_basenames(shot):
+            stem = os.path.splitext(base)[0]
+            candidates = (
+                base,
+                f"{base}.meta.json",
+                f"{base}.fal_url.txt",
+                f"{base}.prompt.txt",
+                f"{base}.review.json",
+                f"{base}.review.jpg",
+                f"{stem}_base.mp4",
+                f"{stem}_base_fal.json",
+                f"{stem}_ref.png",
+            )
+            for name in candidates:
+                path = os.path.join(output_dir, name)
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        removed.append(name)
+                except OSError:
+                    pass
+        for key in (*_SHOT_ARTIFACT_URL_KEYS, "image_path", "_render_files"):
+            shot.pop(key, None)
+        log(f"[кадры] Кадр {number}: перерисовываю заново.")
+    return removed
+
+
 def _attach_shot_previews(
     shots: list,
     clips: list,
@@ -5634,7 +5898,7 @@ def _attach_shot_previews(
     def _url(path: str) -> str:
         return f"/videos/{job_dir}/{os.path.basename(path)}"
 
-    clip_for_number: dict = {}
+    clips_for_number: dict = {}
     for clip in clips:
         members = list(clip.get("shots") or [])
         if clip.get("shot"):
@@ -5642,14 +5906,26 @@ def _attach_shot_previews(
         for member in members:
             num = member.get("shot_number")
             if num is not None:
-                clip_for_number.setdefault(num, clip)
+                clips_for_number.setdefault(num, []).append(clip)
 
     for i, shot in enumerate(shots):
-        clip = clip_for_number.get(shot.get("shot_number"))
+        shot_clips = clips_for_number.get(shot.get("shot_number")) or []
+        clip = shot_clips[0] if shot_clips else None
         clip_path = (clip or {}).get("path")
         if not (clip_path and os.path.exists(clip_path)):
             continue
         shot["clip_url"] = _url(clip_path)
+        # Every file this shot's footage was built from, so a later
+        # «перегенерить» knows exactly what to throw away — a long shot split
+        # into jump cuts owns several clips, and each has its own reference
+        # frame and voiceover slice.
+        rendered = []
+        for member in shot_clips:
+            for key in ("path", "reference_image", "audio_slice"):
+                value = member.get(key)
+                if value:
+                    rendered.append(os.path.basename(value))
+        shot["_render_files"] = list(dict.fromkeys(rendered))
         thumb = os.path.join(output_dir, f"{title_slug}_thumb_{shot.get('shot_number', i + 1):02d}.jpg")
         try:
             if not _nonempty(thumb):
@@ -5795,7 +6071,7 @@ def generate_storyboard_video(
         config.get("minimax_voice_id"),
     )
 
-    title_slug = re.sub(r"[^a-z0-9]+", "_", script.get("title", "storyboard").lower())[:30] or "storyboard"
+    title_slug = storyboard_title_slug(script.get("title", "storyboard"))
     shots = normalize_storyboard_shots(script)
     if not shots:
         raise ValueError("Storyboard script has no shots")

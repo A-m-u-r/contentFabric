@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import saasshorts
 from saasshorts import (
@@ -45,6 +45,130 @@ class SaaSGeminiJsonRecoveryTests(unittest.TestCase):
         # One irreparable object in the middle must not drop its neighbours.
         mixed = '[{"a":1}\n{"b":2 "c":3}\n{"d":4}]'
         self.assertEqual(saasshorts._salvage_json_array(mixed), [{"a": 1}, {"d": 4}])
+
+
+def _storyboard_shot(number, speech):
+    return {
+        "shot_number": number, "start": 0, "end": 3, "role": "hook",
+        "scene": f"Сцена {number}", "camera": "Крупный план", "actor_action": "смотрит в камеру",
+        "transition": "cut", "speech": speech, "emotion": "excited", "overlay_text": "o",
+        "visual_type": "talking", "generation_prompt": "vertical 9:16 realistic",
+    }
+
+
+def _storyboard_answer(title, shot_count):
+    script = {
+        "title": title, "format": "storyboard_v3", "duration_seconds": 18,
+        "shots": [_storyboard_shot(i, f"Реплика {i}") for i in range(1, shot_count + 1)],
+        "actor_description": "a woman in her 30s", "hashtags": ["#reels"],
+    }
+    return json.dumps([script], ensure_ascii=False)
+
+
+def _cut_off_storyboard_answer(complete_shots=3):
+    """Gemini's answer as it arrives when it runs out of output budget.
+
+    It stops right where the next value should start — the "Expecting value"
+    parse error users hit, with no closing bracket anywhere in the answer.
+    """
+    shots = ",\n      ".join(
+        json.dumps(_storyboard_shot(i, f"Реплика {i}"), ensure_ascii=False)
+        for i in range(1, complete_shots + 1)
+    )
+    return (
+        '[\n  {\n    "title": "Ты срываешься вечером не из-за слабости",\n'
+        '    "format": "storyboard_v3",\n    "shots": [\n      '
+        + shots
+        + ',\n      {\n        "shot_number": %d,\n        "camera": ' % (complete_shots + 1)
+    )
+
+
+class SaaSTruncatedGeminiAnswerTests(unittest.TestCase):
+    """Ответ Gemini обрывается на полуслове — сценарий не должен падать целиком."""
+
+    def _generate(self, answers):
+        responses = []
+        for answer in answers:
+            if isinstance(answer, Exception):
+                responses.append(answer)
+                continue
+            response = MagicMock()
+            response.text = answer
+            responses.append(response)
+        client = MagicMock()
+        client.models.generate_content.side_effect = responses
+        with patch("google.genai.Client", return_value=client):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Моя Форма"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="storyboard_v3",
+                language="ru",
+            )
+        return scripts, client.models.generate_content.call_count
+
+    def test_cut_off_answer_keeps_the_shots_that_arrived(self):
+        cut_off = _cut_off_storyboard_answer(complete_shots=3)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(cut_off)
+
+        scripts, note = saasshorts._parse_gemini_script_array(cut_off)
+
+        self.assertEqual(note, saasshorts._JSON_TRUNCATED)
+        self.assertEqual(len(scripts), 1)
+        self.assertEqual([shot["shot_number"] for shot in scripts[0]["shots"]], [1, 2, 3])
+
+    def test_asks_gemini_once_more_when_the_answer_was_cut_off(self):
+        # Пересъёмка платная: лучше переспросить, чем молча отдать огрызок сценария.
+        scripts, calls = self._generate(
+            [_cut_off_storyboard_answer(complete_shots=2), _storyboard_answer("Полный", 6)]
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([s["title"] for s in scripts], ["Полный"])
+        self.assertEqual(len(scripts[0]["shots"]), 6)
+
+    def test_keeps_the_recovered_shots_when_the_retry_comes_back_worse(self):
+        scripts, calls = self._generate([_cut_off_storyboard_answer(complete_shots=3), ""])
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(scripts[0]["shots"]), 3)
+
+    def test_a_failing_retry_does_not_throw_away_the_recovered_shots(self):
+        scripts, calls = self._generate(
+            [_cut_off_storyboard_answer(complete_shots=3), RuntimeError("400 INVALID_ARGUMENT")]
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(scripts[0]["shots"]), 3)
+
+    def test_a_clean_answer_is_not_paid_for_twice(self):
+        scripts, calls = self._generate([_storyboard_answer("Чистый", 5)])
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(scripts[0]["shots"]), 5)
+
+    def test_scripts_without_shots_are_not_offered_as_storyboards(self):
+        empty = json.dumps([{"title": "Без кадров", "shots": []}], ensure_ascii=False)
+        scripts, calls = self._generate([empty, _storyboard_answer("Со кадрами", 4)])
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([s["title"] for s in scripts], ["Со кадрами"])
+
+    def test_two_broken_answers_fail_with_a_message_a_person_can_act_on(self):
+        # Раньше пользователю в лицо прилетали 500 символов сырого JSON.
+        with self.assertRaises(Exception) as raised:
+            self._generate(['[{"title": "Обрыв', '[{"title": "Обрыв'])
+
+        self.assertNotIn("{", str(raised.exception))
+        self.assertIn("try generating again", str(raised.exception))
+
+    def test_failure_message_points_at_the_break_not_at_the_head(self):
+        # Обрыв случается на 6000-м символе — первые 500 символов о нём молчат.
+        note = saasshorts._describe_gemini_json_failure(_cut_off_storyboard_answer(complete_shots=1))
+
+        self.assertIn("ANSWER ENDS HERE", note)
+        self.assertIn('"camera"', note)
 
 
 class SaaSFillShotDetailsTests(unittest.TestCase):
@@ -149,6 +273,165 @@ class SaaSExistingShotFrameTests(unittest.TestCase):
 
     def test_shot_without_any_frame_reference(self):
         self.assertEqual(saasshorts._existing_shot_frame({"speech": "привет"}, self.root), "")
+
+
+class SaaSAdoptJobArtifactsTests(unittest.TestCase):
+    """Пересъёмка готового ролика не должна оплачивать снятые кадры заново."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.source = os.path.join(self.tmp.name, "saas_old")
+        self.target = os.path.join(self.tmp.name, "saas_new")
+        os.makedirs(self.source)
+        for name, body in (
+            ("moya_forma_avatar_01.mp4", "clip"),
+            ("moya_forma_avatar_01.mp4.meta.json", '{"payload": {"prompt": "p"}}'),
+            ("moya_forma_actor_scene_01.png", "frame"),
+            ("moya_forma_voice.mp3", "voice"),
+            ("moya_forma_storyboard_final.mp4", "final cut"),
+            ("moya_forma_final_v2.mp4", "lip-synced version"),
+            ("gallery_metadata.json", "{}"),
+        ):
+            with open(os.path.join(self.source, name), "w", encoding="utf-8") as f:
+                f.write(body)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_paid_artifacts_are_carried_over_without_the_finished_cut(self):
+        copied = saasshorts.adopt_job_artifacts(self.source, self.target, log=lambda *_: None)
+        adopted = set(os.listdir(self.target))
+        self.assertEqual(copied, 4)
+        self.assertIn("moya_forma_avatar_01.mp4", adopted)
+        self.assertIn("moya_forma_avatar_01.mp4.meta.json", adopted)
+        self.assertIn("moya_forma_actor_scene_01.png", adopted)
+        self.assertIn("moya_forma_voice.mp3", adopted)
+        # Прошлый ролик остаётся в своём джобе: иначе новая версия затрёт старую.
+        # Это касается и пересобранных липсинком версий (_final_v2.mp4).
+        self.assertNotIn("moya_forma_storyboard_final.mp4", adopted)
+        self.assertNotIn("moya_forma_final_v2.mp4", adopted)
+        self.assertNotIn("gallery_metadata.json", adopted)
+
+    def test_renamed_title_keeps_the_cache_hitting(self):
+        saasshorts.adopt_job_artifacts(
+            self.source, self.target,
+            source_slug="moya_forma", target_slug="novaya_forma",
+            log=lambda *_: None,
+        )
+        adopted = set(os.listdir(self.target))
+        # Кэш ищет файлы по новому слагу — иначе всё снимается заново за деньги.
+        self.assertIn("novaya_forma_avatar_01.mp4", adopted)
+        self.assertIn("novaya_forma_avatar_01.mp4.meta.json", adopted)
+        self.assertIn("novaya_forma_voice.mp3", adopted)
+        self.assertNotIn("moya_forma_avatar_01.mp4", adopted)
+
+    def test_existing_file_in_the_new_job_is_never_overwritten(self):
+        os.makedirs(self.target)
+        keep = os.path.join(self.target, "moya_forma_avatar_01.mp4")
+        with open(keep, "w", encoding="utf-8") as f:
+            f.write("newer clip")
+        saasshorts.adopt_job_artifacts(self.source, self.target, log=lambda *_: None)
+        with open(keep, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "newer clip")
+
+    def test_missing_source_job_is_not_an_error(self):
+        self.assertEqual(
+            saasshorts.adopt_job_artifacts(os.path.join(self.tmp.name, "gone"), self.target),
+            0,
+        )
+
+
+class SaaSForgetShotArtifactsTests(unittest.TestCase):
+    """«Переснять» должно пробивать кэш: иначе кадр вернётся тот же самый."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.job = self.tmp.name
+        for name in (
+            "slug_avatar_01.mp4",
+            "slug_avatar_01.mp4.meta.json",
+            "slug_avatar_01_base.mp4",
+            "slug_avatar_01_base_fal.json",
+            "slug_actor_scene_01.png",
+            "slug_slice_01.mp3",
+            "slug_avatar_02.mp4",
+            "slug_actor_scene_02.png",
+        ):
+            with open(os.path.join(self.job, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        self.shots = [
+            {
+                "shot_number": 1,
+                "clip_url": "/videos/saas_old/slug_avatar_01.mp4",
+                "preview_frame_url": "/videos/saas_old/slug_thumb_01.jpg",
+                "image_path": "/app/output/saas_old/slug_actor_scene_01.png",
+                "_render_files": ["slug_avatar_01.mp4", "slug_actor_scene_01.png", "slug_slice_01.mp3"],
+            },
+            {
+                "shot_number": 2,
+                "clip_url": "/videos/saas_old/slug_avatar_02.mp4",
+                "_render_files": ["slug_avatar_02.mp4", "slug_actor_scene_02.png"],
+            },
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_marked_shot_loses_its_clip_frame_and_sidecars(self):
+        saasshorts.forget_shot_artifacts(self.job, self.shots, [1], log=lambda *_: None)
+        left = set(os.listdir(self.job))
+        for gone in (
+            "slug_avatar_01.mp4",
+            "slug_avatar_01.mp4.meta.json",
+            "slug_avatar_01_base.mp4",
+            "slug_avatar_01_base_fal.json",
+            "slug_actor_scene_01.png",
+            "slug_slice_01.mp3",
+        ):
+            self.assertNotIn(gone, left)
+        # Соседний кадр не трогаем — он оплачен и не менялся.
+        self.assertIn("slug_avatar_02.mp4", left)
+        self.assertIn("slug_actor_scene_02.png", left)
+
+    def test_urls_of_the_previous_job_are_cleared(self):
+        saasshorts.forget_shot_artifacts(self.job, self.shots, [1], log=lambda *_: None)
+        # Иначе кадр «нашёлся бы» по копии, оставшейся в каталоге прошлого джоба.
+        for key in ("clip_url", "preview_frame_url", "image_path", "_render_files"):
+            self.assertNotIn(key, self.shots[0])
+        self.assertEqual(self.shots[1]["clip_url"], "/videos/saas_old/slug_avatar_02.mp4")
+
+    def test_empty_selection_changes_nothing(self):
+        before = set(os.listdir(self.job))
+        self.assertEqual(saasshorts.forget_shot_artifacts(self.job, self.shots, [], log=lambda *_: None), [])
+        self.assertEqual(set(os.listdir(self.job)), before)
+        self.assertIn("clip_url", self.shots[0])
+
+
+class SaaSShotRenderFilesTests(unittest.TestCase):
+    """Кадр должен помнить, из каких файлов он снят, — иначе нечего пересдавать."""
+
+    def test_split_shot_records_every_clip_frame_and_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clips = []
+            for index in (1, 2):
+                path = os.path.join(tmp, f"slug_avatar_{index:02d}.mp4")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("clip")
+                clips.append({
+                    "path": path,
+                    "shot": {"shot_number": 1},
+                    "reference_image": os.path.join(tmp, f"slug_actor_scene_{index:02d}.png"),
+                    "audio_slice": os.path.join(tmp, f"slug_slice_{index:02d}.mp3"),
+                })
+            shots = [{"shot_number": 1}]
+            with patch.object(saasshorts.subprocess, "run"):
+                saasshorts._attach_shot_previews(shots, clips, tmp, "slug", log=lambda *_: None)
+
+        self.assertEqual(shots[0]["clip_url"], "/videos/" + os.path.basename(tmp) + "/slug_avatar_01.mp4")
+        self.assertEqual(shots[0]["_render_files"], [
+            "slug_avatar_01.mp4", "slug_actor_scene_01.png", "slug_slice_01.mp3",
+            "slug_avatar_02.mp4", "slug_actor_scene_02.png", "slug_slice_02.mp3",
+        ])
 
 
 class SaaSBlankFrameGuardTests(unittest.TestCase):

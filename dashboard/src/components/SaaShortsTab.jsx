@@ -476,6 +476,13 @@ const LAST_JOB_KEY = 'saasshorts_last_job';
 // Раскадровка готового ролика, переданная из UGC-галереи по кнопке «Редактировать».
 const PENDING_STORYBOARD_KEY = 'saasshorts_pending_storyboard';
 
+// Готовое видео лежит по /videos/saas_<job_id>/файл.mp4 — из этого же URL берём
+// джоб, из которого пересъёмка забирает оплаченные клипы.
+function jobIdFromVideoUrl(videoUrl) {
+  const match = /\/videos\/saas_([0-9a-fA-F-]{36})\//.exec(videoUrl || '');
+  return match ? match[1] : '';
+}
+
 function loadLastJob() {
   try {
     return JSON.parse(localStorage.getItem(LAST_JOB_KEY) || 'null');
@@ -614,6 +621,9 @@ export default function SaaShortsTab({
   // Кадры, которые сейчас дозаполняет ИИ (сцена/камера/действие), и ошибка этого запроса.
   const [fillingShots, setFillingShots] = useState([]);
   const [fillError, setFillError] = useState('');
+  // Номера кадров, которые пользователь просит переснять, хотя текст не менялся:
+  // без этого их отдал бы кэш прошлого рендера.
+  const [reshootShots, setReshootShots] = useState([]);
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
@@ -716,10 +726,17 @@ export default function SaaShortsTab({
           image_preview: g.local_url ? getApiUrl(g.local_url) : shot.image_preview,
           generation_prompt: g.generation_prompt || shot.generation_prompt,
           _prompt_source_scene: g._prompt_source_scene ?? shot._prompt_source_scene,
+          _render_files: g._render_files || shot._render_files,
         };
       });
-      return { ...script, shots };
+      // Снятый ролик становится новым источником для пересъёмки, а его кадры —
+      // точкой отсчёта: с этого момента «изменённым» считается то, что правили
+      // после рендера. Превью кадров (frames_only) роликом не является.
+      const renderedJobId = result?.frames_only ? '' : jobIdFromVideoUrl(result?.video_url);
+      if (!renderedJobId) return { ...script, shots };
+      return { ...script, shots, _source_job_id: renderedJobId, _render_baseline: shots };
     });
+    if (!result?.frames_only && jobIdFromVideoUrl(result?.video_url)) setReshootShots([]);
     setScripts(next);
     // Persist to the localStorage cache: `scripts` are re-loaded from it on mount
     // (loadCache), so without this the freshly generated preview_frame_url values
@@ -1042,6 +1059,10 @@ export default function SaaShortsTab({
       shots: pendingStoryboard.shots,
       shots_archived: pendingStoryboard.shots_archived || [],
       _source_video_id: pendingStoryboard.video_id || '',
+      // Джоб с оплаченными клипами + слепок кадров на момент открытия: по нему
+      // видно, что пользователь реально изменил, а значит — за что платить.
+      _source_job_id: pendingStoryboard.job_id || '',
+      _render_baseline: pendingStoryboard.shots,
     };
     // Тот же ролик открыт повторно — обновляем запись, а не плодим копии.
     const existing = scripts.findIndex((script) => script.title === restored.title);
@@ -1469,6 +1490,10 @@ export default function SaaShortsTab({
           background_music: backgroundMusic,
           clip_vision_qc: clipVisionQc,
           broll_image_first: brollImageFirst,
+          // Пересъёмка готового ролика: снятые кадры переезжают из прошлого
+          // джоба, платим только за изменённые и явно отмеченные.
+          source_job_id: sourceJobId || undefined,
+          regenerate_shots: reshootShots,
         }),
       });
 
@@ -1773,6 +1798,55 @@ export default function SaaShortsTab({
     shot?.clip_url || shot?.image_preview || shot?.local_url || shot?.image_url || shot?.preview_frame_url
   );
   const missingFrameCount = (currentScript?.shots || []).filter((shot) => !shotHasFrame(shot)).length;
+
+  // Пересъёмка готового ролика: клипы прошлого рендера переносятся в новый джоб,
+  // поэтому платим только за кадры, которые реально снимаются заново.
+  const sourceJobId = currentScript?._source_job_id || '';
+  const renderPlan = (() => {
+    const shots = currentScript?.shots || [];
+    const baseline = currentScript?._render_baseline;
+    if (!sourceJobId || !Array.isArray(baseline) || !baseline.length) {
+      return { reshoot: shots, reused: [], narrationChanged: true, isReshoot: false };
+    }
+    const speechOf = (list) => list.map((shot) => (shot.speech || '').trim()).join('|');
+    // Правка речи пересобирает озвучку, а по ней нарезаны все говорящие клипы —
+    // тогда переснимается ролик целиком, и обещать «бесплатно» нельзя.
+    const narrationChanged = speechOf(shots) !== speechOf(baseline);
+    const baseByNumber = new Map(baseline.map((shot, i) => [shot.shot_number ?? (i + 1), shot]));
+    const changed = (shot, index) => {
+      const before = baseByNumber.get(shot.shot_number ?? (index + 1));
+      if (!before) return true;
+      return ['scene', 'generation_prompt', 'visual_type', 'image_path', 'local_url'].some(
+        (field) => (shot[field] || '') !== (before[field] || ''),
+      );
+    };
+    const reshoot = shots.filter((shot, index) => (
+      narrationChanged
+      || !shot.clip_url
+      || reshootShots.includes(shot.shot_number ?? (index + 1))
+      || changed(shot, index)
+    ));
+    const reshootSet = new Set(reshoot);
+    return {
+      reshoot,
+      reused: shots.filter((shot) => !reshootSet.has(shot)),
+      narrationChanged,
+      isReshoot: true,
+    };
+  })();
+  const reshootCost = (() => {
+    if (!renderPlan.isReshoot) return null;
+    const billable = estimateSaasVideoCost({
+      text: renderPlan.narrationChanged ? editedNarration : '',
+      videoMode,
+      ttsProvider,
+      brollMode: 'off',
+      hasSelectedActor: Boolean(selectedActor),
+      script: { ...currentScript, shots: renderPlan.reshoot },
+      storyboardGenerationMode,
+    });
+    return billable.videoCost + billable.brollCost + (renderPlan.narrationChanged ? billable.voiceCost : 0);
+  })();
 
   // Свёрнутая строка «ведущий + голос» над раскрывающимися панелями.
   const selectedActorPreviewUrl = (() => {
@@ -2904,6 +2978,24 @@ export default function SaaShortsTab({
                     </div>
                   </div>
 
+                  {/* Пересъёмка готового ролика: клипы прошлого рендера
+                      переносятся в новый джоб, поэтому неизменённые кадры
+                      ничего не стоят — платим за то, что правили. */}
+                  {renderPlan.isReshoot && (
+                    <div className="rounded-xl border border-green-500/20 bg-green-500/[0.05] p-3">
+                      <p className="text-[11px] text-green-100/80">
+                        Ролик уже снят. {renderPlan.narrationChanged
+                          ? 'Речь изменилась — озвучка и все кадры снимаются заново: клипы нарезаны по этой озвучке.'
+                          : (<>
+                              Возьмём {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} из прошлого
+                              рендера бесплатно, снимем заново {renderPlan.reshoot.length}
+                              {reshootCost !== null ? ` (~${formatUsd(reshootCost)})` : ''}.
+                              Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
+                            </>)}
+                      </p>
+                    </div>
+                  )}
+
                   {/* Кадры без описания сцены: ИИ-генерация видео читает промпт,
                       собранный из «Что в кадре», а не реплику. */}
                   {emptyShotNumbers.length > 0 && (
@@ -2961,6 +3053,8 @@ export default function SaaShortsTab({
                       // uploaded photo still wins so the user's choice isn't overwritten.
                       const isGeneratedPreview = !shot.image_preview && !shot.local_url && !shot.image_url && Boolean(shot.preview_frame_url);
                       const clipUrl = shot.clip_url ? getApiUrl(shot.clip_url) : '';
+                      const shotNumber = shot.shot_number ?? (shotIndex + 1);
+                      const markedForReshoot = reshootShots.includes(shotNumber);
                       const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
                       const isBroll = (shot.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
 
@@ -3002,7 +3096,11 @@ export default function SaaShortsTab({
                               </span>
                               {/* Что по этому кадру уже оплачено и лежит на диске:
                                   снятый клип или только стартовый кадр. */}
-                              {clipUrl ? (
+                              {clipUrl && markedForReshoot ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+                                  <RefreshCw size={10} /> Переснимем
+                                </span>
+                              ) : clipUrl ? (
                                 <span className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-semibold text-green-300">
                                   <Check size={10} /> Снят
                                 </span>
@@ -3108,6 +3206,28 @@ export default function SaaShortsTab({
                                 >
                                   ▶ Клип
                                 </a>
+                              )}
+                              {/* Кадр уже снят: без явной отметки следующий рендер
+                                  возьмёт готовый клип и денег не потратит. */}
+                              {clipUrl && renderPlan.isReshoot && (
+                                <button
+                                  type="button"
+                                  onClick={() => setReshootShots((prev) => (
+                                    prev.includes(shotNumber)
+                                      ? prev.filter((num) => num !== shotNumber)
+                                      : [...prev, shotNumber]
+                                  ))}
+                                  title={markedForReshoot
+                                    ? 'Не переснимать — оставить снятый клип'
+                                    : 'Снять этот кадр заново при следующей генерации видео'}
+                                  className={`w-full rounded-lg border px-2 py-1.5 text-[11px] flex items-center justify-center gap-1.5 transition-colors ${
+                                    markedForReshoot
+                                      ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                                      : 'border-white/10 text-zinc-400 hover:border-amber-500/40 hover:text-amber-200'
+                                  }`}
+                                >
+                                  <RefreshCw size={12} /> {markedForReshoot ? 'Не переснимать' : 'Переснять'}
+                                </button>
                               )}
                               {shot.frame_status && (
                                 <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
@@ -3777,6 +3897,13 @@ export default function SaaShortsTab({
                   <><Loader2 size={14} className="animate-spin" /> Генерирую...</>
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Выбери аватара на шаге «Setup»</>
+                ) : storyboardSelected && reshootCost !== null ? (
+                  // Пересъёмка: снятые кадры переезжают из прошлого джоба, в цене
+                  // только то, что снимается заново. Ничего не менялось — значит
+                  // ролик просто пересобирается из готовых клипов.
+                  renderPlan.reshoot.length === 0
+                    ? (<><Film size={14} /> Пересобрать ролик (бесплатно)</>)
+                    : (<><Film size={14} /> Переснять {renderPlan.reshoot.length} {pluralShots(renderPlan.reshoot.length)} ({formatUsd(reshootCost)})</>)
                 ) : storyboardSelected ? (
                   <><Film size={14} /> Сгенерировать видео ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : selectedHeadTemplate ? (
@@ -4062,7 +4189,7 @@ export default function SaaShortsTab({
                   )}
 
                   {/* Actions */}
-                  <div className="flex gap-3 pt-2">
+                  <div className="flex flex-wrap gap-3 pt-2">
                     <a
                       href={getApiUrl(genResult.video_url)}
                       download
@@ -4070,6 +4197,16 @@ export default function SaaShortsTab({
                     >
                       <Download size={14} /> Download
                     </a>
+                    {/* Возврат в раскадровку: снятые кадры уже помечены, следующий
+                        прогон переснимет только те, что тронули. */}
+                    {isStoryboardScript(currentScript) && (
+                      <button
+                        onClick={() => { setStep(2); setGenStatus('idle'); setGenerating(false); }}
+                        className="btn-secondary px-4 py-2 text-sm flex items-center gap-2"
+                      >
+                        <Film size={14} /> Переснять кадры
+                      </button>
+                    )}
                     <button
                       onClick={handleReset}
                       className="btn-secondary px-4 py-2 text-sm flex items-center gap-2"

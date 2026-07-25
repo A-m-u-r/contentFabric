@@ -2972,6 +2972,9 @@ from saasshorts import (
     build_custom_script,
     GeminiTemporaryError,
     generate_full_video,
+    adopt_job_artifacts,
+    forget_shot_artifacts,
+    storyboard_title_slug,
     apply_lipsync_to_saas_job,
     resolve_saas_lipsync_assets,
     generate_actor_images,
@@ -4122,6 +4125,10 @@ class SaaSGenerateRequest(BaseModel):
     background_music: bool = True  # ducked music bed under the voiceover
     frames_only: bool = False  # generate only the Flux start frames (no paid video)
     frames_only_shot: Optional[int] = None  # regenerate a single shot's frame
+    # Re-render a finished video's storyboard: clips/frames/voiceover of the
+    # source job are reused, so only edited (or explicitly listed) shots cost money.
+    source_job_id: Optional[str] = None
+    regenerate_shots: List[int] = []
 
 
 class SaaSLipSyncRequest(BaseModel):
@@ -4178,6 +4185,54 @@ async def saasshorts_save_head_template(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _owned_saas_job_dir(job_id: Optional[str], user: Optional[dict], field: str) -> Optional[str]:
+    """Directory of an existing AI Shorts job the caller is allowed to build on.
+
+    Both «retry» and «re-render this storyboard» point a new run at an older
+    job's files, so both need the same guard: the id must be a plain UUID (it
+    becomes a directory name — a path fragment could escape OUTPUT_DIR), and a
+    logged-in user may only reach their own jobs. Returns None when the job left
+    no directory behind, so the caller can fall back to a clean run.
+    """
+    try:
+        uuid.UUID(str(job_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}")
+
+    # Check memory first, then disk
+    job_dir = os.path.join(OUTPUT_DIR, f"saas_{job_id}")
+    if job_id in saas_jobs:
+        job_dir = saas_jobs[job_id]["output_dir"]
+    if not os.path.isdir(job_dir):
+        return None
+
+    requester = user.get("id") if user else None
+    existing_owner = None
+    if job_id in saas_jobs:
+        existing_owner = saas_jobs[job_id].get("owner_user_id")
+    if not existing_owner:
+        existing_owner = (_read_local_gallery_meta(job_dir) or {}).get("owner_user_id")
+    if requester and existing_owner and existing_owner != requester:
+        raise HTTPException(status_code=404, detail="AI Shorts job not found")
+    return job_dir
+
+
+def _storyboard_slug_of_job(job_dir: str) -> str:
+    """Filename prefix the artifacts in this job dir were named with.
+
+    Adopting them into a new job means renaming that prefix, so it must be the
+    one actually on disk: the gallery title is the source, with the finished
+    cut's filename as the fallback for jobs without metadata.
+    """
+    title = (_read_local_gallery_meta(job_dir) or {}).get("title") or ""
+    if title:
+        return storyboard_title_slug(title)
+    suffix = "_storyboard_final.mp4"
+    for path in sorted(glob.glob(os.path.join(job_dir, f"*{suffix}"))):
+        return os.path.basename(path)[: -len(suffix)]
+    return ""
+
+
 @app.post("/api/saasshorts/generate")
 async def saasshorts_generate(
     req: SaaSGenerateRequest,
@@ -4203,31 +4258,9 @@ async def saasshorts_generate(
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
     if req.retry_job_id:
-        # retry_job_id feeds a directory name — it must be a plain UUID, never a
-        # path fragment, or "saas_{id}" could escape OUTPUT_DIR (path traversal).
-        try:
-            uuid.UUID(str(req.retry_job_id))
-        except (ValueError, AttributeError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid retry_job_id")
+        old_dir = _owned_saas_job_dir(req.retry_job_id, user, "retry_job_id")
 
-        # Check memory first, then disk
-        old_dir = os.path.join(OUTPUT_DIR, f"saas_{req.retry_job_id}")
-        if req.retry_job_id in saas_jobs:
-            old_dir = saas_jobs[req.retry_job_id]["output_dir"]
-
-        if os.path.isdir(old_dir):
-            # A logged-in user may only retry a job they own, so retry can't be
-            # used to reuse/overwrite another account's job dir (write-path authz,
-            # mirroring the ownership check in saasshorts_status).
-            requester = user.get("id") if user else None
-            existing_owner = None
-            if req.retry_job_id in saas_jobs:
-                existing_owner = saas_jobs[req.retry_job_id].get("owner_user_id")
-            if not existing_owner:
-                existing_owner = (_read_local_gallery_meta(old_dir) or {}).get("owner_user_id")
-            if requester and existing_owner and existing_owner != requester:
-                raise HTTPException(status_code=404, detail="AI Shorts job not found")
-
+        if old_dir:
             job_id = req.retry_job_id
             job_output_dir = old_dir
             reused = True
@@ -4255,6 +4288,35 @@ async def saasshorts_generate(
             "output_dir": job_output_dir,
             "owner_user_id": user.get("id") if user else None,
         }
+
+    def queue_log(msg: str):
+        print(f"[AI Shorts Job {job_id[:8]}] {msg}")
+        saas_jobs[job_id]["logs"].append(msg)
+
+    # Re-render of a finished video: adopt its clips, frames and voiceover so the
+    # cache serves every shot the user left alone — only edited shots are paid for.
+    if req.source_job_id and not reused:
+        source_dir = _owned_saas_job_dir(req.source_job_id, user, "source_job_id")
+        if source_dir:
+            adopt_job_artifacts(
+                source_dir,
+                job_output_dir,
+                source_slug=_storyboard_slug_of_job(source_dir),
+                target_slug=storyboard_title_slug(req.script.get("title") or ""),
+                log=queue_log,
+            )
+        else:
+            queue_log("⚠️ Прошлый рендер не найден — кадры генерируются заново.")
+
+    # Explicit per-shot «перегенерить»: drop that shot's cached clip/frame (and
+    # the URLs pointing at the copies in the source job) so it is drawn again.
+    if req.regenerate_shots:
+        forget_shot_artifacts(
+            job_output_dir,
+            req.script.get("shots") or [],
+            req.regenerate_shots,
+            log=queue_log,
+        )
 
     # If user selected a pre-generated actor, resolve it to a local path
     selected_actor_path = None

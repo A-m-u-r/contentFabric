@@ -88,6 +88,25 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("missingFrameCount", tab)
         self.assertIn("Перегенерить", tab)
 
+    def test_finished_video_can_be_reshot_shot_by_shot(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        gallery = UGC_GALLERY.read_text(encoding="utf-8")
+
+        # Галерея отдаёт джоб с оплаченными клипами, редактор — просит их переиспользовать.
+        self.assertIn("job_id: video.job_id || jobIdFromVideoUrl(video.video_url)", gallery)
+        self.assertIn("_source_job_id", tab)
+        self.assertIn("source_job_id: sourceJobId || undefined", tab)
+        self.assertIn("regenerate_shots: reshootShots", tab)
+        # Кадр можно снять заново, даже если текст не менялся.
+        self.assertIn("Переснять", tab)
+        self.assertIn("Не переснимать", tab)
+        # Смета честная: платим только за то, что снимается заново.
+        self.assertIn("renderPlan", tab)
+        self.assertIn("_render_baseline", tab)
+        self.assertIn("narrationChanged", tab)
+        # С экрана готового ролика можно вернуться в раскадровку и переснять кадр.
+        self.assertIn("Переснять кадры", tab)
+
     def test_avatar_and_voice_selection_live_on_setup_step(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
