@@ -107,6 +107,28 @@ class UILayoutPolishTests(unittest.TestCase):
         # С экрана готового ролика можно вернуться в раскадровку и переснять кадр.
         self.assertIn("Переснять кадры", tab)
 
+    def test_reshoot_price_is_one_number_across_the_screen(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Пустой список кадров оценщик читает как «сценария ещё нет» и выдаёт цену
+        # типового ролика: плашка обещала $2.51 рядом с кнопкой «бесплатно».
+        plan = tab[tab.index("const reshootEstimate"):tab.index("const reshootCost")]
+        self.assertLess(plan.index("if (!renderPlan.reshoot.length)"), plan.index("estimateSaasVideoCost"))
+        self.assertIn("total: 0, voiceCost: 0, videoCost: 0, brollCost: 0", plan)
+        # Карточка сметы тоже показывает цену пересъёмки, а не полного ролика.
+        self.assertIn("Стоимость пересъёмки", tab)
+        self.assertIn("reshootEstimate ? reshootEstimate.total : estimate.total", tab)
+        self.assertIn("пересборка бесплатна", tab)
+
+    def test_shot_frame_preview_stays_a_thumbnail_on_narrow_screens(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Кадр 9:16 во всю ширину карточки давал 734x1306 px на каждый кадр и
+        # растягивал раскадровку на 10 000 px — превью держим миниатюрой.
+        self.assertIn("grid gap-3 sm:grid-cols-[120px,minmax(0,1fr)]", tab)
+        self.assertNotIn("grid gap-3 lg:grid-cols-[120px,minmax(0,1fr)]", tab)
+        self.assertIn('aspect-[9/16] w-[104px] shrink-0', tab)
+
     def test_avatar_and_voice_selection_live_on_setup_step(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 

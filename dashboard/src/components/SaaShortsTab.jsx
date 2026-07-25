@@ -1834,8 +1834,13 @@ export default function SaaShortsTab({
       isReshoot: true,
     };
   })();
-  const reshootCost = (() => {
+  const reshootEstimate = (() => {
     if (!renderPlan.isReshoot) return null;
+    // Пустой список кадров оценщик читает как «сценария ещё нет» и выдаёт цену
+    // типового ролика — а платить не за что: считаем ноль явно.
+    if (!renderPlan.reshoot.length) {
+      return { total: 0, voiceCost: 0, videoCost: 0, brollCost: 0 };
+    }
     const billable = estimateSaasVideoCost({
       text: renderPlan.narrationChanged ? editedNarration : '',
       videoMode,
@@ -1845,8 +1850,17 @@ export default function SaaShortsTab({
       script: { ...currentScript, shots: renderPlan.reshoot },
       storyboardGenerationMode,
     });
-    return billable.videoCost + billable.brollCost + (renderPlan.narrationChanged ? billable.voiceCost : 0);
+    // Озвучка переснимается только вместе с речью: в остальных случаях берём
+    // готовый файл прошлого рендера.
+    const voiceCost = renderPlan.narrationChanged ? billable.voiceCost : 0;
+    return {
+      total: billable.videoCost + billable.brollCost + voiceCost,
+      voiceCost,
+      videoCost: billable.videoCost,
+      brollCost: billable.brollCost,
+    };
   })();
+  const reshootCost = reshootEstimate ? reshootEstimate.total : null;
 
   // Свёрнутая строка «ведущий + голос» над раскрывающимися панелями.
   const selectedActorPreviewUrl = (() => {
@@ -1863,7 +1877,9 @@ export default function SaaShortsTab({
 
   return (
     <div className="h-full overflow-y-auto custom-scrollbar">
-      <div className="max-w-5xl mx-auto p-6 pb-28 md:pb-8 lg:p-8">
+      {/* На телефоне вложенные отступы (страница → панель → блок кадров →
+          карточка) съедали 39% ширины экрана — на узких экранах поля меньше. */}
+      <div className="max-w-5xl mx-auto p-4 pb-28 sm:p-6 md:pb-8 lg:p-8">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
@@ -2937,14 +2953,14 @@ export default function SaaShortsTab({
         {/* ── Step 2: Configure ────────────────────────────────── */}
         {step === 2 && scripts[selectedScript] && (
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
-            <div className="glass-panel p-6 space-y-5">
+            <div className="glass-panel p-4 sm:p-6 space-y-5">
               <h2 className="text-lg font-semibold">Настройка ролика</h2>
               <p className="text-sm text-zinc-500">
                 Сценарий: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
 
               {storyboardSelected && (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 space-y-4">
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 sm:p-4 space-y-4">
                   <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
                     <div>
                       <h3 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
@@ -2986,6 +3002,12 @@ export default function SaaShortsTab({
                       <p className="text-[11px] text-green-100/80">
                         Ролик уже снят. {renderPlan.narrationChanged
                           ? 'Речь изменилась — озвучка и все кадры снимаются заново: клипы нарезаны по этой озвучке.'
+                          : renderPlan.reshoot.length === 0
+                          ? (<>
+                              Все {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} возьмём
+                              из прошлого рендера — пересборка бесплатна.
+                              Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
+                            </>)
                           : (<>
                               Возьмём {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} из прошлого
                               рендера бесплатно, снимем заново {renderPlan.reshoot.length}
@@ -3157,9 +3179,13 @@ export default function SaaShortsTab({
                             </div>
                           </div>
 
-                          <div className="grid gap-3 lg:grid-cols-[120px,minmax(0,1fr)]">
-                            <div className="space-y-2">
-                              <div className="aspect-[9/16] overflow-hidden rounded-lg border border-white/10 bg-zinc-950">
+                          <div className="grid gap-3 sm:grid-cols-[120px,minmax(0,1fr)]">
+                            {/* Кадр вертикальный: во всю ширину карточки он вырастал
+                                на полтора экрана и растягивал раскадровку на десять
+                                тысяч пикселей. Держим превью миниатюрой, а на
+                                телефоне ставим кнопки рядом с ним, а не под ним. */}
+                            <div className="flex gap-2 sm:block">
+                              <div className="aspect-[9/16] w-[104px] shrink-0 overflow-hidden rounded-lg border border-white/10 bg-zinc-950 sm:mb-2 sm:w-full">
                                 {previewUrl ? (
                                   <img src={previewUrl} alt={`Кадр ${shotIndex + 1}`} className="h-full w-full object-cover" />
                                 ) : (
@@ -3169,6 +3195,7 @@ export default function SaaShortsTab({
                                   </div>
                                 )}
                               </div>
+                              <div className="flex min-w-0 flex-1 flex-col gap-2">
                               <input
                                 id={inputId}
                                 type="file"
@@ -3232,6 +3259,7 @@ export default function SaaShortsTab({
                               {shot.frame_status && (
                                 <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
                               )}
+                              </div>
                             </div>
 
                             <div className="space-y-3">
@@ -3846,24 +3874,46 @@ export default function SaaShortsTab({
                       ? 'Озвучка + Kling Avatar v2 Pro: чётче лицо и движения, тариф примерно вдвое выше.'
                       : 'Озвучка + Kling Avatar v2 Standard. Основной режим: хорошее качество по разумной цене.';
 
+                // Пересъёмка: в счёт идёт только то, что снимается заново, —
+                // иначе карточка обещала бы полную цену рядом с кнопкой
+                // «Пересобрать ролик (бесплатно)».
+                const shotCount = (currentScript?.shots || []).length;
+                const rows = reshootEstimate
+                  ? [
+                      ['Длительность', `~${estimate.seconds} сек`],
+                      ['Переснимаем', `${renderPlan.reshoot.length} из ${shotCount}`],
+                      ['Озвучка', formatUsd(reshootEstimate.voiceCost)],
+                      ['Видео', formatUsd(reshootEstimate.videoCost)],
+                      ['B-roll', formatUsd(reshootEstimate.brollCost)],
+                    ]
+                  : [
+                      ['Длительность', `~${estimate.seconds} сек`],
+                      ['Озвучка', formatUsd(estimate.voiceCost)],
+                      ['Видео', formatUsd(estimate.videoCost)],
+                      ['Аватар', formatUsd(estimate.actorCost)],
+                      ['B-roll', formatUsd(estimate.brollCost)],
+                    ];
+
                 return (
                   <div className="max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10">
                     <div className="flex items-start justify-between gap-4">
                       <div>
-                        <div className="text-sm font-semibold text-zinc-300">Примерная стоимость</div>
-                        <div className="text-[11px] text-zinc-600 mt-1">{costDetails}</div>
+                        <div className="text-sm font-semibold text-zinc-300">
+                          {reshootEstimate ? 'Стоимость пересъёмки' : 'Примерная стоимость'}
+                        </div>
+                        <div className="text-[11px] text-zinc-600 mt-1">
+                          {reshootEstimate
+                            ? `Кадры, которые не менялись, переезжают из прошлого рендера бесплатно. С нуля этот ролик стоил бы ${formatUsd(estimate.total)}.`
+                            : costDetails}
+                        </div>
                       </div>
-                      <span className="text-lg text-green-400 font-semibold whitespace-nowrap">{formatUsd(estimate.total)}</span>
+                      <span className="text-lg text-green-400 font-semibold whitespace-nowrap">
+                        {formatUsd(reshootEstimate ? reshootEstimate.total : estimate.total)}
+                      </span>
                     </div>
 
                     <div className="mt-4 space-y-2 text-sm">
-                      {[
-                        ['Длительность', `~${estimate.seconds} сек`],
-                        ['Озвучка', formatUsd(estimate.voiceCost)],
-                        ['Видео', formatUsd(estimate.videoCost)],
-                        ['Аватар', formatUsd(estimate.actorCost)],
-                        ['B-roll', formatUsd(estimate.brollCost)],
-                      ].map(([label, value]) => (
+                      {rows.map(([label, value]) => (
                         <div key={label} className="flex items-center justify-between gap-4 border-t border-white/5 pt-2 first:border-t-0 first:pt-0">
                           <span className="text-zinc-500">{label}</span>
                           <span className="font-mono text-zinc-300">{value}</span>
