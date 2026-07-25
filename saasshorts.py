@@ -876,6 +876,10 @@ Return ONLY a JSON array:
         raw_generation_prompt = decision.get("generation_prompt")
         raw_camera = decision.get("camera", "")
         raw_actor_action = decision.get("actor_action", "")
+        if raw_camera is None:
+            raw_camera = ""
+        if raw_actor_action is None:
+            raw_actor_action = ""
         if (
             not isinstance(raw_scene, str)
             or not isinstance(raw_generation_prompt, str)

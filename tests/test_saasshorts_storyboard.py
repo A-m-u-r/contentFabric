@@ -209,6 +209,29 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
             "The pendulum continues moving at a subtly slower pace.",
         )
 
+    def test_null_or_missing_optional_fields_preserve_existing_shot_values(self):
+        scripts = self._scripts_with_broll()
+        original_camera = scripts[0]["shots"][1]["camera"]
+        original_action = scripts[0]["shots"][1]["actor_action"]
+        scripts[0]["shots"][1]["action"] = original_action
+
+        result, _ = self._refine(scripts, [{
+            "script_index": 0, "shot_number": 2, "decision": "replace",
+            "scene": "A faceless walker keeps the same route as their pace gradually slows.",
+            "camera": None,
+            "generation_prompt": "vertical 9:16 realistic UGC b-roll, faceless walker seen from behind gradually slowing on the same path, natural light, no readable text, no watermark",
+        }])
+
+        shot = result[0]["shots"][1]
+        self.assertEqual(
+            shot["scene"],
+            "A faceless walker keeps the same route as their pace gradually slows.",
+        )
+        self.assertIn("faceless walker seen from behind", shot["generation_prompt"])
+        self.assertEqual(shot["camera"], original_camera)
+        self.assertEqual(shot["actor_action"], original_action)
+        self.assertEqual(shot["action"], original_action)
+
     def test_russian_ui_fields_are_requested_while_generation_prompt_stays_english(self):
         scripts = self._scripts_with_broll()
         result, generate = self._refine(scripts, [{
