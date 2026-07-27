@@ -18,6 +18,19 @@ from saasshorts import (
 )
 
 
+def _charge(kwargs, output_path):
+    """Фейк рисовальщика тратит деньги так же, как настоящий: считает обращения.
+
+    Смета превью берётся из числа платных запросов к модели, а не из числа
+    удачных кадров — пустой кадр fal тарифицирует наравне с картинкой. Уже
+    нарисованный кадр настоящий `_flux_reference_frame` отдаёт из кэша, не
+    обращаясь к модели, поэтому второй ракурс на пяти кадрах денег не стоит.
+    """
+    billing = kwargs.get("billing")
+    if billing is not None and not os.path.exists(output_path):
+        billing["calls"] = billing.get("calls", 0) + 1
+
+
 class SaaSGeminiJsonRecoveryTests(unittest.TestCase):
     def test_repair_recovers_missing_comma_between_values(self):
         # The exact failure users hit: "Expecting ',' delimiter" — a dropped
@@ -446,9 +459,10 @@ class SaaSFillShotDetailsTests(unittest.TestCase):
         self.assertEqual(out[0]["visual_type"], "talking")
         # Действие дублируется в legacy-поле, которое читает генерация.
         self.assertEqual(out[0]["action"], out[0]["actor_action"])
-        # Промпт проходит через общий билдер — гардрейлы на месте.
+        # Промпт проходит через общий билдер — формат на месте, запреты нет:
+        # они уходят в negative_prompt запроса.
         self.assertIn("vertical 9:16", out[0]["generation_prompt"])
-        self.assertIn("no burned-in text", out[0]["generation_prompt"])
+        self.assertNotIn("no burned-in text", out[0]["generation_prompt"])
         self.assertEqual(out[0]["_prompt_source_scene"], out[0]["scene"])
 
     def test_existing_values_are_not_overwritten(self):
@@ -721,6 +735,328 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
     def test_missing_file_does_not_crash_and_is_not_blank(self):
         self.assertFalse(saasshorts._looks_blank("/nonexistent/frame.png"))
 
+    def test_oversized_actor_photo_is_shrunk_before_it_goes_to_flux(self):
+        """Фото-условие ужимается: на 4802×3584 Kontext возвращал чёрный кадр."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(2)
+            self._write_png(path, rng.integers(0, 256, size=(600, 800, 3)))  # h=600, w=800
+
+            with patch.object(saasshorts, "_FLUX_CONDITION_MAX_PX", 256):
+                shrunk = saasshorts._flux_condition_photo(path)
+
+            from PIL import Image
+
+            self.assertNotEqual(shrunk, path)
+            with Image.open(shrunk) as im:
+                self.assertLessEqual(max(im.size), 256)
+
+    def test_small_actor_photo_goes_to_flux_untouched(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(3)
+            self._write_png(path, rng.integers(0, 256, size=(128, 72, 3)))
+
+            self.assertEqual(saasshorts._flux_condition_photo(path), path)
+
+    def _fake_httpx_client(self, out, bodies):
+        """httpx.Client, кладущий в out очередную картинку из bodies."""
+        def fake_get(url, *a, **kw):
+            self._write_png(out, next(bodies))
+            with open(out, "rb") as f:
+                return MagicMock(content=f.read(), raise_for_status=lambda: None)
+
+        client = MagicMock()
+        client.__enter__ = lambda self_: self_
+        client.__exit__ = lambda *a: False
+        client.get = fake_get
+        return client
+
+    def test_one_click_buys_at_most_one_paid_frame(self):
+        """Чёрный кадр тарифицируется как обычный — платим за него один раз.
+
+        Автоматический перебор моделей внутри одного прогона превращал неудачу в
+        счёт по числу кандидатов. Зовём ровно одного редактора — выбранного.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(6)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            bodies = iter([np.zeros((128, 72, 3))] * 4)
+            models = []
+            billing = {}
+
+            def fake_run(model_id, args, key, timeout=600):
+                models.append(model_id)
+                return {"images": [{"url": "u"}], "has_nsfw_concepts": [True]}
+
+            with patch.object(saasshorts, "_fal_run", side_effect=fake_run),                  patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"),                  patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, bodies)):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(models, ["fal-ai/flux-pro/kontext"])
+            self.assertEqual(billing["calls"], 1)
+
+    def test_second_click_never_repeats_a_refused_model_on_its_own(self):
+        """Молчаливой подмены модели нет: второй клик просто бесплатно отказывает.
+
+        Раньше пайплайн сам брал следующего кандидата, и человек узнавал о
+        подмене по счёту. Теперь та же модель второй раз не покупается (модерация
+        детерминированна), а другую выбирает пользователь.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(7)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            models = []
+            billing = {}
+
+            def fake_run(model_id, args, key, timeout=600):
+                models.append(model_id)
+                return {"images": [{"url": "u"}], "has_nsfw_concepts": [True]}
+
+            def click():
+                bodies = iter([np.zeros((128, 72, 3))] * 2)
+                with patch.object(saasshorts, "_fal_run", side_effect=fake_run),                      patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"),                      patch.object(saasshorts.httpx, "Client",
+                                  return_value=self._fake_httpx_client(out, bodies)):
+                    return saasshorts._flux_reference_frame(
+                        "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                        billing=billing,
+                    )
+
+            for _ in range(3):
+                self.assertEqual(click(), "")
+
+            # Один платный запрос на все три клика, и ни одного к чужой модели.
+            self.assertEqual(models, [saasshorts.DEFAULT_AVATAR_EDIT_MODEL])
+            self.assertEqual(billing["calls"], 1)
+            # Каждый отказ доезжает до интерфейса, даже бесплатный.
+            self.assertEqual([b["reason"] for b in billing["blocked"]],
+                             ["moderation", "known", "known"])
+
+    def test_chosen_editor_is_the_one_that_gets_called(self):
+        """Выбор пользователя — это и есть модель запроса, без «умных» правок."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(8)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            calls = []
+
+            def fake_run(model_id, args, key, timeout=600):
+                calls.append((model_id, args))
+                return {"images": [{"url": "u"}]}
+
+            bodies = iter([rng.integers(0, 256, size=(128, 72, 3))])
+            with patch.object(saasshorts, "_fal_run", side_effect=fake_run), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, bodies)):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    edit_model="fal-ai/nano-banana/edit",
+                )
+
+            self.assertEqual(made, out)
+            model, args = calls[0]
+            self.assertEqual(model, "fal-ai/nano-banana/edit")
+            # Поле под картинку у каждого эндпоинта своё — иначе 422 вместо кадра.
+            self.assertEqual(args["image_urls"], ["http://photo"])
+
+    def test_plate_adopted_from_the_preview_job_is_not_bought_again(self):
+        """Одобренный ракурс переезжает в рендер и не покупается второй раз.
+
+        Кадр кэшируется по промпту, но внутри папки своего джоба. Пока рендер не
+        забирал файлы предпросмотра, он платил заново за ровно ту картинку,
+        которую пользователь уже посмотрел и утвердил, — и получал другой сэмпл
+        вместо одобренного.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as root:
+            preview = os.path.join(root, "saas_preview")
+            render = os.path.join(root, "saas_render")
+            os.makedirs(preview)
+            os.makedirs(render)
+            photo = os.path.join(root, "actor.png")
+            rng = np.random.default_rng(11)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            plate = os.path.join(preview, "job_actor_set_medium.png")
+            bodies = iter([rng.integers(0, 256, size=(128, 72, 3))])
+            staged = {"scene_override": "kitchen counter at golden hour",
+                      "framing": "Medium shot from the chest up"}
+
+            with patch.object(saasshorts, "_fal_run", return_value={"images": [{"url": "u"}]}), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(plate, bodies)):
+                drawn = saasshorts._avatar_reference_image(
+                    {}, photo, "key", plate, log=lambda *_: None, **staged,
+                )
+            self.assertEqual(drawn, plate)
+
+            saasshorts.adopt_job_artifacts(preview, render, log=lambda *_: None)
+
+            # Рендер зовёт ту же камеру тем же промптом — и упирается в кэш,
+            # переехавший вместе с картинкой.
+            adopted = os.path.join(render, "job_actor_set_medium.png")
+            with patch.object(saasshorts, "_fal_run",
+                              side_effect=AssertionError("одобренный ракурс перерисовывать нельзя")):
+                reused = saasshorts._avatar_reference_image(
+                    {}, photo, "key", adopted, log=lambda *_: None, **staged,
+                )
+            self.assertEqual(reused, adopted)
+
+    def test_blocked_report_carries_the_verdict_and_what_is_left(self):
+        """Отчёт наверх: дословный ответ fal и модели, которых ещё не пробовали.
+
+        Модалка строится из него, поэтому без ответа модели («что за нагота?») и
+        без списка альтернатив она не имеет смысла.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(9)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            billing = {}
+            bodies = iter([np.zeros((128, 72, 3))] * 2)
+
+            with patch.object(saasshorts, "_fal_run",
+                              return_value={"images": [{"url": "u"}], "has_nsfw_concepts": [True]}), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, bodies)):
+                saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            report = billing["blocked"][0]
+            self.assertEqual(report["model"], saasshorts.DEFAULT_AVATAR_EDIT_MODEL)
+            self.assertEqual(report["flags"], {"has_nsfw_concepts": [True]})
+            # Пустой кадр оплачен — умолчать об этом нельзя.
+            self.assertTrue(report["charged"])
+            left = [alt["id"] for alt in report["alternatives"]]
+            self.assertNotIn(saasshorts.DEFAULT_AVATAR_EDIT_MODEL, left)
+            self.assertIn("fal-ai/qwen-image-edit", left)
+
+    def test_refused_endpoint_is_reported_as_unavailable_not_moderation(self):
+        """404/422 — это переехавший эндпоинт, а не «модерация зарубила фото».
+
+        Путать их нельзя: за отказ эндпоинта fal денег не берёт, и советовать
+        из-за него менять фотографию — вредный совет.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(10)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            billing = {}
+
+            with patch.object(saasshorts, "_fal_run",
+                              side_effect=RuntimeError("404 model not found")), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, iter([]))):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(billing["blocked"][0]["reason"], "unavailable")
+            self.assertFalse(billing["blocked"][0]["charged"])
+            self.assertEqual(billing["calls"], 0)
+
+    def test_editor_catalogue_ends_on_a_model_without_a_moderator(self):
+        """Последним стоит редактор с открытыми весами — его никто не зарубит.
+
+        Все, кто выше, — закрытые API со своей модерацией: они и возвращают
+        чёрные квадраты. Замыкать каталог должен тот, у кого чужого модератора
+        нет, — это последнее, что можно предложить вместо смены фото.
+        """
+        catalogue = saasshorts.AVATAR_EDIT_MODELS
+        self.assertEqual(catalogue[-1]["id"], "fal-ai/qwen-image-edit")
+        self.assertEqual(catalogue[0]["id"], saasshorts.DEFAULT_AVATAR_EDIT_MODEL)
+        names = [m["id"] for m in catalogue]
+        # Дубль в каталоге — это два пункта меню, ведущих на одну модерацию.
+        self.assertEqual(len(names), len(set(names)))
+        for model in catalogue:
+            self.assertIn(model["field"], ("image_url", "image_urls"), model["id"])
+            # Витрина: без названия и пояснения выбирать не из чего.
+            self.assertTrue(model["title"] and model["vendor"] and model["note"])
+
+    def test_unknown_editor_id_falls_back_to_the_default(self):
+        """Фронт мог отстать от каталога — незнакомый id не должен уезжать в fal."""
+        self.assertEqual(saasshorts._avatar_edit_model("")["id"],
+                         saasshorts.DEFAULT_AVATAR_EDIT_MODEL)
+        self.assertEqual(saasshorts._avatar_edit_model("fal-ai/nope")["id"],
+                         saasshorts.DEFAULT_AVATAR_EDIT_MODEL)
+        self.assertEqual(saasshorts._avatar_edit_model("fal-ai/qwen-image-edit")["id"],
+                         "fal-ai/qwen-image-edit")
+
+    def test_blank_frame_logs_what_the_model_answered(self):
+        """Причина чёрного кадра должна попасть в лог, а не остаться догадкой."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(7)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            bodies = iter([np.zeros((128, 72, 3))] * 4)
+            lines = []
+
+            with patch.object(saasshorts, "_fal_run",
+                              return_value={"images": [{"url": "u"}], "has_nsfw_concepts": [True]}), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, bodies)):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lines.append, actor_photo_path=photo,
+                )
+
+            self.assertEqual(made, "")
+            self.assertTrue(any("has_nsfw_concepts" in line for line in lines), lines)
+
+    def test_horizontal_actor_photo_stops_the_job_before_paid_video(self):
+        """Раскладка ракурсов не должна уезжать в Kling — это оплаченный брак."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wide = os.path.join(tmp, "sheet.png")
+            tall = os.path.join(tmp, "portrait.png")
+            rng = np.random.default_rng(5)
+            self._write_png(wide, rng.integers(0, 256, size=(384, 512, 3)))  # h<w
+            self._write_png(tall, rng.integers(0, 256, size=(512, 384, 3)))  # h>w
+
+            with self.assertRaises(RuntimeError) as caught:
+                saasshorts._refuse_unusable_start_frame(wide)
+            self.assertIn("Сгенерить недостающие", str(caught.exception))
+
+            saasshorts._refuse_unusable_start_frame(tall)  # вертикальное — пропускаем
+            saasshorts._refuse_unusable_start_frame("/nonexistent.png")  # нечитаемое — не мешаем
+
 
 class SaaSStoryboardTests(unittest.TestCase):
     def test_power_text_model_resolves_to_gemini_31_pro_with_flash_fallback(self):
@@ -778,7 +1114,7 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertIn("vertical 9:16", shot["generation_prompt"])
         self.assertIn("Close-up face near a window", shot["generation_prompt"])
         self.assertIn("looks into camera with raised eyebrows", shot["generation_prompt"])
-        self.assertIn("no burned-in text", shot["generation_prompt"])
+        self.assertNotIn("no burned-in text", shot["generation_prompt"])
 
     def test_custom_storyboard_parses_russian_frame_template(self):
         custom_script = """
@@ -1260,12 +1596,15 @@ class SaaSStoryboardTests(unittest.TestCase):
                 {"shot_number": 2, "visual_type": "broll", "scene": "coffee", "generation_prompt": "p2"},
             ]
 
-            def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print):
+            def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print, **kwargs):
+                avatar_calls.append((output_path, kwargs.get("framing", "")))
+                _charge(kwargs, output_path)
                 with open(output_path, "wb") as f:
                     f.write(b"png")
                 return output_path
 
-            def fake_broll(shot, fal_key, output_path, log=print):
+            def fake_broll(shot, fal_key, output_path, log=print, **kwargs):
+                _charge(kwargs, output_path)
                 with open(output_path, "wb") as f:
                     f.write(b"png")
                 return output_path
@@ -1274,6 +1613,7 @@ class SaaSStoryboardTests(unittest.TestCase):
                 with open(output_path, "wb") as f:
                     f.write(b"a")
 
+            avatar_calls = []
             config = {"fal_key": "k", "selected_actor_path": "", "storyboard_generation_mode": "sliced_avatar"}
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
                  patch("saasshorts._broll_reference_image", side_effect=fake_broll), \
@@ -1288,6 +1628,70 @@ class SaaSStoryboardTests(unittest.TestCase):
             self.assertTrue(shots[1]["image_url"].endswith(".png"))
             self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.10)
 
+    def test_frames_only_counts_the_frames_it_failed_to_draw(self):
+        """Нулевой результат должен быть виден в ответе, а не только в логах.
+
+        Иначе джоб завершается «успешно», интерфейс молча оставляет старую
+        картинку, и пользователь видит «генерация прошла, ничего не изменилось».
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [{"shot_number": 1, "visual_type": "talking", "scene": "kitchen",
+                      "generation_prompt": "p1"}]
+
+            def fake_actor(desc, fal_key, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"a")
+
+            config = {"fal_key": "k", "frames_only_shot": 1}
+            with patch("saasshorts._avatar_reference_image", return_value=""), \
+                 patch("saasshorts.generate_actor_image", side_effect=fake_actor):
+                result = saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
+
+            self.assertEqual(result["frames_made"], 0)
+            self.assertEqual(result["frames_failed"], 1)
+            self.assertEqual(result["cost_estimate"]["total"], 0)
+
+    def test_frames_only_stages_two_cameras_not_one_frame_per_talking_shot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": i, "visual_type": "talking", "scene": f"s{i}",
+                 "generation_prompt": f"p{i}"}
+                for i in range(1, 6)
+            ]
+            avatar_calls = []
+
+            def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print, **kwargs):
+                avatar_calls.append((output_path, kwargs.get("framing", ""),
+                                     kwargs.get("scene_override", "")))
+                _charge(kwargs, output_path)
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                return output_path
+
+            def fake_actor(desc, fal_key, output_path):
+                with open(output_path, "wb") as f:
+                    f.write(b"a")
+
+            config = {"fal_key": "k", "selected_actor_path": "",
+                      "storyboard_generation_mode": "sliced_avatar"}
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._broll_reference_image",
+                       side_effect=AssertionError("no b-roll in this script")), \
+                 patch("saasshorts.generate_actor_image", side_effect=fake_actor):
+                result = saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
+
+            # Five talking shots, two staged cameras — and only two are billed.
+            drawn = {path for path, _, _ in avatar_calls}
+            self.assertEqual(len(drawn), len(saasshorts._AVATAR_FRAMINGS))
+            self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.10)
+            # Every talking shot got one of them, alternating, and they all sit on
+            # the same set: the background must not change between cuts.
+            used = [shot["image_path"] for shot in shots]
+            self.assertEqual(set(used), drawn)
+            for a, b in zip(used, used[1:]):
+                self.assertNotEqual(a, b)
+            self.assertEqual({scene for _, _, scene in avatar_calls}, {"p1"})
+
     def test_frames_only_shot_filter_regenerates_single(self):
         with tempfile.TemporaryDirectory() as tmp:
             shots = [
@@ -1296,7 +1700,7 @@ class SaaSStoryboardTests(unittest.TestCase):
             ]
             calls = []
 
-            def fake_broll(shot, fal_key, output_path, log=print):
+            def fake_broll(shot, fal_key, output_path, log=print, **kwargs):
                 calls.append(shot["shot_number"])
                 with open(output_path, "wb") as f:
                     f.write(b"png")
@@ -1309,6 +1713,33 @@ class SaaSStoryboardTests(unittest.TestCase):
             self.assertEqual(calls, [2])
             self.assertNotIn("local_url", shots[0])
             self.assertTrue(shots[1]["local_url"])
+
+    def test_frames_only_passes_the_actor_photo_only_to_flagged_broll(self):
+        """Перебивка с нашим персонажем снимается с фото аватара, остальные — нет."""
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            with open(photo, "wb") as f:
+                f.write(b"actor")
+            shots = [
+                {"shot_number": 1, "visual_type": "broll", "scene": "холодильник",
+                 "generation_prompt": "p1", "actor_in_frame": True},
+                {"shot_number": 2, "visual_type": "broll", "scene": "яблоко",
+                 "generation_prompt": "p2"},
+            ]
+            calls = {}
+
+            def fake_broll(shot, fal_key, output_path, log=print, **kwargs):
+                calls[shot["shot_number"]] = kwargs.get("actor_photo_path", "")
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                return output_path
+
+            config = {"fal_key": "k", "selected_actor_path": photo}
+            with patch("saasshorts._broll_reference_image", side_effect=fake_broll):
+                saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
+
+            self.assertEqual(calls[1], photo)
+            self.assertEqual(calls[2], "")
 
     def test_veo31_storyboard_uses_per_shot_when_multishot_requested(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -3168,11 +3168,14 @@ from saasshorts import (
     generate_full_video,
     adopt_job_artifacts,
     forget_shot_artifacts,
+    forget_shot_voice,
     storyboard_title_slug,
     apply_lipsync_to_saas_job,
     resolve_saas_lipsync_assets,
     generate_actor_images,
     get_elevenlabs_voices,
+    AVATAR_EDIT_MODELS,
+    DEFAULT_AVATAR_EDIT_MODEL,
     DEFAULT_VOICES,
 )
 
@@ -4311,6 +4314,7 @@ class SaaSGenerateRequest(BaseModel):
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
     punch_in_cuts: bool = True  # jump-cut talking head with alternating punch-in zoom
     storyboard_generation_mode: str = "per_shot"  # "per_shot", "multi_shot", or "sliced_avatar"
+    revoice_all: bool = False  # re-read the whole script in one take instead of per-shot pieces
     reusable_head_template_id: Optional[str] = None
     reusable_lipsync_model: str = "sync-3"
     use_platform_keys: bool = False
@@ -4319,9 +4323,27 @@ class SaaSGenerateRequest(BaseModel):
     background_music: bool = True  # ducked music bed under the voiceover
     frames_only: bool = False  # generate only the Flux start frames (no paid video)
     frames_only_shot: Optional[int] = None  # regenerate a single shot's frame
+    # Записать (и посчитать) только озвучку — платного видео не будет. Дорожка
+    # задаёт длину ролика, границы кадров и число оплачиваемых клипов, поэтому
+    # слушают её до съёмки, а не после.
+    voice_only: bool = False
+    revoice_shots: List[int] = []  # перезаписать реплики этих кадров другим дублем
+    # Какой редактор ставит ведущего в кадр (см. saasshorts.AVATAR_EDIT_MODELS).
+    # Пусто = дефолт. Модель не подменяется молча: если она отказала, пайплайн
+    # возвращает отказ, а следующую выбирает пользователь.
+    avatar_edit_model: Optional[str] = None
     # Re-render a finished video's storyboard: clips/frames/voiceover of the
     # source job are reused, so only edited (or explicitly listed) shots cost money.
     source_job_id: Optional[str] = None
+    # Джоб предпросмотра кадров (`frames_only`). Кадр кэшируется по промпту, но
+    # лежит внутри папки своего джоба, поэтому без этой ссылки рендер рисовал
+    # заново ровно те кадры, которые пользователь только что одобрил, — платил
+    # второй раз и получал другой сэмпл.
+    frames_job_id: Optional[str] = None
+    # Джоб прослушанной озвучки (`voice_only`). Дубль каждый раз новый, поэтому
+    # без этой ссылки рендер записал бы другой — не тот, что человек утвердил, —
+    # и снял бы под него все говорящие кадры.
+    voice_job_id: Optional[str] = None
     regenerate_shots: List[int] = []
 
 
@@ -4427,6 +4449,33 @@ def _storyboard_slug_of_job(job_dir: str) -> str:
     return ""
 
 
+def _frames_slug_of_job(job_dir: str) -> str:
+    """Filename prefix of a frames-only job — read off the staged camera plates.
+
+    A preview job has neither gallery metadata nor a finished cut, so the usual
+    lookup finds nothing. The plates are named after the title at the time they
+    were drawn, which is exactly the prefix that has to be renamed if the user
+    has edited the title since.
+    """
+    marker = "_actor_set_"
+    for path in sorted(glob.glob(os.path.join(job_dir, f"*{marker}*.png"))):
+        return os.path.basename(path).split(marker)[0]
+    return _storyboard_slug_of_job(job_dir)
+
+
+def _voice_slug_of_job(job_dir: str) -> str:
+    """Filename prefix of a voice-preview job — read off the master track.
+
+    Same reason as the frames preview: the job has neither gallery metadata nor
+    a finished cut, and the prefix on disk is the one that has to be renamed
+    when the artifacts move into the render's job.
+    """
+    for marker in ("_voice_manifest.json", "_voice.mp3"):
+        for path in sorted(glob.glob(os.path.join(job_dir, f"*{marker}"))):
+            return os.path.basename(path)[: -len(marker)]
+    return _storyboard_slug_of_job(job_dir)
+
+
 @app.post("/api/saasshorts/generate")
 async def saasshorts_generate(
     req: SaaSGenerateRequest,
@@ -4487,6 +4536,24 @@ async def saasshorts_generate(
         print(f"[AI Shorts Job {job_id[:8]}] {msg}")
         saas_jobs[job_id]["logs"].append(msg)
 
+    # Одобренная на слух озвучка. Копируется первой и потому побеждает дорожку
+    # прошлого рендера: человек только что слушал именно эти дубли, и снимать
+    # надо под них. Клипы, которые под новую дорожку больше не подходят, отсеет
+    # проверка слайсов — она сверяет и границы, и слова.
+    if req.voice_job_id and not reused:
+        voice_dir = _owned_saas_job_dir(req.voice_job_id, user, "voice_job_id")
+        if voice_dir:
+            adopt_job_artifacts(
+                voice_dir,
+                job_output_dir,
+                source_slug=_voice_slug_of_job(voice_dir),
+                target_slug=storyboard_title_slug(req.script.get("title") or ""),
+                source_label="прослушанной озвучки",
+                log=queue_log,
+            )
+        else:
+            queue_log("⚠️ Прослушанная озвучка не найдена — записываю дубли заново.")
+
     # Re-render of a finished video: adopt its clips, frames and voiceover so the
     # cache serves every shot the user left alone — only edited shots are paid for.
     if req.source_job_id and not reused:
@@ -4501,6 +4568,34 @@ async def saasshorts_generate(
             )
         else:
             queue_log("⚠️ Прошлый рендер не найден — кадры генерируются заново.")
+
+    # Одобренные кадры предпросмотра. Копируются после клипов прошлого рендера и
+    # никогда поверх них: клип залипсинчен под свой кадр, и подмена картинки под
+    # готовым клипом отправила бы его на пересъёмку.
+    if req.frames_job_id:
+        frames_dir = _owned_saas_job_dir(req.frames_job_id, user, "frames_job_id")
+        if frames_dir:
+            adopt_job_artifacts(
+                frames_dir,
+                job_output_dir,
+                source_slug=_frames_slug_of_job(frames_dir),
+                target_slug=storyboard_title_slug(req.script.get("title") or ""),
+                source_label="предпросмотра кадров",
+                log=queue_log,
+            )
+        else:
+            queue_log("⚠️ Кадры предпросмотра не найдены — рисую их заново.")
+
+    # «Перезаписать» реплику: удаляем её кусок дорожки, чтобы голос прочитал её
+    # заново. Делается после переноса — иначе стирали бы файл, который тут же
+    # скопируется обратно из прошлого джоба.
+    if req.revoice_shots:
+        forget_shot_voice(
+            job_output_dir,
+            storyboard_title_slug(req.script.get("title") or ""),
+            req.revoice_shots,
+            log=queue_log,
+        )
 
     # Explicit per-shot «перегенерить»: drop that shot's cached clip/frame (and
     # the URLs pointing at the copies in the source job) so it is drawn again.
@@ -4575,6 +4670,8 @@ async def saasshorts_generate(
         "background_music": req.background_music,
         "frames_only": req.frames_only,
         "frames_only_shot": req.frames_only_shot,
+        "voice_only": req.voice_only,
+        "avatar_edit_model": req.avatar_edit_model,
         "voice_id": effective_voice_id,  # avatar binding > request > per-language default
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
@@ -4586,6 +4683,7 @@ async def saasshorts_generate(
         "broll_mode": req.broll_mode or "mockup",
         "punch_in_cuts": req.punch_in_cuts,
         "storyboard_generation_mode": req.storyboard_generation_mode or "per_shot",
+        "revoice_all": req.revoice_all,
         "reusable_head_template_id": reusable_head.get("template_id") if reusable_head else None,
         "reusable_head_path": reusable_head.get("head_path") if reusable_head else None,
         "reusable_head_poster_path": reusable_head.get("poster_path") if reusable_head else None,
@@ -4630,6 +4728,24 @@ async def saasshorts_generate(
                     "shots": result.get("storyboard_shots") or req.script.get("shots", []),
                     "storyboard_generation_mode": result.get("storyboard_generation_mode"),
                     "frames_only": result.get("frames_only", False),
+                    # Прослушивание озвучки: дорожка, покадровая раскладка и
+                    # прогноз съёмки по ней — до единого платного кадра.
+                    "voice_only": result.get("voice_only", False),
+                    "audio_url": result.get("audio_url", ""),
+                    "voice_shots": result.get("voice_shots", []),
+                    "voice_clips_planned": result.get("voice_clips_planned", 0),
+                    "voice_provider": result.get("voice_provider", ""),
+                    "voice_model": result.get("voice_model", ""),
+                    "voice_id": result.get("voice_id", ""),
+                    "video_cost_estimate": result.get("video_cost_estimate", {}),
+                    "frames_made": result.get("frames_made", 0),
+                    "frames_failed": result.get("frames_failed", 0),
+                    "frames_charged": result.get("frames_charged", 0),
+                    # Отказ редактора с дословным ответом fal + каталог моделей:
+                    # интерфейс показывает это модалкой и предлагает выбор.
+                    "frames_blocked": result.get("frames_blocked", []),
+                    "avatar_edit_model": result.get("avatar_edit_model", ""),
+                    "avatar_edit_models": result.get("avatar_edit_models", []),
                     "business_name": req.script.get("_business_name", ""),
                     "business_description": req.script.get("_business_description", ""),
                     "video_topic": req.script.get("_video_topic", ""),
@@ -4638,8 +4754,8 @@ async def saasshorts_generate(
 
                 # Upload to public gallery (non-blocking) — skipped for frames-only previews.
                 try:
-                    if result.get("frames_only"):
-                        raise RuntimeError("frames-only preview — no gallery entry")
+                    if result.get("frames_only") or result.get("voice_only"):
+                        raise RuntimeError("preview job (frames/voice only) — no gallery entry")
                     gallery_meta = {
                         "title": req.script.get("title", "Untitled"),
                         "hook_text": req.script.get("hook_text", ""),
@@ -4880,6 +4996,22 @@ async def saasshorts_status(
         "status": job["status"],
         "logs": job["logs"],
         "result": job.get("result"),
+    }
+
+
+@app.get("/api/saasshorts/frame-editors")
+async def saasshorts_frame_editors():
+    """Каталог моделей, которые ставят ведущего в кадр.
+
+    Отдаётся интерфейсу, чтобы выбор модели существовал до первой неудачи, а не
+    появлялся только вместе с отказом. Ключи здесь не нужны: это справочник.
+    """
+    return {
+        "models": [
+            {k: m[k] for k in ("id", "title", "vendor", "note")}
+            for m in AVATAR_EDIT_MODELS
+        ],
+        "default": DEFAULT_AVATAR_EDIT_MODEL,
     }
 
 

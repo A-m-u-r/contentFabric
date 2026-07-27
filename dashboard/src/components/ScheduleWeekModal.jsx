@@ -2,39 +2,46 @@ import React, { useState, useMemo } from 'react';
 import { X, Loader2, Calendar, Clock, CheckCircle, AlertCircle, Video, Instagram, Youtube, ChevronLeft, ChevronRight, Globe, ExternalLink } from 'lucide-react';
 import { getApiUrl } from '../config';
 
-const DAYS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
-const MONTHS = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+const DAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+const MONTHS = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 
+// Список часовых поясов. Пояса СНГ обязательны: без Europe/Moscow
+// detectTimezone() молча падал в UTC, и вся неделя планировалась на 3 часа раньше.
 const TIMEZONES = [
-    { value: 'Pacific/Midway', label: '(GMT-11:00) Midway' },
-    { value: 'Pacific/Honolulu', label: '(GMT-10:00) Honolulu' },
-    { value: 'America/Anchorage', label: '(GMT-09:00) Alaska' },
-    { value: 'America/Los_Angeles', label: '(GMT-08:00) Los Ángeles' },
-    { value: 'America/Denver', label: '(GMT-07:00) Denver' },
-    { value: 'America/Mexico_City', label: '(GMT-06:00) Ciudad de México' },
-    { value: 'America/Chicago', label: '(GMT-06:00) Chicago' },
-    { value: 'America/New_York', label: '(GMT-05:00) Nueva York' },
-    { value: 'America/Bogota', label: '(GMT-05:00) Bogotá' },
-    { value: 'America/Caracas', label: '(GMT-04:00) Caracas' },
-    { value: 'America/Santiago', label: '(GMT-04:00) Santiago' },
-    { value: 'America/Argentina/Buenos_Aires', label: '(GMT-03:00) Buenos Aires' },
-    { value: 'America/Sao_Paulo', label: '(GMT-03:00) São Paulo' },
-    { value: 'Atlantic/Azores', label: '(GMT-01:00) Azores' },
+    { value: 'Europe/Kaliningrad', label: '(GMT+02:00) Калининград' },
+    { value: 'Europe/Kyiv', label: '(GMT+02:00) Киев' },
+    { value: 'Europe/Minsk', label: '(GMT+03:00) Минск' },
+    { value: 'Europe/Moscow', label: '(GMT+03:00) Москва' },
+    { value: 'Europe/Samara', label: '(GMT+04:00) Самара' },
+    { value: 'Asia/Tbilisi', label: '(GMT+04:00) Тбилиси' },
+    { value: 'Asia/Yerevan', label: '(GMT+04:00) Ереван' },
+    { value: 'Asia/Yekaterinburg', label: '(GMT+05:00) Екатеринбург' },
+    { value: 'Asia/Tashkent', label: '(GMT+05:00) Ташкент' },
+    { value: 'Asia/Almaty', label: '(GMT+05:00) Алматы' },
+    { value: 'Asia/Omsk', label: '(GMT+06:00) Омск' },
+    { value: 'Asia/Krasnoyarsk', label: '(GMT+07:00) Красноярск' },
+    { value: 'Asia/Irkutsk', label: '(GMT+08:00) Иркутск' },
+    { value: 'Asia/Yakutsk', label: '(GMT+09:00) Якутск' },
+    { value: 'Asia/Vladivostok', label: '(GMT+10:00) Владивосток' },
+    { value: 'Asia/Kamchatka', label: '(GMT+12:00) Камчатка' },
     { value: 'UTC', label: '(GMT+00:00) UTC' },
-    { value: 'Europe/London', label: '(GMT+00:00) Londres' },
-    { value: 'Europe/Madrid', label: '(GMT+01:00) Madrid' },
-    { value: 'Europe/Paris', label: '(GMT+01:00) París' },
-    { value: 'Europe/Berlin', label: '(GMT+01:00) Berlín' },
-    { value: 'Europe/Rome', label: '(GMT+01:00) Roma' },
-    { value: 'Africa/Lagos', label: '(GMT+01:00) Lagos' },
-    { value: 'Europe/Istanbul', label: '(GMT+03:00) Estambul' },
-    { value: 'Asia/Dubai', label: '(GMT+04:00) Dubái' },
-    { value: 'Asia/Kolkata', label: '(GMT+05:30) India' },
-    { value: 'Asia/Bangkok', label: '(GMT+07:00) Bangkok' },
-    { value: 'Asia/Shanghai', label: '(GMT+08:00) Shanghái' },
-    { value: 'Asia/Tokyo', label: '(GMT+09:00) Tokio' },
-    { value: 'Australia/Sydney', label: '(GMT+10:00) Sídney' },
-    { value: 'Pacific/Auckland', label: '(GMT+12:00) Auckland' },
+    { value: 'Europe/London', label: '(GMT+00:00) Лондон' },
+    { value: 'Europe/Berlin', label: '(GMT+01:00) Берлин' },
+    { value: 'Europe/Paris', label: '(GMT+01:00) Париж' },
+    { value: 'Europe/Madrid', label: '(GMT+01:00) Мадрид' },
+    { value: 'Europe/Rome', label: '(GMT+01:00) Рим' },
+    { value: 'Europe/Istanbul', label: '(GMT+03:00) Стамбул' },
+    { value: 'Asia/Dubai', label: '(GMT+04:00) Дубай' },
+    { value: 'Asia/Kolkata', label: '(GMT+05:30) Индия' },
+    { value: 'Asia/Bangkok', label: '(GMT+07:00) Бангкок' },
+    { value: 'Asia/Shanghai', label: '(GMT+08:00) Шанхай' },
+    { value: 'Asia/Tokyo', label: '(GMT+09:00) Токио' },
+    { value: 'Australia/Sydney', label: '(GMT+10:00) Сидней' },
+    { value: 'America/New_York', label: '(GMT-05:00) Нью-Йорк' },
+    { value: 'America/Chicago', label: '(GMT-06:00) Чикаго' },
+    { value: 'America/Denver', label: '(GMT-07:00) Денвер' },
+    { value: 'America/Los_Angeles', label: '(GMT-08:00) Лос-Анджелес' },
+    { value: 'America/Sao_Paulo', label: '(GMT-03:00) Сан-Паулу' },
 ];
 
 function getDayLabel(date) {
@@ -45,9 +52,18 @@ function getDayLabel(date) {
     const target = new Date(date);
     target.setHours(0, 0, 0, 0);
 
-    if (target.getTime() === today.getTime()) return 'Hoy';
-    if (target.getTime() === tomorrow.getTime()) return 'Mañana';
+    if (target.getTime() === today.getTime()) return 'сегодня';
+    if (target.getTime() === tomorrow.getTime()) return 'завтра';
     return DAYS[target.getDay()];
+}
+
+// 1 клип, 2 клипа, 5 клипов.
+function clipsPlural(n) {
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return 'клип';
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'клипа';
+    return 'клипов';
 }
 
 function formatDate(date) {
@@ -177,15 +193,15 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                         <Calendar size={20} className="text-white" />
                     </div>
                     <div>
-                        <h3 className="text-lg font-bold text-white">Programar Semana</h3>
-                        <p className="text-xs text-zinc-500">{clips?.length || 0} clips &middot; 1 por día</p>
+                        <h3 className="text-lg font-bold text-white">Запланировать неделю</h3>
+                        <p className="text-xs text-zinc-500">{clips?.length || 0} {clipsPlural(clips?.length || 0)} &middot; по одному в день</p>
                     </div>
                 </div>
 
                 {!uploadPostKey && (
                     <div className="mb-4 p-3 bg-yellow-500/10 border border-yellow-500/20 text-yellow-200 text-xs rounded-lg flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div>Configura tu API Key de Upload-Post en Settings primero.</div>
+                        <div>Сначала добавь API-ключ Upload-Post в настройках.</div>
                     </div>
                 )}
 
@@ -194,7 +210,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                     <div>
                         <label className="block text-xs font-bold text-zinc-400 mb-2 flex items-center gap-2">
                             <Clock size={14} className="text-purple-400" />
-                            Hora
+                            Время
                         </label>
                         <input
                             type="time"
@@ -207,7 +223,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                     <div>
                         <label className="block text-xs font-bold text-zinc-400 mb-2 flex items-center gap-2">
                             <Globe size={14} className="text-indigo-400" />
-                            Zona horaria
+                            Часовой пояс
                         </label>
                         <select
                             value={timezone}
@@ -224,7 +240,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
                 {/* Start day offset */}
                 <div className="mb-5 flex items-center justify-between">
-                    <span className="text-xs font-bold text-zinc-400">Empezar desde</span>
+                    <span className="text-xs font-bold text-zinc-400">Начать с</span>
                     <div className="flex items-center gap-2">
                         <button
                             onClick={() => setStartOffset(Math.max(1, startOffset - 1))}
@@ -262,13 +278,13 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
                             <div className="flex-1 min-w-0">
                                 <div className="text-xs font-bold text-white truncate">
-                                    Clip {index + 1}
+                                    Клип {index + 1}
                                 </div>
                                 <div className="text-[10px] text-zinc-500 truncate">
-                                    {clip.video_title_for_youtube_short || 'Viral Short'}
+                                    {clip.video_title_for_youtube_short || 'Без названия'}
                                 </div>
                                 <div className="text-[10px] text-zinc-600 mt-0.5">
-                                    {time}h &middot; {TIMEZONES.find(t => t.value === timezone)?.label || timezone}
+                                    {time} &middot; {TIMEZONES.find(t => t.value === timezone)?.label || timezone}
                                 </div>
                             </div>
 
@@ -292,7 +308,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
                 {/* Platforms */}
                 <div className="mb-5">
-                    <label className="block text-xs font-bold text-zinc-400 mb-2">Plataformas</label>
+                    <label className="block text-xs font-bold text-zinc-400 mb-2">Платформы</label>
                     <div className="flex gap-2">
                         <button
                             onClick={() => setPlatforms(p => ({ ...p, tiktok: !p.tiktok }))}
@@ -322,7 +338,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                 {(scheduling || done) && (
                     <div className="mb-5">
                         <div className="flex items-center justify-between text-xs text-zinc-400 mb-2">
-                            <span>{scheduling ? 'Programando...' : 'Completado'}</span>
+                            <span>{scheduling ? 'Планирую...' : 'Готово'}</span>
                             <span>{progress.current}/{progress.total}</span>
                         </div>
                         <div className="w-full h-2 bg-white/5 rounded-full overflow-hidden">
@@ -334,9 +350,9 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                         {done && (
                             <div className="mt-3 text-xs text-center">
                                 {failCount === 0 ? (
-                                    <span className="text-green-400">Todos los clips programados correctamente</span>
+                                    <span className="text-green-400">Все клипы успешно запланированы</span>
                                 ) : (
-                                    <span className="text-yellow-400">{successCount} programados, {failCount} fallidos</span>
+                                    <span className="text-yellow-400">Запланировано: {successCount}, с ошибкой: {failCount}</span>
                                 )}
                             </div>
                         )}
@@ -350,7 +366,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                         disabled={scheduling}
                         className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-zinc-300 rounded-xl font-medium transition-colors disabled:opacity-50"
                     >
-                        {done ? 'Cerrar' : 'Cancelar'}
+                        {done ? 'Закрыть' : 'Отмена'}
                     </button>
                     {!done ? (
                         <button
@@ -361,12 +377,12 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                             {scheduling ? (
                                 <>
                                     <Loader2 size={16} className="animate-spin" />
-                                    Programando...
+                                    Планирую...
                                 </>
                             ) : (
                                 <>
                                     <Calendar size={16} />
-                                    Programar {clips?.length || 0} Clips
+                                    Запланировать {clips?.length || 0} {clipsPlural(clips?.length || 0)}
                                 </>
                             )}
                         </button>
@@ -378,7 +394,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                             className="flex-1 py-3 bg-gradient-to-r from-violet-500 to-purple-600 hover:from-violet-400 hover:to-purple-500 text-white rounded-xl font-bold transition-all flex items-center justify-center gap-2 no-underline"
                         >
                             <ExternalLink size={16} />
-                            Ver Calendario
+                            Открыть календарь
                         </a>
                     )}
                 </div>

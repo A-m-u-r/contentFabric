@@ -456,7 +456,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
             <div>
               <h3 className="text-base font-semibold text-zinc-100">Аватары</h3>
               <p className="text-xs text-zinc-500 mt-1">
-                Загружай свои фото или генерируй AI-аватаров здесь. Потом выбирай их в генераторе роликов.
+                Загружай свои фото или генерируй ИИ-аватаров здесь. Потом выбирай их в генераторе роликов.
               </p>
             </div>
 
@@ -533,7 +533,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
                     <Wand2 size={17} />
                   </div>
                   <div>
-                    <h4 className="text-sm font-semibold text-zinc-100">Сгенерировать AI-аватаров</h4>
+                    <h4 className="text-sm font-semibold text-zinc-100">Сгенерировать ИИ-аватаров</h4>
                     <p className="text-xs text-zinc-500 mt-1">
                       Создает 3 варианта и сохраняет их в эту галерею.
                     </p>
@@ -552,7 +552,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
                     placeholder="Например: естественный портрет женщины 30 лет, нейтральная одежда, обычный фон, без ноутбука и гарнитуры"
                   />
                   <p className="text-[10px] text-zinc-600 mt-1">
-                    Пиши коротко и конкретно. Избегай ноутбуков, гарнитур, микрофонов и студийного AI-фона.
+                    Пиши коротко и конкретно. Избегай ноутбуков, гарнитур, микрофонов и студийного ИИ-фона.
                   </p>
                 </div>
 
@@ -1035,7 +1035,7 @@ function VideoActionModal({
                   <Wand2 size={17} />
                 </div>
                 <div>
-                  <h4 className="text-sm font-semibold text-zinc-100">AI-действия</h4>
+                  <h4 className="text-sm font-semibold text-zinc-100">ИИ-действия</h4>
                   <p className="text-xs text-zinc-500">
                     Здесь меняем уже готовый ролик. Для плохого попадания губ используй повторную синхронизацию с сохраненной озвучкой.
                   </p>
@@ -1090,7 +1090,7 @@ function VideoActionModal({
                   </>
                 ) : lipSyncJob?.status === 'completed' ? (
                   <>
-                    <RefreshCw size={16} /> Обновить еще раз через {selectedModel.label}
+                    <RefreshCw size={16} /> Обновить ещё раз через {selectedModel.label}
                   </>
                 ) : (
                   <>

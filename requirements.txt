@@ -8,6 +8,7 @@ faster-whisper==1.2.1
 google-genai==1.75.0
 python-dotenv==1.2.2
 mediapipe==0.10.14
+numpy==2.4.6
 boto3==1.43.4
 
 fastapi==0.136.1

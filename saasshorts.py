@@ -23,6 +23,7 @@ import hashlib
 import shutil
 import subprocess
 import httpx
+import numpy as np
 import textwrap
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable, Any
@@ -789,13 +790,14 @@ def refine_storyboard_broll_alignment(
                 "scene": (shot.get("scene") or "").strip(),
                 "camera": (shot.get("camera") or "").strip(),
                 "actor_action": (shot.get("actor_action") or shot.get("action") or "").strip(),
+                "actor_in_frame": _shot_wants_actor(shot),
                 "generation_prompt": (shot.get("generation_prompt") or "").strip(),
             })
     if not candidates:
         return scripts
 
     target_language = {"ru": "Russian", "es": "Spanish"}.get(language, "English")
-    prompt = f"""You are the final semantic storyboard reviewer for vertical 9:16 UGC ads.
+    prompt = f"""You are the final semantic storyboard reviewer for vertical 9:16 social videos.
 Review every B-roll shot below in one batch. The exact `speech` is the source of truth.
 Target UI language: {target_language}. Write scene, camera, and actor_action only in
 {target_language}. Write generation_prompt only in English.
@@ -810,6 +812,11 @@ numbers, charts, labels, signs, or screens: percentages, ages, dates and values 
 deterministic overlay added later. A conceptually necessary faceless human is allowed: back view,
 cropped body or hands, silhouette, or non-identifiable profile. Never request an identifiable
 generated face unless an actor reference is actually available.
+
+`actor_in_frame` says whether the person in that insert is the presenter herself. Return it with
+every decision: true when your visual shows the same person who speaks (from behind, over the
+shoulder, her hands, her silhouette), false when it shows objects, food or an interior. A person
+in a `false` shot would be a stranger appearing mid-reel, so either mark it true or keep people out.
 
 Do not rewrite speech, timing, overlay text, shot order, or talking-head shots. Return `keep`
 only when the current visual is semantically relevant. For `replace`, provide a localized scene,
@@ -827,6 +834,7 @@ Return ONLY a JSON array:
     "scene": "localized user-facing scene",
     "camera": "localized user-facing camera",
     "actor_action": "localized user-facing action",
+    "actor_in_frame": true or false,
     "generation_prompt": "English prompt",
     "reason": "short internal reason"
   }}
@@ -903,6 +911,10 @@ Return ONLY a JSON array:
         if actor_action:
             shot["actor_action"] = actor_action
             shot["action"] = actor_action
+        # The review rewrites what is in the insert, so it also owns whether the
+        # presenter is in it — a replaced visual must not keep the old answer.
+        if decision.get("actor_in_frame") is not None:
+            shot["actor_in_frame"] = _shot_wants_actor(decision)
         shot["generation_prompt"] = _build_storyboard_generation_prompt({
             **shot,
             "generation_prompt": generation_prompt,
@@ -1198,7 +1210,8 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
         "emotion": "excited",
         "overlay_text": "Short text on screen",
         "visual_type": "talking",
-        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same woman, scene, action, camera, lighting, no text in image"
+        "actor_in_frame": false,
+        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same woman, scene, action, camera, lighting"
       }}
     ],
     "full_narration": "All shot speech joined exactly",
@@ -1215,12 +1228,13 @@ RULES:
 - Use visual variety: close-up, kitchen/lifestyle, exercise/home, product close-up, final CTA.
 - Do NOT rely only on talking head. Use the actor as a consistent character across shots.
 - visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference. The first shot (hook) and the last shot (cta) MUST be "talking". Make 1-2 middle shots "broll" for visual dynamics.
+- actor_in_frame per shot: true ONLY when a "broll" shot shows the SAME person who speaks in the talking shots (seen from behind, over the shoulder, her hands, her silhouette), false when the insert shows objects, food, an interior or anybody else. It is the difference between our presenter walking into her own kitchen and a random stranger appearing mid-reel — say it explicitly, we cannot guess it from the scene text. Always false for "talking" shots.
 - Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
 - Each shot MUST include emotion — one of: excited, warm, confident, calm, urgent, playful. Vary it across shots to follow the narrative arc.
 - role must be one of: hook, problem, explanation, solution, proof, cta.
 - transition should be "cut" or "smooth_0.3s".
 - speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
-- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. For B-roll, forbid identifiable faces and generated readable text, but allow a faceless human action when it is needed by the exact spoken claim.
+- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor/character, natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
@@ -1666,13 +1680,12 @@ def build_custom_storyboard_script(
                 _extract_storyboard_field(block, ["Переход", "Transition"]) or transition_map.get(idx, "cut")
             )
             prompt_bits = [
-                "vertical 9:16 realistic UGC ad",
+                "vertical 9:16 realistic phone video",
                 "same actor/character",
                 scene,
                 actor_action,
                 camera,
                 "natural light",
-                "no burned-in text, no watermark",
             ]
             shots.append({
                 "shot_number": idx,
@@ -1709,7 +1722,7 @@ def build_custom_storyboard_script(
                 "overlay_text": chunk[:50],
                 "transition": "cut",
                 "visual_type": "talking",
-                "generation_prompt": "vertical 9:16 realistic UGC ad, same actor/character, natural light, no burned-in text, no watermark",
+                "generation_prompt": "vertical 9:16 realistic phone video, same actor/character, natural light",
             })
             cursor += shot_duration
 
@@ -1774,11 +1787,11 @@ def build_custom_script(
 
     broll_problem = (
         f"Vertical smartphone-style b-roll showing the problem behind: {topic or product_desc}. "
-        "Realistic home setting, natural light, authentic everyday scene, no text overlays."
+        "Realistic home setting, natural light, authentic everyday scene."
     )
     broll_demo = (
         f"Vertical smartphone-style b-roll showing the product/result for {product_name}: "
-        "phone tracker, checklist, simple food prep, clean table, realistic UGC look, no text overlays."
+        "phone tracker, checklist, simple food prep, clean table, filmed on a phone."
     )
 
     # Keep a familiar 5-part structure for preview and b-roll timing. The final
@@ -2505,18 +2518,29 @@ KLING_AVATAR_TIERS = {
 def build_kling_avatar_request(
     image_url: str,
     audio_url: str,
-    prompt: str,
+    prompt: str = "",
     tier: str = "standard",
 ) -> tuple[str, dict]:
-    """Build fal.ai Kling Avatar v2 model id and payload for Standard/Pro."""
+    """Build fal.ai Kling Avatar v2 model id and payload for Standard/Pro.
+
+    The avatar model is driven by the reference frame and the audio; the prompt
+    field only hurts. Side-by-side on the same image and audio (2026-07-26):
+    without a prompt the frame is clean, with our prompt Kling paints garbled
+    caption-like text along the bottom — the very thing the prompt asked it not
+    to do, because the model has no negative prompting and "no text, no
+    watermark, no subtitles" just seeds it with text. So an empty prompt is
+    left out of the payload entirely.
+    """
     tier = (tier or "standard").strip().lower()
     if tier not in KLING_AVATAR_TIERS:
         raise ValueError(f"Unsupported Kling Avatar tier: {tier}")
-    return KLING_AVATAR_TIERS[tier]["model_id"], {
+    payload = {
         "image_url": image_url,
         "audio_url": audio_url,
-        "prompt": prompt,
     }
+    if (prompt or "").strip():
+        payload["prompt"] = prompt
+    return KLING_AVATAR_TIERS[tier]["model_id"], payload
 
 
 def kling_avatar_cost_per_second(tier: str = "standard") -> float:
@@ -2645,23 +2669,19 @@ def _build_storyboard_generation_prompt(shot: dict) -> str:
         additions = []
         if "9:16" not in existing:
             additions.append("vertical 9:16")
-        if "no burned-in text" not in existing.lower():
-            additions.append("no burned-in text, no watermark")
         return ", ".join([existing] + additions)
 
     scene = (shot.get("scene") or shot.get("visual") or "realistic social video scene").strip()
     actor_action = (shot.get("actor_action") or shot.get("action") or "natural movement").strip()
     camera = (shot.get("camera") or "vertical 9:16 steady handheld smartphone video").strip()
     bits = [
-        "vertical 9:16 realistic UGC ad",
+        "vertical 9:16 realistic phone video",
         "same actor/character across shots",
         scene,
         actor_action,
         camera,
         "natural light",
         "authentic smartphone footage",
-        "no burned-in text",
-        "no watermark",
     ]
     return ", ".join(bit for bit in bits if bit)
 
@@ -2714,6 +2734,7 @@ def _rebuild_prompts_from_scene(
             {
                 "n": i,
                 "visual_type": "broll" if _is_broll_shot(s) else "talking",
+                "actor_in_frame": _shot_wants_actor(s),
                 "scene": (s.get("scene") or "").strip(),
                 "action": (s.get("actor_action") or s.get("action") or "").strip(),
                 "camera": (s.get("camera") or "").strip(),
@@ -2724,17 +2745,22 @@ def _rebuild_prompts_from_scene(
         ]
         prompt = (
             "You convert Russian shot descriptions into English video-generation prompts "
-            "for Kling V3 (vertical 9:16 realistic UGC ad).\n"
+            "for Kling V3 (vertical 9:16 realistic phone video).\n"
             f"Actor: {actor_description or 'a consistent real person, same across all shots'}.\n"
             "For each shot, write ONE English prompt that fully describes the scene, action "
             "and camera on its own. Rules: vertical 9:16, same actor/character across shots, "
-            "natural light, authentic smartphone footage, no burned-in text, no logos, no "
-            "watermark. For visual_type 'broll', use the exact speech as the visual source of "
+            "natural light, authentic smartphone footage. Describe only what IS in frame — "
+            "never write 'no text', 'no watermark' or any other ban, those go to the model in "
+            "a separate field and in the description they only make it draw them. "
+            "For visual_type 'broll', use the exact speech as the visual source of "
             "truth: literally demonstrate the claim or use one clear visual analogy. Do not use "
             "generic wellness filler (avocado, salad, measuring tape, yoga mat, supplements, "
             "scales or food prep) unless the speech explicitly concerns it. A faceless human "
             "action is allowed when conceptually necessary (back view, cropped body/hands, "
-            "silhouette, non-identifiable profile); never request an identifiable face. Never "
+            "silhouette, non-identifiable profile); never request an identifiable face. When "
+            "actor_in_frame is true the person in that insert IS the presenter herself — write "
+            "'the same woman from the reference' (or man) and keep her face away from camera; "
+            "when it is false do not put any recognisable person in the shot. Never "
             "request readable on-screen text, numbers, charts or screens.\n"
             f"Shots JSON: {json.dumps(payload, ensure_ascii=False)}\n"
             'Return ONLY a JSON array: [{"n": <n>, "prompt": "<english prompt>"}].'
@@ -2810,7 +2836,7 @@ def fill_storyboard_shot_details(
         }
         for s in targets
     ]
-    prompt = f"""You are a storyboard director for vertical UGC ads (9:16).
+    prompt = f"""You are a storyboard director for vertical social videos (9:16).
 
 Video: "{script.get('title') or ''}"
 Topic: {script.get('_video_topic') or script.get('topic') or ''}
@@ -2834,6 +2860,10 @@ RULES:
   non-identifiable profile); never request an identifiable face. Prefer "talking"
   for lines that carry the argument, "broll" for lines that describe a thing or a
   result. Never put two "broll" shots in a row given the surrounding storyboard.
+- actor_in_frame: true ONLY when a "broll" shot shows the SAME person who speaks in
+  the talking shots (from behind, over the shoulder, her hands, her silhouette),
+  false when the insert is objects, food, an interior or a different person. Always
+  false for "talking" shots. This cannot be inferred from the scene text, so state it.
 - In "talking" shots the actor holds a steady selfie pose: subtle expressions and
   small head movement only. No exercising, walking, drinking or big gestures —
   motion breaks lip-sync.
@@ -2844,14 +2874,16 @@ RULES:
 - No readable text anywhere: no labels, signs, numbers, stickers, no phone/laptop
   screens facing camera — video models render text as garbage glyphs.
 - generation_prompt MUST be English and fully describe scene, action and camera on
-  its own: vertical 9:16, realistic UGC ad, same actor, natural light, no burned-in
-  text, no watermark. For "broll" forbid identifiable faces and generated readable
-  text, but allow a faceless human action when the speech requires it.
+  its own: vertical 9:16, realistic phone video, same actor, natural light. Describe only
+  what IS in frame — never write "no text", "no watermark" or any other ban, those
+  reach the model in a separate field and inside the description they only make it
+  draw them. For "broll" pick subjects with no identifiable face and nothing written
+  on them; a faceless human action is allowed when the speech requires it.
 
 Return ONLY a JSON array:
 [{{"shot_number": <n>, "scene": "...", "camera": "...", "actor_action": "...",
   "role": "...", "emotion": "...", "transition": "...", "visual_type": "...",
-  "overlay_text": "...", "generation_prompt": "..."}}]"""
+  "actor_in_frame": false, "overlay_text": "...", "generation_prompt": "..."}}]"""
 
     client = genai.Client(api_key=gemini_key)
     resp = _generate_gemini_content(
@@ -2884,6 +2916,10 @@ Return ONLY a JSON array:
                 merged[field] = value
         if merged.get("actor_action") and not (merged.get("action") or "").strip():
             merged["action"] = merged["actor_action"]
+        # A bool, so it can't ride the string loop above. The user's own toggle
+        # wins: we only answer for shots that never stated it.
+        if "actor_in_frame" not in merged and item.get("actor_in_frame") is not None:
+            merged["actor_in_frame"] = _shot_wants_actor(item)
         if not (merged.get("overlay_text") or "").strip():
             merged["overlay_text"] = (item.get("overlay_text") or "").strip()
         # The prompt is what the video model actually renders — always (re)build it
@@ -2960,6 +2996,11 @@ def normalize_storyboard_shots(script: dict) -> list:
             "transition": transition,
             "visual_type": (shot.get("visual_type") or ("talking" if speech else "broll")).strip().lower(),
         }
+        # Only coerce when the storyboard actually stated it: an absent flag must
+        # stay absent so `fill_storyboard_shot_details` can still decide, while a
+        # user's explicit "no" is never re-decided for them.
+        if "actor_in_frame" in shot:
+            normalized["actor_in_frame"] = _shot_wants_actor(shot)
         normalized["generation_prompt"] = _build_storyboard_generation_prompt(normalized)
         shots.append(normalized)
     return shots
@@ -2980,6 +3021,16 @@ def split_storyboard_shots(shots: list, max_duration: int = 15) -> list:
     if current:
         chunks.append(current)
     return chunks
+
+
+# The single place where "things we do not want in frame" is allowed to be
+# spelled out: Kling V3 and Veo both take a real negative prompt. In the
+# positive prompt these same words are an order to draw them.
+_STORYBOARD_NEGATIVE_PROMPT = (
+    "blur, distort, low quality, deformed face, extra fingers, "
+    "burned-in text, subtitles, captions, letters, numbers, logos, watermark, "
+    "signage, user interface"
+)
 
 
 def build_kling_v3_storyboard_request(
@@ -3015,7 +3066,7 @@ def build_kling_v3_storyboard_request(
             "prompt": shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot",
             "aspect_ratio": aspect_ratio,
             "duration": _veo31_duration(_shot_duration(shot)),
-            "negative_prompt": "blur, distort, low quality, deformed face, extra fingers, wrong text, watermark",
+            "negative_prompt": _STORYBOARD_NEGATIVE_PROMPT,
             "resolution": tier_config.get("resolution", "1080p"),
             "generate_audio": False,
             "auto_fix": False,
@@ -3028,7 +3079,7 @@ def build_kling_v3_storyboard_request(
     payload = {
         "duration": str(min(15, sum(_shot_duration(shot) for shot in normalized))),
         "generate_audio": False,
-        "negative_prompt": "blur, distort, low quality, deformed face, extra fingers, wrong text, watermark",
+        "negative_prompt": _STORYBOARD_NEGATIVE_PROMPT,
     }
     if use_image_to_video:
         payload["start_image_url"] = start_image_url
@@ -3116,44 +3167,44 @@ def prepare_kling_actor_image(image_path: str, output_path: str) -> str:
     return output_path
 
 
-def _neutralize_avatar_ad_style(prompt: str) -> str:
-    """Remove style cues that make avatar models imitate captioned social ads."""
-    result = prompt or ""
-    replacements = (
-        (r"\brealistic\s+UGC(?:[-\s]+style)?(?:[-\s]+ad)?\b", "natural portrait video"),
-        (r"\bUGC(?:[-\s]+style)?(?:[-\s]+ad)?\b", "natural portrait video"),
-        (r"\b(?:authentic\s+)?smartphone\s+video\b", "natural camera framing"),
-        (r"\bsocial(?:[-\s]+media)?[-\s]+(?:video|ad|advertisement)\b", "portrait video"),
-    )
-    for pattern, replacement in replacements:
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
-    return re.sub(r"\s{2,}", " ", result).strip()
+def _file_fingerprint(path: str) -> str:
+    """Content hash of a local file, or "" when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return ""
 
 
-def _avatar_request_prompt(scene_prompt: str) -> str:
-    """The prompt a Kling Avatar request carries — single source for cache checks."""
-    framing = _neutralize_avatar_ad_style(scene_prompt)
-    if not framing:
-        framing = "One person talking naturally to the camera in a steady close-up."
-    if not framing.endswith("."):
-        framing += "."
-    return (
-        f"{framing} "
-        "Keep body movement minimal and controlled. Use only subtle head movement, "
-        "natural blinking, and small micro-expressions. Maintain eye contact with the camera. "
-        "Mouth movement must follow the provided audio exactly. When the audio is silent or ends, "
-        "keep lips closed and hold a calm neutral expression. "
-        # Kling occasionally clones the actor toward the frame edges when driven
-        # from a single portrait; forbid it explicitly so the vision QC stops
-        # flagging "дублирование персонажа по краям кадра".
-        "Show exactly one single person, centered and fully inside the frame. "
-        "Never duplicate the subject, never show a twin, clone, mirror copy or a second face, "
-        "and keep the edges of the frame free of any extra person. "
-        "Keep the outfit, skin and background exactly as in the reference image. "
-        "Do not create or display any written characters, letters, numbers, symbols, captions, "
-        "subtitles, logos, watermarks, signs, labels, interface elements or typography anywhere "
-        "in the frame."
-    )
+# Words that name something we do NOT want in frame. Kling Avatar has no
+# negative prompting, so "no burned-in text, no watermark" reads to it as a
+# request for text and it paints garbled captions along the bottom (verified
+# side-by-side on the same image and audio, 2026-07-26). Anything we want gone
+# has to be expressed as the state we do want instead.
+_AVATAR_PROMPT_BANNED_WORDS = (
+    "text", "caption", "subtitle", "letter", "word", "logo", "watermark",
+    "sign", "label", "typography", "glyph", "character", "number", "symbol",
+    "screen", "interface", "tattoo", "print",
+)
+
+# Short, positive, motion-only. The frame itself (scene, outfit, framing) comes
+# from the reference image, so the prompt's single job is to hold the body
+# still: with no prompt at all Kling invents leg-crossing and hand-shuffling
+# that reads as fidgeting. Length is deliberate — fal's own schema defaults this
+# field to "." and the comparable Longcat avatar endpoint defaults to a single
+# plain sentence, so two sentences is already the upper end of what these models
+# expect here.
+_AVATAR_MOTION_PROMPT = (
+    "The person stays seated in the same pose, hands resting calmly, legs still, speaking "
+    "straight to the camera with a calm friendly expression. Only the face moves: the lips "
+    "follow the audio, natural blinking, small head movements, one locked-off take."
+)
+
+
+def _avatar_prompt_issues(prompt: str) -> list:
+    """Words in an avatar prompt that the model will draw instead of avoid."""
+    lowered = (prompt or "").lower()
+    return [word for word in _AVATAR_PROMPT_BANNED_WORDS if re.search(rf"\b{word}s?\b", lowered)]
 
 
 def generate_talking_head(
@@ -3162,12 +3213,13 @@ def generate_talking_head(
     fal_key: str,
     output_path: str,
     tier: str = "standard",
-    scene_prompt: str = "",
 ) -> str:
     """Generate talking head video using Kling Avatar v2 Standard/Pro on fal.ai.
 
-    `scene_prompt` overrides the generic framing line with per-shot scene,
-    camera, and mood so a storyboard's shots don't all look identical.
+    Framing comes from `image_path` — the shot's own reference frame — and the
+    performance from the audio. The only prompt sent is `_AVATAR_MOTION_PROMPT`:
+    it holds the body still, and it deliberately names nothing we want kept out
+    of frame (see `_AVATAR_PROMPT_BANNED_WORDS`).
     """
     import shutil
 
@@ -3181,9 +3233,11 @@ def generate_talking_head(
         prepare_kling_actor_image(image_path, kling_image_path),
         fal_key,
     )
-    base_prompt = _avatar_request_prompt(scene_prompt)
+    # Fingerprint the frame we were handed, not the 9:16 render of it: that is
+    # what the cache check can recompute later.
+    reference_fingerprint = _file_fingerprint(image_path)
     attempts_config = [
-        {"name": "base", "audio_path": audio_path, "prompt": base_prompt},
+        {"name": "base", "audio_path": audio_path, "prompt": _AVATAR_MOTION_PROMPT},
     ]
     attempts = []
     selected_attempt = None
@@ -3207,6 +3261,9 @@ def generate_talking_head(
             "audio_path": attempt_audio_path,
             "model_id": model_id,
             "payload": payload,
+            # What this clip was actually built from, for the cache check: the
+            # payload only carries a one-off fal upload URL.
+            "reference_fingerprint": reference_fingerprint,
         }
 
         try:
@@ -3232,6 +3289,7 @@ def generate_talking_head(
                 "tier": tier,
                 "model_id": model_id,
                 "payload": payload,
+                "reference_fingerprint": reference_fingerprint,
                 "fal_request": result.get("_fal_request", {}),
                 "result": result,
                 "quality": quality,
@@ -3684,8 +3742,8 @@ def generate_broll(
         {
             "prompt": (
                 f"{prompt}. Authentic vertical smartphone photo, natural light, "
-                "realistic everyday scene, candid UGC style, natural imperfections, "
-                "no text, no watermark, not a studio shot."
+                "realistic everyday scene, candid phone footage, natural imperfections, "
+                "plain unbranded surfaces, not a studio shot."
             ),
             "image_size": "portrait_16_9",
             "safety_tolerance": 5,
@@ -5380,23 +5438,33 @@ def composite_storyboard_video(
     for index, clip in enumerate(clips):
         actual = _get_media_duration(clip["path"])
         duration = max(0.1, float(clip.get("duration") or actual))
-        deficit = duration - actual
+        # A lip-synced clip can open with the head of silence its driving audio
+        # carried (see _mp3_encoder_delay): skipping it puts the lips back on
+        # the master voiceover instead of that many milliseconds behind it.
+        head = min(max(0.0, float(clip.get("speech_offset") or 0.0)), max(0.0, actual - 0.1))
+        head_arg = f"{head:.3f}" if head else "0"
+        usable = max(0.1, actual - head)
+        deficit = duration - usable
         stretchable = _is_broll_shot(clip.get("shot") or {})
-        if actual > 0 and 0.05 < deficit <= actual * 0.15 and stretchable:
+        if usable > 0 and 0.05 < deficit <= usable * 0.15 and stretchable:
             # Short b-roll: slow the whole clip a touch instead of a visible
             # end-freeze — motion carries through and the seam disappears.
             # Talking shots keep the freeze: stretching them would drag the
             # lips out of sync with the master voiceover.
-            ratio = duration / actual
+            ratio = duration / usable
+            head_chain = f"trim=start={head_arg},setpts=PTS-STARTPTS," if head else ""
             chain = (
-                f"[{index}:v]setpts={ratio:.6f}*PTS,{norm},"
+                f"[{index}:v]{head_chain}setpts={ratio:.6f}*PTS,{norm},"
                 f"trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS"
             )
         else:
-            chain = f"[{index}:v]trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS,{norm}"
+            chain = (
+                f"[{index}:v]trim=start={head_arg}:end={head + duration:.3f},"
+                f"setpts=PTS-STARTPTS,{norm}"
+            )
             # Clip came back shorter than its slot: freeze the last frame
             # instead of silently shifting every later shot off-sync.
-            if actual > 0 and deficit > 0.05:
+            if usable > 0 and deficit > 0.05:
                 chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
         filter_parts.append(chain + f"[v{index}]")
         concat_parts.append(f"[v{index}]")
@@ -5432,6 +5500,20 @@ def composite_storyboard_video(
 
 def _normalize_align_token(token: str) -> str:
     return re.sub(r"[\W_]+", "", (token or "").lower(), flags=re.UNICODE)
+
+
+# A slice that opens with dead air is what makes a cut read as "the picture is
+# ahead of the voice": the avatar model starts its clip from the reference pose
+# and the mouth moves while nothing is being said yet. Measured on job
+# saas_b13f0229 — 130-590 ms of silence at the head of every shot but the first,
+# and the lips visibly settling through it. So a cut lands just before the next
+# phrase and the pause stays with the shot that has just finished talking.
+_SLICE_LEAD_IN = 0.08
+
+
+def _phrase_boundary(prev_end: float, next_start: float) -> float:
+    """Cut point inside an inter-word pause: right before the next word."""
+    return max(prev_end, next_start - _SLICE_LEAD_IN)
 
 
 def _align_shots_to_voiceover(shots: list, words: list, audio_duration: float) -> tuple:
@@ -5481,7 +5563,7 @@ def _align_shots_to_voiceover(shots: list, words: list, audio_duration: float) -
                         - 0.06 * abs(k - target_idx)
                     ),
                 )
-            boundary = (float(words[best - 1]["end"]) + float(words[best]["start"])) / 2
+            boundary = _phrase_boundary(float(words[best - 1]["end"]), float(words[best]["start"]))
         else:
             boundary = audio_duration * cum / total_weight
         boundaries.append(boundary)
@@ -5503,6 +5585,44 @@ def _align_shots_to_voiceover(shots: list, words: list, audio_duration: float) -
             )
         slices.append({"shot": shot, "start": round(start, 3), "end": round(end, 3)})
     return slices, skipped
+
+
+# libmp3lame writes 576 samples of encoder lookahead plus 529 samples of
+# decoder delay ahead of the first real sample and declares them in the LAME
+# info tag.
+_LAME_ENCODER_DELAY_SAMPLES = 1105
+
+
+def _mp3_encoder_delay(path: str) -> float:
+    """Leading silence an mp3 slice carries that a naive decoder keeps.
+
+    ffmpeg honours the LAME info tag and drops this head, the avatar service
+    does not: the speech it lip-syncs against starts one encoder delay into our
+    slice, so its clip comes back with the mouth exactly that late. Measured on
+    job saas_b13f0229: every talking clip's audio sat +25 ms behind its slice
+    (44.1 kHz → 1105/44100 s), and the same +20…+27 ms showed up in the pixels
+    when the clip was compared with Kling's own render. Non-mp3 slices (plain
+    PCM) have no such head, so this returns 0 and the compensation disappears
+    on its own.
+    """
+    if not path or os.path.splitext(path)[1].lower() != ".mp3":
+        return 0.0
+    rate = 0.0
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        output = result.stdout.strip().splitlines()
+        if output and output[0].strip().isdigit():
+            rate = float(output[0].strip())
+    except Exception as e:
+        print(f"[SaaSShorts] ffprobe sample rate failed for {path}: {e}")
+    return _LAME_ENCODER_DELAY_SAMPLES / (rate or 44100.0)
 
 
 def _slice_voiceover_segment(audio_path: str, start: float, end: float, output_path: str) -> str:
@@ -5528,24 +5648,43 @@ def _ensure_slice_audio(
     output_path: str,
     clip_path: str,
     log: Callable[[str], None] = print,
+    identity: str = "",
 ) -> str:
-    """Cut the voiceover slice, invalidating stale audio when its bounds moved.
+    """Cut the voiceover slice, invalidating stale audio when it no longer fits.
 
-    Slice files are cached by name. If a code change (e.g. long shots now split
-    into jump cuts) moves the bounds, the cached audio — and the avatar clip
-    that was lip-synced against it — no longer match the timeline. Duration is
-    the tell: renumbered slices land on files cut for different bounds.
+    Slice files are cached by name, and the name is an ordinal — so deleting a
+    shot and rendering again hands slice 3 to what used to be shot 4. Two things
+    have to match before a cached slice is trusted: its length, which catches
+    moved bounds, and its identity, which catches a file that now belongs to a
+    different shot or to different words. Neither alone is enough — a reordered
+    script full of similar-length lines passes the duration check happily, and
+    the clip lip-synced to that audio would then play against someone else's
+    sentence.
     """
     expected = max(0.0, end - start)
+    identity_path = f"{output_path}.id.txt"
     if _nonempty(output_path):
+        stored = ""
+        try:
+            with open(identity_path, encoding="utf-8") as f:
+                stored = f.read().strip()
+        except OSError:
+            # Legacy slice with no identity recorded: length is all we have, and
+            # re-cutting it would throw away a paid clip on a guess.
+            stored = identity
         actual = _get_media_duration(output_path)
-        if abs(actual - expected) <= 0.08:
+        if abs(actual - expected) <= 0.08 and stored == identity:
             return output_path
+        reason = (
+            f"границы сместились ({actual:.2f}s -> {expected:.2f}s)"
+            if abs(actual - expected) > 0.08 else "звук кадра изменился"
+        )
         log(
-            f"  Слайс {os.path.basename(output_path)}: границы сместились "
-            f"({actual:.2f}s -> {expected:.2f}s) — пересечка звука и перегенерация клипа."
+            f"  Слайс {os.path.basename(output_path)}: {reason} — "
+            "пересечка звука и перегенерация клипа."
         )
         for stale in (
+            identity_path,
             output_path,
             f"{output_path}.fal_url.txt",
             clip_path,
@@ -5561,48 +5700,121 @@ def _ensure_slice_audio(
                     os.remove(stale)
             except OSError:
                 pass
-    return _slice_voiceover_segment(audio_path, start, end, output_path)
+    _slice_voiceover_segment(audio_path, start, end, output_path)
+    if identity:
+        with open(identity_path, "w", encoding="utf-8") as f:
+            f.write(identity)
+    return output_path
 
 
-_MAX_TALKING_SLICE_SECONDS = 5.0
+_MIN_TALKING_SLICE_SECONDS = 2.0
+_MAX_TALKING_SLICE_SECONDS = 8.0
+# Cut fast on the hook, let the body breathe. Measured off the reel that broke
+# through (16 shots / 72s): 2.2 2.2 2.8 on the hook, then 4.3-8.2, median 4.7.
+_HOOK_WINDOW_SECONDS = 8.0
+_HOOK_SLICE_SECONDS = 2.6
+_BODY_WINDOW_SECONDS = 30.0
+_BODY_SLICE_SECONDS = 5.0
+_LATE_SLICE_SECONDS = 6.5
 
 
-def _split_long_slices(slices: list, words: list, max_len: float = _MAX_TALKING_SLICE_SECONDS) -> list:
-    """Split talking slices longer than max_len into jump-cut sub-slices.
+def _target_slice_seconds(start: float) -> float:
+    """How long one talking shot may run at this point in the reel."""
+    if start < _HOOK_WINDOW_SECONDS:
+        return _HOOK_SLICE_SECONDS
+    if start < _BODY_WINDOW_SECONDS:
+        return _BODY_SLICE_SECONDS
+    return _LATE_SLICE_SECONDS
 
-    A shot is ~3 seconds, 5 at the absolute limit (user rule): Kling Avatar
-    lip-sync drifts over long takes and a long static monologue reads dead.
-    Cuts snap to inter-word pauses; each sub-slice carries a copy of the shot,
-    so the per-clip reference punch-ins render the splits as natural jump cuts.
-    B-roll slices pass through: the master voiceover plays over them, no
-    lip-sync involved.
+
+def _stored_slice_cuts(shot: dict, duration: float, cuts_by_shot: Optional[dict]) -> list:
+    """Jump cuts this shot was split at last time, if they still fit its audio.
+
+    Reused rather than recomputed because the cuts are found in a transcript of
+    the whole reel: re-voicing a neighbour shifts that transcript, the cuts move
+    a few milliseconds, and every sub-slice of an untouched shot looks changed —
+    which costs an avatar clip per sub-slice, for nothing.
+    """
+    stored = (cuts_by_shot or {}).get(str(shot.get("shot_number")))
+    if not isinstance(stored, list) or not stored:
+        return []
+    cuts = [float(c) for c in stored]
+    if any(b - a < _MIN_TALKING_SLICE_SECONDS for a, b in zip([0.0] + cuts, cuts + [duration])):
+        return []
+    return cuts
+
+
+def _split_long_slices(
+    slices: list,
+    words: list,
+    max_len: Optional[float] = None,
+    cuts_by_shot: Optional[dict] = None,
+) -> list:
+    """Split talking slices into jump-cut sub-slices on a rhythm curve.
+
+    Kling Avatar lip-sync drifts over long takes and a long static monologue
+    reads dead, so shots stay short — shortest on the hook, where attention is
+    won or lost. Pass max_len to override the curve with one flat limit, or
+    cuts_by_shot to replay the cuts a shot already got. Cuts snap to inter-word
+    pauses; each sub-slice carries a copy of the shot, so the alternating
+    framings render the splits as natural angle changes. B-roll slices pass
+    through: the master voiceover plays over them, no lip-sync involved.
     """
     result = []
     for sl in slices:
         duration = sl["end"] - sl["start"]
-        if _is_broll_shot(sl["shot"]) or duration <= max_len + 0.01:
+        limit = max_len if max_len is not None else _target_slice_seconds(sl["start"])
+        if _is_broll_shot(sl["shot"]) or duration <= limit + 0.01:
             result.append(sl)
             continue
-        parts = int(math.ceil(duration / max_len))
+        replay = _stored_slice_cuts(sl["shot"], duration, cuts_by_shot)
+        if replay:
+            bounds = [sl["start"]] + [round(sl["start"] + c, 3) for c in replay] + [sl["end"]]
+            for i in range(len(bounds) - 1):
+                result.append({"shot": dict(sl["shot"]), "start": bounds[i], "end": bounds[i + 1]})
+            continue
+        parts = int(math.ceil(duration / limit))
+        # Never slice below the floor: Kling wants real audio in every clip and
+        # sub-second flashes read as a glitch, not as an edit.
+        parts = max(1, min(parts, int(duration // _MIN_TALKING_SLICE_SECONDS)))
+        if parts < 2:
+            result.append(sl)
+            continue
+        floor = _MIN_TALKING_SLICE_SECONDS
         gaps = []
         for prev, nxt in zip(words or [], (words or [])[1:]):
-            boundary = (float(prev["end"]) + float(nxt["start"])) / 2
-            if sl["start"] + 1.0 < boundary < sl["end"] - 1.0:
+            boundary = _phrase_boundary(float(prev["end"]), float(nxt["start"]))
+            if sl["start"] + floor < boundary < sl["end"] - floor:
                 gaps.append((boundary, max(0.0, float(nxt["start"]) - float(prev["end"]))))
         bounds = [sl["start"]]
         for i in range(1, parts):
-            target = sl["start"] + duration * i / parts
-            usable = [g for g in gaps if g[0] > bounds[-1] + 1.0]
+            # Keep the floor on both sides: reserve room for every remaining part,
+            # otherwise the last cut gets dragged back and leaves a flash frame.
+            low = bounds[-1] + floor
+            high = sl["end"] - floor * (parts - i)
+            if high < low:
+                break
+            target = min(max(sl["start"] + duration * i / parts, low), high)
+            usable = [g for g in gaps if low <= g[0] <= high]
             if usable:
                 cut = max(usable, key=lambda g: g[1] - 0.15 * abs(g[0] - target))[0]
             else:
                 cut = target
-            cut = min(max(cut, bounds[-1] + 1.0), sl["end"] - 1.0)
             bounds.append(round(cut, 3))
         bounds.append(sl["end"])
         for i in range(len(bounds) - 1):
             result.append({"shot": dict(sl["shot"]), "start": bounds[i], "end": bounds[i + 1]})
     return result
+
+
+def _job_output_root(output_dir: str) -> str:
+    """The directory jobs live in, so a `/videos/<job>/...` url can be resolved.
+
+    Frames approved in a preview job sit in that job's folder, and the render
+    runs in its own — without the root there is no way back to a picture the
+    user already paid for.
+    """
+    return os.path.dirname(output_dir.rstrip("/\\")) or "output"
 
 
 def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) -> str:
@@ -5631,72 +5843,57 @@ def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) 
     return ""
 
 
-def _avatar_scene_parts_prompt(shot: dict) -> str:
-    """Avatar framing built from scene/camera/action/emotion fields.
+def _avatar_clip_cache_valid(clip_path: str, reference_path: str) -> bool:
+    """True while a cached Kling Avatar clip still matches its reference frame.
 
-    Pre-generation_prompt recipe: kept as the fallback for shots without a
-    prompt and for cache-compat checks on clips generated before the switch.
-    """
-    parts = []
-    for value in (
-        shot.get("scene"),
-        shot.get("actor_action") or shot.get("action"),
-        shot.get("camera"),
-    ):
-        value = (value or "").strip().rstrip(".")
-        if value:
-            parts.append(value)
-    emotion = (shot.get("emotion") or "").strip().rstrip(".")
-    if emotion:
-        parts.append(f"{emotion} mood")
-    if parts:
-        # Kling рисует мусорные глифы вместо текста: экраны в кадре — только нечитаемые
-        parts.append("no readable on-screen text, any device screens turned away or out of focus")
-    return ". ".join(parts)
+    An avatar clip is defined by two things: the frame it was staged from and
+    the audio slice it was lip-synced to. The audio side is handled by
+    `_ensure_slice_audio`, which drops the clip when the slice bounds move, so
+    the check here is the picture: the shot's own scene edits land in the
+    reference frame (`_avatar_reference_image`), and a new frame means the clip
+    has to be shot again.
 
-
-def _avatar_scene_prompt(shot: dict) -> str:
-    """Per-shot Kling Avatar framing.
-
-    The UI exposes each shot's generation_prompt as the editable «Kling prompt»,
-    so when it is set it must drive the avatar framing too — otherwise edits to
-    talking shots are silently ignored. Shots without one (bare dicts) fall back
-    to the scene-field recipe.
-    """
-    custom = (shot.get("generation_prompt") or "").strip().rstrip(".")
-    if custom:
-        return (
-            f"{custom}. "
-            "no readable on-screen text, any device screens turned away or out of focus"
-        )
-    return _avatar_scene_parts_prompt(shot)
-
-
-def _avatar_clip_cache_valid(clip_path: str, shot: dict) -> bool:
-    """True while a cached Kling Avatar clip still matches the shot's framing prompt.
-
-    Clips without meta (legacy jobs) stay valid, and so do clips built with the
-    old scene-fields recipe — an avatar clip is the most expensive artifact in
-    the pipeline, so only a real user edit may trigger regeneration.
+    Clips shot with any other prompt came from the old recipe that made Kling
+    paint garbled captions into the frame — those are never reusable. Clips
+    without meta (legacy jobs) stay valid: an avatar clip is the most expensive
+    artifact in the pipeline, so an unknown history is not enough to spend
+    money again.
     """
     if not _nonempty(clip_path):
         return False
     meta_path = clip_path.replace(".mp4", "_base_fal.json")
     try:
         with open(meta_path, encoding="utf-8") as f:
-            stored = (json.load(f).get("payload") or {}).get("prompt")
+            meta = json.load(f)
     except (OSError, json.JSONDecodeError):
         return True
-    if not isinstance(stored, str):
+    stored_prompt = ((meta.get("payload") or {}).get("prompt") or "").strip()
+    if stored_prompt and stored_prompt != _AVATAR_MOTION_PROMPT:
+        return False
+    stored = meta.get("reference_fingerprint")
+    if not isinstance(stored, str) or not stored:
         return True
-    return stored in (
-        _avatar_request_prompt(_avatar_scene_prompt(shot)),
-        _avatar_request_prompt(_avatar_scene_parts_prompt(shot)),
-    )
+    return stored == _file_fingerprint(reference_path)
 
 
 def _is_broll_shot(shot: dict) -> bool:
     return (shot.get("visual_type") or "").strip().lower() in ("broll", "b-roll", "b_roll")
+
+
+def _shot_wants_actor(shot: dict) -> bool:
+    """True when a b-roll insert shows OUR presenter, not a stranger.
+
+    Half the inserts are objects and hands with nobody in them; the other half
+    is the same character seen from behind or cropped ("вид сзади: женский
+    силуэт закрывает холодильник"). Only the storyboard knows which, so it says
+    so per shot — guessing from the Russian scene text at render time is how a
+    different woman ends up in the middle of the reel. Missing means false: we
+    never claim a continuity we are not staging.
+    """
+    value = shot.get("actor_in_frame")
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "да")
+    return bool(value)
 
 
 def _broll_slice_shot(shot: dict, slice_duration: float) -> dict:
@@ -5711,30 +5908,184 @@ def _broll_slice_shot(shot: dict, slice_duration: float) -> dict:
     v3_shot["end"] = int(math.ceil(max(1.0, slice_duration)))
     base = (v3_shot.get("generation_prompt") or "").strip() or _build_storyboard_generation_prompt(v3_shot)
     v3_shot["generation_prompt"] = (
-        f"{base}, nobody speaks on camera, mouth closed, no lip movement, "
-        "no readable text, no labels or lettering on objects, no digital displays, "
-        "no devices with screens, any screens turned away or out of focus, "
+        f"{base}, anyone in frame keeps their mouth closed and still, "
+        "plain surfaces with nothing written on them, "
+        "any device screens turned away from camera or out of focus, "
         "voiceover plays over the scene"
     )
     return v3_shot
 
 
-def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Callable[[str], None] = print) -> str:
-    """Flux still of the b-roll scene, so Kling animates it via image-to-video.
+# Image-conditioned Flux edit: keeps the reference person's identity while
+# staging a new scene. Swap here if a better identity model becomes available.
+AVATAR_REFERENCE_MODEL = "fal-ai/flux-pro/kontext"
 
-    Text-only Kling controls composition poorly (it invented strangers before
-    the no-people rules); a cheap Flux frame pins the exact composition and a
-    consistent aesthetic. Returns "" on any failure — the caller falls back to
-    plain text-to-video, a worse shot beats a failed job.
+# Каталог редакторов «поставь этого человека в эту сцену» — витрина для
+# пользователя, а не цепочка фолбэков.
+#
+# Kontext на фото ведущего может отдать чёрный кадр: у Flux так выглядит
+# сработавшая модерация входного изображения — картинка валидная, просто пустая
+# (см. `_looks_blank`), денег это не отменяет. Раньше код в таком случае молча
+# брал следующего кандидата, и человек узнавал о подмене только по счёту. Теперь
+# выбор его: пайплайн зовёт ровно ту модель, которую попросили, а отказ отдаёт
+# наверх вместе с дословным ответом fal (см. `_FAL_MODERATION_FIELDS`).
+#
+# Порядок — по убыванию качества переноса личности и по убыванию строгости
+# фильтров, и это одна и та же ось: у закрытых API (BFL, Google, ByteDance)
+# модерация стоит и на входе, и на выходе — оттуда и берутся чёрные квадраты.
+# Замыкает список Qwen-Image-Edit: открытые веса, которые fal крутит на своих
+# GPU, то есть чужого модератора над ними нет вообще. Он рисует хуже соседей,
+# но именно он должен нарисовать хоть что-то, когда остальные отказали.
+#
+# `field` — имя поля под картинку: у разных эндпоинтов оно своё, поэтому лежит в
+# таблице, а не в коде. Неизвестный или переименованный эндпоинт ответит 404/422
+# — это бесплатно, платим только за реальную генерацию.
+AVATAR_EDIT_MODELS = (
+    {
+        "id": AVATAR_REFERENCE_MODEL,
+        "title": "FLUX Kontext",
+        "vendor": "Black Forest Labs",
+        "note": "Лучший перенос лица и самые строгие фильтры.",
+        "field": "image_url",
+        "args": {"aspect_ratio": "9:16", "safety_tolerance": "5"},
+    },
+    {
+        "id": "fal-ai/nano-banana/edit",
+        "title": "Nano Banana",
+        "vendor": "Google",
+        "note": "Держит личность почти как Kontext, модерация — гугловская.",
+        "field": "image_urls",
+        "args": {},
+    },
+    {
+        "id": "fal-ai/bytedance/seedream/v4/edit",
+        "title": "Seedream 4",
+        "vendor": "ByteDance",
+        "note": "Третий независимый стек модерации при похожем качестве.",
+        "field": "image_urls",
+        "args": {},
+    },
+    {
+        "id": "fal-ai/qwen-image-edit",
+        "title": "Qwen Image Edit",
+        "vendor": "Alibaba (открытые веса)",
+        "note": "Рисует слабее остальных, зато чужого модератора над ним нет.",
+        "field": "image_url",
+        "args": {},
+    },
+)
+
+DEFAULT_AVATAR_EDIT_MODEL = AVATAR_EDIT_MODELS[0]["id"]
+
+# Поля ответа, по которым видно, что кадр зарубила модерация, а не сбой сети.
+_FAL_MODERATION_FIELDS = ("has_nsfw_concepts", "nsfw_content_detected", "error", "message", "detail")
+
+
+def _avatar_edit_model(model_id: str = "") -> dict:
+    """Каталожная запись выбранного редактора; по умолчанию — первый.
+
+    Незнакомый id значит, что фронт отстал от каталога, — берём дефолт, а не
+    падаем: неизвестная модель уехала бы в fal и вернула 422.
     """
-    base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
-    prompt = (
-        f"{base_prompt}. Single photographic frame, vertical 9:16, first frame of a short "
-        "product b-roll: keep the requested subject and action, natural light, shallow depth "
-        "of field, smartphone realism. no people unless the requested action needs a faceless "
-        "back view, cropped body/hands, silhouette or non-identifiable profile; no identifiable "
-        "generated faces, no readable text, no logos, no watermark"
-    )
+    for entry in AVATAR_EDIT_MODELS:
+        if entry["id"] == (model_id or "").strip():
+            return entry
+    return AVATAR_EDIT_MODELS[0]
+
+
+def _blank_model_memo(photo_path: str) -> str:
+    return f"{photo_path}.blank_models.json"
+
+
+def _models_that_blanked(photo_path: str) -> set:
+    """Редакторы, уже вернувшие чёрный кадр на это фото.
+
+    Пустой кадр fal тарифицирует как обычный: платим за чёрный квадрат ровно
+    столько же, сколько за картинку. Модерация срабатывает детерминированно —
+    повторный запрос той же моделью с тем же фото купит тот же квадрат. Поэтому
+    вердикт запоминается рядом с фотографией и переживает джобы.
+    """
+    try:
+        with open(_blank_model_memo(photo_path), encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _remember_blank_model(photo_path: str, model: str) -> None:
+    known = _models_that_blanked(photo_path) | {model}
+    try:
+        with open(_blank_model_memo(photo_path), "w", encoding="utf-8") as f:
+            json.dump(sorted(known), f)
+    except OSError:
+        pass
+
+
+def _drop_frame_files(output_path: str) -> None:
+    for stale in (output_path, f"{output_path}.fal_url.txt"):
+        try:
+            if os.path.exists(stale):
+                os.remove(stale)
+        except OSError:
+            pass
+
+
+def _report_blocked_editor(
+    billing: Optional[dict],
+    entry: dict,
+    reason: str,
+    flags: dict,
+    charged: bool,
+    photo_path: str,
+) -> None:
+    """Записать отказ редактора так, чтобы интерфейс мог о нём рассказать.
+
+    Лог читают не все, а деньги списываются со всех. Отчёт несёт дословный ответ
+    fal (`has_nsfw_concepts` и соседи) и список моделей, которые на этом фото ещё
+    не пробовали, — из него интерфейс собирает предложение сменить модель.
+    """
+    if billing is None:
+        return
+    tried = _models_that_blanked(photo_path) if photo_path else set()
+    billing.setdefault("blocked", []).append({
+        "model": entry["id"],
+        "title": entry["title"],
+        "vendor": entry["vendor"],
+        # "moderation" — модель зарубила кадр, "known" — уже рубила его раньше,
+        # "unavailable" — эндпоинт не ответил (404/422), это не про модерацию.
+        "reason": reason,
+        "flags": flags,
+        "charged": charged,
+        "alternatives": [
+            {"id": m["id"], "title": m["title"], "vendor": m["vendor"], "note": m["note"]}
+            for m in AVATAR_EDIT_MODELS
+            if m["id"] not in tried and m["id"] != entry["id"]
+        ],
+    })
+
+
+def _flux_reference_frame(
+    prompt: str,
+    fal_key: str,
+    output_path: str,
+    log: Callable[[str], None] = print,
+    actor_photo_path: str = "",
+    label: str = "Reference frame",
+    on_failure: str = "",
+    billing: Optional[dict] = None,
+    edit_model: str = "",
+) -> str:
+    """Draw one Flux still for a shot, cached by prompt. "" on any failure.
+
+    Two models behind one door: given an actor photo this is an image-conditioned
+    edit that keeps that person's identity, without one it is plain
+    text-to-image. The cache keys on the prompt, so an edited shot is redrawn and
+    an untouched one never pays twice.
+
+    `edit_model` — какой редактор из `AVATAR_EDIT_MODELS` позвать (пусто = дефолт).
+    Отказ никогда не переходит на другую модель сам: он попадает в `billing`
+    отчётом, а выбор остаётся за пользователем.
+    """
     prompt_sidecar = f"{output_path}.prompt.txt"
     if _nonempty(output_path):
         try:
@@ -5745,19 +6096,38 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
         # Референс валиден, пока совпадает промпт кадра (юзер мог его отредактировать).
         if cached_prompt is None or cached_prompt == prompt:
             return output_path
-        for stale in (output_path, f"{output_path}.fal_url.txt"):
-            try:
-                if os.path.exists(stale):
-                    os.remove(stale)
-            except OSError:
-                pass
+        _drop_frame_files(output_path)
+    # Один клик — максимум один платный запрос, и ровно к той модели, которую
+    # выбрал пользователь. Молчаливого перехода к следующей нет: чёрный кадр
+    # стоит столько же, сколько нормальный, и подменять модель за спиной значит
+    # тратить чужие деньги на догадку. Отказ уходит наверх, решение — за юзером.
+    entry = _avatar_edit_model(edit_model)
+    if actor_photo_path:
+        blanked = _models_that_blanked(actor_photo_path)
+        if entry["id"] in blanked:
+            # Бесплатный отказ: модерация детерминированна, тот же редактор с тем
+            # же фото купит тот же чёрный квадрат.
+            log(f"  ⚠️ {label}: {entry['title']} на это фото уже вернул пустой кадр. "
+                "Повторный запрос не делаю — он платный и вернёт то же самое. "
+                "Нужна другая модель или другое фото ведущего.")
+            _report_blocked_editor(billing, entry, "known", {}, False, actor_photo_path)
+            return ""
+        model, image_field, extra = entry["id"], entry["field"], entry["args"]
+        image_url = _fal_upload_file(_flux_condition_photo(actor_photo_path), fal_key)
+    else:
+        model, image_field, extra = "fal-ai/flux-2-pro", "", {"image_size": "portrait_16_9", "safety_tolerance": 5}
+        image_url = ""
+
+    args = {"prompt": prompt, **extra}
+    if image_field == "image_urls":
+        args["image_urls"] = [image_url]
+    elif image_field:
+        args[image_field] = image_url
+
     try:
-        result = _fal_run(
-            "fal-ai/flux-2-pro",
-            {"prompt": prompt, "image_size": "portrait_16_9", "safety_tolerance": 5},
-            fal_key,
-            timeout=600,
-        )
+        if billing is not None:
+            billing["calls"] = billing.get("calls", 0) + 1
+        result = _fal_run(model, args, fal_key, timeout=600)
         images = result.get("images") or result.get("output", [])
         if not images:
             raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
@@ -5768,25 +6138,122 @@ def _broll_reference_image(shot: dict, fal_key: str, output_path: str, log: Call
             with open(output_path, "wb") as f:
                 f.write(resp.content)
         if _looks_blank(output_path):
-            log("  ⚠️ B-roll reference frame came back blank/black; discarding")
-            for stale in (output_path, f"{output_path}.fal_url.txt"):
-                try:
-                    if os.path.exists(stale):
-                        os.remove(stale)
-                except OSError:
-                    pass
+            # Ответ модели — единственное место, где видно «зарубила модерация»
+            # вместо «что-то пошло не так». Без него причина остаётся догадкой.
+            flags = {k: result[k] for k in _FAL_MODERATION_FIELDS if k in result}
+            log(f"  ⚠️ {label}: {model} вернул пустой кадр"
+                + (f" — ответ модели: {flags}" if flags else " (модель не назвала причину)"))
+            _drop_frame_files(output_path)
+            if actor_photo_path:
+                _remember_blank_model(actor_photo_path, model)
+                _report_blocked_editor(billing, entry, "moderation", flags, True, actor_photo_path)
+                left = [m["title"] for m in AVATAR_EDIT_MODELS
+                        if m["id"] not in _models_that_blanked(actor_photo_path)]
+                log(f"  {label}: не пробовали на этом фото: {', '.join(left)} — выбор за тобой."
+                    if left else f"  {label}: редакторы кончились — нужно другое фото ведущего.")
             return ""
+        if model != DEFAULT_AVATAR_EDIT_MODEL and actor_photo_path:
+            log(f"  ✅ {label}: кадр нарисовала {model}")
         with open(prompt_sidecar, "w", encoding="utf-8") as f:
             f.write(prompt)
         return output_path
     except Exception as e:
-        log(f"  ⚠️ B-roll reference frame failed ({e}); falling back to text-to-video")
+        # Отказ эндпоинта деньгами не пахнет (fal берёт только за генерацию), но
+        # и повторять его незачем: сетевые сбои переигрывает сам `_fal_run`, а
+        # 404/422 значит, что модель переехала — запоминаем и идём дальше.
+        log(f"  ⚠️ {label}: {model} не отработал ({e}){on_failure}")
+        if billing is not None:
+            billing["calls"] = max(0, billing.get("calls", 1) - 1)
+        if actor_photo_path:
+            _remember_blank_model(actor_photo_path, model)
+            _report_blocked_editor(billing, entry, "unavailable", {"error": str(e)}, False,
+                                   actor_photo_path)
         return ""
 
 
-# Image-conditioned Flux edit: keeps the reference person's identity while
-# staging a new scene. Swap here if a better identity model becomes available.
-AVATAR_REFERENCE_MODEL = "fal-ai/flux-pro/kontext"
+# Длинная сторона фото-условия, которое уходит в Flux Kontext. Фото ведущего
+# приходит как есть из галереи или загрузки — попадаются 4802×3584 на 30 МБ.
+# Kontext на таких молча возвращает чёрный кадр (см. `_looks_blank`), а дальше
+# пайплайн оживляет исходное фото. Ужимаем — на качество кадра это не влияет,
+# модель всё равно рисует свой.
+_FLUX_CONDITION_MAX_PX = 2048
+
+
+def _flux_condition_photo(path: str) -> str:
+    """Уменьшенная копия фото для Flux; сам путь — если ужимать нечего."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            if max(im.size) <= _FLUX_CONDITION_MAX_PX:
+                return path
+            small = f"{os.path.splitext(path)[0]}_cond.png"
+            if _nonempty(small):
+                return small
+            copy = im.convert("RGB")
+            copy.thumbnail((_FLUX_CONDITION_MAX_PX, _FLUX_CONDITION_MAX_PX))
+            copy.save(small)
+            return small
+    except Exception:
+        # Не смогли прочитать — отдаём оригинал: пусть решает fal, а не мы.
+        return path
+
+
+def _broll_reference_image(
+    shot: dict,
+    fal_key: str,
+    output_path: str,
+    log: Callable[[str], None] = print,
+    actor_photo_path: str = "",
+    billing: Optional[dict] = None,
+    edit_model: str = "",
+) -> str:
+    """Flux still of the b-roll scene, so Kling animates it via image-to-video.
+
+    Text-only Kling controls composition poorly (it invented strangers before
+    the no-people rules); a cheap Flux frame pins the exact composition and a
+    consistent aesthetic. Returns "" on any failure — the caller falls back to
+    plain text-to-video, a worse shot beats a failed job.
+
+    When the storyboard marks the insert as showing our own presenter
+    (`actor_in_frame`), the frame is staged from the actor photo instead: same
+    hair, build and outfit, face turned away. Otherwise a stranger walks into
+    the middle of the reel, and the viewer reads that as a different story —
+    they don't know the shot is "b-roll".
+    """
+    base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
+    if _shot_wants_actor(shot) and actor_photo_path and os.path.exists(actor_photo_path):
+        actor_prompt = (
+            "Keep the exact same person as in the reference image: same hairstyle, build "
+            f"and clothing. {base_prompt + '. ' if base_prompt else ''}"
+            "Single photographic frame, vertical 9:16, this person seen from behind, over "
+            "the shoulder or cropped so the face stays out of frame. One person only, "
+            "natural light, shallow depth of field, smartphone realism, plain unbranded "
+            "surfaces."
+        )
+        made = _flux_reference_frame(
+            actor_prompt, fal_key, output_path, log=log,
+            actor_photo_path=actor_photo_path,
+            label="B-roll frame with our presenter",
+            billing=billing,
+            edit_model=edit_model,
+            on_failure="; drawing the insert without them instead",
+        )
+        if made:
+            return made
+    prompt = (
+        f"{base_prompt}. Single photographic frame, vertical 9:16, first frame of a short "
+        "product b-roll: keep the requested subject and action, natural light, shallow depth "
+        "of field, smartphone realism. no people unless the requested action needs a faceless "
+        "back view, cropped body/hands, silhouette or non-identifiable profile; faces stay out "
+        "of frame, plain unbranded surfaces"
+    )
+    return _flux_reference_frame(
+        prompt, fal_key, output_path, log=log,
+        label="B-roll reference frame",
+        on_failure="; falling back to text-to-video",
+        billing=billing,
+    )
 
 
 def _avatar_reference_image(
@@ -5795,83 +6262,71 @@ def _avatar_reference_image(
     fal_key: str,
     output_path: str,
     log: Callable[[str], None] = print,
+    scene_override: str = "",
+    framing: str = "",
+    billing: Optional[dict] = None,
+    edit_model: str = "",
 ) -> str:
-    """Per-shot avatar frame from the actor photo + the shot's scene description.
+    """Avatar frame from the actor photo + a scene description.
 
     Keeps the saved avatar's identity (face, hair, outfit) via an image-conditioned
     Flux edit, but stages the described scene so each cut is its own composition
     instead of a crop of one static photo — which made Kling clone the person
     toward the frame edges. Returns "" on any failure so the caller falls back to
     a punch-in crop of the shared photo: a plainer frame beats a failed job.
+
+    scene_override pins one set for every talking shot of a reel; framing asks
+    for a specific crop of that set, so the reel reads as two cameras on one
+    take instead of a new room behind every cut.
     """
     if not (actor_photo_path and os.path.exists(actor_photo_path)):
         return ""
-    scene = (shot.get("generation_prompt") or shot.get("scene") or "").strip().rstrip(".")
+    scene = (scene_override or shot.get("generation_prompt") or shot.get("scene") or "")
+    scene = scene.strip().rstrip(".")
+    framing = (framing or "").strip().rstrip(".")
     prompt = (
         "Keep the exact same person, face, hairstyle and outfit as in the reference image. "
         f"{scene + '. ' if scene else ''}"
+        f"{framing + '. ' if framing else ''}"
         "Vertical 9:16 portrait, one single person only, centered and fully inside the frame, "
-        "photorealistic UGC selfie look, natural light. Never duplicate the person, never add a "
-        "second face, keep the frame edges free of any extra person. No on-screen text, no logos, "
-        "no watermark."
+        "photorealistic phone-camera look, natural light. Never duplicate the person, never add a "
+        "second face, keep the frame edges free of any extra person. Plain unbranded clothing "
+        "and background."
     )
-    prompt_sidecar = f"{output_path}.prompt.txt"
-    if _nonempty(output_path):
-        try:
-            with open(prompt_sidecar, encoding="utf-8") as f:
-                cached_prompt = f.read()
-        except OSError:
-            cached_prompt = None
-        # Reference stays valid while the shot's prompt is unchanged (user edits win).
-        if cached_prompt is None or cached_prompt == prompt:
-            return output_path
-        for stale in (output_path, f"{output_path}.fal_url.txt"):
-            try:
-                if os.path.exists(stale):
-                    os.remove(stale)
-            except OSError:
-                pass
-    try:
-        image_url = _fal_upload_file(actor_photo_path, fal_key)
-        result = _fal_run(
-            AVATAR_REFERENCE_MODEL,
-            {
-                "prompt": prompt,
-                "image_url": image_url,
-                "aspect_ratio": "9:16",
-                "safety_tolerance": "5",
-            },
-            fal_key,
-            timeout=600,
-        )
-        images = result.get("images") or result.get("output", [])
-        if not images:
-            raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
-        img_url = images[0]["url"] if isinstance(images[0], dict) else images[0]
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.get(img_url)
-            resp.raise_for_status()
-            with open(output_path, "wb") as f:
-                f.write(resp.content)
-        if _looks_blank(output_path):
-            log("  ⚠️ Avatar reference frame came back blank/black; discarding")
-            for stale in (output_path, f"{output_path}.fal_url.txt"):
-                try:
-                    if os.path.exists(stale):
-                        os.remove(stale)
-                except OSError:
-                    pass
-            return ""
-        with open(prompt_sidecar, "w", encoding="utf-8") as f:
-            f.write(prompt)
-        return output_path
-    except Exception as e:
-        log(f"  ⚠️ Avatar reference frame failed ({e}); using cropped photo instead")
-        return ""
+    return _flux_reference_frame(
+        prompt, fal_key, output_path, log=log,
+        actor_photo_path=actor_photo_path,
+        label="Avatar reference frame",
+        on_failure="; using cropped photo instead",
+        billing=billing,
+        edit_model=edit_model,
+    )
 
+
+# Two cameras on one set, alternating — the whole trick behind reels that read as
+# a filmed interview: the background never changes, only the framing does, so the
+# pose reset every generated clip starts with lands between two different angles
+# and stops registering as a jump.
+_AVATAR_FRAMINGS = (
+    ("medium",
+     "Medium shot from the chest up, the person centred with the room visible behind them"),
+    ("close",
+     "Tight close-up, the face filling the frame, shoulders cropped, background softly "
+     "out of focus"),
+)
+
+
+def _framing_plate_path(output_dir: str, title_slug: str, key: str) -> str:
+    """Where one camera's staged frame lives — same name for preview and render."""
+    return os.path.join(output_dir, f"{title_slug}_actor_set_{key}.png")
+
+
+def _is_framing_plate(path: str, title_slug: str) -> bool:
+    return os.path.basename(path or "").startswith(f"{title_slug}_actor_set_")
 
 # Gentle alternating punch-ins (zoom, center-x, center-y as fractions). Variant 0
-# keeps the original so the first shot matches the approved actor photo.
+# keeps the original so the first shot matches the approved actor photo. Used only
+# when the staged framing plates are unavailable.
 _AVATAR_REFERENCE_VARIANTS = [
     None,
     (1.10, 0.50, 0.42),
@@ -5879,6 +6334,36 @@ _AVATAR_REFERENCE_VARIANTS = [
     (1.10, 0.54, 0.55),
     (1.16, 0.50, 0.60),
 ]
+
+
+def _refuse_unusable_start_frame(photo_path: str) -> None:
+    """Стоп до платного Kling, если оживлять собираемся заведомо не тот кадр.
+
+    Когда постановочный кадр не получился, говорящий клип уходит от фото
+    ведущего как есть. Для одиночного вертикального портрета это честная
+    деградация — ради неё запасной путь и написан. Но фото ведущего бывает
+    «раскладкой»: несколько ракурсов одного человека рядом на одном листе,
+    почти всегда горизонтальной. Kling оживляет её целиком — три фигуры в
+    кадре, — и это уже оплаченный брак. Горизонтальная картинка в вертикальном
+    ролике всё равно не стартовый кадр, так что режем по ориентации.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(photo_path) as im:
+            width, height = im.size
+    except Exception:
+        return  # не прочитали — не мешаем генерации
+    if width <= height:
+        return
+    raise RuntimeError(
+        f"Не удалось поставить кадр ведущего, а его фото — горизонтальное "
+        f"({width}×{height}); в вертикальном ролике оно попадёт в кадр целиком "
+        f"(так бывает с раскладками «несколько ракурсов на одном листе»). "
+        f"Остановился до платной генерации видео. Что сделать: нажать «Сгенерить недостающие» "
+        f"на шаге раскадровки и проверить кадры глазами, либо выбрать ведущего "
+        f"одиночным вертикальным портретом."
+    )
 
 
 def _avatar_reference_variant(image_path: str, output_path: str, index: int) -> str:
@@ -5920,6 +6405,9 @@ def generate_sliced_avatar_clips(
     broll_tier: str = "standard",
     broll_image_first: bool = True,
     avatar_image_first: bool = True,
+    voice_manifest: Optional[dict] = None,
+    edit_model: str = "",
+    billing: Optional[dict] = None,
     log: Callable[[str], None] = print,
 ) -> list:
     """
@@ -5932,7 +6420,14 @@ def generate_sliced_avatar_clips(
     must not visibly talk in those clips.
     """
     audio_duration = _get_media_duration(audio_path)
-    slices, skipped = _align_shots_to_voiceover(shots, words, audio_duration)
+    # The manifest wins when it covers the reel: it records where each shot's own
+    # audio was laid down, so an untouched shot keeps its exact bounds while a
+    # neighbour is re-voiced. Re-deriving them from a transcript would move them
+    # by a few milliseconds and cost that shot's paid clip for nothing.
+    voice_manifest = voice_manifest or {}
+    slices, skipped = _slices_from_voice_bounds(shots, voice_manifest)
+    if len(slices) != len(_speech_shots_numbered(shots)):
+        slices, skipped = _align_shots_to_voiceover(shots, words, audio_duration)
     for shot in skipped:
         log(
             f"  ⚠️ Shot {shot.get('shot_number', '?')} has no speech — skipped: "
@@ -5941,58 +6436,121 @@ def generate_sliced_avatar_clips(
     if not slices:
         raise ValueError("Sliced-avatar mode requires at least one shot with speech")
     pre_split = len(slices)
-    slices = _split_long_slices(slices, words)
+    slices = _split_long_slices(
+        slices, words,
+        cuts_by_shot={k: v.get("cuts") for k, v in voice_manifest.items() if v.get("cuts")},
+    )
+    update_voice_cuts(output_dir, title_slug, _cuts_from_slices(slices))
+    shot_parts: dict = {}
     if len(slices) != pre_split:
         log(
-            f"  Длинная речь в кадре: {pre_split} кадров -> {len(slices)} клипов "
-            f"(джамп-каты, каждый дубль <= {_MAX_TALKING_SLICE_SECONDS:.0f}s — липсинк держится на коротких дублях)."
+            f"  Ритм: {pre_split} кадров -> {len(slices)} клипов "
+            f"(хук по {_HOOK_SLICE_SECONDS:.1f}s, дальше {_BODY_SLICE_SECONDS:.0f}-{_LATE_SLICE_SECONDS:.1f}s — "
+            "частая склейка держит внимание, короткий дубль держит липсинк)."
         )
 
     fallback_actor_img = ""
+    plates: dict = {}
+    # One set for the whole reel, taken from the first talking shot: every talking
+    # clip is staged on it, only the framing alternates.
+    pinned_set = ""
+    for sl in slices:
+        if not _is_broll_shot(sl["shot"]):
+            pinned_set = (
+                sl["shot"].get("generation_prompt") or sl["shot"].get("scene") or ""
+            ).strip()
+            if pinned_set:
+                break
 
-    def _resolve_image(sl, index):
+    def _shared_actor_photo():
         nonlocal fallback_actor_img
-        ref = _storyboard_avatar_reference_image(sl["shot"], output_dir, index)
-        if ref:
-            return ref
         if selected_actor_path and os.path.exists(selected_actor_path):
-            shared = selected_actor_path
-        else:
-            if not fallback_actor_img:
-                fallback_actor_img = os.path.join(output_dir, f"{title_slug}_actor.png")
-                if not _nonempty(fallback_actor_img):
-                    desc = actor_description or (
-                        "a young professional in their late 20s, wearing a casual modern outfit, clean background"
-                    )
-                    generate_actor_image(desc, fal_key, fallback_actor_img)
-            shared = fallback_actor_img
-        # Prefer a fresh per-shot frame that keeps the actor's identity but stages
-        # the described scene, so each cut is its own composition instead of a crop
-        # of one photo (which made Kling clone the person toward the edges).
+            return selected_actor_path
+        if not fallback_actor_img:
+            fallback_actor_img = os.path.join(output_dir, f"{title_slug}_actor.png")
+            if not _nonempty(fallback_actor_img):
+                desc = actor_description or (
+                    "a young professional in their late 20s, wearing a casual modern outfit, clean background"
+                )
+                generate_actor_image(desc, fal_key, fallback_actor_img)
+        return fallback_actor_img
+
+    def _framing_plate(framing_index):
+        """Staged frame for one camera of the pinned set, generated once per reel."""
+        key, framing_line = _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
+        if key in plates:
+            return plates[key]
+        plate_path = _framing_plate_path(output_dir, title_slug, key)
+        made = _avatar_reference_image(
+            {}, _shared_actor_photo(), fal_key, plate_path, log=log,
+            scene_override=pinned_set, framing=framing_line,
+            billing=billing, edit_model=edit_model,
+        )
+        plates[key] = made
+        if made:
+            log(f"  Ракурс «{key}» готов — он держится на всех говорящих кадрах.")
+        return made
+
+    def _resolve_image(sl, index, framing_index):
+        # A frame the user picked or generated for this shot always wins — but a
+        # split shot must not play the same framing twice in a row, so every other
+        # talking clip gets a punch-in of it.
+        ref = _storyboard_avatar_reference_image(sl["shot"], output_dir, index)
+        # A frame the storyboard already staged as one of our cameras is not a
+        # per-shot choice — the cursor owns which camera plays, so that a shot
+        # split in two never plays the same angle twice in a row.
+        if ref and _is_framing_plate(ref, title_slug):
+            ref = ""
+        if ref:
+            if framing_index % len(_AVATAR_FRAMINGS) == 0:
+                return ref
+            punch_path = os.path.join(output_dir, f"{title_slug}_shot_ref_{index:02d}.png")
+            return _avatar_reference_variant(ref, punch_path, 2)
         if avatar_image_first:
-            scene_path = os.path.join(output_dir, f"{title_slug}_actor_scene_{index:02d}.png")
-            conditioned = _avatar_reference_image(sl["shot"], shared, fal_key, scene_path, log=log)
-            if conditioned:
-                return conditioned
+            plate = _framing_plate(framing_index)
+            if plate:
+                return plate
         # Fallback: vary the crop of the shared photo so cuts read as camera changes.
+        photo = _shared_actor_photo()
+        _refuse_unusable_start_frame(photo)
         variant_path = os.path.join(output_dir, f"{title_slug}_actor_ref_{index:02d}.png")
-        return _avatar_reference_variant(shared, variant_path, index)
+        return _avatar_reference_variant(photo, variant_path, framing_index + 1)
 
     jobs = []
+    framing_cursor = 0
     for index, sl in enumerate(slices, start=1):
         slice_audio = os.path.join(output_dir, f"{title_slug}_slice_{index:02d}.mp3")
         broll = _is_broll_shot(sl["shot"])
         # Distinct names so a shot flipping talking<->broll never reuses a stale clip
         clip_name = f"{title_slug}_avatar_broll_{index:02d}.mp4" if broll else f"{title_slug}_avatar_{index:02d}.mp4"
         clip_path = os.path.join(output_dir, clip_name)
-        _ensure_slice_audio(audio_path, sl["start"], sl["end"], slice_audio, clip_path, log)
+        # Jump cuts carry a copy of the shot, so they are counted by shot number:
+        # part 2 of shot 3 must not be mistaken for part 1 on the next render.
+        key = str(sl["shot"].get("shot_number"))
+        part = shot_parts[key] = shot_parts.get(key, 0) + 1
+        _ensure_slice_audio(
+            audio_path, sl["start"], sl["end"], slice_audio, clip_path, log,
+            identity=_slice_identity(sl, voice_manifest or {}, part),
+        )
+        actor_ref = ""
+        if broll:
+            image = ""
+            # Resolved here, not inside the parallel render: `_shared_actor_photo`
+            # may draw the fallback actor, and two threads would draw it twice.
+            if broll_image_first and _shot_wants_actor(sl["shot"]):
+                actor_ref = _shared_actor_photo()
+        else:
+            # Two talking shots may sit back to back, but never on the same camera.
+            image = _resolve_image(sl, index, framing_cursor)
+            framing_cursor += 1
         jobs.append({
             "index": index,
             "slice": sl,
             "audio": slice_audio,
-            "image": "" if broll else _resolve_image(sl, index),
+            "image": image,
             "clip_path": clip_path,
             "broll": broll,
+            "actor_ref": actor_ref,
         })
         # Keep overlay/subtitle timing aligned with the real audio timeline
         sl["shot"]["start"] = sl["start"]
@@ -6012,24 +6570,34 @@ def generate_sliced_avatar_clips(
                 f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
             )
             if broll_image_first:
-                ref = _broll_reference_image(
-                    v3_shot, fal_key,
-                    job["clip_path"].replace(".mp4", "_ref.png"),
-                    log=log,
-                )
-                if ref:
-                    v3_shot["image_path"] = ref
+                # Кадр, одобренный в предпросмотре, уже оплачен. Рисовать его
+                # заново — это второй счёт за ту же картинку и другой сэмпл
+                # вместо того, что человек посмотрел и утвердил.
+                approved = _existing_shot_frame(v3_shot, _job_output_root(output_dir))
+                if approved:
+                    log(f"  B-roll shot {job['index']}: кадр одобрен в предпросмотре — не перерисовываю.")
+                    v3_shot["image_path"] = approved
+                else:
+                    ref = _broll_reference_image(
+                        v3_shot, fal_key,
+                        job["clip_path"].replace(".mp4", "_ref.png"),
+                        log=log,
+                        actor_photo_path=job["actor_ref"],
+                        billing=billing, edit_model=edit_model,
+                    )
+                    if ref:
+                        v3_shot["image_path"] = ref
             return generate_storyboard_shot_clip(
                 v3_shot,
                 fal_key,
                 job["clip_path"],
                 tier=broll_tier,
             )
-        if _avatar_clip_cache_valid(job["clip_path"], job["slice"]["shot"]):
+        if _avatar_clip_cache_valid(job["clip_path"], job["image"]):
             log(f"  Avatar shot {job['index']} cached.")
             return job["clip_path"]
         if _nonempty(job["clip_path"]):
-            log(f"  Avatar shot {job['index']}: промпт изменился — перегенерация кадра.")
+            log(f"  Avatar shot {job['index']}: референсный кадр изменился — перегенерация.")
             for stale in (
                 job["clip_path"],
                 f"{job['clip_path']}.review.json",
@@ -6050,7 +6618,6 @@ def generate_sliced_avatar_clips(
             fal_key,
             job["clip_path"],
             tier=tier,
-            scene_prompt=_avatar_scene_prompt(job["slice"]["shot"]),
         )
 
     errors = []
@@ -6074,9 +6641,523 @@ def generate_sliced_avatar_clips(
             "reference_image": job["image"],
             "start": job["slice"]["start"],
             "end": job["slice"]["end"],
+            # B-roll carries no audio, so only lip-synced clips inherit the
+            # slice's encoder delay — and only they need it skipped.
+            "speech_offset": 0.0 if job["broll"] else _mp3_encoder_delay(job["audio"]),
         }
         for job in jobs
     ]
+
+
+# --------------------------------------------------------------------------
+# Incremental voiceover
+#
+# Regenerating one take for the whole reel is what used to kill the paid avatar
+# clips: a fresh take differs from the old one *everywhere* (eleven_v3 in
+# Creative mode is never twice the same), so every clip lip-synced against the
+# old one had to be shot again — including the shots the user never touched. So
+# the take is not the unit of caching; the shot is. Each shot keeps its own
+# audio file, and only runs of consecutive shots whose text actually changed get
+# voiced again.
+#
+# The numbers below are measured, not guessed — tools/tts_seam_test.py on a real
+# 5-shot Russian reel. That voice leaves ~410 ms between sentences, and a join
+# padded to that length measured *quieter* than an average sentence boundary
+# inside one continuous take (0.74 dB of level step against a natural 0.68 dB
+# median, 0.49 semitones against 1.93). Voicing shot by shot instead of run by
+# run measured three times worse (up to 3.77 dB, 4.45 st), which is why runs
+# exist: the fewer joins, the longer each take, the more natural the delivery.
+#
+# eleven_v3 rejects previous_text/next_text/previous_request_ids outright, so
+# there is no API-side stitching to lean on. The join is an edit, not a prompt.
+_VOICE_JOIN_PAUSE_MS = 410.0
+_VOICE_PIECE_EDGE_MS = 120.0
+_VOICE_TARGET_LUFS = -16.0
+_VOICE_SAMPLE_RATE = 44100
+
+
+def _voice_manifest_path(output_dir: str, title_slug: str) -> str:
+    return os.path.join(output_dir, f"{title_slug}_voice_manifest.json")
+
+
+def _speech_shots_numbered(shots: list) -> list:
+    """Every shot with speech, paired with the number its voiceover files use.
+
+    One rule in one place: the manifest, the piece filenames and the slicer all
+    have to agree on what "shot 3" means, or a cached piece ends up under
+    somebody else's line.
+    """
+    speaking = [s for s in shots if (s.get("speech") or "").strip()]
+    return [(shot, shot.get("shot_number") or (index + 1)) for index, shot in enumerate(speaking)]
+
+
+def read_voice_manifest(output_dir: str, title_slug: str) -> dict:
+    """Where each shot's own audio sits inside the master track, by shot number."""
+    manifest = _read_json_file(_voice_manifest_path(output_dir, title_slug)) or {}
+    return {str(entry.get("shot_number")): entry for entry in (manifest.get("shots") or [])}
+
+
+def update_voice_cuts(output_dir: str, title_slug: str, cuts_by_shot: dict) -> None:
+    """Remember where a shot's audio was cut into jump cuts, so it can be replayed."""
+    path = _voice_manifest_path(output_dir, title_slug)
+    manifest = _read_json_file(path)
+    if not manifest.get("shots"):
+        return
+    for entry in manifest["shots"]:
+        cuts = cuts_by_shot.get(str(entry.get("shot_number")))
+        if cuts:
+            entry["cuts"] = [round(float(c), 3) for c in cuts]
+        else:
+            entry.pop("cuts", None)
+    _write_json_file(path, manifest)
+
+
+def _slices_from_voice_bounds(shots: list, manifest: dict) -> tuple:
+    """Turn the voiceover manifest's exact per-shot bounds into avatar slices.
+
+    Preferred over re-deriving boundaries from a transcript of the master track:
+    the manifest already knows where each shot's own audio was laid down, so a
+    shot nobody edited keeps the very same bounds when its neighbours are
+    re-voiced — and keeps the paid clip lip-synced to them.
+    """
+    slices, skipped = [], []
+    numbered = dict((id(shot), number) for shot, number in _speech_shots_numbered(shots))
+    for shot in shots:
+        bound = manifest.get(str(numbered.get(id(shot))))
+        if not bound:
+            skipped.append(shot)
+            continue
+        slices.append({"shot": shot, "start": float(bound["start"]), "end": float(bound["end"])})
+    return slices, skipped
+
+
+def _cuts_from_slices(slices: list) -> dict:
+    """Where each shot ended up being cut, relative to its own start."""
+    starts, cuts = {}, {}
+    for sl in slices:
+        number = sl["shot"].get("shot_number")
+        if number is None:
+            continue
+        number = str(number)
+        if number not in starts:
+            starts[number] = sl["start"]
+            continue
+        cuts.setdefault(number, []).append(round(sl["start"] - starts[number], 3))
+    return cuts
+
+
+def _slice_identity(sl: dict, manifest: dict, part: int) -> str:
+    """What a cached slice file has to still be, to be reused.
+
+    The shot it belongs to, the words in it, and which jump cut of that shot it
+    is. Without this a slice is trusted on its filename and length alone, and
+    both survive a shot being deleted from the middle of the reel.
+    """
+    number = sl["shot"].get("shot_number")
+    entry = manifest.get(str(number)) or {}
+    signature = entry.get("signature") or (sl["shot"].get("speech") or "").strip()
+    return f"{number}|{part}|{hashlib.sha1(signature.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _voice_piece_path(output_dir: str, title_slug: str, shot_number) -> str:
+    # WAV, not mp3: pieces are concatenated back together, and every mp3 would
+    # contribute its own encoder delay as a gap inside what used to be one
+    # continuous take.
+    return os.path.join(output_dir, f"{title_slug}_speech_{int(shot_number):02d}.wav")
+
+
+def _read_wav_samples(path: str):
+    import wave
+
+    with wave.open(path, "rb") as f:
+        data = f.readframes(f.getnframes())
+    return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _write_wav_samples(path: str, samples, rate: int = _VOICE_SAMPLE_RATE) -> str:
+    import wave
+
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes((np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+    return path
+
+
+def _decode_audio_samples(path: str):
+    """Any audio file as mono float samples at the pipeline's rate."""
+    proc = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path,
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", str(_VOICE_SAMPLE_RATE), "-"],
+        check=True, capture_output=True,
+    )
+    return np.frombuffer(proc.stdout, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _encode_audio_samples(samples, output_path: str) -> str:
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "s16le", "-ar", str(_VOICE_SAMPLE_RATE),
+         "-ac", "1", "-i", "-", "-c:a", "libmp3lame", "-b:a", "192k", output_path],
+        input=(np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes(),
+        check=True, capture_output=True,
+    )
+    return output_path
+
+
+def _measured_lufs(path: str) -> float:
+    """Integrated loudness of a file, or NaN when ffmpeg will not say."""
+    proc = subprocess.run(
+        ["ffmpeg", "-nostdin", "-i", path, "-af",
+         f"loudnorm=I={_VOICE_TARGET_LUFS}:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    marker = proc.stderr.rfind('"input_i"')
+    if marker < 0:
+        return float("nan")
+    start, end = proc.stderr.rfind("{", 0, marker), proc.stderr.find("}", marker)
+    try:
+        return float(json.loads(proc.stderr[start:end + 1])["input_i"])
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return float("nan")
+
+
+def _take_gain(path: str) -> float:
+    """One scalar that puts a whole take at the reel's loudness target.
+
+    Per take, never per shot: a single gain leaves the take's own dynamics
+    untouched and only matches its overall level to its neighbours, which is the
+    artifact the ear catches first at a join.
+    """
+    measured = _measured_lufs(path)
+    if measured != measured:  # NaN
+        return 1.0
+    return float(10 ** ((_VOICE_TARGET_LUFS - measured) / 20))
+
+
+def _speech_bounds(samples, edge_ms: float = _VOICE_PIECE_EDGE_MS) -> tuple:
+    """Where speech sits in a take, with a fixed strip of silence left on it.
+
+    TTS hands back takes with whatever silence it felt like at the edges — in
+    practice near zero, which is why two takes butted together sounded like the
+    speaker gasping through a full stop. Normalising the edges here means the
+    join can be a constant, decided once, instead of a measurement repeated on
+    every render.
+    """
+    if not len(samples):
+        return 0, 0
+    win = _VOICE_SAMPLE_RATE // 100
+    usable = len(samples) - len(samples) % win
+    if usable < win:
+        return 0, len(samples)
+    frames = np.abs(samples[:usable].reshape(-1, win)).max(axis=1)
+    floor = max(float(np.percentile(frames, 15)) * 3, float(frames.max()) * 0.02)
+    loud = np.flatnonzero(frames > floor)
+    if not len(loud):
+        return 0, len(samples)
+    edge = int(_VOICE_SAMPLE_RATE * edge_ms / 1000)
+    return (max(0, int(loud[0]) * win - edge),
+            min(len(samples), (int(loud[-1]) + 1) * win + edge))
+
+
+def _shot_speech_signature(shot: dict, **tts_settings) -> str:
+    return _tts_signature((shot.get("speech") or "").strip(), **tts_settings)
+
+
+def _voice_runs(entries: list) -> list:
+    """Group the shots that need voicing into runs of consecutive ones.
+
+    One request per run rather than per shot: a run is read as continuous
+    speech, so the delivery inside it stays natural and the reel gains exactly
+    one join per edit boundary instead of one per shot.
+    """
+    runs, current = [], []
+    for entry in entries:
+        if entry["reusable"]:
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        current.append(entry)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _split_take_into_pieces(
+    samples,
+    take_shots: list,
+    take_path: str,
+    language: str,
+    log: Callable[[str], None],
+) -> list:
+    """Cut one take into one piece per shot, so each shot can be cached alone.
+
+    Boundaries come from the same word-proportional tiling the avatar slicer
+    uses, so a piece ends where the shot's last scripted word ends rather than
+    at an arbitrary proportional guess.
+    """
+    if len(take_shots) == 1:
+        return [samples]
+    duration = len(samples) / _VOICE_SAMPLE_RATE
+    words = []
+    try:
+        words = transcribe_audio_for_subs(take_path, language=language)
+        if words:
+            words = _align_asr_words_to_script(
+                words, " ".join((s.get("speech") or "").strip() for s in take_shots), log=log
+            )
+    except Exception as e:
+        log(f"  ⚠️ Не удалось распознать дубль для нарезки по кадрам ({e}) — режу пропорционально.")
+    slices, _ = _align_shots_to_voiceover(take_shots, words, duration)
+    pieces = []
+    for index, sl in enumerate(slices):
+        start = int(sl["start"] * _VOICE_SAMPLE_RATE)
+        # The last piece takes the remainder so the pieces rebuild the take exactly.
+        end = len(samples) if index == len(slices) - 1 else int(sl["end"] * _VOICE_SAMPLE_RATE)
+        pieces.append(samples[start:end])
+    return pieces
+
+
+def build_incremental_voiceover(
+    shots: list,
+    output_dir: str,
+    title_slug: str,
+    *,
+    provider: str,
+    fal_key: str,
+    elevenlabs_key: str,
+    voice_id: str,
+    minimax_voice_id: str,
+    language: str,
+    actor_gender: str,
+    revoice_all: bool = False,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Voice only what changed, and hand back a master track plus its map.
+
+    Returns the master voiceover path, each shot's exact [start, end] inside it,
+    and which shots were re-voiced — the callers use the last one to work out
+    which paid clips are still valid.
+    """
+    numbered = _speech_shots_numbered(shots)
+    if not numbered:
+        raise ValueError("Voiceover needs at least one shot with speech")
+
+    tts_settings = {
+        "provider": provider,
+        "elevenlabs_voice_id": voice_id,
+        "minimax_voice_id": minimax_voice_id,
+        "language": language,
+        "actor_gender": actor_gender,
+    }
+    stored = _read_json_file(_voice_manifest_path(output_dir, title_slug)) or {}
+    known = read_voice_manifest(output_dir, title_slug)
+    master_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
+    narration = " ".join((shot.get("speech") or "").strip() for shot, _ in numbered)
+    whole_signature = _tts_signature(
+        narration, provider, voice_id, minimax_voice_id, language, actor_gender
+    )
+
+    def whole_take(reason: str = "", salvage: str = "", used: Optional[dict] = None) -> dict:
+        """One take for the whole reel — the old behaviour, kept as the floor.
+
+        Reached by a job recorded before per-shot pieces existed, and by any
+        provider whose audio we cannot take apart. Losing incremental caching is
+        a cost; losing the render would be a bug. `salvage` is a take that
+        already holds the whole narration: paying for it a second time because
+        we could not slice it would be absurd.
+        """
+        if reason:
+            log(f"[1/5] {reason}")
+        # A manifest describes a master built from pieces. Falling back to one
+        # take replaces that master, so its map now points into audio that no
+        # longer exists — and a later render must not slice by it.
+        try:
+            os.remove(_voice_manifest_path(output_dir, title_slug))
+        except OSError:
+            pass
+        if salvage and _nonempty(salvage):
+            shutil.move(salvage, master_path)
+            return {"path": master_path, "bounds": [],
+                    "changed_shots": [number for _, number in numbered],
+                    "provider": (used or {}).get("provider") or provider,
+                    "model": (used or {}).get("model") or ""}
+        if not (_nonempty(master_path) and _read_tts_metadata(master_path).get("signature") == whole_signature):
+            outcome = generate_voiceover_with_fallback(
+                narration, master_path,
+                provider=provider, fal_key=fal_key, elevenlabs_key=elevenlabs_key,
+                elevenlabs_voice_id=voice_id, minimax_voice_id=minimax_voice_id,
+                language=language, actor_gender=actor_gender, log=log,
+            )
+            return {"path": master_path, "bounds": [],
+                    "changed_shots": [number for _, number in numbered],
+                    "provider": outcome["provider"], "model": outcome.get("model") or ""}
+        log("[1/5] Voiceover cached, skipping.")
+        cached = _read_tts_metadata(master_path)
+        return {"path": master_path, "bounds": [], "changed_shots": [],
+                "provider": cached.get("provider") or provider, "model": cached.get("model") or ""}
+
+    if not known and _nonempty(master_path) and not revoice_all:
+        # A job from before this existed: its master still matches the script, so
+        # reuse it rather than re-voicing (and re-paying for) every clip. The
+        # first real edit moves the job onto per-shot pieces.
+        if _read_tts_metadata(master_path).get("signature") == whole_signature:
+            return whole_take()
+
+    entries = []
+    for shot, number in numbered:
+        piece_path = _voice_piece_path(output_dir, title_slug, number)
+        signature = _shot_speech_signature(shot, **tts_settings)
+        previous = known.get(str(number)) or {}
+        reusable = (
+            not revoice_all
+            and previous.get("signature") == signature
+            and _nonempty(piece_path)
+        )
+        entries.append({
+            "shot": shot, "shot_number": number, "piece": piece_path,
+            "signature": signature, "reusable": reusable,
+            "take_seq": previous.get("take_seq", 0) if reusable else 0,
+            # A re-voiced shot's jump cuts belong to audio that no longer exists.
+            "cuts": previous.get("cuts") if reusable else None,
+        })
+
+    runs = _voice_runs(entries)
+    next_seq = max([e["take_seq"] for e in entries] + [0]) + 1
+    provider_used = stored.get("provider") or provider
+    model_used = stored.get("model") or ""
+
+    if not runs:
+        log("[1/5] Озвучка не менялась — беру целиком из кэша.")
+    for run in runs:
+        numbers = ", ".join(str(e["shot_number"]) for e in run)
+        log(f"[1/5] Озвучиваю кадры {numbers} одним дублем ({len(run)} шт.)...")
+        take_path = os.path.join(output_dir, f"{title_slug}_take_{next_seq:02d}.mp3")
+        result = generate_voiceover_with_fallback(
+            " ".join((e["shot"].get("speech") or "").strip() for e in run),
+            take_path,
+            provider=provider,
+            fal_key=fal_key,
+            elevenlabs_key=elevenlabs_key,
+            elevenlabs_voice_id=voice_id,
+            minimax_voice_id=minimax_voice_id,
+            language=language,
+            actor_gender=actor_gender,
+            log=log,
+        )
+        provider_used, model_used = result["provider"], result.get("model") or ""
+
+        try:
+            samples = _decode_audio_samples(take_path) * _take_gain(take_path)
+            head, tail = _speech_bounds(samples)
+            pieces = _split_take_into_pieces(
+                samples[head:tail], [e["shot"] for e in run], take_path, language, log
+            )
+        except Exception as e:
+            covers_reel = len(runs) == 1 and len(run) == len(entries)
+            return whole_take(
+                f"Дубль не читается как аудио ({e}) — озвучиваю ролик одним куском.",
+                salvage=take_path if covers_reel else "",
+                used=result,
+            )
+        for entry, piece in zip(run, pieces):
+            _write_wav_samples(entry["piece"], piece)
+            entry["take_seq"] = next_seq
+        next_seq += 1
+
+    # A join between two takes gets the pause this voice takes between sentences
+    # anyway. It is charged to whichever side was voiced later: that shot is
+    # being re-rendered regardless, so the untouched neighbour keeps its bounds —
+    # and with them its clip.
+    pad = np.zeros(
+        int(_VOICE_SAMPLE_RATE * max(0.0, _VOICE_JOIN_PAUSE_MS - 2 * _VOICE_PIECE_EDGE_MS) / 1000),
+        dtype=np.float32,
+    )
+    timeline, bounds, cursor = [], [], 0
+    for index, entry in enumerate(entries):
+        piece = _read_wav_samples(entry["piece"])
+        previous = entries[index - 1] if index else None
+        start = cursor
+        if previous is not None and previous["take_seq"] != entry["take_seq"]:
+            timeline.append(pad)
+            cursor += len(pad)
+            if entry["take_seq"] < previous["take_seq"]:
+                # The older take is on the right, so the pause is charged to the
+                # newer one on the left — its bound grows, the untouched shot's
+                # does not. Otherwise `start` stays put and the pause opens this
+                # shot's slice instead.
+                bounds[-1]["end"] = round(cursor / _VOICE_SAMPLE_RATE, 3)
+                start = cursor
+        timeline.append(piece)
+        cursor += len(piece)
+        bounds.append({
+            "shot_number": entry["shot_number"],
+            "start": round(start / _VOICE_SAMPLE_RATE, 3),
+            "end": round(cursor / _VOICE_SAMPLE_RATE, 3),
+        })
+
+    master_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
+    _encode_audio_samples(np.concatenate(timeline), master_path)
+
+    changed = [e["shot_number"] for e in entries if not e["reusable"]]
+    seams = sum(
+        1 for i in range(1, len(entries))
+        if entries[i]["take_seq"] != entries[i - 1]["take_seq"]
+    )
+    _write_json_file(_voice_manifest_path(output_dir, title_slug), {
+        "provider": provider_used,
+        "model": model_used,
+        "shots": [
+            {
+                "signature": entry["signature"],
+                "take_seq": entry["take_seq"],
+                "piece": os.path.basename(entry["piece"]),
+                **({"cuts": entry["cuts"]} if entry["cuts"] else {}),
+                **bound,
+            }
+            for entry, bound in zip(entries, bounds)
+        ],
+    })
+    if runs and changed != [e["shot_number"] for e in entries]:
+        log(f"[1/5] Перезаписано кадров: {len(changed)} из {len(entries)}, швов в дорожке: {seams}.")
+    return {
+        "path": master_path,
+        "bounds": bounds,
+        "changed_shots": changed,
+        "provider": provider_used,
+        "model": model_used,
+    }
+
+
+def already_prepared_voiceover(audio_path: str) -> dict:
+    """Preparation report for a master track the builder already normalised.
+
+    `prepare_voiceover_for_video_generation` strips silence off both edges, and
+    the head is the problem: cutting it slides every bound in the voice manifest
+    out of place, and each avatar clip would then be lip-synced against audio
+    that starts a beat early. The incremental builder normalises the edges as it
+    assembles, so the track is already what the avatar service wants. What stays
+    is the refusal to hand Kling something unusable.
+    """
+    usable = _decodable_audio_duration(audio_path)
+    if usable is None or usable < _MIN_VOICEOVER_SECONDS:
+        raise ValueError(
+            "Voiceover audio is empty or too short to animate "
+            f"({'unreadable' if usable is None else f'{usable:.2f}s'}) — "
+            "add spoken lines to the script before generating video."
+        )
+    return {
+        "path": audio_path,
+        "original_path": audio_path,
+        "original_duration": round(usable, 3),
+        "duration": round(usable, 3),
+        "leading_silence": 0.0,
+        "trailing_silence": 0.0,
+        "silence_events": 0,
+        "trimmed": False,
+        "status": "normalized",
+    }
 
 
 def _purge_voiceover_derived_assets(output_dir: str, title_slug: str) -> None:
@@ -6122,6 +7203,7 @@ def adopt_job_artifacts(
     output_dir: str,
     source_slug: str = "",
     target_slug: str = "",
+    source_label: str = "прошлого рендера",
     log: Callable[[str], None] = print,
 ) -> int:
     """Carry a finished job's paid artifacts into a fresh job dir.
@@ -6159,9 +7241,9 @@ def adopt_job_artifacts(
             shutil.copy2(src, dst)
             copied += 1
         except OSError as e:
-            log(f"  ⚠️ Файл {name} из прошлого рендера не скопирован: {e}")
+            log(f"  ⚠️ Файл {name} из {source_label} не скопирован: {e}")
     if copied:
-        log(f"[кадры] Взял {copied} файл(ов) из прошлого рендера — платим только за изменённые кадры.")
+        log(f"[кадры] Взял {copied} файл(ов) из {source_label} — платим только за изменённые кадры.")
     return copied
 
 
@@ -6237,6 +7319,35 @@ def forget_shot_artifacts(
         for key in (*_SHOT_ARTIFACT_URL_KEYS, "image_path", "_render_files"):
             shot.pop(key, None)
         log(f"[кадры] Кадр {number}: перерисовываю заново.")
+    return removed
+
+
+def forget_shot_voice(
+    output_dir: str,
+    title_slug: str,
+    shot_numbers,
+    log: Callable[[str], None] = print,
+) -> list:
+    """Drop the cached voice piece of the lines the user wants read again.
+
+    A line whose text did not change is served from its cached take, so
+    «перезаписать» is the only way to ask this voice for another reading. Only
+    the piece is deleted: the builder then re-records that line, its bounds move,
+    and the slice check drops the clip that was lip-synced to the old take.
+    """
+    removed = []
+    for number in shot_numbers or []:
+        try:
+            piece = _voice_piece_path(output_dir, title_slug, int(number))
+        except (TypeError, ValueError):
+            continue
+        try:
+            if os.path.isfile(piece):
+                os.remove(piece)
+                removed.append(os.path.basename(piece))
+                log(f"[озвучка] Кадр {number}: перезаписываю реплику заново.")
+        except OSError:
+            pass
     return removed
 
 
@@ -6334,6 +7445,7 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
     selected_actor_path = config.get("selected_actor_path") or ""
     actor_description = config.get("actor_description") or ""
     only = config.get("frames_only_shot")
+    edit_model = _avatar_edit_model(config.get("avatar_edit_model") or "")["id"]
     job_dir = os.path.basename(output_dir.rstrip("/\\"))
     fallback_actor = {"path": ""}
 
@@ -6350,14 +7462,43 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
             fallback_actor["path"] = path
         return fallback_actor["path"]
 
-    output_root = os.path.dirname(output_dir.rstrip("/\\")) or "output"
+    output_root = _job_output_root(output_dir)
+
+    # Talking shots share two staged cameras of one set. A frame per shot is both
+    # a Flux charge per shot and a new room behind every cut — which is exactly
+    # what makes the avatar jump between scenes.
+    pinned_set = ""
+    for shot in shots:
+        if not _is_broll_shot(shot):
+            pinned_set = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
+            if pinned_set:
+                break
+    talking_order = {}
+    for shot in shots:
+        if not _is_broll_shot(shot):
+            talking_order[id(shot)] = len(talking_order)
 
     made = 0
     reused = 0
+    failed = 0
+    # Считаем не нарисованные кадры, а обращения к модели: пустой кадр fal
+    # тарифицирует наравне с картинкой, и смета обязана совпадать со счётом.
+    # Сюда же складываются отказы редакторов (`blocked`) — из них интерфейс
+    # собирает предупреждение с дословным ответом модели.
+    billing = {"calls": 0, "blocked": []}
     for shot in shots:
         num = shot.get("shot_number")
         if only is not None and num != only:
             continue
+        broll = _is_broll_shot(shot)
+        framing = ""
+        if broll:
+            frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
+        else:
+            key, framing = _AVATAR_FRAMINGS[
+                talking_order.get(id(shot), 0) % len(_AVATAR_FRAMINGS)
+            ]
+            frame_path = _framing_plate_path(output_dir, title_slug, key)
         if only is None:
             # Reopened storyboard: this shot already carries a frame (or a
             # rendered clip) from an earlier job. Drawing it again is a fresh
@@ -6370,7 +7511,6 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
                 log(f"[кадры] Кадр {num}: уже есть — пропускаю.")
                 reused += 1
                 continue
-        frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
         if only is not None:
             # Explicit per-shot regenerate: drop the cached frame so a new one is drawn.
             for stale in (frame_path, f"{frame_path}.prompt.txt", f"{frame_path}.fal_url.txt"):
@@ -6379,32 +7519,245 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
                         os.remove(stale)
                 except OSError:
                     pass
-        log(f"[кадры] Генерирую кадр {num}...")
-        if _is_broll_shot(shot):
-            made_path = _broll_reference_image(shot, fal_key, frame_path, log=log)
+            if not broll:
+                log(f"[кадры] Кадр {num}: перерисовываю ракурс «{key}» — он общий "
+                    "для всех кадров на этой камере.")
+        drawn_before = _nonempty(frame_path)
+        if drawn_before and not broll:
+            log(f"[кадры] Кадр {num}: ракурс «{key}» уже отрисован — переиспользую.")
         else:
-            made_path = _avatar_reference_image(shot, _actor_photo(), fal_key, frame_path, log=log)
+            log(f"[кадры] Генерирую кадр {num}...")
+        if broll:
+            made_path = _broll_reference_image(
+                shot, fal_key, frame_path, log=log,
+                actor_photo_path=_actor_photo() if _shot_wants_actor(shot) else "",
+                billing=billing,
+                edit_model=edit_model,
+            )
+        else:
+            made_path = _avatar_reference_image(
+                {}, _actor_photo(), fal_key, frame_path, log=log,
+                scene_override=pinned_set, framing=framing,
+                billing=billing,
+                edit_model=edit_model,
+            )
         if made_path and _nonempty(made_path):
             url = f"/videos/{job_dir}/{os.path.basename(made_path)}"
             shot["image_path"] = made_path
             shot["local_url"] = url
             shot["image_url"] = url
             shot["preview_frame_url"] = url
-            made += 1
+            # A second shot on an already-drawn camera costs nothing.
+            if drawn_before and not broll:
+                reused += 1
+            else:
+                made += 1
         else:
+            failed += 1
             log(f"  ⚠️ Кадр {num}: не удалось сгенерировать.")
 
-    log(f"[кадры] Готово: {made} кадр(ов)." + (f" Пропущено готовых: {reused}." if reused else ""))
-    cost = round(made * 0.05, 2)
+    log(f"[кадры] Готово: {made} кадр(ов)." + (f" Пропущено готовых: {reused}." if reused else "")
+        + (f" Платных обращений к модели: {billing['calls']}." if billing["calls"] != made else ""))
+    cost = round(billing["calls"] * 0.05, 2)
+    # Один отказ на модель: первый — настоящий (с ответом fal), остальные кадры
+    # той же пачки упираются в тот же вердикт по памяти и ничего нового не несут.
+    blocked_by_model = {}
+    for item in billing.get("blocked", []):
+        blocked_by_model.setdefault(item["model"], item)
+    actor_photo = selected_actor_path or fallback_actor["path"]
+    tried = _models_that_blanked(actor_photo) if actor_photo else set()
     return {
         "video_path": "",
         "video_filename": "",
         "frames_only": True,
+        # Счётчики, а не только лог: без них джоб завершается «успешно» с нулём
+        # кадров, интерфейс молча показывает старую картинку, и пользователь
+        # видит «генерация прошла, но ничего не изменилось».
+        "frames_made": made,
+        "frames_reused": reused,
+        "frames_failed": failed,
+        # Сколько раз реально заплатили: пустой кадр стоит столько же, сколько картинка.
+        "frames_charged": billing["calls"],
+        # Кто и почему отказался рисовать — с дословным ответом fal. Интерфейс
+        # показывает это модалкой: тихая подмена модели за спиной у юзера была бы
+        # тратой его денег на нашу догадку.
+        "frames_blocked": list(blocked_by_model.values()),
+        "avatar_edit_model": edit_model,
+        "avatar_edit_models": [
+            {**{k: m[k] for k in ("id", "title", "vendor", "note")}, "blocked": m["id"] in tried}
+            for m in AVATAR_EDIT_MODELS
+        ],
         "duration": 0,
         "storyboard_shots": shots,
         "storyboard_generation_mode": (config.get("storyboard_generation_mode") or "sliced_avatar"),
         "cost_estimate": {"reference_frames_flux": cost, "total": cost},
         "quality_warnings": [],
+    }
+
+
+def _storyboard_voice_only_result(
+    shots: list,
+    output_dir: str,
+    title_slug: str,
+    audio_path: str,
+    voice_manifest: dict,
+    generation_mode: str,
+    tier: str,
+    language: str,
+    full_narration: str,
+    voiced_text: str,
+    voice_id: str,
+    tts_provider_used: str,
+    tts_model_used: str,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Hand back the finished voiceover and the shoot it implies — no paid video.
+
+    The voiceover decides everything after it: its length is the video's length,
+    its per-shot bounds are where the cuts fall, and a long line is split into
+    several avatar clips — each one paid for. Recording it costs cents, so it is
+    worth hearing (and re-recording) before that, which is what this returns —
+    the master track, each shot's own piece of it, and the clip plan it buys.
+    """
+    job_dir = os.path.basename(output_dir.rstrip("/\\"))
+
+    def _url(path: str) -> str:
+        return f"/videos/{job_dir}/{os.path.basename(path)}" if path and _nonempty(path) else ""
+
+    audio_duration = _get_media_duration(audio_path)
+
+    slices, _skipped = _slices_from_voice_bounds(shots, voice_manifest)
+    covered = len(slices) == len(_speech_shots_numbered(shots))
+
+    words = []
+    # Расшифровка нужна только там, где по ней ищут границы: длинные реплики
+    # режутся по паузам между словами, а без манифеста по ним же раскладываются
+    # и сами кадры. В остальных случаях это минуты CPU впустую.
+    if not covered or generation_mode == "sliced_avatar":
+        try:
+            words = transcribe_audio_for_subs(audio_path, language=language)
+            if words:
+                # Сверяем со всем текстом ролика, а не с перезаписанным куском:
+                # расшифровка снята со всей дорожки, и по половине сценария
+                # слова легли бы не на свои места, а с ними и разрезы.
+                words = _align_asr_words_to_script(words, full_narration or "", log=log)
+        except Exception as e:
+            log(f"[озвучка] Дорожку не удалось разобрать по словам ({e}) — план съёмки посчитан по долям текста.")
+
+    if not covered:
+        slices, _skipped = _align_shots_to_voiceover(shots, words, audio_duration)
+    # Тот же раскрой, что сделает рендер, но в манифест он не пишется: манифест
+    # описывает снятое, а это ещё прогноз — иначе рендер повторил бы разрезы,
+    # посчитанные по расшифровке, которая здесь могла и не получиться.
+    if generation_mode == "sliced_avatar":
+        slices = _split_long_slices(
+            slices, words,
+            cuts_by_shot={k: v.get("cuts") for k, v in (voice_manifest or {}).items() if v.get("cuts")},
+        )
+
+    spans: dict = {}
+    for sl in slices:
+        key = str(sl["shot"].get("shot_number"))
+        span = spans.setdefault(key, {"start": sl["start"], "end": sl["end"], "clips": 0})
+        span["start"] = min(span["start"], sl["start"])
+        span["end"] = max(span["end"], sl["end"])
+        span["clips"] += 1
+
+    numbered = dict((id(shot), number) for shot, number in _speech_shots_numbered(shots))
+    voice_shots = []
+    for shot in shots:
+        number = numbered.get(id(shot))
+        span = spans.get(str(shot.get("shot_number"))) or {}
+        piece = _voice_piece_path(output_dir, title_slug, number) if number is not None else ""
+        seconds = round(max(0.0, span.get("end", 0.0) - span.get("start", 0.0)), 2)
+        # Кладём на сам кадр: редактор раскадровки читает шоты, и без этого
+        # длительность реплики некуда показать рядом с самой репликой.
+        shot["voice_url"] = _url(piece)
+        # Текст, который реально прочитан: правку реплики после записи иначе
+        # видно только по звуку, а редактор молча показывал бы старую длину.
+        shot["voice_speech"] = (shot.get("speech") or "").strip()
+        shot["voice_start"] = round(span.get("start", 0.0), 3)
+        shot["voice_end"] = round(span.get("end", 0.0), 3)
+        shot["voice_seconds"] = seconds
+        shot["voice_clips"] = span.get("clips", 0)
+        voice_shots.append({
+            "shot_number": shot.get("shot_number"),
+            "speech": (shot.get("speech") or "").strip(),
+            "voice_url": shot["voice_url"],
+            "start": shot["voice_start"],
+            "end": shot["voice_end"],
+            "seconds": seconds,
+            "clips": shot["voice_clips"],
+        })
+
+    talking = [sl for sl in slices if not _is_broll_shot(sl["shot"])]
+    broll = [sl for sl in slices if _is_broll_shot(sl["shot"])]
+    talking_seconds = sum(sl["end"] - sl["start"] for sl in talking)
+    broll_seconds = sum(sl["end"] - sl["start"] for sl in broll)
+    forecast: dict = {}
+    if generation_mode == "sliced_avatar":
+        avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
+        forecast[f"sliced_avatar_kling_{avatar_tier}"] = round(
+            talking_seconds * kling_avatar_cost_per_second(avatar_tier), 2
+        )
+        if broll_seconds:
+            broll_tier = tier if tier in KLING_V3_STORYBOARD_TIERS else "standard"
+            forecast[f"sliced_broll_kling_v3_{broll_tier}"] = round(
+                broll_seconds * storyboard_video_cost_per_second(broll_tier), 2
+            )
+    else:
+        forecast[f"storyboard_{storyboard_video_family(tier)}_{tier}"] = round(
+            (talking_seconds + broll_seconds) * storyboard_video_cost_per_second(tier), 2
+        )
+    forecast["total"] = round(sum(forecast.values()), 2)
+
+    # Заплачено ровно за перезаписанные реплики: остальные куски дорожки взяты
+    # из кэша и второй раз не тарифицируются.
+    tts_cost_key = "voiceover_fal_minimax" if tts_provider_used == "fal_minimax" else "voiceover_elevenlabs"
+    tts_cost = round(len(voiced_text or "") * (0.0001 if tts_provider_used == "fal_minimax" else 0.00003), 3)
+
+    warnings = []
+    if tts_provider_used == "elevenlabs" and tts_model_used and tts_model_used != "eleven_v3":
+        # Ровно та подмена, из-за которой голос звучит «по-дикторски»: v3 не
+        # ответил, а v2 читает ровно и не понимает [excited]/[sighs].
+        warnings.append(
+            f"Озвучка записана резервной моделью {tts_model_used}: eleven_v3 не ответил, "
+            "поэтому подача ровнее и звучит более «дикторски»."
+        )
+    if tts_provider_used == "fal_minimax":
+        warnings.append("Озвучка записана резервным движком MiniMax: ElevenLabs не ответил, голос другой.")
+    silent = [
+        shot.get("shot_number") for shot in shots
+        if (shot.get("speech") or "").strip() and not shot.get("voice_seconds")
+    ]
+    if silent:
+        warnings.append(
+            "Не попали в дорожку кадры: " + ", ".join(str(n) for n in silent) + "."
+        )
+
+    log(
+        f"[озвучка] Готово: {audio_duration:.1f} с, кадров с речью {len(spans)}, "
+        f"клипов в съёмке {len(slices)} (~{forecast['total']:.2f}$)."
+    )
+    return {
+        "video_path": "",
+        "video_filename": "",
+        "voice_only": True,
+        "duration": round(audio_duration, 2),
+        "audio_url": _url(audio_path),
+        "voice_shots": voice_shots,
+        "voice_clips_planned": len(slices),
+        "voice_provider": tts_provider_used,
+        "voice_model": tts_model_used,
+        "voice_id": voice_id,
+        # Что уже потрачено на дубли — и отдельно во что обойдётся съёмка по этой
+        # дорожке: смешивать их в одну сумму значит показать счёт за то, чего ещё
+        # не было.
+        "cost_estimate": {tts_cost_key: tts_cost, "total": tts_cost},
+        "video_cost_estimate": forecast,
+        "storyboard_shots": shots,
+        "storyboard_generation_mode": generation_mode,
+        "quality_warnings": warnings,
     }
 
 
@@ -6471,37 +7824,76 @@ def generate_storyboard_video(
 
     log("[1/5] Generating voiceover for storyboard...")
     expected_signature = _tts_signature(full_narration, tts_provider, voice_id, minimax_voice_id, language, actor_gender)
-    cached_meta = _read_tts_metadata(audio_path) if _nonempty(audio_path) else {}
-    if _nonempty(audio_path) and cached_meta.get("signature") == expected_signature:
-        tts_provider_used = cached_meta.get("provider") or tts_provider
-        tts_model_used = cached_meta.get("model") or ""
-        log("[1/5] Voiceover cached, skipping.")
-    else:
-        if _nonempty(audio_path):
-            log("[1/5] Script or voice changed — regenerating voiceover and audio-derived clips.")
-            _purge_voiceover_derived_assets(output_dir, title_slug)
-        voice_result = generate_voiceover_with_fallback(
-            full_narration,
-            audio_path,
+    voice_manifest: dict = {}
+    # Текст, за который в этом прогоне реально заплатили: остальное взято из
+    # кэша, и показывать его в счёте — врать о списании.
+    voiced_text = ""
+    if any((shot.get("speech") or "").strip() for shot in shots):
+        # Shot by shot, so that editing one line does not throw away the paid
+        # clips of the lines around it. Consecutive changed shots still share a
+        # single take — the fewer joins, the more natural the delivery.
+        voice_result = build_incremental_voiceover(
+            shots, output_dir, title_slug,
             provider=tts_provider,
             fal_key=fal_key,
             elevenlabs_key=elevenlabs_key,
-            elevenlabs_voice_id=voice_id,
+            voice_id=voice_id,
             minimax_voice_id=minimax_voice_id,
             language=language,
             actor_gender=actor_gender,
+            revoice_all=bool(config.get("revoice_all")),
             log=log,
         )
+        audio_path = voice_result["path"]
+        # No bounds means the builder fell back to one take for the whole reel;
+        # slicing then goes back to deriving boundaries from the transcript.
+        if voice_result["bounds"]:
+            voice_manifest = read_voice_manifest(output_dir, title_slug)
         tts_provider_used = voice_result["provider"]
         tts_model_used = voice_result.get("model") or ""
-        _write_tts_metadata(audio_path, {
-            "signature": expected_signature,
-            "provider": voice_result["provider"],
-            "voice_id": voice_result["voice_id"],
-            "model": tts_model_used,
-        })
+        revoiced = set(voice_result.get("changed_shots") or [])
+        voiced_text = " ".join(
+            (shot.get("speech") or "").strip()
+            for shot, number in _speech_shots_numbered(shots) if number in revoiced
+        ).strip()
+    else:
+        # Narration that lives outside the shots (legacy scripts, overlay-only
+        # boards) has nothing to cache per shot — one take, as before.
+        cached_meta = _read_tts_metadata(audio_path) if _nonempty(audio_path) else {}
+        if _nonempty(audio_path) and cached_meta.get("signature") == expected_signature:
+            tts_provider_used = cached_meta.get("provider") or tts_provider
+            tts_model_used = cached_meta.get("model") or ""
+            log("[1/5] Voiceover cached, skipping.")
+        else:
+            if _nonempty(audio_path):
+                log("[1/5] Script or voice changed — regenerating voiceover and audio-derived clips.")
+                _purge_voiceover_derived_assets(output_dir, title_slug)
+            result = generate_voiceover_with_fallback(
+                full_narration,
+                audio_path,
+                provider=tts_provider,
+                fal_key=fal_key,
+                elevenlabs_key=elevenlabs_key,
+                elevenlabs_voice_id=voice_id,
+                minimax_voice_id=minimax_voice_id,
+                language=language,
+                actor_gender=actor_gender,
+                log=log,
+            )
+            tts_provider_used = result["provider"]
+            tts_model_used = result.get("model") or ""
+            voiced_text = full_narration
+    _write_tts_metadata(audio_path, {
+        "signature": expected_signature,
+        "provider": tts_provider_used,
+        "voice_id": voice_id,
+        "model": tts_model_used,
+    })
 
-    voiceover_preparation = prepare_voiceover_for_video_generation(audio_path, log=log)
+    voiceover_preparation = (
+        already_prepared_voiceover(audio_path) if voice_manifest
+        else prepare_voiceover_for_video_generation(audio_path, log=log)
+    )
     audio_path = voiceover_preparation["path"]
 
     generation_mode = (config.get("storyboard_generation_mode") or "per_shot").lower()
@@ -6525,7 +7917,10 @@ def generate_storyboard_video(
     if generation_mode in ("per_shot", "multi_shot"):
         try:
             derived_duration = _get_media_duration(audio_path)
-            derived_slices, derived_skipped = _align_shots_to_voiceover(shots, [], derived_duration)
+            derived_slices, derived_skipped = (
+                _slices_from_voice_bounds(shots, voice_manifest) if voice_manifest
+                else _align_shots_to_voiceover(shots, [], derived_duration)
+            )
             for sl in derived_slices:
                 sl["shot"]["start"] = round(sl["start"], 3)
                 sl["shot"]["end"] = round(sl["end"], 3)
@@ -6536,8 +7931,33 @@ def generate_storyboard_video(
         except Exception as e:
             log(f"[2/5] Could not derive shot durations from voiceover ({e}); keeping script timings.")
 
+    # Дальше начинается платное. Озвучка уже готова — отдаём её на прослушивание
+    # и останавливаемся: голос выбирается под ролик один раз, и менять его после
+    # съёмки — значит переснимать всё, что уже оплачено.
+    if config.get("voice_only"):
+        return _storyboard_voice_only_result(
+            shots,
+            output_dir,
+            title_slug,
+            audio_path,
+            voice_manifest,
+            generation_mode,
+            tier,
+            language,
+            full_narration,
+            voiced_text,
+            voice_id,
+            tts_provider_used,
+            tts_model_used,
+            log=log,
+        )
+
     spoken_words = []
     clips = []
+    # Отказы редакторов кадра во время платного рендера: без них ролик просто
+    # выходит с обрезанным фото вместо поставленного кадра, и понять почему —
+    # неоткуда. Уходят в quality_warnings, которые интерфейс уже показывает.
+    frame_report: dict = {"calls": 0, "blocked": []}
     if generation_mode == "sliced_avatar":
         avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
         broll_tier = tier if tier in KLING_V3_STORYBOARD_TIERS else "standard"
@@ -6568,6 +7988,9 @@ def generate_storyboard_video(
             broll_tier=broll_tier,
             broll_image_first=bool(config.get("broll_image_first", True)),
             avatar_image_first=bool(config.get("avatar_image_first", True)),
+            voice_manifest=voice_manifest,
+            edit_model=_avatar_edit_model(config.get("avatar_edit_model") or "")["id"],
+            billing=frame_report,
             log=log,
         )
     elif generation_mode == "multi_shot":
@@ -6601,9 +8024,24 @@ def generate_storyboard_video(
             clips.append({"path": clip_path, "duration": _shot_duration(shot), "shot": shot})
 
     vision_warnings = []
+    reported_editors = set()
+    for item in frame_report.get("blocked", []):
+        if item["model"] in reported_editors:
+            continue
+        reported_editors.add(item["model"])
+        warning = (
+            f"{item['title']} не нарисовал кадр ведущего"
+            + (f" — ответ модели: {item['flags']}" if item["flags"] else "")
+            + ". Кадры сняты обрезкой исходного фото; выбери другую модель редактора "
+              "или другое фото ведущего."
+        )
+        vision_warnings.append(warning)
+        log(f"  ⚠️ {warning}")
+
     gemini_key = config.get("gemini_key")
     if gemini_key and config.get("clip_vision_qc", True):
         log("[3/5] Vision-проверка клипов (Gemini)...")
+        vision_issues = 0
         for clip_index, clip in enumerate(clips, start=1):
             clip_shot = clip.get("shot")
             if not clip_shot:
@@ -6616,8 +8054,9 @@ def generate_storyboard_video(
             for issue in issues:
                 warning = f"Клип {clip_index}: {issue}"
                 vision_warnings.append(warning)
+                vision_issues += 1
                 log(f"  ⚠️ {warning}")
-        if not vision_warnings:
+        if not vision_issues:
             log("  ✅ Vision-проверка: дефектов не найдено.")
 
     log("[3/5] Transcribing voiceover and generating subtitles...")
@@ -6740,6 +8179,12 @@ def generate_full_video(
 
     if is_storyboard_script(script) or (config.get("video_mode") or "").lower() in STORYBOARD_VIDEO_MODES:
         return generate_storyboard_video(script, config, output_dir, log)
+
+    # Прослушивание озвучки останавливает именно раскадровочный пайплайн. Здесь
+    # такой остановки нет, а дальше по коду — платная генерация: молча снять
+    # ролик вместо запрошенного дубля значит выставить счёт за то, чего не просили.
+    if config.get("voice_only"):
+        raise ValueError("Предварительная озвучка доступна только для раскадровки (storyboard).")
 
     fal_key = config["fal_key"]
     elevenlabs_key = config.get("elevenlabs_key")

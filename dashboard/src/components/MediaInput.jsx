@@ -41,28 +41,34 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
     return (
         <div className="bg-surface border border-white/5 rounded-2xl p-6 animate-[fadeIn_0.6s_ease-out]">
-            <div className="flex gap-4 mb-6 border-b border-white/5 pb-4">
+            {/* Segmented control — same idiom as the rest of the app, and it
+                avoids the brittle negative-margin underline this used before. */}
+            <div className="mb-6 inline-flex overflow-hidden rounded-xl border border-white/10">
                 {youtubeUrlEnabled && (
                     <button
+                        type="button"
                         onClick={() => setMode('url')}
-                        className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'url'
-                            ? 'text-primary border-b-2 border-primary -mb-[17px]'
-                            : 'text-zinc-400 hover:text-white'
+                        aria-pressed={mode === 'url'}
+                        className={`flex items-center gap-2 px-3.5 py-2 text-sm transition-colors ${mode === 'url'
+                            ? 'bg-primary/15 text-violet-200'
+                            : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'
                             }`}
                     >
-                        <Youtube size={18} />
-                        YouTube URL
+                        <Youtube size={16} />
+                        Ссылка на YouTube
                     </button>
                 )}
                 <button
+                    type="button"
                     onClick={() => setMode('file')}
-                    className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'file'
-                        ? 'text-primary border-b-2 border-primary -mb-[17px]'
-                        : 'text-zinc-400 hover:text-white'
+                    aria-pressed={mode === 'file'}
+                    className={`flex items-center gap-2 px-3.5 py-2 text-sm transition-colors ${mode === 'file'
+                        ? 'bg-primary/15 text-violet-200'
+                        : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'
                         }`}
                 >
-                    <Upload size={18} />
-                    Upload File
+                    <Upload size={16} />
+                    Загрузить файл
                 </button>
             </div>
 
@@ -106,8 +112,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     className="hidden"
                                 />
                                 <Upload className="mx-auto mb-3 text-zinc-500" size={24} />
-                                <p className="text-zinc-400">Click to upload or drag and drop</p>
-                                <p className="text-xs text-zinc-600 mt-1">MP4, MOV up to 500MB</p>
+                                <p className="text-zinc-400">Нажми, чтобы выбрать файл, или перетащи его сюда</p>
+                                <p className="text-xs text-zinc-600 mt-1">MP4 или MOV, до 500 МБ</p>
                             </label>
                         )}
                     </div>
@@ -120,8 +126,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         onChange={(e) => setAcknowledged(e.target.checked)}
                         className="mt-0.5 accent-primary cursor-pointer"
                     />
-                    <span>
-                        I confirm I own this content or have the rights to process it. I am responsible for any content I submit. See our <a href="/#legal" target="_blank" rel="noopener noreferrer" className="inline-flex py-2 text-primary underline" onClick={(e) => e.stopPropagation()}>Terms & Privacy</a>.
+                    <span className="leading-relaxed">
+                        Подтверждаю, что это моё видео или у меня есть права на его обработку, и я отвечаю за загружаемый контент. См.{' '}
+                        <a href="/#legal" target="_blank" rel="noopener noreferrer" className="text-primary underline" onClick={(e) => e.stopPropagation()}>условия и политику конфиденциальности</a>.
                     </span>
                 </label>
 
@@ -133,12 +140,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     {isProcessing ? (
                         <>
                             <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                            Processing Video...
+                            Обрабатываю видео...
                         </>
                     ) : (
-                        <>
-                            Generate Clips
-                        </>
+                        'Нарезать клипы'
                     )}
                 </button>
             </form>

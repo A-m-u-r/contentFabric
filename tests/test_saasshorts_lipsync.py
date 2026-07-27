@@ -21,18 +21,14 @@ from saasshorts import (
 
 class SaaSLipSyncTests(unittest.TestCase):
     def test_builds_kling_avatar_standard_and_pro_payloads(self):
-        prompt = "Natural UGC creator talking to camera."
-
         standard_model, standard_payload = build_kling_avatar_request(
             "https://cdn.example/avatar.png",
             "https://cdn.example/voice.mp3",
-            prompt,
             tier="standard",
         )
         pro_model, pro_payload = build_kling_avatar_request(
             "https://cdn.example/avatar.png",
             "https://cdn.example/voice.mp3",
-            prompt,
             tier="pro",
         )
 
@@ -42,36 +38,41 @@ class SaaSLipSyncTests(unittest.TestCase):
         self.assertEqual(kling_avatar_cost_per_second("standard"), 0.0562)
         self.assertEqual(kling_avatar_cost_per_second("pro"), 0.115)
 
-    def test_avatar_prompt_forbids_duplicate_subject(self):
-        prompt = saasshorts._avatar_request_prompt("close-up, warm light")
-        self.assertIn("close-up, warm light", prompt)
-        lowered = prompt.lower()
-        self.assertIn("one single person", lowered)
-        self.assertIn("never duplicate", lowered)
+    def test_empty_prompt_is_left_out_of_the_payload(self):
+        _, payload = build_kling_avatar_request("https://cdn/a.png", "https://cdn/v.mp3")
+        self.assertEqual(set(payload), {"image_url", "audio_url"})
 
-    def test_avatar_prompt_removes_ad_style_but_keeps_strict_glyph_ban(self):
-        prompt = saasshorts._avatar_request_prompt(
-            "Vertical 9:16 realistic UGC ad, same actor, a natural woman looking at "
-            "the camera, warm morning light, authentic smartphone video, no text, "
-            "no burned-in text, no watermark. no readable on-screen text, any device "
-            "screens turned away or out of focus"
+        _, forced = build_kling_avatar_request("https://cdn/a.png", "https://cdn/v.mp3",
+                                               "explicit framing")
+        self.assertEqual(forced["prompt"], "explicit framing")
+
+    def test_avatar_prompt_never_names_what_it_wants_gone(self):
+        """У Kling нет негативного промпта: «no text» он читает как «text».
+
+        Проверено на одной картинке и одном звуке (2026-07-26): с длинным
+        промптом внизу кадра появляется нечитаемый текст, без него кадр чистый.
+        Поэтому промпт держит только позу и мимику — позитивными формулировками.
+        """
+        prompt = saasshorts._AVATAR_MOTION_PROMPT
+        self.assertEqual(saasshorts._avatar_prompt_issues(prompt), [])
+        self.assertNotIn(" no ", f" {prompt.lower()} ")
+        self.assertNotIn("never", prompt.lower())
+        self.assertLess(len(prompt), 500)
+
+    def test_prompt_checker_catches_the_old_recipe(self):
+        issues = saasshorts._avatar_prompt_issues(
+            "Vertical 9:16 UGC ad, no burned-in text, no watermark, no subtitles"
         )
-        lowered = prompt.lower()
+        self.assertIn("text", issues)
+        self.assertIn("watermark", issues)
+        self.assertIn("subtitle", issues)
 
-        self.assertIn("same actor", lowered)
-        self.assertIn("warm morning light", lowered)
-        for trigger in ("ugc", "smartphone video", "social video"):
-            self.assertNotIn(trigger, lowered)
-        for forbidden_visual in (
-            "written characters",
-            "letters",
-            "symbols",
-            "captions",
-            "subtitles",
-            "logos",
-            "watermarks",
-        ):
-            self.assertIn(forbidden_visual, lowered)
+    def test_avatar_prompt_holds_the_body_still(self):
+        lowered = saasshorts._AVATAR_MOTION_PROMPT.lower()
+        # Без этого Kling сам придумывает перекладывание ног и рук.
+        self.assertIn("hands resting", lowered)
+        self.assertIn("legs still", lowered)
+        self.assertIn("only the face moves", lowered)
 
     def test_avatar_reference_image_conditions_on_photo_and_scene(self):
         class FakeResp:
@@ -880,6 +881,27 @@ class SlicedAvatarTests(unittest.TestCase):
         self.assertEqual(slices[0]["start"], 0.0)
         self.assertEqual(slices[1]["end"], 6.6)
 
+    def test_slice_opens_on_speech_not_on_dead_air(self):
+        """Кадр не должен начинаться с тишины: рот в клипе шевелится, а звука нет."""
+        # Пауза 0.6с между фразами: старая середина паузы давала кадру 2
+        # триста миллисекунд немой картинки на старте.
+        words = self._words([(10, 0.0, 3.0), (10, 3.6, 6.6)])
+        shots = [
+            {"shot_number": 1, "speech": "один два три четыре пять шесть семь восемь девять десять"},
+            {"shot_number": 2, "speech": "раз два три четыре пять шесть семь восемь девять десять"},
+        ]
+
+        slices, _ = saasshorts._align_shots_to_voiceover(shots, words, 6.6)
+
+        dead_air = words[10]["start"] - slices[1]["start"]
+        self.assertLessEqual(dead_air, saasshorts._SLICE_LEAD_IN + 0.001)
+        self.assertGreaterEqual(dead_air, 0.0)
+
+    def test_boundary_never_cuts_into_the_previous_word(self):
+        # Пауза короче разгона: режем сразу за последним словом, а не по нему.
+        self.assertAlmostEqual(saasshorts._phrase_boundary(3.00, 3.02), 3.00, places=6)
+        self.assertAlmostEqual(saasshorts._phrase_boundary(3.00, 3.60), 3.52, places=6)
+
     def test_align_prefers_scripted_last_word_over_longer_earlier_pause(self):
         # Real-world case: the pause after "сахара" (decoy) is longer than the
         # pause after the shot's true last word "срываешься" — the boundary
@@ -905,31 +927,51 @@ class SlicedAvatarTests(unittest.TestCase):
         self.assertLess(slices[0]["end"], words[13]["start"])
 
     def test_split_long_slices_breaks_into_jumpcuts(self):
-        # A single 8.5s talking slice must split into <=5s sub-clips at pauses.
+        # A single 8.5s talking slice on the hook must break into several sub-clips.
         words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(18)]
         shot = {"visual_type": "talking", "speech": "long monologue"}
         slices = [{"shot": shot, "start": 0.0, "end": 8.5}]
 
         out = saasshorts._split_long_slices(slices, words)
 
-        self.assertGreater(len(out), 1)
+        self.assertGreaterEqual(len(out), 3)
         for sub in out:
-            self.assertLessEqual(sub["end"] - sub["start"], saasshorts._MAX_TALKING_SLICE_SECONDS + 0.01)
+            length = sub["end"] - sub["start"]
+            self.assertLessEqual(length, saasshorts._MAX_TALKING_SLICE_SECONDS + 0.01)
+            self.assertGreaterEqual(length, saasshorts._MIN_TALKING_SLICE_SECONDS - 0.01)
         # Sub-slices tile the original range with no gaps or overlaps
         self.assertEqual(out[0]["start"], 0.0)
         self.assertEqual(out[-1]["end"], 8.5)
         for a, b in zip(out, out[1:]):
             self.assertEqual(a["end"], b["start"])
-        # Each split carries its own shot dict so per-clip punch-ins differ
+        # Each split carries its own shot dict so per-clip framings differ
         self.assertIsNot(out[0]["shot"], out[1]["shot"])
 
-    def test_split_long_slices_leaves_short_and_broll_untouched(self):
+    def test_the_hook_is_cut_faster_than_the_body(self):
+        words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(90)]
+        on_hook = [{"shot": {"visual_type": "talking"}, "start": 0.0, "end": 4.0}]
+        self.assertEqual(len(saasshorts._split_long_slices(on_hook, words)), 2)
+        # The same 4 seconds later in the reel is one shot: attention is already won.
+        in_body = [{"shot": {"visual_type": "talking"}, "start": 12.0, "end": 16.0}]
+        self.assertEqual(len(saasshorts._split_long_slices(in_body, words)), 1)
+
+    def test_split_never_produces_a_clip_below_the_floor(self):
+        words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(12)]
+        # 3.4s on the hook: one cut would leave a sub-second flash, so it stays whole.
+        tight = [{"shot": {"visual_type": "talking"}, "start": 0.0, "end": 3.4}]
+        out = saasshorts._split_long_slices(tight, words)
+        for sub in out:
+            self.assertGreaterEqual(sub["end"] - sub["start"],
+                                    saasshorts._MIN_TALKING_SLICE_SECONDS - 0.01)
+
+    def test_split_long_slices_leaves_broll_untouched(self):
         words = [{"word": "w", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(18)]
-        short = [{"shot": {"visual_type": "talking"}, "start": 0.0, "end": 4.0}]
-        self.assertEqual(len(saasshorts._split_long_slices(short, words)), 1)
         # b-roll plays under the master voiceover: no lip-sync, never split
         broll = [{"shot": {"visual_type": "broll"}, "start": 0.0, "end": 9.0}]
         self.assertEqual(len(saasshorts._split_long_slices(broll, words)), 1)
+        # An explicit flat limit still overrides the curve.
+        long_talk = [{"shot": {"visual_type": "talking"}, "start": 0.0, "end": 8.5}]
+        self.assertEqual(len(saasshorts._split_long_slices(long_talk, words, max_len=9.0)), 1)
 
     def test_align_proportional_without_words(self):
         shots = [
@@ -1023,15 +1065,17 @@ class SlicedAvatarTests(unittest.TestCase):
                  patch("saasshorts._get_media_duration", return_value=8.0):
                 result = saasshorts.generate_storyboard_video(script, config, tmp)
 
-            self.assertEqual(len(head_calls), 2)
+            # Both 4s shots sit on the hook, so each is cut in two: more shots at
+            # the same total cost, because Kling bills per second of audio.
+            self.assertEqual(len(head_calls), 4)
             self.assertEqual({c["image"] for c in head_calls}, {ref1, ref2})
             self.assertEqual({c["tier"] for c in head_calls}, {"standard"})
-            scene_prompts = " | ".join(c["scene_prompt"] for c in head_calls)
-            self.assertIn("close-up", scene_prompts)
-            self.assertIn("medium", scene_prompts)
+            # Сцена доезжает до клипа референсным кадром, а не промптом:
+            # промпт заставлял Kling рисовать кракозябры внизу кадра.
+            self.assertEqual({c["scene_prompt"] for c in head_calls}, {""})
 
             clips = composite_mock.call_args[0][0]
-            self.assertEqual(len(clips), 2)
+            self.assertEqual(len(clips), 4)
             self.assertAlmostEqual(sum(c["duration"] for c in clips), 8.0, delta=0.01)
 
             self.assertEqual(result["storyboard_generation_mode"], "sliced_avatar")
@@ -1146,13 +1190,13 @@ class SlicedAvatarTests(unittest.TestCase):
                 return output_path
 
             def fake_talking_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
-                head_calls.append(image_path)
+                head_calls.append((output_path, image_path))
                 with open(output_path, "wb") as f:
                     f.write(b"clip")
                 return output_path
 
-            def fake_avatar_ref(shot, actor_photo, fal_key, output_path, log=print):
-                scene_calls.append((actor_photo, output_path))
+            def fake_avatar_ref(shot, actor_photo, fal_key, output_path, log=print, **kwargs):
+                scene_calls.append((actor_photo, output_path, kwargs.get("framing", "")))
                 with open(output_path, "wb") as f:
                     f.write(b"scene")
                 return output_path
@@ -1202,13 +1246,20 @@ class SlicedAvatarTests(unittest.TestCase):
                  patch("saasshorts._get_media_duration", return_value=8.0):
                 saasshorts.generate_storyboard_video(script, config, tmp)
 
-            # Exactly two shots kept -> exactly two clips generated.
-            self.assertEqual(len(head_calls), 2)
-            # Every clip was staged from the saved photo, and the talking head was
-            # driven by the conditioned frame (not the raw photo/crop).
-            self.assertEqual(len(scene_calls), 2)
-            self.assertTrue(all(src == actor for src, _ in scene_calls))
-            self.assertEqual(set(head_calls), {out for _, out in scene_calls})
+            # Two 4s shots on the hook -> four clips.
+            self.assertEqual(len(head_calls), 4)
+            # ...but the set is staged once per camera, not once per clip: the
+            # background has to stay identical or every cut reads as a new room.
+            self.assertEqual(len(scene_calls), len(saasshorts._AVATAR_FRAMINGS))
+            self.assertTrue(all(src == actor for src, _, _ in scene_calls))
+            self.assertEqual({img for _, img in head_calls},
+                             {out for _, out, _ in scene_calls})
+            # Each camera asked for its own framing, and no two clips in a row
+            # play the same one (clips render in parallel, so order by file name).
+            self.assertEqual(len({framing for _, _, framing in scene_calls}), 2)
+            in_order = [img for _, img in sorted(head_calls)]
+            for a, b in zip(in_order, in_order[1:]):
+                self.assertNotEqual(a, b)
 
     def test_storyboard_sliced_avatar_routes_broll_shots_to_v3(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1297,22 +1348,23 @@ class SlicedAvatarTests(unittest.TestCase):
                  patch("saasshorts._get_media_duration", return_value=12.0):
                 result = saasshorts.generate_storyboard_video(script, config, tmp)
 
-            # Talking shots -> Kling Avatar, broll shot -> Kling V3
-            self.assertEqual(len(head_calls), 2)
+            # Talking shots -> Kling Avatar, broll shot -> Kling V3.
+            # Shot 1 sits on the hook and is cut in two; shot 3 starts past it.
+            self.assertEqual(len(head_calls), 3)
             self.assertEqual({c["image"] for c in head_calls}, {ref1, ref3})
             self.assertEqual(len(v3_calls), 1)
-            self.assertIn("_avatar_broll_02", v3_calls[0]["output"])
+            self.assertIn("_avatar_broll_03", v3_calls[0]["output"])
             self.assertEqual(v3_calls[0]["tier"], "standard")
 
             # V3 shot copy: duration ceiled to cover the 4s slice, lips shut
             v3_shot = v3_calls[0]["shot"]
             self.assertEqual(v3_shot["start"], 0)
             self.assertEqual(v3_shot["end"], 4)
-            self.assertIn("no lip movement", v3_shot["generation_prompt"])
+            self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
             self.assertIn("vegetables", v3_shot["generation_prompt"])
 
             clips = composite_mock.call_args[0][0]
-            self.assertEqual(len(clips), 3)
+            self.assertEqual(len(clips), 4)
             self.assertAlmostEqual(sum(c["duration"] for c in clips), 12.0, delta=0.01)
 
             cost = result["cost_estimate"]

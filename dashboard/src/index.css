@@ -20,23 +20,49 @@
   @apply bg-primary hover:bg-violet-600 text-white px-6 py-3 rounded-xl font-medium transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-primary/20;
 }
 
-/* Custom Scrollbar */
+/* Scrollbars — app-wide default.
+   Previously only `.custom-scrollbar` was styled, so every element that forgot
+   the class (textareas, panels, dropdowns) fell back to the chunky native
+   Windows scrollbar with arrow buttons. Styling the default means no element
+   can regress; `.custom-scrollbar` is kept so existing markup still reads
+   intentionally. */
+.app-shell,
+.app-shell * {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+.app-shell ::-webkit-scrollbar,
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
+.app-shell ::-webkit-scrollbar-track,
 .custom-scrollbar::-webkit-scrollbar-track {
   background: transparent;
 }
 
+.app-shell ::-webkit-scrollbar-thumb,
 .custom-scrollbar::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
   border-radius: 10px;
 }
 
+.app-shell ::-webkit-scrollbar-thumb:hover,
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.2);
+}
+
+/* Native scrollbar buttons (the little arrows) never fit a dark, minimal UI. */
+.app-shell ::-webkit-scrollbar-button,
+.custom-scrollbar::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* Textareas grow via JS where possible; when one does scroll, keep it thin. */
+.app-shell textarea {
+  scrollbar-width: thin;
 }
 
 /* Custom Animations */

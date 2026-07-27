@@ -198,7 +198,42 @@ class UILayoutPolishTests(unittest.TestCase):
 
         self.assertIn("function workspaceStep(snapshot)", tab)
         self.assertIn("const [step, setStep] = useState(() => workspaceStep(initialCache));", tab)
-        self.assertIn("setStep(workspaceStep(snapshot));", tab)
+        self.assertIn("if (restoreStep) setStep(workspaceStep(snapshot));", tab)
+
+    def test_generation_and_result_steps_survive_a_reload(self):
+        """Шаги «идёт генерация» и «готовый ролик» восстанавливаются из снапшота.
+
+        Обрезка до шага 2 отнимала у пользователя логи уже запущенной генерации и
+        экран результата уже оплаченного рендера: и jobId, и genResult лежат в
+        снапшоте, возвращать на раскадровку не из чего.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        step_fn = tab[tab.index("function workspaceStep(snapshot)"):tab.index("export default function SaaShortsTab")]
+
+        self.assertIn("if (desired >= 4) return snapshot?.genResult ? 4 : editorStep;", step_fn)
+        self.assertIn("if (desired === 3) return snapshot?.jobId ? 3 : editorStep;", step_fn)
+        self.assertNotIn("Math.min(desired, 2)", step_fn)
+
+    def test_frame_preview_reports_a_run_that_drew_nothing(self):
+        """«Прошло, но ничего не изменилось» — это отброшенный пустой кадр.
+
+        Джоб превью завершается успешно и с нулём кадров: модель вернула пустое
+        изображение, его выбросили. Молчать об этом нельзя — иначе пользователь
+        видит ту же картинку и считает, что сломан интерфейс.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("const [framesNotice, setFramesNotice] = useState('');", tab)
+        self.assertIn("const framesMade = Number(data.result?.frames_made ?? 0);", tab)
+        self.assertIn("const framesFailed = Number(data.result?.frames_failed ?? 0);", tab)
+        self.assertIn("{framesNotice && (", tab)
+
+    def test_regenerated_frame_is_not_served_from_browser_cache(self):
+        """Ракурс общий, имя файла не меняется — без метки кэш покажет старый кадр."""
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("const bust = result?.frames_only ? `?v=${Date.now()}` : '';", tab)
+        self.assertIn("image_preview: g.local_url ? `${getApiUrl(g.local_url)}${bust}` : shot.image_preview,", tab)
 
     def test_ai_shorts_applies_remote_put_winner_and_replaces_stale_sync_snapshot(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -209,8 +244,31 @@ class UILayoutPolishTests(unittest.TestCase):
 
         self.assertIn("const saved = saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);", put_response)
         self.assertIn("latestWorkspaceSnapshotRef.current = saved;", put_response)
-        self.assertIn("applyWorkspaceSnapshot(saved);", put_response)
+        self.assertIn("applyWorkspaceSnapshot(saved, { restoreStep: false });", put_response)
         self.assertIn("setWorkspaceHydrationVersion((version) => version + 1);", put_response)
+
+    def test_workspace_sync_ignores_the_echo_of_its_own_put(self):
+        """Автосохранение не должно зацикливаться на собственном ответе сервера.
+
+        PUT возвращает ту же ревизию со своим updated_at (всегда чуть позже
+        нашего), поэтому «свежее победило» принимало эхо за чужую запись,
+        раскладывало его по состоянию и дёргало workspaceHydrationVersion — а он
+        стоит в зависимостях эффекта сохранения. Круг: PUT → apply → PUT.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        put_response = tab[
+            tab.index("function flushWorkspaceSync()"):
+            tab.index("function queueWorkspaceSync")
+        ]
+
+        self.assertIn(
+            "if (Number(data.workspace.revision) <= Number(snapshot.revision || 0)) return;",
+            put_response,
+        )
+        self.assertLess(
+            put_response.index("if (Number(data.workspace.revision)"),
+            put_response.index("const remoteWorkspace = {"),
+        )
 
     def test_app_shell_uses_mobile_bottom_navigation_instead_of_persistent_sidebar(self):
         app = APP.read_text(encoding="utf-8")
@@ -290,6 +348,55 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("missingFrameCount", tab)
         self.assertIn("Перегенерить", tab)
 
+    def test_render_starts_from_the_frames_the_user_approved(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Кадр кэшируется по промпту, но внутри папки своего джоба. Без ссылки на
+        # джоб предпросмотра рендер рисовал заново ровно те кадры, которые
+        # пользователь только что одобрил: второй счёт и другой сэмпл.
+        self.assertIn("_frames_job_id", tab)
+        self.assertIn("frames_job_id: framesJobId || undefined", tab)
+        self.assertIn("applyGeneratedShots(data.result, { frames: framesJobId })", tab)
+
+    def test_voiceover_can_be_heard_and_re_recorded_before_paid_video(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Дорожка задаёт длину ролика, границы кадров и число платных клипов,
+        # поэтому её слушают до съёмки, а не после.
+        self.assertIn("handleGenerateVoice", tab)
+        self.assertIn("voice_only: true", tab)
+        self.assertIn("Записать озвучку", tab)
+        # Перезапись одной реплики и перечитывание всего текста одним дублем.
+        self.assertIn("revoice_shots: shotNumber ? [shotNumber] : []", tab)
+        self.assertIn("Перечитать всё одним дублем", tab)
+        # Плеер на дорожку целиком и на каждую реплику отдельно.
+        self.assertIn("voicePreview.url", tab)
+        self.assertIn("getApiUrl(shot.voice_url)", tab)
+
+    def test_render_uses_the_take_the_user_approved(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Дубль каждый раз новый: без ссылки на прослушанный джоб рендер записал
+        # бы другой и залипсинчил кадры под звук, которого никто не слышал.
+        self.assertIn("_voice_job_id", tab)
+        self.assertIn("voice_job_id: voiceJobId || undefined", tab)
+        self.assertIn("applyGeneratedShots(data.result, { voice: newVoiceJobId })", tab)
+        # Правка реплики после записи должна быть видна, а не всплывать в ролике.
+        self.assertIn("текст изменился после записи", tab)
+
+    def test_deleted_shots_come_back_where_they_were(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Раскадровку разбирают, чтобы отрендерить один кадр на пробу. Возврат в
+        # конец списка собирал её в другом порядке — позиция запоминается вместе
+        # с кадром, а «вернуть все» отменяет удаления с конца, то есть точно.
+        self.assertIn("_archived_at: shotIndex", tab)
+        self.assertIn("const archivedShotSlot", tab)
+        self.assertIn("restoreAllArchivedShots", tab)
+        self.assertIn("Вернуть все", tab)
+        restore_all = tab[tab.index("const restoreAllArchivedShots"):tab.index("const dropArchivedShot")]
+        self.assertIn("for (let i = archived.length - 1; i >= 0; i -= 1)", restore_all)
+
     def test_finished_video_can_be_reshot_shot_by_shot(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
         gallery = UGC_GALLERY.read_text(encoding="utf-8")
@@ -305,7 +412,10 @@ class UILayoutPolishTests(unittest.TestCase):
         # Смета честная: платим только за то, что снимается заново.
         self.assertIn("renderPlan", tab)
         self.assertIn("_render_baseline", tab)
-        self.assertIn("narrationChanged", tab)
+        # Речь сравнивается покадрово: озвучка теперь нарезана на куски по кадру,
+        # поэтому правка одной реплики больше не пересчитывает весь ролик.
+        self.assertIn("const speechChanged", tab)
+        self.assertIn("revoicedText", tab)
         # С экрана готового ролика можно вернуться в раскадровку и переснять кадр.
         self.assertIn("Переснять кадры", tab)
 

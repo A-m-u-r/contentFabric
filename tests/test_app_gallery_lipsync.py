@@ -126,6 +126,44 @@ class StoryboardReshootSourceTests(unittest.TestCase):
             self.assertEqual(app._storyboard_slug_of_job(job_dir), "moya_forma_30")
         app.OUTPUT_DIR = old_output_dir
 
+    def test_preview_job_slug_is_read_off_the_staged_camera_plates(self):
+        # У джоба предпросмотра нет ни метаданных, ни готового ролика — только
+        # кадры. Без слага перенос промахнётся мимо кэша, и рендер купит заново
+        # ровно те картинки, которые пользователь уже одобрил.
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = os.path.join(tmp, "saas_preview")
+            os.makedirs(job_dir)
+            with open(os.path.join(job_dir, "moya_forma_30_actor_set_medium.png"), "wb") as f:
+                f.write(b"plate")
+            self.assertEqual(app._frames_slug_of_job(job_dir), "moya_forma_30")
+
+    def test_preview_job_without_plates_falls_back_to_the_usual_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = os.path.join(tmp, "saas_preview")
+            os.makedirs(job_dir)
+            self.assertEqual(app._frames_slug_of_job(job_dir), "")
+
+    def test_voice_preview_slug_is_read_off_the_recorded_track(self):
+        # Джоб прослушивания — это только звук: ни метаданных, ни ролика. Без
+        # слага дорожка не переедет в рендер, и он запишет другой дубль вместо
+        # того, который человек послушал и утвердил.
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = os.path.join(tmp, "saas_voice")
+            os.makedirs(job_dir)
+            with open(os.path.join(job_dir, "moya_forma_30_voice.mp3"), "wb") as f:
+                f.write(b"take")
+            self.assertEqual(app._voice_slug_of_job(job_dir), "moya_forma_30")
+
+            with open(os.path.join(job_dir, "moya_forma_30_voice_manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"shots": []}, f)
+            self.assertEqual(app._voice_slug_of_job(job_dir), "moya_forma_30")
+
+    def test_voice_preview_slug_without_a_track_falls_back_to_the_usual_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = os.path.join(tmp, "saas_voice")
+            os.makedirs(job_dir)
+            self.assertEqual(app._voice_slug_of_job(job_dir), "")
+
 
 if __name__ == "__main__":
     unittest.main()

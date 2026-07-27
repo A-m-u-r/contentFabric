@@ -145,7 +145,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
   const isRegister = mode === 'register';
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-6">
+    <div className="app-shell min-h-screen bg-background flex items-center justify-center p-6">
       <div className="w-full max-w-md glass-panel p-8 space-y-6">
         <div className="space-y-2">
           <div className="w-11 h-11 rounded-xl bg-violet-500/15 text-violet-300 flex items-center justify-center">
@@ -910,7 +910,7 @@ function App() {
   }
 
   return (
-    <div className="flex h-dvh bg-background overflow-hidden selection:bg-primary/30">
+    <div className="app-shell flex h-dvh bg-background overflow-hidden selection:bg-primary/30">
       <Sidebar />
 
       <main className="relative mb-20 flex min-w-0 flex-1 flex-col overflow-hidden md:mb-0">

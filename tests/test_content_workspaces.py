@@ -45,6 +45,19 @@ class ContentWorkspaceTests(unittest.TestCase):
         self.assertEqual(stored["stage"], "script")
         self.assertEqual(stored["snapshot"], {"title": "Plan", "nested": {"frames": [1, 2]}})
 
+    def test_save_echoes_the_revision_it_was_given(self):
+        """Запись возвращает присланную ревизию, а не свою следующую.
+
+        По этому фронт отличает эхо собственного PUT от чужой записи: ревизия в
+        ответе больше присланной — значит, писал кто-то ещё, и снапшот надо
+        принять. Начни PUT возвращать revision+1 — и автосохранение закольцуется
+        (каждый ответ выглядел бы новее локального).
+        """
+        first = self._save(revision=7, snapshot={"title": "Draft"})
+        second = self._save(revision=8, snapshot={"title": "Draft"})
+
+        self.assertEqual((first["revision"], second["revision"]), (7, 8))
+
     def test_stale_revision_returns_the_newer_stored_workspace(self):
         self._save(revision=4, snapshot={"title": "Newer"})
 

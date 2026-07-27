@@ -24,7 +24,7 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                 <div className="p-2 bg-accent/20 rounded-lg text-accent">
                     <Key size={20} />
                 </div>
-                <h2 className="text-lg font-semibold">Gemini API Key</h2>
+                <h2 className="text-lg font-semibold">API-ключ Gemini</h2>
             </div>
 
             <div className="flex gap-3">
@@ -62,7 +62,7 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                 </button>
             </div>
             <p className="mt-3 text-xs text-zinc-500">
-                {hasAccountKey ? 'Gemini key is saved in your account vault.' : 'Your key can be saved to your account vault after login.'}
+                {hasAccountKey ? 'Ключ Gemini сохранён в хранилище аккаунта.' : 'После входа ключ можно сохранить в хранилище аккаунта.'}
                 <br />
                 <a
                     href="https://aistudio.google.com/app/apikey"
@@ -70,7 +70,7 @@ export default function KeyInput({ onKeySet, savedKey, onAccountSave, hasAccount
                     rel="noopener noreferrer"
                     className="mt-1 inline-flex py-2 text-primary hover:underline"
                 >
-                    Get your free Gemini API Key here →
+                    Получить бесплатный ключ Gemini →
                 </a>
             </p>
         </div>

@@ -80,7 +80,7 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon: Icon }) {
     >
       <Icon size={24} className="mx-auto text-zinc-500 mb-2" />
       <p className="text-sm text-zinc-400">{label}</p>
-      <p className="text-xs text-zinc-600 mt-1">Drop or click to upload</p>
+      <p className="text-xs text-zinc-600 mt-1">Перетащи файл или нажми, чтобы выбрать</p>
       <input
         ref={inputRef}
         type="file"
@@ -468,7 +468,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
             </button>
           )}
         </div>
-        <p className="text-sm text-zinc-500 mb-6">Generate viral titles, AI thumbnails, descriptions and publish directly to YouTube</p>
+        <p className="text-sm text-zinc-500 mb-6">Заголовки, обложки и описание для YouTube — и публикация в один клик</p>
 
         <StepIndicator currentStep={step} />
 
@@ -477,8 +477,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
           <div className="mb-6 p-5 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-start gap-3">
             <AlertCircle size={20} className="text-amber-400 shrink-0 mt-0.5" />
             <div>
-              <p className="text-sm font-semibold text-amber-300">Gemini API Key Required</p>
-              <p className="text-xs text-amber-400/70 mt-1">YouTube Studio requires a Google Gemini API key to function. Please configure it in the <strong>Settings</strong> tab before using this feature. Gemini's free tier includes 1,500 requests per day.</p>
+              <p className="text-sm font-semibold text-amber-300">Нужен API-ключ Gemini</p>
+              <p className="text-xs text-amber-400/70 mt-1">Для YouTube-студии нужен API-ключ Google Gemini. Добавь его в разделе <strong>Настройки</strong>. На бесплатном тарифе Gemini доступно 1500 запросов в день.</p>
             </div>
           </div>
         )}
@@ -493,13 +493,13 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   <Video size={16} className="text-violet-400" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-semibold text-white">Analyze Video</h3>
-                  <p className="text-xs text-zinc-500">AI suggests viral titles from your content</p>
+                  <h3 className="text-sm font-semibold text-white">Разобрать видео</h3>
+                  <p className="text-xs text-zinc-500">ИИ предложит цепляющие заголовки по твоему видео</p>
                 </div>
               </div>
 
               <DragDropZone
-                label="Upload video file"
+                label="Загрузить видеофайл"
                 accept="video/*"
                 onFile={(f) => { setVideoFile(f); setMode('video'); handlePreUpload(f); }}
                 file={videoFile}
@@ -533,7 +533,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 ) : (
                   <>
                     <Sparkles size={16} />
-                    Analyze & Get Titles
+                    Разобрать и получить заголовки
                   </>
                 )}
               </button>
@@ -546,8 +546,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   <Type size={16} className="text-purple-400" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-semibold text-white">Write Your Own</h3>
-                  <p className="text-xs text-zinc-500">Skip analysis, enter your title directly</p>
+                  <h3 className="text-sm font-semibold text-white">Свой заголовок</h3>
+                  <p className="text-xs text-zinc-500">Без разбора видео — вписать заголовок самому</p>
                 </div>
               </div>
 
@@ -556,7 +556,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   type="text"
                   value={manualTitle}
                   onChange={(e) => setManualTitle(e.target.value)}
-                  placeholder="Enter your YouTube title..."
+                  placeholder="Впиши заголовок для YouTube..."
                   className="input-field text-sm mb-4"
                   maxLength={70}
                 />
@@ -569,7 +569,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 className="w-full py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-colors border border-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <ArrowRight size={16} />
-                Use This Title
+                Использовать заголовок
               </button>
             </div>
           </div>
@@ -582,7 +582,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
             <div className="md:col-span-2 flex flex-col gap-4">
               {mode === 'manual' ? (
                 <div className="glass-panel p-6 space-y-4">
-                  <h3 className="text-sm font-semibold text-white">Your Title</h3>
+                  <h3 className="text-sm font-semibold text-white">Твой заголовок</h3>
                   <input
                     type="text"
                     value={manualTitle}
@@ -604,7 +604,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 <div className="glass-panel p-4 flex flex-col h-[500px]">
                   <div className="flex items-center gap-2 mb-3 pb-3 border-b border-white/5">
                     <MessageSquare size={14} className="text-primary" />
-                    <span className="text-xs font-medium text-zinc-400">Title Refinement Chat</span>
+                    <span className="text-xs font-medium text-zinc-400">Доработка заголовков</span>
                   </div>
 
                   {/* Chat messages */}
@@ -629,7 +629,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleRefine()}
-                      placeholder="Make them more clickbait..."
+                      placeholder="Например: сделай их острее и цепляюче..."
                       className="input-field text-xs flex-1"
                       disabled={isRefining}
                     />
@@ -650,7 +650,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   className="w-full btn-primary py-3 text-sm font-semibold flex items-center justify-center gap-2"
                 >
                   <ArrowRight size={16} />
-                  Use Selected Title
+                  Взять выбранный заголовок
                 </button>
               )}
             </div>
@@ -710,7 +710,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               {isRefining && (
                 <div className="flex items-center justify-center py-8 text-zinc-500">
                   <Loader2 size={20} className="animate-spin mr-2" />
-                  <span className="text-sm">Refining titles...</span>
+                  <span className="text-sm">Дорабатываю заголовки...</span>
                 </div>
               )}
             </div>
@@ -723,7 +723,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
             {/* Left: Controls */}
             <div className="md:col-span-2 space-y-4">
               <div className="glass-panel p-6 space-y-4">
-                <h3 className="text-sm font-semibold text-white mb-1">Selected Title</h3>
+                <h3 className="text-sm font-semibold text-white mb-1">Выбранный заголовок</h3>
                 <div className="p-3 bg-primary/10 border border-primary/20 rounded-lg text-sm text-primary">
                   {selectedTitle || manualTitle}
                 </div>
@@ -732,12 +732,12 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   onClick={() => setStep(1)}
                   className="text-xs text-zinc-500 hover:text-white transition-colors flex items-center gap-1"
                 >
-                  <ArrowLeft size={12} /> Change title
+                  <ArrowLeft size={12} /> Сменить заголовок
                 </button>
               </div>
 
               <div className="glass-panel p-6 space-y-4">
-                <h3 className="text-sm font-semibold text-white">Face Image <span className="text-zinc-600 font-normal">(optional)</span></h3>
+                <h3 className="text-sm font-semibold text-white">Лицо на обложке <span className="text-zinc-600 font-normal">(необязательно)</span></h3>
                 <DragDropZone
                   label="Upload face / person photo"
                   accept="image/*"
@@ -749,7 +749,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               </div>
 
               <div className="glass-panel p-6 space-y-4">
-                <h3 className="text-sm font-semibold text-white">Background Image <span className="text-zinc-600 font-normal">(optional)</span></h3>
+                <h3 className="text-sm font-semibold text-white">Фон обложки <span className="text-zinc-600 font-normal">(необязательно)</span></h3>
                 <DragDropZone
                   label="Upload background image"
                   accept="image/*"
@@ -761,7 +761,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               </div>
 
               <div className="glass-panel p-6 space-y-4">
-                <h3 className="text-sm font-semibold text-white">Extra Instructions <span className="text-zinc-600 font-normal">(optional)</span></h3>
+                <h3 className="text-sm font-semibold text-white">Доп. пожелания <span className="text-zinc-600 font-normal">(необязательно)</span></h3>
                 <textarea
                   value={extraPrompt}
                   onChange={(e) => setExtraPrompt(e.target.value)}
@@ -771,7 +771,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               </div>
 
               <div className="glass-panel p-6 space-y-4">
-                <h3 className="text-sm font-semibold text-white">Number of Thumbnails</h3>
+                <h3 className="text-sm font-semibold text-white">Сколько обложек</h3>
                 <div className="flex gap-2">
                   {[1, 2, 3, 4].map(n => (
                     <button
@@ -796,7 +796,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 {isGenerating ? (
                   <>
                     <Loader2 size={16} className="animate-spin" />
-                    Generating thumbnails...
+                    Генерирую обложки...
                   </>
                 ) : (
                   <>
@@ -812,7 +812,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
             <div className="md:col-span-3">
               {generatedThumbnails.length > 0 ? (
                 <div className="space-y-4">
-                  <h3 className="text-sm font-semibold text-zinc-400">Generated Thumbnails — click to select for publishing</h3>
+                  <h3 className="text-sm font-semibold text-zinc-400">Готовые обложки — нажми, чтобы выбрать для публикации</h3>
                   <div className="grid gap-4">
                     {generatedThumbnails.map((url, i) => (
                       <div
@@ -887,8 +887,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 <div className="h-full flex flex-col items-center justify-center text-zinc-500 space-y-4 min-h-[400px]">
                   <div className="w-16 h-16 rounded-full border-2 border-zinc-800 border-t-primary animate-spin" />
                   <div className="text-center">
-                    <p className="text-sm font-medium text-zinc-400">Generating thumbnails...</p>
-                    <p className="text-xs text-zinc-600 mt-1">This may take a minute per thumbnail</p>
+                    <p className="text-sm font-medium text-zinc-400">Генерирую обложки...</p>
+                    <p className="text-xs text-zinc-600 mt-1">На каждую обложку уходит около минуты</p>
                   </div>
                 </div>
               ) : (
@@ -897,8 +897,8 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                     <Image size={32} className="text-zinc-600" />
                   </div>
                   <div className="text-center">
-                    <p className="text-sm text-zinc-400">Your thumbnails will appear here</p>
-                    <p className="text-xs text-zinc-600 mt-1">Configure options and click Generate</p>
+                    <p className="text-sm text-zinc-400">Здесь появятся обложки</p>
+                    <p className="text-xs text-zinc-600 mt-1">Задай параметры и нажми «Сгенерировать»</p>
                   </div>
                 </div>
               )}
@@ -915,10 +915,10 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 onClick={() => setStep(2)}
                 className="text-xs text-zinc-500 hover:text-white transition-colors flex items-center gap-1 mb-2"
               >
-                <ArrowLeft size={12} /> Back to Generate
+                <ArrowLeft size={12} /> Назад к генерации
               </button>
 
-              {/* Selected Thumbnail Preview */}
+              {/* Выбранная обложка Preview */}
               {selectedThumbnail && (
                 <div className="glass-panel overflow-hidden">
                   <img
@@ -927,14 +927,14 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                     className="w-full aspect-video object-cover"
                   />
                   <div className="p-3">
-                    <span className="text-xs text-green-400 flex items-center gap-1"><Check size={10} /> Selected Thumbnail</span>
+                    <span className="text-xs text-green-400 flex items-center gap-1"><Check size={10} /> Выбранная обложка</span>
                   </div>
                 </div>
               )}
 
               {/* Title */}
               <div className="glass-panel p-6 space-y-3">
-                <h3 className="text-sm font-semibold text-white">Video Title</h3>
+                <h3 className="text-sm font-semibold text-white">Заголовок видео</h3>
                 <div className="p-3 bg-primary/10 border border-primary/20 rounded-lg text-sm text-primary">
                   {selectedTitle || manualTitle}
                 </div>
@@ -948,7 +948,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                       <Sparkles size={14} className="text-yellow-400" />
                       AI Description
                     </h3>
-                    <span className="text-[10px] text-zinc-600">with chapters</span>
+                    <span className="text-[10px] text-zinc-600">с главами</span>
                   </div>
                   <p className="text-xs text-zinc-500">
                     Generate a YouTube description with chapter timestamps from your video transcript.
@@ -1000,7 +1000,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder={mode === 'video'
-                    ? "Click 'Generate Description' to auto-generate with chapters, or write your own..."
+                    ? "Нажми «Сгенерировать описание», чтобы получить текст с главами, или напиши своё..."
                     : "Write your YouTube video description here..."
                   }
                   className="input-field text-sm resize-none flex-1 min-h-[500px] font-mono custom-scrollbar"
@@ -1028,10 +1028,10 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 onClick={() => setStep(3)}
                 className="text-xs text-zinc-500 hover:text-white transition-colors flex items-center gap-1 mb-2"
               >
-                <ArrowLeft size={12} /> Back to Description
+                <ArrowLeft size={12} /> Назад к описанию
               </button>
 
-              {/* Selected Thumbnail Preview */}
+              {/* Выбранная обложка Preview */}
               {selectedThumbnail && (
                 <div className="glass-panel overflow-hidden">
                   <img
@@ -1040,14 +1040,14 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                     className="w-full aspect-video object-cover"
                   />
                   <div className="p-3">
-                    <span className="text-xs text-green-400 flex items-center gap-1"><Check size={10} /> Selected Thumbnail</span>
+                    <span className="text-xs text-green-400 flex items-center gap-1"><Check size={10} /> Выбранная обложка</span>
                   </div>
                 </div>
               )}
 
               {/* Editable Title */}
               <div className="glass-panel p-6 space-y-3">
-                <h3 className="text-sm font-semibold text-white">Video Title</h3>
+                <h3 className="text-sm font-semibold text-white">Заголовок видео</h3>
                 <input
                   type="text"
                   value={selectedTitle || manualTitle}
@@ -1062,7 +1062,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 <div className="glass-panel p-6 space-y-3">
                   <div className="flex items-center gap-2 text-amber-400">
                     <AlertCircle size={16} />
-                    <span className="text-sm font-medium">Upload-Post Not Configured</span>
+                    <span className="text-sm font-medium">Upload-Post не подключён</span>
                   </div>
                   <p className="text-xs text-zinc-500">
                     To publish directly to YouTube, configure your Upload-Post API key and connect a profile in Settings.
@@ -1101,15 +1101,15 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                     <div className="flex items-center gap-2 text-green-400">
                       <CheckCircle2 size={16} />
                       <div>
-                        <p className="text-sm font-medium">Published successfully!</p>
-                        <p className="text-xs text-zinc-500 mt-1">Your video is being uploaded to YouTube asynchronously.</p>
+                        <p className="text-sm font-medium">Опубликовано!</p>
+                        <p className="text-xs text-zinc-500 mt-1">Видео загружается на YouTube в фоне.</p>
                       </div>
                     </div>
                   ) : (
                     <div className="flex items-center gap-2 text-red-400">
                       <AlertCircle size={16} />
                       <div>
-                        <p className="text-sm font-medium">Publish failed</p>
+                        <p className="text-sm font-medium">Не удалось опубликовать</p>
                         <p className="text-xs text-zinc-500 mt-1">{publishResult.error}</p>
                       </div>
                     </div>

@@ -149,7 +149,7 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
             className={`w-full h-full ${isSyncedPlaying ? '' : 'pointer-events-none scale-110'}`}
             // Add enablejsapi=1 for postMessage control
             src={`https://www.youtube.com/embed/${videoSrc}?autoplay=1&mute=1&controls=0&loop=1&playlist=${videoSrc}&modestbranding=1&showinfo=0&rel=0&enablejsapi=1`}
-            title="Processing Video"
+            title="Обрабатываемое видео"
             frameBorder="0"
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
           />

@@ -6,15 +6,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from saasshorts import (
+    _AVATAR_MOTION_PROMPT,
     _avatar_clip_cache_valid,
-    _avatar_request_prompt,
-    _avatar_scene_parts_prompt,
-    _avatar_scene_prompt,
     _broll_reference_image,
     _broll_slice_shot,
     _chunk_request_prompts,
+    _file_fingerprint,
+    _mp3_encoder_delay,
     _parse_review_issues,
     _shot_request_prompt,
+    build_kling_v3_storyboard_request,
     composite_storyboard_video,
     generate_sliced_avatar_clips,
     generate_storyboard_chunk_clip,
@@ -26,12 +27,13 @@ from saasshorts import (
 class FreezeVsStretchTest(unittest.TestCase):
     """Short clips: b-roll gets a gentle slowdown, talking heads keep the freeze."""
 
-    def _filter_for(self, shot, actual, slot):
+    def _filter_for(self, shot, actual, slot, speech_offset=0.0):
+        clip = {"path": "/tmp/a.mp4", "duration": slot, "shot": shot,
+                "speech_offset": speech_offset}
         with patch("saasshorts.subprocess.run") as run_mock, \
              patch("saasshorts._get_media_duration", return_value=actual):
             composite_storyboard_video(
-                [{"path": "/tmp/a.mp4", "duration": slot, "shot": shot}],
-                "/tmp/voice.mp3", "/tmp/subs.ass", "/tmp/out.mp4",
+                [clip], "/tmp/voice.mp3", "/tmp/subs.ass", "/tmp/out.mp4",
             )
         cmd = run_mock.call_args[0][0]
         return cmd[cmd.index("-filter_complex") + 1]
@@ -55,6 +57,75 @@ class FreezeVsStretchTest(unittest.TestCase):
         flt = self._filter_for({"visual_type": "broll"}, actual=5.5, slot=5.0)
         self.assertIn("trim=start=0:end=5.000", flt)
         self.assertNotIn("tpad", flt)
+
+
+class LipSyncHeadSkipTest(unittest.TestCase):
+    """Клип, снятый по mp3-слайсу, открывается тишиной энкодера — её срезаем.
+
+    Иначе губы стоят на этой задержке позже мастер-озвучки: замер на джобе
+    saas_b13f0229 дал +25 мс на каждом говорящем кадре.
+    """
+
+    def _filter_for(self, clip, actual):
+        with patch("saasshorts.subprocess.run") as run_mock, \
+             patch("saasshorts._get_media_duration", return_value=actual):
+            composite_storyboard_video(
+                [clip], "/tmp/voice.mp3", "/tmp/subs.ass", "/tmp/out.mp4",
+            )
+        cmd = run_mock.call_args[0][0]
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    def test_talking_clip_starts_after_the_encoder_delay(self):
+        flt = self._filter_for(
+            {"path": "/tmp/a.mp4", "duration": 5.0, "shot": {"visual_type": "talking"},
+             "speech_offset": 0.025},
+            actual=5.5,
+        )
+        self.assertIn("trim=start=0.025:end=5.025", flt)
+        self.assertNotIn("tpad", flt)
+
+    def test_clip_without_offset_keeps_its_first_frame(self):
+        flt = self._filter_for(
+            {"path": "/tmp/a.mp4", "duration": 5.0, "shot": {"visual_type": "talking"}},
+            actual=5.5,
+        )
+        self.assertIn("trim=start=0:end=5.000", flt)
+
+    def test_head_skip_counts_against_the_usable_length(self):
+        # 5.0s клип минус 0.2s головы не закрывает слот — добираем фризом,
+        # а не сдвигом всех следующих кадров.
+        flt = self._filter_for(
+            {"path": "/tmp/a.mp4", "duration": 5.0, "shot": {"visual_type": "talking"},
+             "speech_offset": 0.2},
+            actual=5.0,
+        )
+        self.assertIn("trim=start=0.200:end=5.200", flt)
+        self.assertIn("tpad=stop_mode=clone:stop_duration=0.200", flt)
+
+    def test_offset_never_eats_the_whole_clip(self):
+        flt = self._filter_for(
+            {"path": "/tmp/a.mp4", "duration": 3.0, "shot": {"visual_type": "talking"},
+             "speech_offset": 9.0},
+            actual=3.0,
+        )
+        self.assertIn("trim=start=2.900:end=5.900", flt)
+
+
+class Mp3EncoderDelayTest(unittest.TestCase):
+    def test_delay_follows_the_slice_sample_rate(self):
+        with patch("saasshorts.subprocess.run",
+                   return_value=SimpleNamespace(stdout="48000\n", stderr="")):
+            self.assertAlmostEqual(_mp3_encoder_delay("/tmp/slice_01.mp3"), 1105 / 48000, places=6)
+
+    def test_unreadable_rate_falls_back_to_44_1k(self):
+        with patch("saasshorts.subprocess.run",
+                   return_value=SimpleNamespace(stdout="N/A\n", stderr="")):
+            self.assertAlmostEqual(_mp3_encoder_delay("/tmp/slice_01.mp3"), 1105 / 44100, places=6)
+
+    def test_pcm_slice_has_no_encoder_head(self):
+        with patch("saasshorts.subprocess.run",
+                   side_effect=AssertionError("ffprobe must not run for wav")):
+            self.assertEqual(_mp3_encoder_delay("/tmp/slice_01.wav"), 0.0)
 
 
 class ParseReviewIssuesTest(unittest.TestCase):
@@ -189,6 +260,74 @@ class BrollReferenceImageTest(unittest.TestCase):
                                                 log=lambda *_: None)
         self.assertEqual(result, out)
 
+    def _draw(self, shot, actor_photo_path=""):
+        """Run one b-roll frame against a fake fal, return (model, args)."""
+
+        class FakeResp:
+            content = b"png-bytes"
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def get(self, url):
+                return FakeResp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "ref.png")
+            with patch("saasshorts._fal_run", return_value={"images": [{"url": "https://fal.example/f.png"}]}) as fal_mock, \
+                 patch("saasshorts._fal_upload_file", return_value="https://fal.example/actor.png"), \
+                 patch("saasshorts.httpx.Client", FakeClient):
+                result = _broll_reference_image(
+                    shot, "key", out, log=lambda *_: None,
+                    actor_photo_path=actor_photo_path,
+                )
+            self.assertEqual(result, out)
+        return fal_mock.call_args[0][0], fal_mock.call_args[0][1]
+
+    def test_broll_with_our_presenter_is_staged_from_the_actor_photo(self):
+        """«Женский силуэт со спины» — это наша героиня, а не случайная женщина."""
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            with open(photo, "wb") as f:
+                f.write(b"actor")
+            model, args = self._draw(
+                {"generation_prompt": "a woman closes the fridge door, seen from behind",
+                 "visual_type": "broll", "actor_in_frame": True},
+                actor_photo_path=photo,
+            )
+        self.assertEqual(model, "fal-ai/flux-pro/kontext")
+        self.assertEqual(args["image_url"], "https://fal.example/actor.png")
+        self.assertIn("same person as in the reference image", args["prompt"])
+        self.assertIn("face stays out of frame", args["prompt"])
+        self.assertIn("closes the fridge door", args["prompt"])
+
+    def test_broll_without_the_flag_never_touches_the_actor_photo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            with open(photo, "wb") as f:
+                f.write(b"actor")
+            model, args = self._draw(
+                {"generation_prompt": "a fridge door closing", "visual_type": "broll"},
+                actor_photo_path=photo,
+            )
+        self.assertEqual(model, "fal-ai/flux-2-pro")
+        self.assertNotIn("image_url", args)
+        self.assertIn("no people", args["prompt"])
+
+    def test_presenter_broll_without_a_photo_falls_back_to_the_faceless_prompt(self):
+        model, args = self._draw(
+            {"generation_prompt": "a woman closes the fridge door",
+             "visual_type": "broll", "actor_in_frame": True},
+        )
+        self.assertEqual(model, "fal-ai/flux-2-pro")
+        self.assertIn("no people", args["prompt"])
+
 
 class ClipCacheInvalidationTest(unittest.TestCase):
     """Editing a shot's Kling prompt must invalidate the cached clip on retry."""
@@ -222,7 +361,8 @@ class ClipCacheInvalidationTest(unittest.TestCase):
         prompt = _shot_request_prompt(self._shot("крупный план кофейной чашки на столе"))
         self.assertIn("крупный план кофейной чашки", prompt)
         self.assertIn("vertical 9:16", prompt)
-        self.assertIn("no burned-in text", prompt)
+        # Запреты живут в negative_prompt запроса, а не в описании кадра.
+        self.assertNotIn("no burned-in text", prompt)
         # Идемпотентность: повторная нормализация не должна менять промпт,
         # иначе кэш клипов вечно считал бы его «изменённым».
         reshot = self._shot("x")
@@ -265,69 +405,101 @@ class ClipCacheInvalidationTest(unittest.TestCase):
             self.assertFalse(os.path.exists(ref))
 
 
-class AvatarPromptTest(unittest.TestCase):
-    """The UI's editable «Kling prompt» must drive talking shots too."""
+class PromptNegationsTest(unittest.TestCase):
+    """«Не рисуй текст» в описании кадра — это заказ на текст.
 
-    def test_generation_prompt_drives_avatar_framing(self):
-        shot = {
-            "scene": "kitchen counter",
-            "camera": "close-up",
-            "generation_prompt": "woman at a sunset window, vertical 9:16",
-        }
-        prompt = _avatar_scene_prompt(shot)
-        self.assertIn("woman at a sunset window", prompt)
-        self.assertIn("no readable on-screen text", prompt)
-        self.assertNotIn("kitchen counter", prompt)
+    У Kling V3 и Veo есть настоящее поле negative_prompt, туда всё и уезжает;
+    у аватарного эндпойнта такого поля нет вовсе, поэтому там запретов быть
+    не должно вообще.
+    """
 
-    def test_scene_fields_fallback_without_prompt(self):
-        prompt = _avatar_scene_prompt({"scene": "kitchen counter", "camera": "close-up"})
-        self.assertIn("kitchen counter", prompt)
-        self.assertIn("close-up", prompt)
+    def test_our_own_prompt_recipe_describes_only_what_is_in_frame(self):
+        prompt = _shot_request_prompt({
+            "shot_number": 1, "start": 0, "end": 4,
+            "scene": "hands pour coffee", "camera": "close-up",
+        })
+        for banned in ("no text", "no burned-in text", "no watermark", "no logos"):
+            self.assertNotIn(banned, prompt.lower())
 
-    def test_bare_shot_keeps_empty_contract(self):
-        self.assertEqual(_avatar_scene_prompt({"speech": "только текст"}), "")
+    def test_bans_live_in_the_negative_prompt_instead(self):
+        _, payload = build_kling_v3_storyboard_request(
+            [{"shot_number": 1, "start": 0, "end": 5, "generation_prompt": "a wooden table"}],
+            tier="standard",
+        )
+        self.assertNotIn("no ", payload["prompt"].lower())
+        for banned in ("burned-in text", "subtitles", "captions", "watermark", "logos"):
+            self.assertIn(banned, payload["negative_prompt"])
 
 
 class AvatarClipCacheValidTest(unittest.TestCase):
-    shot = {"scene": "kitchen", "camera": "close-up", "generation_prompt": "sunset window"}
+    """Клип живёт ровно до тех пор, пока жив кадр, с которого он снят."""
 
-    def _clip(self, tmp, stored_prompt=None):
+    def _reference(self, tmp, content=b"frame"):
+        ref = os.path.join(tmp, "ref_01.png")
+        with open(ref, "wb") as f:
+            f.write(content)
+        return ref
+
+    def _clip(self, tmp, meta=None):
         clip = os.path.join(tmp, "job_avatar_01.mp4")
         with open(clip, "wb") as f:
             f.write(b"clip")
-        if stored_prompt is not None:
+        if meta is not None:
             with open(clip.replace(".mp4", "_base_fal.json"), "w", encoding="utf-8") as f:
-                json.dump({"payload": {"prompt": stored_prompt}}, f)
+                json.dump(meta, f)
         return clip
 
     def test_missing_file_is_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertFalse(_avatar_clip_cache_valid(os.path.join(tmp, "nope.mp4"), self.shot))
+            self.assertFalse(
+                _avatar_clip_cache_valid(os.path.join(tmp, "nope.mp4"), self._reference(tmp))
+            )
 
     def test_clip_without_meta_stays_valid(self):
+        # Историю не знаем — самый дорогой артефакт не переснимаем наугад.
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp), self.shot))
+            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp), self._reference(tmp)))
 
-    def test_current_prompt_is_valid(self):
+    def test_same_reference_frame_is_valid(self):
         with tempfile.TemporaryDirectory() as tmp:
-            stored = _avatar_request_prompt(_avatar_scene_prompt(self.shot))
-            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+            ref = self._reference(tmp)
+            clip = self._clip(tmp, {"payload": {}, "reference_fingerprint": _file_fingerprint(ref)})
+            self.assertTrue(_avatar_clip_cache_valid(clip, ref))
 
-    def test_legacy_scene_recipe_stays_valid(self):
-        # Clips generated before the generation_prompt switch must not be
-        # surprise-regenerated: an avatar clip is the priciest artifact.
+    def test_edited_scene_gives_a_new_frame_and_invalidates(self):
         with tempfile.TemporaryDirectory() as tmp:
-            stored = _avatar_request_prompt(_avatar_scene_parts_prompt(self.shot))
-            self.assertTrue(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+            ref = self._reference(tmp)
+            clip = self._clip(tmp, {"payload": {}, "reference_fingerprint": _file_fingerprint(ref)})
+            with open(ref, "wb") as f:
+                f.write(b"a different staging of the same actor")
+            self.assertFalse(_avatar_clip_cache_valid(clip, ref))
 
-    def test_edited_prompt_invalidates(self):
+    def test_clip_shot_with_the_current_motion_prompt_is_valid(self):
         with tempfile.TemporaryDirectory() as tmp:
-            stored = _avatar_request_prompt("a completely different framing")
-            self.assertFalse(_avatar_clip_cache_valid(self._clip(tmp, stored), self.shot))
+            ref = self._reference(tmp)
+            clip = self._clip(tmp, {
+                "payload": {"prompt": _AVATAR_MOTION_PROMPT},
+                "reference_fingerprint": _file_fingerprint(ref),
+            })
+            self.assertTrue(_avatar_clip_cache_valid(clip, ref))
+
+    def test_clip_shot_with_the_old_prompt_is_never_reused(self):
+        # Старый промпт — источник кракозябр в кадре, такие дубли не тащим дальше.
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = self._reference(tmp)
+            clip = self._clip(tmp, {
+                "payload": {"prompt": "Vertical 9:16 UGC ad, no burned-in text"},
+                "reference_fingerprint": _file_fingerprint(ref),
+            })
+            self.assertFalse(_avatar_clip_cache_valid(clip, ref))
 
 
 class SlicedAvatarCacheTest(unittest.TestCase):
-    """Retry of a sliced-avatar job regenerates only the prompt-edited shots."""
+    """Retry of a sliced-avatar job regenerates only what the user actually changed.
+
+    Talking shots are keyed by their reference frame (the avatar request has no
+    prompt), b-roll by its Kling prompt.
+    """
 
     TALKING_PROMPT = "creator at a desk, vertical 9:16, no burned-in text, no watermark"
     BROLL_PROMPT = "coffee cup close-up, vertical 9:16, no burned-in text, no watermark"
@@ -359,27 +531,27 @@ class SlicedAvatarCacheTest(unittest.TestCase):
                 broll_image_first=False, log=lambda *_: None,
             )
 
-    def _seed_cached_clips(self, tmp, shots, talking_meta_prompt, broll_meta_prompt):
+    def _seed_cached_clips(self, tmp, talking_reference, broll_meta_prompt):
         talking_clip = os.path.join(tmp, "job_avatar_01.mp4")
         broll_clip = os.path.join(tmp, "job_avatar_broll_02.mp4")
         for clip in (talking_clip, broll_clip):
             with open(clip, "wb") as f:
                 f.write(b"cached")
         with open(talking_clip.replace(".mp4", "_base_fal.json"), "w", encoding="utf-8") as f:
-            json.dump({"payload": {"prompt": talking_meta_prompt}}, f)
+            json.dump({"payload": {}, "reference_fingerprint": talking_reference}, f)
         with open(f"{broll_clip}.meta.json", "w", encoding="utf-8") as f:
             json.dump({"payload": {"prompt": broll_meta_prompt}}, f)
         return talking_clip, broll_clip
 
-    def test_unchanged_prompts_reuse_both_cached_clips(self):
+    def test_unchanged_shots_reuse_both_cached_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
             ref = os.path.join(tmp, "ref.png")
             with open(ref, "wb") as f:
                 f.write(b"img")
             shots = self._shots(ref)
             self._seed_cached_clips(
-                tmp, shots,
-                talking_meta_prompt=_avatar_request_prompt(_avatar_scene_prompt(shots[0])),
+                tmp,
+                talking_reference=_file_fingerprint(ref),
                 broll_meta_prompt=_shot_request_prompt(_broll_slice_shot(shots[1], 3.0)),
             )
             clips = self._run(
@@ -389,15 +561,15 @@ class SlicedAvatarCacheTest(unittest.TestCase):
             )
         self.assertEqual(len(clips), 2)
 
-    def test_edited_prompts_regenerate_both_clips(self):
+    def test_edited_shots_regenerate_both_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
             ref = os.path.join(tmp, "ref.png")
             with open(ref, "wb") as f:
                 f.write(b"img")
             shots = self._shots(ref)
             self._seed_cached_clips(
-                tmp, shots,
-                talking_meta_prompt=_avatar_request_prompt("stale avatar framing"),
+                tmp,
+                talking_reference="fingerprint of a frame that no longer exists",
                 broll_meta_prompt="stale broll prompt",
             )
             calls = {"head": 0, "v3": 0}
@@ -416,6 +588,121 @@ class SlicedAvatarCacheTest(unittest.TestCase):
 
             self._run(tmp, shots, head_mock=fake_head, v3_mock=fake_v3)
         self.assertEqual(calls, {"head": 1, "v3": 1})
+
+    def test_clips_report_the_head_the_assembly_has_to_skip(self):
+        def fake_clip(*args, **kwargs):
+            output_path = args[3] if len(args) > 3 else args[2]
+            with open(output_path, "wb") as f:
+                f.write(b"clip")
+            return output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            with open(ref, "wb") as f:
+                f.write(b"img")
+            with patch("saasshorts._mp3_encoder_delay", return_value=0.025):
+                clips = self._run(tmp, self._shots(ref),
+                                  head_mock=fake_clip, v3_mock=fake_clip)
+        self.assertEqual([clip["speech_offset"] for clip in clips], [0.025, 0.0])
+
+
+class ApprovedFrameReuseTest(unittest.TestCase):
+    """Кадр, одобренный в предпросмотре, платный рендер не перерисовывает.
+
+    Предпросмотр и рендер — разные джобы, а кадр кэшируется по промпту внутри
+    папки своего джоба. Пока рендер не умел смотреть в чужую папку, он покупал
+    заново ровно ту картинку, которую пользователь только что посмотрел и
+    утвердил, — и получал другой сэмпл вместо одобренного.
+    """
+
+    @staticmethod
+    def _fake_slice(audio_path, start, end, output_path):
+        with open(output_path, "wb") as f:
+            f.write(b"slice")
+        return output_path
+
+    @staticmethod
+    def _fake_clip(*args, **kwargs):
+        output_path = args[3] if len(args) > 3 else args[2]
+        with open(output_path, "wb") as f:
+            f.write(b"clip")
+        return output_path
+
+    def test_broll_takes_the_frame_approved_in_the_preview_job(self):
+        seen = {}
+
+        def fake_v3(shot, fal_key, output_path, tier="standard", **kwargs):
+            seen["image_path"] = shot.get("image_path")
+            return self._fake_clip(shot, fal_key, output_path)
+
+        with tempfile.TemporaryDirectory() as root:
+            preview = os.path.join(root, "saas_preview")
+            render = os.path.join(root, "saas_render")
+            os.makedirs(preview)
+            os.makedirs(render)
+            with open(os.path.join(preview, "job_frame_02.png"), "wb") as f:
+                f.write(b"approved-frame")
+            talking_ref = os.path.join(render, "ref.png")
+            with open(talking_ref, "wb") as f:
+                f.write(b"img")
+            shots = [
+                {"shot_number": 1, "start": 0, "end": 3, "visual_type": "talking",
+                 "speech": "Первая фраза кадра.", "image_path": talking_ref,
+                 "generation_prompt": "creator at a desk"},
+                # Кадр лежит в папке джоба предпросмотра — так его и отдаёт фронт.
+                {"shot_number": 2, "start": 3, "end": 6, "visual_type": "broll",
+                 "speech": "Вторая фраза кадра.", "generation_prompt": "coffee cup close-up",
+                 "local_url": "/videos/saas_preview/job_frame_02.png"},
+            ]
+            with patch("saasshorts._get_media_duration", return_value=6.0), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=self._fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=self._fake_clip), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=fake_v3), \
+                 patch("saasshorts._broll_reference_image",
+                       side_effect=AssertionError("одобренный кадр перерисовывать нельзя")):
+                generate_sliced_avatar_clips(
+                    shots, os.path.join(render, "voice.mp3"), [], "key", render, "job",
+                    broll_image_first=True, log=lambda *_: None,
+                )
+
+        self.assertEqual(
+            seen["image_path"],
+            os.path.normpath(os.path.join(root, "saas_preview", "job_frame_02.png")),
+        )
+
+    def test_broll_without_an_approved_frame_still_draws_one(self):
+        drawn = {"calls": 0}
+
+        def fake_reference(shot, fal_key, output_path, **kwargs):
+            drawn["calls"] += 1
+            with open(output_path, "wb") as f:
+                f.write(b"fresh-frame")
+            return output_path
+
+        with tempfile.TemporaryDirectory() as root:
+            render = os.path.join(root, "saas_render")
+            os.makedirs(render)
+            talking_ref = os.path.join(render, "ref.png")
+            with open(talking_ref, "wb") as f:
+                f.write(b"img")
+            shots = [
+                {"shot_number": 1, "start": 0, "end": 3, "visual_type": "talking",
+                 "speech": "Первая фраза кадра.", "image_path": talking_ref,
+                 "generation_prompt": "creator at a desk"},
+                {"shot_number": 2, "start": 3, "end": 6, "visual_type": "broll",
+                 "speech": "Вторая фраза кадра.", "generation_prompt": "coffee cup close-up"},
+            ]
+            with patch("saasshorts._get_media_duration", return_value=6.0), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=self._fake_slice), \
+                 patch("saasshorts.generate_talking_head", side_effect=self._fake_clip), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=self._fake_clip), \
+                 patch("saasshorts._broll_reference_image", side_effect=fake_reference):
+                generate_sliced_avatar_clips(
+                    shots, os.path.join(render, "voice.mp3"), [], "key", render, "job",
+                    broll_image_first=True, log=lambda *_: None,
+                )
+
+        self.assertEqual(drawn["calls"], 1)
 
 
 class ChunkCacheInvalidationTest(unittest.TestCase):

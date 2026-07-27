@@ -8,7 +8,6 @@ import httpx
 from saasshorts import (
     _align_shots_to_voiceover,
     _avatar_reference_variant,
-    _avatar_scene_prompt,
     _broll_slice_shot,
     _elevenlabs_voice_for,
     _estimate_speech_duration,
@@ -116,22 +115,6 @@ class GenerateVoiceoverV3Tests(unittest.TestCase):
 
 
 class SlicedAvatarShotVarietyTests(unittest.TestCase):
-    def test_scene_prompt_built_from_shot_fields(self):
-        shot = {
-            "scene": "Kitchen counter, morning light",
-            "actor_action": "leans in, gestures with cup",
-            "camera": "medium close-up",
-            "emotion": "warm",
-        }
-        prompt = _avatar_scene_prompt(shot)
-        self.assertIn("Kitchen counter", prompt)
-        self.assertIn("gestures with cup", prompt)
-        self.assertIn("medium close-up", prompt)
-        self.assertIn("warm mood", prompt)
-
-    def test_scene_prompt_empty_for_bare_shot(self):
-        self.assertEqual(_avatar_scene_prompt({"speech": "только текст"}), "")
-
     def test_first_shot_keeps_original_reference(self):
         result = _avatar_reference_variant("/img/actor.png", "/img/ref_01.png", 1)
         self.assertEqual(result, "/img/actor.png")
@@ -276,16 +259,16 @@ class BrollSliceShotTests(unittest.TestCase):
         self.assertEqual(v3_shot["start"], 0)
         self.assertEqual(v3_shot["end"], 5)
         self.assertTrue(v3_shot["generation_prompt"].startswith(shot["generation_prompt"]))
-        self.assertIn("no lip movement", v3_shot["generation_prompt"])
+        self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
         # Оригинальный кадр не мутируется — им ещё пользуются субтитры
         self.assertEqual(shot["start"], 3.2)
-        self.assertNotIn("no lip movement", shot["generation_prompt"])
+        self.assertNotIn("mouth closed", shot["generation_prompt"])
 
     def test_builds_prompt_from_scene_when_missing(self):
         shot = {"visual_type": "broll", "scene": "hands pour coffee", "speech": "текст"}
         v3_shot = _broll_slice_shot(shot, 3.0)
         self.assertIn("hands pour coffee", v3_shot["generation_prompt"])
-        self.assertIn("no lip movement", v3_shot["generation_prompt"])
+        self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
 
 
 class CaptionHighlightTests(unittest.TestCase):
@@ -514,8 +497,9 @@ class AlignWithAudioTagsTests(unittest.TestCase):
         slices, skipped = _align_shots_to_voiceover(shots, self._words(), 4.0)
         self.assertEqual(skipped, [])
         self.assertEqual(len(slices), 2)
-        # Граница в паузе между "три" (1.4) и "четыре" (2.4)
-        self.assertAlmostEqual(slices[0]["end"], 1.9, delta=0.05)
+        # Граница в паузе между "три" (1.4) и "четыре" (2.4), у самого начала
+        # второй фразы — чтобы кадр 2 открывался речью, а не тишиной.
+        self.assertAlmostEqual(slices[0]["end"], 2.32, delta=0.05)
 
     def test_tag_only_words_do_not_skew_weights(self):
         shots = [
@@ -524,7 +508,7 @@ class AlignWithAudioTagsTests(unittest.TestCase):
         ]
         slices, _ = _align_shots_to_voiceover(shots, self._words(), 4.0)
         # Без учёта тегов веса равные (3 и 3) — граница остаётся в паузе
-        self.assertAlmostEqual(slices[0]["end"], 1.9, delta=0.05)
+        self.assertAlmostEqual(slices[0]["end"], 2.32, delta=0.05)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
+import FrameEditorBlockedModal from './FrameEditorBlockedModal';
 import {
   loadBusinessProfiles,
   saveBusinessProfiles,
@@ -356,6 +357,15 @@ function pluralShots(n) {
   return 'кадров';
 }
 
+// Клип ≠ кадр: длинная реплика снимается несколькими клипами, и платят именно
+// за них — поэтому в смете считаются клипы.
+function pluralClips(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'клипом';
+  return 'клипами';
+}
+
 // Duration of a single shot in whole seconds (min 1). We keep the storyboard on
 // a "each shot has a length" model; absolute start/end are derived from it.
 function shotDurationSeconds(shot) {
@@ -574,8 +584,29 @@ function workspaceHasProgress(snapshot) {
   );
 }
 
+// Никогда не открываем мастер на шаге, который нечем отрисовать. Каждый шаг
+// отрисовывается только при своих данных (шаг 1 — при analysis, шаг 2 — при
+// scripts), поэтому «есть прогресс → шаг 1» давал пустой экран: например,
+// сценарии сохранены, а analysis === null (ручной сценарий, импорт из галереи).
+// Единственным выходом оставалось «Начать заново», т.е. потеря работы.
+//
+// Шаги 3 (логи генерации) и 4 (готовый ролик) — полноправные: и jobId, и
+// genResult лежат в снапшоте, так что после перезагрузки возвращаемся к своей
+// генерации, а не к настройке. Резать их до 2, как здесь было, значит отнимать
+// у пользователя и логи, и результат уже оплаченного рендера.
 function workspaceStep(snapshot) {
-  return Number.isInteger(snapshot?.step) ? snapshot.step : (workspaceHasProgress(snapshot) ? 1 : 0);
+  const hasAnalysis = Boolean(snapshot?.analysis);
+  const hasScripts = Array.isArray(snapshot?.scripts) && snapshot.scripts.length > 0;
+  const desired = Number.isInteger(snapshot?.step)
+    ? snapshot.step
+    : (workspaceHasProgress(snapshot) ? 1 : 0);
+  const editorStep = hasScripts ? 2 : (hasAnalysis ? 1 : 0);
+
+  if (desired >= 4) return snapshot?.genResult ? 4 : editorStep;
+  if (desired === 3) return snapshot?.jobId ? 3 : editorStep;
+  if (desired === 2) return editorStep;
+  if (desired === 1) return hasAnalysis ? 1 : (hasScripts ? 2 : 0);
+  return 0;
 }
 
 export default function SaaShortsTab({
@@ -681,6 +712,9 @@ export default function SaaShortsTab({
   // Номера кадров, которые пользователь просит переснять, хотя текст не менялся:
   // без этого их отдал бы кэш прошлого рендера.
   const [reshootShots, setReshootShots] = useState([]);
+  // Прочитать весь текст одним дублем вместо пошотных кусков: швов не будет
+  // совсем, но пересниматься придётся всем говорящим кадрам.
+  const [revoiceAll, setRevoiceAll] = useState(false);
   const [generatingActors, setGeneratingActors] = useState(false);
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
@@ -713,6 +747,21 @@ export default function SaaShortsTab({
   // step 2 (перед платной генерацией видео), staying on the storyboard editor.
   const [framesGenerating, setFramesGenerating] = useState(false);
   const [framesShot, setFramesShot] = useState(null); // shot_number currently regenerating, or null for «все»
+  // Что сказать после превью кадров: «прошло, но ничего не изменилось» — это
+  // всегда отброшенный пустой кадр, и молчать об этом нельзя.
+  const [framesNotice, setFramesNotice] = useState('');
+  // Прослушивание озвучки до платного видео: дорожка задаёт длину ролика,
+  // границы кадров и число оплачиваемых клипов, поэтому её слушают первой.
+  const [voiceGenerating, setVoiceGenerating] = useState(false);
+  const [voiceShot, setVoiceShot] = useState(null); // shot_number, чью реплику перезаписываем
+  const [voiceNotice, setVoiceNotice] = useState('');
+  // Кто ставит ведущего в кадр. Пусто = дефолт бэкенда. Модель меняется только
+  // руками: молчаливый перебор редакторов оплачивался пользователем, который о
+  // нём не знал.
+  const [avatarEditModel, setAvatarEditModel] = useState('');
+  const [avatarEditModels, setAvatarEditModels] = useState([]);
+  // Отказ редактора: что ответила модель и с какого кадра начинать повтор.
+  const [frameBlock, setFrameBlock] = useState(null);
 
   // Publish
   const [publishing, setPublishing] = useState(false);
@@ -736,7 +785,10 @@ export default function SaaShortsTab({
     return `/api/user/content-workspaces/${encodeURIComponent(profileId)}/${encodeURIComponent(itemId)}`;
   };
 
-  const applyWorkspaceSnapshot = (snapshot) => {
+  // restoreStep=false — для чужой записи, приехавшей во время работы: подхватить
+  // её данные можно, а вот перекинуть пользователя на другой шаг мастера посреди
+  // генерации нельзя.
+  const applyWorkspaceSnapshot = (snapshot, { restoreStep = true } = {}) => {
     if (!snapshot) return;
     setDescription(snapshot.description || '');
     setTopic(snapshot.topic ?? activeContentPlanContext?.topic ?? activeContentPlanContext?.item?.topic ?? '');
@@ -749,7 +801,7 @@ export default function SaaShortsTab({
     setAnalysis(snapshot.analysis || null);
     setWebResearch(snapshot.webResearch || null);
     setScripts(snapshot.scripts || []);
-    setStep(workspaceStep(snapshot));
+    if (restoreStep) setStep(workspaceStep(snapshot));
     setSelectedScript(snapshot.selectedScript ?? 0);
     setEditedNarration(snapshot.editedNarration || '');
     setJobId(snapshot.jobId || null);
@@ -807,6 +859,15 @@ export default function SaaShortsTab({
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (!data?.workspace || !activeContentPlanContext) return;
+        // Ответ на собственный PUT — это эхо: сервер возвращает ту же ревизию,
+        // что мы прислали, только со своим updated_at (а он всегда на миллисекунды
+        // позже нашего). chooseNewestWorkspace честно объявлял такое эхо «более
+        // свежим», мы раскладывали его обратно по состоянию и дёргали
+        // workspaceHydrationVersion — а он стоит в зависимостях эффекта
+        // сохранения. Круг замыкался: PUT → apply → PUT, по несколько раз в
+        // секунду, пока открыта вкладка (в базе накопилось 10 000 ревизий одной
+        // записи). Принимаем только чужую запись — со строго большей ревизией.
+        if (Number(data.workspace.revision) <= Number(snapshot.revision || 0)) return;
         const remoteWorkspace = {
           ...data.workspace.snapshot,
           revision: data.workspace.revision,
@@ -817,7 +878,7 @@ export default function SaaShortsTab({
         if (newestWorkspace === remoteWorkspace) {
           const saved = saveLocalWorkspace(activeContentPlanContext, remoteWorkspace);
           latestWorkspaceSnapshotRef.current = saved;
-          applyWorkspaceSnapshot(saved);
+          applyWorkspaceSnapshot(saved, { restoreStep: false });
           setWorkspaceHydrationVersion((version) => version + 1);
         }
       })
@@ -986,11 +1047,15 @@ export default function SaaShortsTab({
   // the rebuilt prompt baseline). Merge them into the matching script by title so
   // the storyboard editor shows the actual generated frames and future «Что в кадре»
   // edits diff against the new baseline.
-  const applyGeneratedShots = (result) => {
+  const applyGeneratedShots = (result, previewJobs = {}) => {
     const genShots = result?.shots;
     const title = result?.script?.title;
     if (!Array.isArray(genShots) || !genShots.length || !title) return;
     const byNumber = new Map(genShots.map((s, i) => [s.shot_number ?? (i + 1), s]));
+    // Перерисованный кадр ложится по тому же адресу: ракурс общий на весь ролик,
+    // имя файла не меняется. Браузер отдаёт картинку из кэша, и «Перегенерить»
+    // выглядит как «ничего не произошло» даже когда кадр честно нарисован заново.
+    const bust = result?.frames_only ? `?v=${Date.now()}` : '';
     const next = scripts.map((script) => {
       if (script.title !== title || !Array.isArray(script.shots) || !script.shots.length) return script;
       const shots = script.shots.map((shot, i) => {
@@ -1004,18 +1069,57 @@ export default function SaaShortsTab({
           image_url: g.image_url || shot.image_url,
           local_url: g.local_url || shot.local_url,
           image_path: g.image_path || shot.image_path,
-          image_preview: g.local_url ? getApiUrl(g.local_url) : shot.image_preview,
+          image_preview: g.local_url ? `${getApiUrl(g.local_url)}${bust}` : shot.image_preview,
           generation_prompt: g.generation_prompt || shot.generation_prompt,
           _prompt_source_scene: g._prompt_source_scene ?? shot._prompt_source_scene,
           _render_files: g._render_files || shot._render_files,
+          // Реплика, записанная голосом: её кусок дорожки, длина и во сколько
+          // платных клипов она превратится. `voice_speech` — текст, который
+          // реально прочитан: по нему видно, что реплику после этого правили.
+          voice_url: g.voice_url || shot.voice_url,
+          voice_speech: g.voice_speech ?? shot.voice_speech,
+          voice_start: g.voice_start ?? shot.voice_start,
+          voice_end: g.voice_end ?? shot.voice_end,
+          voice_seconds: g.voice_seconds ?? shot.voice_seconds,
+          voice_clips: g.voice_clips ?? shot.voice_clips,
         };
       });
       // Снятый ролик становится новым источником для пересъёмки, а его кадры —
       // точкой отсчёта: с этого момента «изменённым» считается то, что правили
       // после рендера. Превью кадров (frames_only) роликом не является.
-      const renderedJobId = result?.frames_only ? '' : jobIdFromVideoUrl(result?.video_url);
-      if (!renderedJobId) return { ...script, shots };
-      return { ...script, shots, _source_job_id: renderedJobId, _render_baseline: shots };
+      const renderedJobId = (result?.frames_only || result?.voice_only)
+        ? ''
+        : jobIdFromVideoUrl(result?.video_url);
+      if (!renderedJobId) {
+        // Джоб предпросмотра: клипов в нём нет, зато есть оплаченные кадры и
+        // утверждённые дубли. Рендер заберёт их оттуда — иначе он переделал бы
+        // ровно то, что пользователь только что посмотрел, послушал и одобрил.
+        return {
+          ...script,
+          shots,
+          ...(previewJobs.frames ? { _frames_job_id: previewJobs.frames } : {}),
+          ...(previewJobs.voice ? {
+            _voice_job_id: previewJobs.voice,
+            _voice_track: result?.audio_url || '',
+            _voice_seconds: result?.duration || 0,
+            _voice_clips: result?.voice_clips_planned || 0,
+            _voice_model: result?.voice_model || '',
+            _voice_provider: result?.voice_provider || '',
+            _voice_shoot_cost: result?.video_cost_estimate?.total ?? null,
+          } : {}),
+        };
+      }
+      return {
+        ...script,
+        shots,
+        _source_job_id: renderedJobId,
+        _render_baseline: shots,
+        // Снятый ролик сам стал источником звука и кадров, а папки превью
+        // вычищаются через сутки — держать ссылки на них уже не на что.
+        _frames_job_id: '',
+        _voice_job_id: '',
+        _voice_track: '',
+      };
     });
     if (!result?.frames_only && jobIdFromVideoUrl(result?.video_url)) setReshootShots([]);
     setScripts(next);
@@ -1454,7 +1558,9 @@ export default function SaaShortsTab({
   const removeSelectedScriptShot = (shotIndex) => {
     const shots = scripts[selectedScript]?.shots || [];
     if (shots.length <= 1) return; // keep at least one shot
-    const removed = { ...shots[shotIndex] };
+    // Позиция запоминается вместе с кадром: без неё возврат клал кадр в конец,
+    // и раскадровка, разобранная на время теста, собиралась в другом порядке.
+    const removed = { ...shots[shotIndex], _archived_at: shotIndex };
     mutateSelectedScriptShots(
       (next) => { next.splice(shotIndex, 1); return next; },
       (archived) => [...archived, removed],
@@ -1531,13 +1637,48 @@ export default function SaaShortsTab({
     await fillShotDetails([shotNumber], nextScripts);
   };
 
+  // Куда вернуть кадр — на то место, откуда его удалили. Индекс записан при
+  // удалении, поэтому возврат с конца архива это точная отмена удалений: порядок
+  // кадров совпадает с исходным, даже если удаляли вразнобой. Старые записи без
+  // индекса уходят в конец, как раньше.
+  const archivedShotSlot = (shot, shots) => {
+    const at = Number.isInteger(shot?._archived_at) ? shot._archived_at : shots.length;
+    return Math.max(0, Math.min(at, shots.length));
+  };
+
+  const restoredShot = (shot) => {
+    const rest = { ...shot };
+    delete rest._archived_at;
+    return rest;
+  };
+
   const restoreArchivedShot = (archiveIndex) => {
     const archived = scripts[selectedScript]?.shots_archived || [];
     const shot = archived[archiveIndex];
     if (!shot) return;
     mutateSelectedScriptShots(
-      (next) => [...next, { ...shot }],
+      (next) => {
+        next.splice(archivedShotSlot(shot, next), 0, restoredShot(shot));
+        return next;
+      },
       (list) => list.filter((_, i) => i !== archiveIndex),
+    );
+  };
+
+  // Собрать раскадровку обратно одним нажатием. Возвращаем с конца архива:
+  // каждое восстановление отменяет своё удаление, поэтому кадры встают ровно
+  // туда, где стояли, — что и нужно после теста «отрендерить один кадр».
+  const restoreAllArchivedShots = () => {
+    const archived = scripts[selectedScript]?.shots_archived || [];
+    if (!archived.length) return;
+    mutateSelectedScriptShots(
+      (next) => {
+        for (let i = archived.length - 1; i >= 0; i -= 1) {
+          next.splice(archivedShotSlot(archived[i], next), 0, restoredShot(archived[i]));
+        }
+        return next;
+      },
+      () => [],
     );
   };
 
@@ -1625,15 +1766,19 @@ export default function SaaShortsTab({
   // Сгенерировать начальные кадры шотов (Flux) БЕЗ платной генерации видео.
   // shotNumber задан → перегенерировать один кадр, иначе все. По готовности
   // мержим кадры в редактор (applyGeneratedShots) и остаёмся на шаге 2.
-  const handleGenerateFrames = async (shotNumber = null) => {
+  // modelOverride — выбор из модалки отказа: setState асинхронен, а запрос уходит
+  // сразу, поэтому модель передаётся аргументом, а не читается из стейта.
+  const handleGenerateFrames = async (shotNumber = null, modelOverride = null) => {
     if (!falKey) {
       alert('fal.ai API key required. Set it in Settings.');
       return;
     }
     if (framesGenerating) return;
 
+    const editModel = modelOverride ?? avatarEditModel;
     setFramesGenerating(true);
     setFramesShot(shotNumber);
+    setFramesNotice('');
 
     try {
       const scriptToSend = { ...scripts[selectedScript] };
@@ -1668,6 +1813,7 @@ export default function SaaShortsTab({
           broll_image_first: brollImageFirst,
           frames_only: true,
           frames_only_shot: shotNumber ?? undefined,
+          avatar_edit_model: editModel || undefined,
         }),
       });
 
@@ -1690,7 +1836,38 @@ export default function SaaShortsTab({
         if (!poll.ok) continue;
         const data = await poll.json();
         if (data.status === 'completed') {
-          applyGeneratedShots(data.result);
+          applyGeneratedShots(data.result, { frames: framesJobId });
+          // Джоб «успешен» и с нулём кадров: модель может вернуть пустую
+          // картинку, её отбрасывают, и раньше пользователь видел ровно то же
+          // самое изображение без единого слова о том, что произошло.
+          const framesMade = Number(data.result?.frames_made ?? 0);
+          const framesFailed = Number(data.result?.frames_failed ?? 0);
+          // Пустой кадр тарифицируется наравне с картинкой, поэтому в сообщении
+          // о неудаче стоит сумма: молчать о списании нельзя.
+          const charged = Number(data.result?.frames_charged ?? 0);
+          const spent = charged ? ` Списано: ${formatUsd(charged * 0.05)}.` : ' Денег не списано.';
+          // Каталог редакторов приходит с результатом — он же помечает, кто уже
+          // отказал на этом фото.
+          const catalogue = data.result?.avatar_edit_models || [];
+          if (catalogue.length) setAvatarEditModels(catalogue);
+          if (data.result?.avatar_edit_model) setAvatarEditModel(data.result.avatar_edit_model);
+          // Отказ модели показываем модалкой, а не строкой в углу: это решение
+          // пользователя (другая модель или другое фото), а не уведомление.
+          const blocked = data.result?.frames_blocked || [];
+          if (blocked.length) {
+            setFrameBlock({
+              ...blocked[0],
+              shotNumber,
+              spentUsd: charged ? formatUsd(charged * 0.05) : '',
+            });
+          }
+          setFramesNotice(
+            framesFailed && !framesMade
+              ? `Кадр не нарисовался: модель вернула пустое изображение.${spent}`
+              : framesFailed
+                ? `Готово кадров: ${framesMade}. Не получилось: ${framesFailed} — модель вернула пустое изображение.${spent}`
+                : '',
+          );
           break;
         }
         if (data.status === 'failed') {
@@ -1702,6 +1879,103 @@ export default function SaaShortsTab({
     } finally {
       setFramesGenerating(false);
       setFramesShot(null);
+    }
+  };
+
+  // Записать озвучку БЕЗ платной генерации видео и остаться в редакторе.
+  // shotNumber — перезаписать одну реплику, everything — перечитать весь текст
+  // одним дублем. Дубль каждый раз новый, поэтому уже одобренные куски дорожки
+  // переносятся из прошлого превью: иначе правка одной реплики меняла бы голос
+  // во всём ролике.
+  const handleGenerateVoice = async (shotNumber = null, everything = false) => {
+    if (ttsProvider === 'elevenlabs' && !elevenLabsKey) {
+      alert('ElevenLabs API key required. Set it in Settings.');
+      return;
+    }
+    if (voiceGenerating) return;
+
+    setVoiceGenerating(true);
+    setVoiceShot(shotNumber);
+    setVoiceNotice('');
+
+    try {
+      const scriptToSend = { ...scripts[selectedScript] };
+      scriptToSend._product_name = analysis?.product_name || analysis?.name || '';
+      scriptToSend._business_name = businessName.trim();
+      scriptToSend._business_description = description.trim();
+      scriptToSend._video_topic = topic.trim();
+      scriptToSend._product_url = '';
+
+      const headers = {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+      };
+      if (falKey && !isManagedKey(falKey)) headers['X-Fal-Key'] = falKey;
+      if (elevenLabsKey && !isManagedKey(elevenLabsKey)) headers['X-ElevenLabs-Key'] = elevenLabsKey;
+
+      const res = await fetch(getApiUrl('/api/saasshorts/generate'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          script: scriptToSend,
+          voice_id: selectedVoice,
+          tts_provider: ttsProvider,
+          minimax_voice_id: minimaxVoice,
+          actor_gender: actorGender,
+          language,
+          actor_description: actorDescription || undefined,
+          selected_actor_url: selectedActor || undefined,
+          video_mode: videoMode,
+          broll_mode: storyboardSelected ? 'off' : brollMode,
+          storyboard_generation_mode: storyboardGenerationMode,
+          use_platform_keys: usePlatformKeys,
+          voice_only: true,
+          // Галочка «одним дублем» действует в момент записи — иначе человек
+          // слушал бы дорожку со стыками, а ролик снимался бы под другую.
+          revoice_all: everything || revoiceAll,
+          revoice_shots: shotNumber ? [shotNumber] : [],
+          // Дубли, которые уже слушали, переезжают в новый джоб как есть.
+          voice_job_id: voiceJobId || undefined,
+          // Пересъёмка: у снятого ролика звук уже есть, и перезаписывать его
+          // целиком значит отправить на пересъёмку все говорящие кадры.
+          source_job_id: sourceJobId || undefined,
+        }),
+      });
+
+      if (!res.ok) {
+        let msg = 'Voiceover failed';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+
+      const { job_id: newVoiceJobId } = await res.json();
+
+      // Свой опрос, как и у кадров: основной genStatus/step не трогаем, чтобы
+      // остаться в редакторе раскадровки.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (Date.now() > deadline) throw new Error('Voiceover timed out');
+        const poll = await fetch(getApiUrl(`/api/saasshorts/status/${newVoiceJobId}`), { headers: authHeaders() });
+        if (!poll.ok) continue;
+        const data = await poll.json();
+        if (data.status === 'completed') {
+          applyGeneratedShots(data.result, { voice: newVoiceJobId });
+          // Подмена движка или модели слышна как «диктор вместо человека» —
+          // об этом говорим словами, а не оставляем догадываться на слух.
+          setVoiceNotice((data.result?.quality_warnings || []).join(' '));
+          break;
+        }
+        if (data.status === 'failed') {
+          throw new Error(data.error || 'Voiceover failed');
+        }
+      }
+    } catch (e) {
+      alert(`Не удалось записать озвучку: ${e.message}`);
+    } finally {
+      setVoiceGenerating(false);
+      setVoiceShot(null);
     }
   };
 
@@ -1755,6 +2029,9 @@ export default function SaaShortsTab({
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
+          // Кадры ведущего в платном рендере рисует та же модель, что выбрана в
+          // превью, — иначе выбор чинил бы только превью.
+          avatar_edit_model: avatarEditModel || undefined,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
@@ -1764,7 +2041,17 @@ export default function SaaShortsTab({
           // Пересъёмка готового ролика: снятые кадры переезжают из прошлого
           // джоба, платим только за изменённые и явно отмеченные.
           source_job_id: sourceJobId || undefined,
+          // Кадры, одобренные в предпросмотре, переезжают в рендер как есть:
+          // в ролик попадает ровно то, что человек утвердил, и второй раз за
+          // ту же картинку никто не платит.
+          frames_job_id: framesJobId || undefined,
+          // Ролик снимается под ту дорожку, которую человек послушал: заново
+          // записанный дубль звучит иначе, и липсинк лёг бы под другой звук.
+          voice_job_id: voiceJobId || undefined,
           regenerate_shots: reshootShots,
+          // Прослушанная дорожка уже записана так, как надо, — перечитывать её
+          // на съёмке значит выбросить утверждённый дубль и записать другой.
+          revoice_all: voiceJobId ? false : revoiceAll,
         }),
       });
 
@@ -1826,6 +2113,11 @@ export default function SaaShortsTab({
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
+          avatar_edit_model: avatarEditModel || undefined,
+          // Повтор после сбоя тоже начинает с одобренных кадров и дубля: то,
+          // что уже нарисовано, записано и оплачено, не переделывается.
+          frames_job_id: framesJobId || undefined,
+          voice_job_id: voiceJobId || undefined,
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
@@ -1909,6 +2201,25 @@ export default function SaaShortsTab({
       console.error('Actor gallery refresh failed:', e);
     }
   };
+
+  // Каталог редакторов кадра — справочник, ключи не нужны. Тянем один раз, чтобы
+  // модель можно было сменить заранее, а не только после отказа.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl('/api/saasshorts/frame-editors'));
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled || !data.models?.length) return;
+        setAvatarEditModels((prev) => (prev.length ? prev : data.models));
+        setAvatarEditModel((prev) => prev || data.default || '');
+      } catch (e) {
+        console.error('Frame editors catalogue failed:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const refreshHeadTemplates = async () => {
     setLoadingHeadTemplates(true);
@@ -2095,20 +2406,66 @@ export default function SaaShortsTab({
   );
   const missingFrameCount = (currentScript?.shots || []).filter((shot) => !shotHasFrame(shot)).length;
 
+  // Говорящие кадры снимаются двумя общими ракурсами на весь ролик, поэтому
+  // платим не за кадр, а за камеру: b-roll по картинке на кадр, говорящие —
+  // максимум две на всех. Оценка сверху: уже отрисованный ракурс бесплатен.
+  const AVATAR_FRAMING_COUNT = 2;
+  const isBrollShot = (shot) => (shot?.visual_type || '')
+    .toLowerCase().replace(/[-_]/g, '').includes('broll');
+  const billableFrameCount = (() => {
+    const missing = (currentScript?.shots || []).filter((shot) => !shotHasFrame(shot));
+    const talking = missing.filter((shot) => !isBrollShot(shot)).length;
+    return missing.length - talking + Math.min(talking, AVATAR_FRAMING_COUNT);
+  })();
+
   // Пересъёмка готового ролика: клипы прошлого рендера переносятся в новый джоб,
   // поэтому платим только за кадры, которые реально снимаются заново.
   const sourceJobId = currentScript?._source_job_id || '';
+  // Джоб предпросмотра кадров. Кадр кэшируется по промпту, но лежит в папке
+  // своего джоба, поэтому рендеру нужно сказать, откуда его взять.
+  const framesJobId = currentScript?._frames_job_id || '';
+  // Джоб прослушанной озвучки: дубль каждый раз новый, поэтому рендеру надо
+  // сказать, где лежит тот самый, который человек утвердил.
+  const voiceJobId = currentScript?._voice_job_id || '';
+  // Записанная дорожка: сама запись, её длина и во сколько платных клипов
+  // распадётся по ней съёмка. Живёт в сценарии, а не в стейте, — иначе после
+  // перезагрузки страницы слушать было бы нечего.
+  const voicePreview = (() => {
+    const track = currentScript?._voice_track || '';
+    if (!track) return null;
+    const shots = currentScript?.shots || [];
+    return {
+      url: getApiUrl(track),
+      seconds: Number(currentScript?._voice_seconds || 0),
+      clips: Number(currentScript?._voice_clips || 0),
+      model: currentScript?._voice_model || '',
+      shootCost: currentScript?._voice_shoot_cost,
+      // Реплики, переписанные уже после записи. Съёмка перезапишет их сама, но
+      // услышать их до готового ролика можно только записав озвучку ещё раз.
+      stale: shots
+        .filter((shot) => typeof shot.voice_speech === 'string'
+          && (shot.speech || '').trim() !== shot.voice_speech)
+        .map((shot, index) => shot.shot_number ?? (index + 1)),
+    };
+  })();
   const renderPlan = (() => {
     const shots = currentScript?.shots || [];
     const baseline = currentScript?._render_baseline;
+    const wholeNarration = shots.map((shot) => (shot.speech || '').trim()).filter(Boolean).join(' ');
     if (!sourceJobId || !Array.isArray(baseline) || !baseline.length) {
-      return { reshoot: shots, reused: [], narrationChanged: true, isReshoot: false };
+      return { reshoot: shots, reused: [], revoicedText: '', isReshoot: false };
     }
-    const speechOf = (list) => list.map((shot) => (shot.speech || '').trim()).join('|');
-    // Правка речи пересобирает озвучку, а по ней нарезаны все говорящие клипы —
-    // тогда переснимается ролик целиком, и обещать «бесплатно» нельзя.
-    const narrationChanged = speechOf(shots) !== speechOf(baseline);
+    if (revoiceAll) {
+      // Один дубль на весь ролик — значит и звук у каждого кадра новый.
+      return { reshoot: shots, reused: [], revoicedText: wholeNarration, isReshoot: true };
+    }
     const baseByNumber = new Map(baseline.map((shot, i) => [shot.shot_number ?? (i + 1), shot]));
+    // Озвучка теперь пошотная: правка одной реплики переписывает её кусок звука
+    // и только его, поэтому соседние клипы больше не сгорают вместе с ней.
+    const speechChanged = (shot, index) => {
+      const before = baseByNumber.get(shot.shot_number ?? (index + 1));
+      return !before || (shot.speech || '').trim() !== (before.speech || '').trim();
+    };
     const changed = (shot, index) => {
       const before = baseByNumber.get(shot.shot_number ?? (index + 1));
       if (!before) return true;
@@ -2117,16 +2474,20 @@ export default function SaaShortsTab({
       );
     };
     const reshoot = shots.filter((shot, index) => (
-      narrationChanged
-      || !shot.clip_url
+      !shot.clip_url
       || reshootShots.includes(shot.shot_number ?? (index + 1))
+      || speechChanged(shot, index)
       || changed(shot, index)
     ));
     const reshootSet = new Set(reshoot);
     return {
       reshoot,
       reused: shots.filter((shot) => !reshootSet.has(shot)),
-      narrationChanged,
+      // Платим за озвучку ровно тех реплик, что переписаны.
+      revoicedText: shots
+        .filter((shot, index) => speechChanged(shot, index))
+        .map((shot) => (shot.speech || '').trim())
+        .join(' '),
       isReshoot: true,
     };
   })();
@@ -2138,7 +2499,7 @@ export default function SaaShortsTab({
       return { total: 0, voiceCost: 0, videoCost: 0, brollCost: 0 };
     }
     const billable = estimateSaasVideoCost({
-      text: renderPlan.narrationChanged ? editedNarration : '',
+      text: renderPlan.revoicedText || '',
       videoMode,
       ttsProvider,
       brollMode: 'off',
@@ -2146,9 +2507,9 @@ export default function SaaShortsTab({
       script: { ...currentScript, shots: renderPlan.reshoot },
       storyboardGenerationMode,
     });
-    // Озвучка переснимается только вместе с речью: в остальных случаях берём
-    // готовый файл прошлого рендера.
-    const voiceCost = renderPlan.narrationChanged ? billable.voiceCost : 0;
+    // Озвучиваются только переписанные реплики — остальные куски звука берутся
+    // из прошлого рендера как есть.
+    const voiceCost = renderPlan.revoicedText ? billable.voiceCost : 0;
     return {
       total: billable.videoCost + billable.brollCost + voiceCost,
       voiceCost,
@@ -2834,19 +3195,6 @@ export default function SaaShortsTab({
                 </>)}
               </div>
 
-              <div className="hidden">
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  {url.trim() ? 'Extra context' : 'Describe your product/business'} <span className="text-zinc-600">{url.trim() ? '(optional)' : '(required if no URL)'}</span>
-                </label>
-                <textarea
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  rows={2}
-                  className="input-field resize-none text-sm"
-                  placeholder="e.g. Pizzería artesanal en Madrid, Coach de productividad, Tienda de ropa deportiva, App de meditación..."
-                />
-              </div>
-
               <div>
                 <label className="block text-sm font-medium text-zinc-300 mb-2">
                   Тема текущего ролика <span className="text-zinc-600">(необязательно, но лучше заполнить)</span>
@@ -2858,7 +3206,7 @@ export default function SaaShortsTab({
                   className="input-field text-sm"
                   placeholder="Напр.: Почему вечерний срыв начинается утром; Что съесть в 17:00, чтобы не тянуло на сладкое вечером..."
                 />
-                <p className="text-[10px] text-zinc-600 mt-1">В AI-режиме варианты сценариев строятся вокруг этой темы. В ручном режиме тема нужна для заголовка, caption и визуальных подсказок.</p>
+                <p className="text-[10px] text-zinc-600 mt-1">В ИИ-режиме варианты сценариев строятся вокруг этой темы. В ручном режиме тема нужна для заголовка, caption и визуальных подсказок.</p>
               </div>
 
               {scriptMode === 'custom' && (
@@ -2962,7 +3310,7 @@ export default function SaaShortsTab({
               </div>
               <div className="glass-panel p-4">
                 <Film size={16} className="text-violet-400 mb-2" />
-                <h3 className="text-sm font-medium text-zinc-300">Ваши AI-ролики</h3>
+                <h3 className="text-sm font-medium text-zinc-300">Ваши ИИ-ролики</h3>
                 <p className="text-xs text-zinc-500 mt-1">Realistic AI-generated actors with lip-sync, b-roll, and viral subtitles. From ~$0.50/video.</p>
               </div>
             </div>
@@ -3296,9 +3644,7 @@ export default function SaaShortsTab({
                   {renderPlan.isReshoot && (
                     <div className="rounded-xl border border-green-500/20 bg-green-500/[0.05] p-3">
                       <p className="text-[11px] text-green-100/80">
-                        Ролик уже снят. {renderPlan.narrationChanged
-                          ? 'Речь изменилась — озвучка и все кадры снимаются заново: клипы нарезаны по этой озвучке.'
-                          : renderPlan.reshoot.length === 0
+                        Ролик уже снят. {renderPlan.reshoot.length === 0
                           ? (<>
                               Все {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} возьмём
                               из прошлого рендера — пересборка бесплатна.
@@ -3311,6 +3657,21 @@ export default function SaaShortsTab({
                               Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
                             </>)}
                       </p>
+                      {/* Пошотная озвучка оставляет на границе правки один стык.
+                          Замеры говорят, что он тише обычного перехода между
+                          предложениями, но если он всё же слышен — вот выход. */}
+                      <label className="mt-2 flex items-start gap-2 text-[11px] text-green-100/70">
+                        <input
+                          type="checkbox"
+                          checked={revoiceAll}
+                          onChange={(event) => setRevoiceAll(event.target.checked)}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-green-500/40 bg-black/40 text-green-400 focus:ring-green-500"
+                        />
+                        <span>
+                          Перечитать весь текст одним дублем
+                          <span className="text-green-100/40"> — ни одного стыка в озвучке, но тогда переснимаются все говорящие кадры</span>
+                        </span>
+                      </label>
                     </div>
                   )}
 
@@ -3338,13 +3699,91 @@ export default function SaaShortsTab({
                     <p className="text-[11px] text-red-300">{fillError}</p>
                   )}
 
+                  {/* Озвучка идёт первой: её длина — это длина ролика, её паузы —
+                      границы кадров, а длинная реплика режется на несколько
+                      платных клипов. Стоит копейки, поэтому слушаем до съёмки. */}
+                  <div className="rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-3 space-y-3">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="max-w-md">
+                        <h4 className="text-[12px] font-semibold text-sky-100 flex items-center gap-1.5">
+                          <Volume2 size={13} /> Озвучка
+                        </h4>
+                        <p className="text-[11px] text-zinc-400 mt-0.5">
+                          По ней собирается ролик: её длина задаёт длину видео, паузы — границы кадров,
+                          а длинная реплика снимается несколькими платными клипами.
+                          Послушай и перезапиши до съёмки — после неё голос уже не поменять,
+                          не переснимая всё заново.
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 flex-col gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleGenerateVoice(null, false)}
+                          disabled={voiceGenerating}
+                          className="btn-secondary px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+                        >
+                          {voiceGenerating && voiceShot === null
+                            ? (<><Loader2 size={13} className="animate-spin" /> Записываю…</>)
+                            : voicePreview
+                              ? (<><RefreshCw size={13} /> Обновить озвучку</>)
+                              : (<><Volume2 size={13} /> Записать озвучку</>)}
+                        </button>
+                        {voicePreview && (
+                          <button
+                            type="button"
+                            onClick={() => handleGenerateVoice(null, true)}
+                            disabled={voiceGenerating}
+                            title="Перечитать весь текст одним дублем: ни одного стыка, но все реплики звучат заново"
+                            className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-300 transition-colors hover:border-sky-400/40 hover:text-sky-200 disabled:opacity-50"
+                          >
+                            Перечитать всё одним дублем
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {voicePreview && (
+                      <div className="space-y-2">
+                        <audio
+                          controls
+                          preload="metadata"
+                          src={voicePreview.url}
+                          className="h-9 w-full"
+                        />
+                        <p className="text-[11px] text-zinc-400">
+                          {voicePreview.seconds ? `${voicePreview.seconds.toFixed(1)} с` : 'длина неизвестна'}
+                          {voicePreview.clips
+                            ? ` · снимется ${voicePreview.clips} ${pluralClips(voicePreview.clips)}${
+                                voicePreview.shootCost != null ? ` (~${formatUsd(voicePreview.shootCost)})` : ''
+                              }`
+                            : ''}
+                          {voicePreview.model ? ` · ${voicePreview.model}` : ''}
+                        </p>
+                        {voicePreview.stale.length > 0 && (
+                          <p className="text-[11px] text-amber-100/80">
+                            После записи изменились реплики {voicePreview.stale.join(', ')}.
+                            При съёмке они перезапишутся сами, но услышать их заранее можно,
+                            только записав озвучку ещё раз.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {voiceNotice && (
+                    <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3">
+                      <p className="text-[11px] text-amber-100/80">{voiceNotice}</p>
+                    </div>
+                  )}
+
                   {/* Сгенерировать стартовые кадры (Flux) до платного видео,
                       чтобы увидеть и утвердить композицию каждого шота. */}
                   <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-[11px] text-zinc-400 max-w-md">
                       Сгенерируй стартовые кадры и проверь композицию до платной генерации видео.
-                      Готовые кадры пропускаются — платишь только за недостающие. Перегенерить кадр
-                      или заменить его своим фото можно по кнопке на самом кадре.
+                      Говорящие кадры снимаются двумя общими ракурсами — за них платишь дважды,
+                      сколько бы их ни было; у каждой перебивки свой кадр. Готовые пропускаются.
+                      Перегенерить кадр или заменить его своим фото можно по кнопке на самом кадре.
                     </p>
                     <button
                       type="button"
@@ -3356,9 +3795,41 @@ export default function SaaShortsTab({
                         ? (<><Loader2 size={13} className="animate-spin" /> Генерирую…</>)
                         : missingFrameCount === 0
                           ? (<><Check size={13} /> Все кадры готовы</>)
-                          : (<><Sparkles size={13} /> Сгенерить недостающие: {missingFrameCount} (~{formatUsd(missingFrameCount * 0.05)})</>)}
+                          : (<><Sparkles size={13} /> Сгенерить недостающие: {missingFrameCount} (~{formatUsd(billableFrameCount * 0.05)})</>)}
                     </button>
                   </div>
+
+                  {framesNotice && (
+                    <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3">
+                      <p className="text-[11px] text-amber-100/80">{framesNotice}</p>
+                    </div>
+                  )}
+
+                  {/* Какой моделью рисуется ведущий. Строка появляется, как
+                      только бэкенд прислал каталог: до этого выбирать не из чего. */}
+                  {avatarEditModels.length > 0 && (
+                    <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <p className="text-[11px] text-zinc-400">
+                        Ведущего в кадр ставит{' '}
+                        <span className="text-zinc-200">
+                          {(avatarEditModels.find((m) => m.id === avatarEditModel) || avatarEditModels[0]).title}
+                        </span>
+                        . Если модель откажет — предложу сменить её, подменять сама она не будет.
+                      </p>
+                      <select
+                        value={avatarEditModel || avatarEditModels[0].id}
+                        onChange={(e) => setAvatarEditModel(e.target.value)}
+                        disabled={framesGenerating}
+                        className="input-field shrink-0 text-[12px] py-1.5"
+                      >
+                        {avatarEditModels.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.title}{model.blocked ? ' — уже отказала' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
 
                   <div className="space-y-2.5">
                     {(scripts[selectedScript].shots || []).map((shot, shotIndex) => {
@@ -3610,10 +4081,62 @@ export default function SaaShortsTab({
                                   placeholder={isBroll ? 'Что звучит голосом, пока показываем вставку (можно оставить пустым)' : 'Реплика для этого кадра'}
                                 />
                               </label>
+                              {/* Записанная реплика: послушать именно её, увидеть
+                                  её длину (её задаёт голос, а не поле «секунды»)
+                                  и заказать другой дубль, не трогая остальные. */}
+                              {(shot.voice_url || shot.voice_seconds > 0) && (
+                                <div className="-mt-1 flex flex-wrap items-center gap-2">
+                                  {shot.voice_url && (
+                                    <audio
+                                      controls
+                                      preload="none"
+                                      src={getApiUrl(shot.voice_url)}
+                                      className="h-8 w-full max-w-[240px]"
+                                    />
+                                  )}
+                                  <span className="text-[10px] text-zinc-500">
+                                    {Number(shot.voice_seconds || 0).toFixed(1)} с
+                                    {shot.voice_clips > 1 ? ` · ${shot.voice_clips} ${pluralClips(shot.voice_clips)}` : ''}
+                                  </span>
+                                  {typeof shot.voice_speech === 'string'
+                                    && (shot.speech || '').trim() !== shot.voice_speech && (
+                                    <span className="text-[10px] text-amber-300/80">текст изменился после записи</span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleGenerateVoice(shotNumber)}
+                                    disabled={voiceGenerating}
+                                    title="Прочитать эту реплику заново. Остальные дубли останутся как есть."
+                                    className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-sky-400/40 hover:text-sky-200 disabled:opacity-50"
+                                  >
+                                    {voiceGenerating && voiceShot === shotNumber
+                                      ? (<><Loader2 size={11} className="animate-spin" /> Пишу…</>)
+                                      : (<><Volume2 size={11} /> Перезаписать</>)}
+                                  </button>
+                                </div>
+                              )}
                               {isBroll && (
-                                <p className="-mt-1.5 text-[10px] text-zinc-600">
-                                  В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
-                                </p>
+                                <div className="-mt-1.5 space-y-1.5">
+                                  <p className="text-[10px] text-zinc-600">
+                                    В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
+                                  </p>
+                                  {/* Кадр перебивки рисуется отдельно от аватара, поэтому по
+                                      тексту сцены мы не угадаем, наш это человек или чужой.
+                                      Без галочки «женский силуэт со спины» — посторонняя
+                                      женщина посреди ролика. */}
+                                  <label className="flex items-start gap-2 text-[11px] text-zinc-400">
+                                    <input
+                                      type="checkbox"
+                                      checked={Boolean(shot.actor_in_frame)}
+                                      onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_in_frame', event.target.checked)}
+                                      className="mt-0.5 w-3.5 h-3.5 rounded border-zinc-600 bg-black/50 text-violet-500 focus:ring-violet-500"
+                                    />
+                                    <span>
+                                      В кадре наш персонаж
+                                      <span className="text-zinc-600"> — со спины, руки или силуэт: кадр снимем с фото аватара, лицо не покажем</span>
+                                    </span>
+                                  </label>
+                                </div>
                               )}
                               {(() => {
                                 // Collapsed by default: the prompt is auto-derived from the
@@ -3754,9 +4277,22 @@ export default function SaaShortsTab({
                   {(scripts[selectedScript].shots_archived || []).length > 0 && (
                     <details className="rounded-xl border border-white/10 bg-black/20">
                       <summary className="cursor-pointer list-none px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200">
-                        Удалённые кадры ({(scripts[selectedScript].shots_archived || []).length}) — текст сохранён, можно вернуть
+                        Удалённые кадры ({(scripts[selectedScript].shots_archived || []).length}) — текст сохранён, вернутся на свои места
                       </summary>
                       <div className="space-y-2 border-t border-white/10 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] text-zinc-500">
+                            Кадры помнят свои позиции — можно спокойно разобрать раскадровку
+                            на тестовый рендер и собрать обратно.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={restoreAllArchivedShots}
+                            className="shrink-0 rounded-md border border-primary/40 px-2 py-1 text-[11px] text-violet-200 transition-colors hover:bg-primary/10"
+                          >
+                            Вернуть все ({(scripts[selectedScript].shots_archived || []).length})
+                          </button>
+                        </div>
                         {(scripts[selectedScript].shots_archived || []).map((shot, i) => (
                           <div key={i} className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-2">
                             <div className="min-w-0 flex-1">
@@ -4752,6 +5288,23 @@ export default function SaaShortsTab({
           </div>
         )}
       </div>
+
+      {/* Отказ редактора кадра: показываем дословный ответ модели и даём выбрать
+          другую. Молчаливой подмены больше нет — она оплачивалась пользователем,
+          который о ней не знал. */}
+      <FrameEditorBlockedModal
+        block={frameBlock}
+        models={avatarEditModels}
+        spentUsd={frameBlock?.spentUsd || ''}
+        busy={framesGenerating}
+        onClose={() => setFrameBlock(null)}
+        onPick={(modelId) => {
+          const retryShot = frameBlock?.shotNumber ?? null;
+          setAvatarEditModel(modelId);
+          setFrameBlock(null);
+          handleGenerateFrames(retryShot, modelId);
+        }}
+      />
     </div>
   );
 }
