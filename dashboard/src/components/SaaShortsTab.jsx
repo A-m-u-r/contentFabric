@@ -535,17 +535,24 @@ function clearLastJob(cacheKey) {
 // вместо выбранного голоса, сгенерированный Flux-актёр вместо загруженного фото).
 const VIDEO_PREFS_KEY = 'saasshorts_video_prefs';
 
-function loadVideoPrefs() {
+function workspaceVideoPrefsKey(cacheKey) {
+  return !cacheKey || cacheKey === CACHE_KEY
+    ? VIDEO_PREFS_KEY
+    : `${cacheKey}_video_prefs`;
+}
+
+function loadVideoPrefs(cacheKey = CACHE_KEY) {
   try {
-    return JSON.parse(localStorage.getItem(VIDEO_PREFS_KEY) || 'null') || {};
+    const scoped = localStorage.getItem(workspaceVideoPrefsKey(cacheKey));
+    return scoped ? (JSON.parse(scoped) || {}) : {};
   } catch {
     return {};
   }
 }
 
-function saveVideoPrefs(prefs) {
+function saveVideoPrefs(cacheKey, prefs) {
   try {
-    localStorage.setItem(VIDEO_PREFS_KEY, JSON.stringify(prefs));
+    localStorage.setItem(workspaceVideoPrefsKey(cacheKey), JSON.stringify(prefs));
   } catch { /* localStorage full */ }
 }
 
@@ -624,6 +631,7 @@ export default function SaaShortsTab({
   const activeWorkspaceKey = activeContentPlanContext
     ? workspaceStorageKey(activeContentPlanContext)
     : CACHE_KEY;
+  const [initialVideoPrefs] = useState(() => loadVideoPrefs(activeWorkspaceKey));
   const [initialCache] = useState(() => (
     activeContentPlanContext
       ? loadLocalWorkspace(activeContentPlanContext)
@@ -688,23 +696,27 @@ export default function SaaShortsTab({
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
-  const [ttsProvider, setTtsProvider] = useState(() => loadVideoPrefs().ttsProvider || 'auto');
+  const [ttsProvider, setTtsProvider] = useState(() => initialVideoPrefs.ttsProvider || 'auto');
   const [brollMode, setBrollMode] = useState('mockup');
   const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('sliced_avatar');
   // Тонкие настройки пайплайна: по умолчанию всё включено, «!== false» —
   // чтобы старые prefs без этих полей не выключали фичи.
-  const [backgroundMusic, setBackgroundMusic] = useState(() => loadVideoPrefs().backgroundMusic !== false);
-  const [clipVisionQc, setClipVisionQc] = useState(() => loadVideoPrefs().clipVisionQc !== false);
-  const [brollImageFirst, setBrollImageFirst] = useState(() => loadVideoPrefs().brollImageFirst !== false);
-  const [selectedVoice, setSelectedVoice] = useState(() => loadVideoPrefs().selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
+  const [backgroundMusic, setBackgroundMusic] = useState(() => initialVideoPrefs.backgroundMusic !== false);
+  const [clipVisionQc, setClipVisionQc] = useState(() => initialVideoPrefs.clipVisionQc !== false);
+  const [brollImageFirst, setBrollImageFirst] = useState(() => initialVideoPrefs.brollImageFirst !== false);
+  const [selectedVoice, setSelectedVoice] = useState(() => initialVideoPrefs.selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
+  const [selectedVoiceName, setSelectedVoiceName] = useState(() => initialVideoPrefs.selectedVoiceName || '');
+  const [voiceSelectionSource, setVoiceSelectionSource] = useState(
+    () => initialVideoPrefs.voiceSelectionSource || 'default',
+  );
   const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
   const [editedNarration, setEditedNarration] = useState(() => initialCache?.editedNarration || '');
   const [actorOptions, setActorOptions] = useState([]);
-  const [selectedActor, setSelectedActor] = useState(() => loadVideoPrefs().selectedActor || null);
+  const [selectedActor, setSelectedActor] = useState(() => initialVideoPrefs.selectedActor || null);
   // Блок ведущего свёрнут до одной строки «кто говорит + каким голосом».
   // Сетка аватаров сама открывается, пока ведущий не выбран.
-  const [avatarPickerOpen, setAvatarPickerOpen] = useState(() => !loadVideoPrefs().selectedActor);
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(() => !initialVideoPrefs.selectedActor);
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   // Кадры, которые сейчас дозаполняет ИИ (сцена/камера/действие), и ошибка этого запроса.
   const [fillingShots, setFillingShots] = useState([]);
@@ -726,9 +738,14 @@ export default function SaaShortsTab({
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
   const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
+  const selectVoiceManually = (voiceId, voiceName = '') => {
+    setSelectedVoice(voiceId);
+    setSelectedVoiceName(voiceName || voiceId);
+    setVoiceSelectionSource('manual');
+  };
   const [uploadedActorPreview, setUploadedActorPreview] = useState(() => {
     // {localPreview, serverUrl}; после перезагрузки превью строим от серверного URL
-    const url = loadVideoPrefs().uploadedActorUrl;
+    const url = initialVideoPrefs.uploadedActorUrl;
     return url ? { localPreview: getApiUrl(url), serverUrl: url } : null;
   });
   const [actorUploadStatus, setActorUploadStatus] = useState('');
@@ -1105,6 +1122,9 @@ export default function SaaShortsTab({
             _voice_clips: result?.voice_clips_planned || 0,
             _voice_model: result?.voice_model || '',
             _voice_provider: result?.voice_provider || '',
+            _voice_id: result?.voice_id || '',
+            _voice_name: result?.voice_name || '',
+            _voice_selection_source: result?.voice_selection_source || '',
             _voice_shoot_cost: result?.video_cost_estimate?.total ?? null,
           } : {}),
         };
@@ -1201,7 +1221,7 @@ export default function SaaShortsTab({
   // между генерациями. Теперь: детерминированный дефолт по языку/полу, и ручной
   // выбор НЕ затирается на смене пола / ремаунте — только когда реально нужно
   // (сменился язык, голос не выбран, или голос не того языка).
-  const voiceAutoKeyRef = useRef(loadVideoPrefs().voiceKey || '');
+  const voiceAutoKeyRef = useRef(initialVideoPrefs.voiceKey || '');
   useEffect(() => {
     const comboKey = `${language}-${actorGender}`;
     if (voiceAutoKeyRef.current === comboKey) return;
@@ -1217,19 +1237,23 @@ export default function SaaShortsTab({
     };
     const curated = genderDefaults[comboKey] || genderDefaults['en-female'];
     const languageChanged = Boolean(prevLang) && prevLang !== language;
-    setSelectedVoice((prev) => {
-      const wrongForLanguage =
-        (language === 'ru' && prev === '21m00Tcm4TlvDq8ikWAM') ||  // Rachel (англ.) на русском
-        (language !== 'ru' && prev === 'D5RRIJYa9pFwxiSpbGbR');    // Victoria (рус.) на не-русском
-      if (!prev || languageChanged || wrongForLanguage) return curated;
-      return prev;  // уважаем ручной выбор — на смене пола/ремаунте не трогаем
-    });
-  }, [actorGender, language]);
+    const wrongForLanguage =
+      (language === 'ru' && selectedVoice === '21m00Tcm4TlvDq8ikWAM') ||  // Rachel (англ.) на русском
+      (language !== 'ru' && selectedVoice === 'D5RRIJYa9pFwxiSpbGbR');    // Victoria (рус.) на не-русском
+    if (!selectedVoice || languageChanged || wrongForLanguage) {
+      setSelectedVoice(curated);
+      setSelectedVoiceName('');
+      setVoiceSelectionSource('default');
+    }
+    // Иначе уважаем ручной выбор — на смене пола/ремаунте не трогаем.
+  }, [actorGender, language, selectedVoice]);
 
   // Персистим выбор озвучки и актёра (см. loadVideoPrefs)
   useEffect(() => {
-    saveVideoPrefs({
+    saveVideoPrefs(activeWorkspaceKey, {
       selectedVoice,
+      selectedVoiceName,
+      voiceSelectionSource,
       voiceKey: `${language}-${actorGender}`,
       ttsProvider,
       selectedActor: selectedActor || '',
@@ -1238,7 +1262,7 @@ export default function SaaShortsTab({
       clipVisionQc,
       brollImageFirst,
     });
-  }, [selectedVoice, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
+  }, [activeWorkspaceKey, selectedVoice, selectedVoiceName, voiceSelectionSource, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
 
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
@@ -1800,8 +1824,11 @@ export default function SaaShortsTab({
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          voice_name: selectedVoiceLabel,
+          voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
           minimax_voice_id: minimaxVoice,
+          minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
           language,
           actor_description: actorDescription || undefined,
@@ -1919,8 +1946,11 @@ export default function SaaShortsTab({
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          voice_name: selectedVoiceLabel,
+          voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
           minimax_voice_id: minimaxVoice,
+          minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
           language,
           actor_description: actorDescription || undefined,
@@ -2020,8 +2050,11 @@ export default function SaaShortsTab({
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          voice_name: selectedVoiceLabel,
+          voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
           minimax_voice_id: minimaxVoice,
+          minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
           language,
           actor_description: actorDescription || undefined,
@@ -2103,8 +2136,11 @@ export default function SaaShortsTab({
         body: JSON.stringify({
           script: scriptToSend,
           voice_id: selectedVoice,
+          voice_name: selectedVoiceLabel,
+          voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
           minimax_voice_id: minimaxVoice,
+          minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
           language,
           actor_description: actorDescription || undefined,
@@ -2439,6 +2475,9 @@ export default function SaaShortsTab({
       seconds: Number(currentScript?._voice_seconds || 0),
       clips: Number(currentScript?._voice_clips || 0),
       model: currentScript?._voice_model || '',
+      voiceId: currentScript?._voice_id || '',
+      voiceName: currentScript?._voice_name || '',
+      voiceSource: currentScript?._voice_selection_source || '',
       shootCost: currentScript?._voice_shoot_cost,
       // Реплики, переписанные уже после записи. Съёмка перезапишет их сама, но
       // услышать их до готового ролика можно только записав озвучку ещё раз.
@@ -2525,10 +2564,22 @@ export default function SaaShortsTab({
     if (uploadedActorPreview?.serverUrl === selectedActor) return uploadedActorPreview.localPreview;
     return actorGallery.find((actor) => actor.url === selectedActor)?.url || selectedActor;
   })();
+  const minimaxVoiceLabel = (MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en)
+    .find((voice) => voice.id === minimaxVoice)?.name || minimaxVoice;
+  const knownDefaultVoiceNames = {
+    D5RRIJYa9pFwxiSpbGbR: 'Victoria',
+    '21m00Tcm4TlvDq8ikWAM': 'Rachel',
+    '29vD33N1CtxCmqQRPOHJ': 'Drew',
+    EXAVITQu4vr4xnSDxMaL: 'Bella',
+    ErXwobaYiN019PkySvjV: 'Antoni',
+  };
   const selectedVoiceLabel = ttsProvider === 'fal_minimax'
-    ? ((MINIMAX_VOICE_OPTIONS[language] || MINIMAX_VOICE_OPTIONS.en)
-        .find((voice) => voice.id === minimaxVoice)?.name || minimaxVoice)
-    : (voices.find((voice) => voice.voice_id === selectedVoice)?.name || selectedVoice || 'по умолчанию');
+    ? minimaxVoiceLabel
+    : (voices.find((voice) => voice.voice_id === selectedVoice)?.name
+      || selectedVoiceName
+      || knownDefaultVoiceNames[selectedVoice]
+      || selectedVoice
+      || 'по умолчанию');
 
   // ─── Render Steps ─────────────────────────────────────────────────
 
@@ -2897,8 +2948,13 @@ export default function SaaShortsTab({
                             type="button"
                             onClick={() => {
                               setSelectedActor(img.url);
-                              // Avatar carries its own bound voice — apply it.
-                              if (img.voice?.voice_id) setSelectedVoice(img.voice.voice_id);
+                              // Привязка — только дефолт. Ручной выбор голоса
+                              // клик по фотографии аватара больше не заменяет.
+                              if (img.voice?.voice_id && voiceSelectionSource !== 'manual') {
+                                setSelectedVoice(img.voice.voice_id);
+                                setSelectedVoiceName(img.voice.voice_name || img.voice.voice_id);
+                                setVoiceSelectionSource('avatar_binding');
+                              }
                             }}
                             className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
                               selectedActor === img.url
@@ -3031,17 +3087,34 @@ export default function SaaShortsTab({
                 {/* Голос озвучки (ElevenLabs) */}
                 {ttsProvider !== 'fal_minimax' && (() => {
                   const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
+                  const manualVoiceOverridesBinding = Boolean(
+                    boundVoice?.voice_id
+                    && selectedVoice
+                    && selectedVoice !== boundVoice.voice_id,
+                  );
                   return (
                     <div>
                       <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
                         <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
                       </label>
                       {boundVoice?.voice_id && (
-                        // Голос привязан к аватару — предлагаем его по умолчанию,
-                        // но НЕ блокируем ручной выбор (пользователь может сменить ниже).
-                        <div className="mb-2 flex items-start gap-2 rounded-lg border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-200">
+                        <div className={`mb-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
+                          manualVoiceOverridesBinding
+                            ? 'border-amber-400/30 bg-amber-500/10 text-amber-100'
+                            : 'border-violet-400/30 bg-violet-500/10 text-violet-200'
+                        }`}>
                           <Volume2 size={12} className="mt-0.5 shrink-0" />
-                          <span>У аватара есть привязанный голос <b>{boundVoice.voice_name || boundVoice.voice_id}</b> — он выбран по умолчанию. Можно оставить его или выбрать другой ниже.</span>
+                          {manualVoiceOverridesBinding ? (
+                            <span>
+                              Голос <b>{selectedVoiceLabel}</b> выбран вручную и не заменён привязкой аватара
+                              {' '}<b>{boundVoice.voice_name || boundVoice.voice_id}</b>.
+                            </span>
+                          ) : (
+                            <span>
+                              У аватара есть привязанный голос <b>{boundVoice.voice_name || boundVoice.voice_id}</b>.
+                              Он используется как дефолт, пока ты не выберешь другой.
+                            </span>
+                          )}
                         </div>
                       )}
                       {(() => {
@@ -3060,11 +3133,11 @@ export default function SaaShortsTab({
                                   key={v.voice_id}
                                   role="button"
                                   tabIndex={0}
-                                  onClick={() => setSelectedVoice(v.voice_id)}
+                                  onClick={() => selectVoiceManually(v.voice_id, v.name)}
                                   onKeyDown={(e) => {
                                     if (e.key === 'Enter' || e.key === ' ') {
                                       e.preventDefault();
-                                      setSelectedVoice(v.voice_id);
+                                      selectVoiceManually(v.voice_id, v.name);
                                     }
                                   }}
                                   className={`w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-all ${
@@ -3142,7 +3215,10 @@ export default function SaaShortsTab({
                         return (
                           <OptionPicker
                             value={selectedVoice}
-                            onChange={setSelectedVoice}
+                            onChange={(voiceId) => {
+                              const option = opts.find((item) => item.id === voiceId);
+                              selectVoiceManually(voiceId, option?.name || voiceId);
+                            }}
                             options={opts.map((o) => ({ value: o.id, label: o.name }))}
                           />
                         );
@@ -3177,7 +3253,7 @@ export default function SaaShortsTab({
                         <div className="border-t border-white/10 p-3">
                           <input
                             value={selectedVoice}
-                            onChange={(e) => setSelectedVoice(e.target.value.trim())}
+                            onChange={(e) => selectVoiceManually(e.target.value.trim())}
                             className="input-field text-xs font-mono"
                             placeholder="voice_id из ElevenLabs..."
                           />
@@ -3750,6 +3826,10 @@ export default function SaaShortsTab({
                           src={voicePreview.url}
                           className="h-9 w-full"
                         />
+                        <p className="text-[11px] font-medium text-sky-100">
+                          Голос: {voicePreview.voiceName || selectedVoiceLabel}
+                          {voicePreview.voiceId ? ` · ${voicePreview.voiceId}` : ''}
+                        </p>
                         <p className="text-[11px] text-zinc-400">
                           {voicePreview.seconds ? `${voicePreview.seconds.toFixed(1)} с` : 'длина неизвестна'}
                           {voicePreview.clips

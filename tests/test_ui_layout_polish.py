@@ -10,6 +10,8 @@ SAAS_SHORTS = ROOT / "dashboard" / "src" / "components" / "SaaShortsTab.jsx"
 CONTENT_PLAN = ROOT / "dashboard" / "src" / "components" / "ContentPlanTab.jsx"
 BUSINESS_PROFILES = ROOT / "dashboard" / "src" / "lib" / "businessProfiles.js"
 CONTENT_PLAN_WORKSPACES = ROOT / "dashboard" / "src" / "lib" / "contentPlanWorkspaces.js"
+SERVER = ROOT / "app.py"
+PIPELINE = ROOT / "saasshorts.py"
 
 
 class UILayoutPolishTests(unittest.TestCase):
@@ -473,6 +475,37 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("D5RRIJYa9pFwxiSpbGbR", tab)
         # Ручной выбор уважается (не сбрасываем на смене пола/ремаунте).
         self.assertIn("уважаем ручной выбор", tab)
+
+    def test_manual_voice_survives_actor_click_and_is_auditable(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        gallery = UGC_GALLERY.read_text(encoding="utf-8")
+
+        self.assertIn("voiceSelectionSource", tab)
+        self.assertIn("voiceSelectionSource !== 'manual'", tab)
+        self.assertIn("voice_name: selectedVoiceLabel", tab)
+        self.assertIn("voice_selection_source: voiceSelectionSource", tab)
+        self.assertIn("loadVideoPrefs(activeWorkspaceKey)", tab)
+        self.assertIn("выбран вручную и не заменён привязкой аватара", tab)
+        self.assertIn("video.voice_name", gallery)
+        self.assertIn("video.voice_model", gallery)
+
+    def test_project_voice_prefs_never_fall_back_to_the_global_project(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+        loader = tab[tab.index("function loadVideoPrefs"):tab.index("function saveVideoPrefs")]
+
+        self.assertIn("workspaceVideoPrefsKey(cacheKey)", loader)
+        self.assertNotIn("localStorage.getItem(VIDEO_PREFS_KEY)", loader)
+
+    def test_generation_logs_distinguish_cached_frames_from_new_video(self):
+        server = SERVER.read_text(encoding="utf-8")
+        pipeline = PIPELINE.read_text(encoding="utf-8")
+
+        self.assertNotIn('"logs": ["AI Shorts job started."]', server)
+        self.assertIn("Задача AI Shorts поставлена в очередь", server)
+        self.assertIn("Стартовый PNG взят из предпросмотра", pipeline)
+        self.assertIn("создаю новое видео", pipeline)
+        self.assertIn("создаю новое lip-sync видео", pipeline)
+        self.assertIn("Кадр {job['shot_number']}", pipeline)
 
     def test_generated_frames_are_persisted_so_they_survive_reload(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")

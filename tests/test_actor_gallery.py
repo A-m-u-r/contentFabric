@@ -183,6 +183,49 @@ class EffectiveVoiceForRequestTests(unittest.TestCase):
         self.assertEqual(source, "request")
         self.assertEqual(app.effective_voice_for_request(None, None), (None, "request"))
 
+    def test_voice_audit_keeps_a_manual_pick_visible_and_named(self):
+        audit = app.resolve_voice_audit(
+            "anna-id",
+            "Anna",
+            "manual",
+            self.BOUND,
+        )
+
+        self.assertEqual(audit, {
+            "voice_id": "anna-id",
+            "voice_name": "Anna",
+            "voice_selection_source": "manual",
+            "binding_overridden": True,
+        })
+
+    def test_voice_audit_uses_the_avatar_binding_only_as_a_default(self):
+        audit = app.resolve_voice_audit(None, None, "default", self.BOUND)
+
+        self.assertEqual(audit["voice_id"], "victoria")
+        self.assertEqual(audit["voice_name"], "Victoria")
+        self.assertEqual(audit["voice_selection_source"], "avatar_binding")
+        self.assertFalse(audit["binding_overridden"])
+
+    def test_finished_voice_metadata_records_the_actual_model(self):
+        metadata = app.voice_metadata_for_result(
+            {
+                "voice_id": "anna-id",
+                "voice_name": "Anna",
+                "voice_model": "eleven_v3",
+                "voice_selection_source": "manual",
+            },
+            fallback_id="fallback-id",
+            fallback_name="Fallback",
+            fallback_source="default",
+        )
+
+        self.assertEqual(metadata, {
+            "voice_id": "anna-id",
+            "voice_name": "Anna",
+            "voice_model": "eleven_v3",
+            "voice_selection_source": "manual",
+        })
+
 
 class SafeOutputSubpathTests(unittest.TestCase):
     """A client-supplied /videos/ reference must never resolve outside

@@ -566,7 +566,36 @@ class SaaSAdoptJobArtifactsTests(unittest.TestCase):
         self.assertNotIn("moya_forma_final_v2.mp4", adopted)
         self.assertNotIn("gallery_metadata.json", adopted)
 
+    def test_adopt_log_names_voice_artifacts_as_voice_not_frames(self):
+        logs = []
+
+        saasshorts.adopt_job_artifacts(
+            self.source,
+            self.target,
+            source_label="прослушанной озвучки",
+            log=logs.append,
+        )
+
+        self.assertTrue(any(line.startswith("[озвучка]") for line in logs))
+        self.assertFalse(any(line.startswith("[кадры]") for line in logs))
+        self.assertFalse(any("изменённые кадры" in line for line in logs))
+
     def test_renamed_title_keeps_the_cache_hitting(self):
+        with open(
+            os.path.join(self.source, "moya_forma_voice_manifest.json"),
+            "w",
+            encoding="utf-8",
+        ) as manifest_file:
+            json.dump({
+                "shots": [{
+                    "shot_number": 1,
+                    "signature": "same-voice",
+                    "piece": "moya_forma_speech_01.wav",
+                }],
+            }, manifest_file)
+        with open(os.path.join(self.source, "moya_forma_speech_01.wav"), "wb") as piece:
+            piece.write(b"voice piece")
+
         saasshorts.adopt_job_artifacts(
             self.source, self.target,
             source_slug="moya_forma", target_slug="novaya_forma",
@@ -578,6 +607,15 @@ class SaaSAdoptJobArtifactsTests(unittest.TestCase):
         self.assertIn("novaya_forma_avatar_01.mp4.meta.json", adopted)
         self.assertIn("novaya_forma_voice.mp3", adopted)
         self.assertNotIn("moya_forma_avatar_01.mp4", adopted)
+        with open(
+            os.path.join(self.target, "novaya_forma_voice_manifest.json"),
+            encoding="utf-8",
+        ) as manifest_file:
+            manifest = json.load(manifest_file)
+        self.assertEqual(
+            manifest["shots"][0]["piece"],
+            "novaya_forma_speech_01.wav",
+        )
 
     def test_existing_file_in_the_new_job_is_never_overwritten(self):
         os.makedirs(self.target)

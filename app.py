@@ -3724,6 +3724,56 @@ def effective_voice_for_request(request_voice_id: Optional[str], bound: Optional
     return picked, ("override" if picked != bound["voice_id"] else "request")
 
 
+def resolve_voice_audit(
+    request_voice_id: Optional[str],
+    request_voice_name: Optional[str],
+    request_source: Optional[str],
+    bound: Optional[dict],
+) -> dict:
+    """Resolve the voice and retain enough context to explain the choice later."""
+    voice_id, backend_source = effective_voice_for_request(request_voice_id, bound)
+    if backend_source == "bound":
+        voice_name = (bound or {}).get("voice_name") or voice_id or ""
+        selection_source = "avatar_binding"
+    else:
+        voice_name = (request_voice_name or "").strip()
+        if not voice_name and bound and bound.get("voice_id") == voice_id:
+            voice_name = bound.get("voice_name") or ""
+        voice_name = voice_name or voice_id or ""
+        requested = (request_source or "").strip().lower()
+        if backend_source == "override":
+            selection_source = "manual"
+        elif requested in {"manual", "default", "avatar_binding"}:
+            selection_source = requested
+        else:
+            selection_source = "request"
+    return {
+        "voice_id": voice_id,
+        "voice_name": voice_name,
+        "voice_selection_source": selection_source,
+        "binding_overridden": backend_source == "override",
+    }
+
+
+def voice_metadata_for_result(
+    result: dict,
+    *,
+    fallback_id: Optional[str] = None,
+    fallback_name: Optional[str] = None,
+    fallback_source: Optional[str] = None,
+) -> dict:
+    """Durable voice provenance for job status and gallery metadata."""
+    voice_id = result.get("voice_id") or fallback_id or ""
+    return {
+        "voice_id": voice_id,
+        "voice_name": result.get("voice_name") or fallback_name or voice_id,
+        "voice_model": result.get("voice_model") or result.get("tts_model") or "",
+        "voice_selection_source": (
+            result.get("voice_selection_source") or fallback_source or "request"
+        ),
+    }
+
+
 def _safe_output_subpath(rel_url: Optional[str]) -> Optional[str]:
     """Resolve a client-supplied ``/videos/...`` reference to an absolute path
     that is guaranteed to live inside ``OUTPUT_DIR``.
@@ -4303,8 +4353,11 @@ async def saasshorts_set_avatar_voice(
 class SaaSGenerateRequest(BaseModel):
     script: dict
     voice_id: Optional[str] = None
+    voice_name: Optional[str] = None
+    voice_selection_source: Optional[str] = None
     tts_provider: str = "auto"  # "auto", "elevenlabs", or "fal_minimax"
     minimax_voice_id: Optional[str] = None
+    minimax_voice_name: Optional[str] = None
     actor_gender: Optional[str] = None
     language: Optional[str] = None
     actor_description: Optional[str] = None
@@ -4526,7 +4579,7 @@ async def saasshorts_generate(
         os.makedirs(job_output_dir, exist_ok=True)
         saas_jobs[job_id] = {
             "status": "processing",
-            "logs": ["AI Shorts job started."],
+            "logs": ["Задача AI Shorts поставлена в очередь."],
             "result": None,
             "output_dir": job_output_dir,
             "owner_user_id": user.get("id") if user else None,
@@ -4631,16 +4684,33 @@ async def saasshorts_generate(
                 selected_actor_path = src
 
     _bound = resolve_avatar_bound_voice(req.selected_actor_url)
-    effective_voice_id, _voice_source = effective_voice_for_request(req.voice_id, _bound)
-    if _bound:
+    eleven_voice_audit = resolve_voice_audit(
+        req.voice_id,
+        req.voice_name,
+        req.voice_selection_source,
+        _bound,
+    )
+    effective_voice_id = eleven_voice_audit["voice_id"]
+    requested_voice_audit = eleven_voice_audit
+    if (req.tts_provider or "").lower() == "fal_minimax":
+        requested_voice_audit = resolve_voice_audit(
+            req.minimax_voice_id,
+            req.minimax_voice_name,
+            req.voice_selection_source,
+            None,
+        )
+    audit_id = requested_voice_audit["voice_id"] or "автоматически"
+    audit_name = requested_voice_audit["voice_name"] or "голос по умолчанию"
+    saas_jobs[job_id]["logs"].append(
+        f"🎙️ Озвучка: {audit_name} (id: {audit_id}); "
+        f"источник: {requested_voice_audit['voice_selection_source']}; "
+        f"провайдер: {req.tts_provider or 'auto'}."
+    )
+    if eleven_voice_audit["binding_overridden"] and _bound:
         _bound_name = _bound.get("voice_name") or _bound["voice_id"]
-        if _voice_source == "bound":
-            saas_jobs[job_id]["logs"].append(f"🔗 Using voice bound to avatar ({_bound_name}).")
-        elif _voice_source == "override":
-            # Voice drift used to be undebuggable after the fact — say it plainly.
-            saas_jobs[job_id]["logs"].append(
-                f"🎙️ Voice picked manually ({effective_voice_id}); avatar binding ({_bound_name}) not applied."
-            )
+        saas_jobs[job_id]["logs"].append(
+            f"Ручной выбор сохранён; привязка аватара «{_bound_name}» не применена."
+        )
 
     reusable_head = None
     if req.reusable_head_template_id:
@@ -4672,9 +4742,12 @@ async def saasshorts_generate(
         "frames_only_shot": req.frames_only_shot,
         "voice_only": req.voice_only,
         "avatar_edit_model": req.avatar_edit_model,
-        "voice_id": effective_voice_id,  # avatar binding > request > per-language default
+        "voice_id": effective_voice_id,  # explicit request > avatar binding > language default
+        "voice_name": eleven_voice_audit["voice_name"],
+        "voice_selection_source": requested_voice_audit["voice_selection_source"],
         "tts_provider": req.tts_provider or "auto",
         "minimax_voice_id": req.minimax_voice_id,
+        "minimax_voice_name": req.minimax_voice_name,
         "actor_gender": req.actor_gender or "female",
         "language": resolved_language,
         "actor_description": req.actor_description,
@@ -4706,6 +4779,17 @@ async def saasshorts_generate(
             result = await loop.run_in_executor(None, run)
 
             if job_id in saas_jobs:
+                voice_meta = voice_metadata_for_result(
+                    result,
+                    fallback_id=requested_voice_audit["voice_id"],
+                    fallback_name=requested_voice_audit["voice_name"],
+                    fallback_source=requested_voice_audit["voice_selection_source"],
+                )
+                log_msg(
+                    f"🎙️ Использован голос: {voice_meta['voice_name']} "
+                    f"(id: {voice_meta['voice_id'] or 'не указан'}, "
+                    f"модель: {voice_meta['voice_model'] or 'не указана'})."
+                )
                 video_filename = result["video_filename"]
                 owner_user_id = user.get("id") if user else None
                 saas_jobs[job_id]["status"] = "completed"
@@ -4735,8 +4819,7 @@ async def saasshorts_generate(
                     "voice_shots": result.get("voice_shots", []),
                     "voice_clips_planned": result.get("voice_clips_planned", 0),
                     "voice_provider": result.get("voice_provider", ""),
-                    "voice_model": result.get("voice_model", ""),
-                    "voice_id": result.get("voice_id", ""),
+                    **voice_meta,
                     "video_cost_estimate": result.get("video_cost_estimate", {}),
                     "frames_made": result.get("frames_made", 0),
                     "frames_failed": result.get("frames_failed", 0),
@@ -4768,6 +4851,7 @@ async def saasshorts_generate(
                         "duration": result.get("duration", 0),
                         "video_mode": req.video_mode,
                         "tts_provider": result.get("tts_provider", req.tts_provider),
+                        **voice_meta,
                         "broll_mode": result.get("broll_mode", req.broll_mode),
                         "head_source": result.get("head_source", "generated"),
                         "head_template_id": result.get("head_template_id"),

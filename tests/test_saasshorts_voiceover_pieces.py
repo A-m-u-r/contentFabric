@@ -1,5 +1,6 @@
 import hashlib
 import itertools
+import json
 import os
 import tempfile
 import unittest
@@ -50,6 +51,11 @@ def spoken_audio(text):
 def digest(path):
     with open(path, "rb") as f:
         return hashlib.sha1(f.read()).hexdigest()
+
+
+def manifest_piece(tmp, number):
+    entry = read_voice_manifest(tmp, SLUG)[str(number)]
+    return os.path.join(tmp, entry["piece"])
 
 
 class IncrementalVoiceoverTests(unittest.TestCase):
@@ -114,6 +120,109 @@ class IncrementalVoiceoverTests(unittest.TestCase):
             # Their place in the master has not moved either, so the clips
             # lip-synced against those bounds stay valid.
             self.assertEqual(second["bounds"][:2], first["bounds"][:2])
+
+    def test_a_removed_shot_is_restored_from_its_retired_voice_piece(self):
+        complete = [
+            shot(1, "Первая реплика."),
+            shot(2, "Вторая реплика."),
+            shot(3, "Третья реплика."),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(complete, tmp)
+            third_before = digest(manifest_piece(tmp, 3))
+
+            self.spoken.clear()
+            self.build(complete[:2], tmp)
+            self.assertEqual(self.spoken, [])
+            with open(os.path.join(tmp, f"{SLUG}_voice_manifest.json"), encoding="utf-8") as f:
+                stored = json.load(f)
+            retired = [
+                entry for entry in stored["shots"]
+                if entry.get("retired") and entry.get("signature")
+                == saasshorts._shot_speech_signature(complete[2], **{
+                    "provider": SETTINGS["provider"],
+                    "elevenlabs_voice_id": SETTINGS["voice_id"],
+                    "minimax_voice_id": SETTINGS["minimax_voice_id"],
+                    "language": SETTINGS["language"],
+                    "actor_gender": SETTINGS["actor_gender"],
+                })
+            ]
+            self.assertEqual(len(retired), 1)
+
+            self.spoken.clear()
+            restored = self.build(complete, tmp)
+
+            self.assertEqual(self.spoken, [])
+            self.assertEqual(restored["changed_shots"], [])
+            self.assertEqual(digest(manifest_piece(tmp, 3)), third_before)
+
+    def test_reordering_shots_reuses_voice_pieces_by_signature(self):
+        original = [
+            shot(1, "Первая реплика."),
+            shot(2, "Вторая реплика."),
+            shot(3, "Третья реплика."),
+        ]
+        reordered = [
+            shot(1, "Третья реплика."),
+            shot(2, "Первая реплика."),
+            shot(3, "Вторая реплика."),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(original, tmp)
+            before = {
+                item["speech"]: digest(manifest_piece(tmp, item["shot_number"]))
+                for item in original
+            }
+
+            self.spoken.clear()
+            result = self.build(reordered, tmp)
+
+            self.assertEqual(self.spoken, [])
+            self.assertEqual(result["changed_shots"], [])
+            after = {
+                item["speech"]: digest(manifest_piece(tmp, item["shot_number"]))
+                for item in reordered
+            }
+            self.assertEqual(after, before)
+
+    def test_revoice_uses_the_manifest_piece_after_an_earlier_edit(self):
+        original = [shot(1, "Первая реплика."), shot(2, "Вторая реплика.")]
+        edited = [original[0], shot(2, "Новая вторая реплика.")]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(original, tmp)
+            self.build(edited, tmp)
+            edited_piece = manifest_piece(tmp, 2)
+            self.assertNotEqual(
+                os.path.basename(edited_piece),
+                f"{SLUG}_speech_02.wav",
+            )
+
+            self.spoken.clear()
+            removed = saasshorts.forget_shot_voice(
+                tmp, SLUG, [2], log=lambda *_: None
+            )
+            self.build(edited, tmp)
+
+            self.assertIn(os.path.basename(edited_piece), removed)
+            self.assertEqual(self.spoken, ["Новая вторая реплика."])
+
+    def test_voice_preview_resolves_the_piece_recorded_for_the_current_shot(self):
+        original = [shot(1, "Первая реплика."), shot(2, "Вторая реплика.")]
+        edited = [original[0], shot(2, "Новая вторая реплика.")]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(original, tmp)
+            self.build(edited, tmp)
+            manifest = read_voice_manifest(tmp, SLUG)
+
+            resolved = saasshorts._voice_piece_for_shot(
+                tmp, SLUG, manifest, 2
+            )
+
+            self.assertEqual(resolved, manifest_piece(tmp, 2))
+            self.assertNotEqual(
+                os.path.basename(resolved),
+                f"{SLUG}_speech_02.wav",
+            )
 
     def test_editing_one_shot_leaves_both_its_neighbours_alone(self):
         shots = [shot(1, "Первая реплика."), shot(2, "Вторая реплика."), shot(3, "Третья реплика.")]
@@ -282,6 +391,28 @@ class VoiceManifestTests(unittest.TestCase):
             self.assertLess(manifest["1"]["end"], manifest["3"]["start"] + 0.001)
 
 
+class VoiceProvenanceTests(unittest.TestCase):
+    def test_actual_fallback_provider_records_its_own_voice(self):
+        metadata = saasshorts._voice_provenance(
+            {
+                "voice_name": "Anna",
+                "minimax_voice_name": "Ambitious Woman",
+                "voice_selection_source": "manual",
+            },
+            provider_used="fal_minimax",
+            model_used="minimax-speech-02-hd",
+            elevenlabs_voice_id="anna-id",
+            minimax_voice_id="Russian_AmbitiousWoman",
+        )
+
+        self.assertEqual(metadata, {
+            "voice_id": "Russian_AmbitiousWoman",
+            "voice_name": "Ambitious Woman",
+            "voice_model": "minimax-speech-02-hd",
+            "voice_selection_source": "manual",
+        })
+
+
 class VoiceOnlyPreviewTests(unittest.TestCase):
     """Listening to the voiceover before paying for the film."""
 
@@ -293,6 +424,11 @@ class VoiceOnlyPreviewTests(unittest.TestCase):
         saasshorts._encode_audio_samples(spoken_audio(text), output_path)
         return {"path": output_path, "provider": "elevenlabs",
                 "voice_id": "voice_ru", "model": "eleven_v3"}
+
+    @staticmethod
+    def decoded_duration(path):
+        samples = saasshorts._decode_audio_samples(path)
+        return len(samples) / saasshorts._VOICE_SAMPLE_RATE
 
     SCRIPT = {
         "title": "Voice first",
@@ -319,6 +455,8 @@ class VoiceOnlyPreviewTests(unittest.TestCase):
         # Every paid step of the render is armed to fail: the whole promise of
         # this mode is that listening to the voiceover costs nothing but the read.
         with patch("saasshorts.generate_voiceover_with_fallback", side_effect=self.fake_tts), \
+             patch("saasshorts._decodable_audio_duration", side_effect=self.decoded_duration), \
+             patch("saasshorts._get_media_duration", side_effect=self.decoded_duration), \
              patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
              patch("saasshorts.generate_sliced_avatar_clips",
                    side_effect=AssertionError("платная съёмка не должна запускаться")), \

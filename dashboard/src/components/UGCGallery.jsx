@@ -812,6 +812,14 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
         <p className="text-[9px] text-zinc-500">
           {video.duration?.toFixed(0)}s · ${video.cost_estimate?.total?.toFixed(2) || '?'}
         </p>
+        {video.voice_name && (
+          <p
+            className="truncate text-[9px] text-sky-300/80"
+            title={`Голос: ${video.voice_name}${video.voice_id ? ` (${video.voice_id})` : ''}${video.voice_model ? ` · ${video.voice_model}` : ''}`}
+          >
+            Голос: {video.voice_name}{video.voice_model ? ` · ${video.voice_model}` : ''}
+          </p>
+        )}
         {video.caption && (
           <p className="text-[9px] text-zinc-400 line-clamp-2">{video.caption}</p>
         )}
@@ -866,6 +874,13 @@ function VideoActionModal({
             <p className="text-xs text-zinc-500">
               {video.duration?.toFixed(1) || '?'}s В· ${video.cost_estimate?.total?.toFixed(2) || '?'}
             </p>
+            {video.voice_name && (
+              <p className="mt-1 text-xs text-sky-300/80">
+                Голос: {video.voice_name}
+                {video.voice_id ? ` (${video.voice_id})` : ''}
+                {video.voice_model ? ` · ${video.voice_model}` : ''}
+              </p>
+            )}
           </div>
           <button
             type="button"

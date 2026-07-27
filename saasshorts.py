@@ -2178,11 +2178,19 @@ def generate_actor_image(
 
 
 _AUDIO_TAG_RE = re.compile(r"\[[A-Za-z][^\]\n]*\]")
+_WHISPER_TAG_RE = re.compile(r"\[(?:whispers?|whispering)\]", re.IGNORECASE)
 
 
 def _strip_audio_tags(text: str) -> str:
     """Remove ElevenLabs v3 audio tags ([sighs], [excited]...) for TTS engines that would read them aloud."""
     return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub(" ", text or "")).strip()
+
+
+def _shot_performance(shot: dict) -> str:
+    explicit = str((shot or {}).get("_performance") or "").strip().lower()
+    if explicit in {"normal", "whisper"}:
+        return explicit
+    return "whisper" if _WHISPER_TAG_RE.search((shot or {}).get("speech") or "") else "normal"
 
 
 def generate_voiceover(
@@ -2354,6 +2362,28 @@ def _elevenlabs_voice_for(language: str, voice_id: str = None) -> str:
     if voice_id and not (language == "ru" and voice_id in _GENERIC_ENGLISH_FALLBACK_VOICES):
         return voice_id
     return DEFAULT_ELEVENLABS_VOICES_BY_LANGUAGE.get(language, "21m00Tcm4TlvDq8ikWAM")
+
+
+def _voice_provenance(
+    config: dict,
+    *,
+    provider_used: str,
+    model_used: str,
+    elevenlabs_voice_id: str,
+    minimax_voice_id: str,
+) -> dict:
+    """Describe the voice that actually produced the audio, including fallbacks."""
+    minimax = provider_used == "fal_minimax"
+    voice_id = minimax_voice_id if minimax else elevenlabs_voice_id
+    configured_name = (
+        config.get("minimax_voice_name") if minimax else config.get("voice_name")
+    )
+    return {
+        "voice_id": voice_id or "",
+        "voice_name": (configured_name or "").strip() or voice_id or "",
+        "voice_model": model_used or "",
+        "voice_selection_source": config.get("voice_selection_source") or "request",
+    }
 
 
 def _tts_signature(
@@ -3200,6 +3230,12 @@ _AVATAR_MOTION_PROMPT = (
     "follow the audio, natural blinking, small head movements, one locked-off take."
 )
 
+_AVATAR_WHISPER_MOTION_PROMPT = (
+    "The person leans slightly closer to the camera, chin lowered, one hand resting near the "
+    "mouth, whispering confidentially with a restrained conspiratorial expression. The lips "
+    "follow the audio, natural blinking, tiny head movements, one locked-off take."
+)
+
 
 def _avatar_prompt_issues(prompt: str) -> list:
     """Words in an avatar prompt that the model will draw instead of avoid."""
@@ -3213,13 +3249,14 @@ def generate_talking_head(
     fal_key: str,
     output_path: str,
     tier: str = "standard",
+    motion_prompt: Optional[str] = None,
 ) -> str:
     """Generate talking head video using Kling Avatar v2 Standard/Pro on fal.ai.
 
     Framing comes from `image_path` — the shot's own reference frame — and the
-    performance from the audio. The only prompt sent is `_AVATAR_MOTION_PROMPT`:
-    it holds the body still, and it deliberately names nothing we want kept out
-    of frame (see `_AVATAR_PROMPT_BANNED_WORDS`).
+    performance from the audio. `motion_prompt` may select a restrained whisper
+    performance; both recipes deliberately name nothing we want kept out of
+    frame (see `_AVATAR_PROMPT_BANNED_WORDS`).
     """
     import shutil
 
@@ -3236,8 +3273,9 @@ def generate_talking_head(
     # Fingerprint the frame we were handed, not the 9:16 render of it: that is
     # what the cache check can recompute later.
     reference_fingerprint = _file_fingerprint(image_path)
+    motion_prompt = motion_prompt or _AVATAR_MOTION_PROMPT
     attempts_config = [
-        {"name": "base", "audio_path": audio_path, "prompt": _AVATAR_MOTION_PROMPT},
+        {"name": "base", "audio_path": audio_path, "prompt": motion_prompt},
     ]
     attempts = []
     selected_attempt = None
@@ -5438,6 +5476,15 @@ def composite_storyboard_video(
     for index, clip in enumerate(clips):
         actual = _get_media_duration(clip["path"])
         duration = max(0.1, float(clip.get("duration") or actual))
+        clip_norm = norm
+        if _shot_performance(clip.get("shot") or {}) == "whisper":
+            # Free pattern interrupt for the hush shot. This changes only the
+            # crop: slowing a lip-synced clip would move its mouth off the
+            # untouched master voiceover.
+            clip_norm += (
+                ",crop=iw/1.08:ih/1.08:(iw-ow)/2:(ih-oh)*0.42,"
+                "scale=1080:1920"
+            )
         # A lip-synced clip can open with the head of silence its driving audio
         # carried (see _mp3_encoder_delay): skipping it puts the lips back on
         # the master voiceover instead of that many milliseconds behind it.
@@ -5454,13 +5501,13 @@ def composite_storyboard_video(
             ratio = duration / usable
             head_chain = f"trim=start={head_arg},setpts=PTS-STARTPTS," if head else ""
             chain = (
-                f"[{index}:v]{head_chain}setpts={ratio:.6f}*PTS,{norm},"
+                f"[{index}:v]{head_chain}setpts={ratio:.6f}*PTS,{clip_norm},"
                 f"trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS"
             )
         else:
             chain = (
                 f"[{index}:v]trim=start={head_arg}:end={head + duration:.3f},"
-                f"setpts=PTS-STARTPTS,{norm}"
+                f"setpts=PTS-STARTPTS,{clip_norm}"
             )
             # Clip came back shorter than its slot: freeze the last frame
             # instead of silently shifting every later shot off-sync.
@@ -5744,6 +5791,75 @@ def _stored_slice_cuts(shot: dict, duration: float, cuts_by_shot: Optional[dict]
     return cuts
 
 
+def _split_performance_slices(slices: list, words: list) -> list:
+    """Give an inline ``[whispers]`` direction its own visual performance.
+
+    TTS already understands the tag. This maps the same point onto the video
+    timeline, so the whispered phrase starts on a deliberate edit instead of
+    continuing in the ordinary camera setup. Each side stays at least as long
+    as Kling's reliable clip floor; when the source shot is too short to split,
+    the whole shot uses the whisper performance rather than creating flashes.
+    """
+    result = []
+    for sl in slices:
+        shot = sl["shot"]
+        speech = shot.get("speech") or ""
+        match = _WHISPER_TAG_RE.search(speech)
+        if _is_broll_shot(shot) or not match:
+            result.append(sl)
+            continue
+
+        before = _strip_audio_tags(speech[:match.start()])
+        after = _strip_audio_tags(speech[match.end():])
+        if not after:
+            result.append(sl)
+            continue
+        if not before:
+            whispered = dict(shot)
+            whispered["_performance"] = "whisper"
+            whispered["speech"] = after
+            result.append({**sl, "shot": whispered})
+            continue
+
+        start, end = float(sl["start"]), float(sl["end"])
+        duration = end - start
+        if duration < 2 * _MIN_TALKING_SLICE_SECONDS:
+            whispered = dict(shot)
+            whispered["_performance"] = "whisper"
+            result.append({**sl, "shot": whispered})
+            continue
+
+        before_count = len(before.split())
+        local_words = [
+            word for word in (words or [])
+            if start <= (float(word["start"]) + float(word["end"])) / 2 <= end
+        ]
+        if 0 < before_count < len(local_words):
+            target = _phrase_boundary(
+                float(local_words[before_count - 1]["end"]),
+                float(local_words[before_count]["start"]),
+            )
+        else:
+            spoken_count = max(1, before_count + len(after.split()))
+            target = start + duration * before_count / spoken_count
+        cut = round(min(
+            max(target, start + _MIN_TALKING_SLICE_SECONDS),
+            end - _MIN_TALKING_SLICE_SECONDS,
+        ), 3)
+
+        normal = dict(shot)
+        normal["_performance"] = "normal"
+        normal["speech"] = before
+        whispered = dict(shot)
+        whispered["_performance"] = "whisper"
+        whispered["speech"] = after
+        result.extend([
+            {"shot": normal, "start": start, "end": cut},
+            {"shot": whispered, "start": cut, "end": end},
+        ])
+    return result
+
+
 def _split_long_slices(
     slices: list,
     words: list,
@@ -5843,7 +5959,11 @@ def _storyboard_avatar_reference_image(shot: dict, output_dir: str, index: int) 
     return ""
 
 
-def _avatar_clip_cache_valid(clip_path: str, reference_path: str) -> bool:
+def _avatar_clip_cache_valid(
+    clip_path: str,
+    reference_path: str,
+    motion_prompt: str = _AVATAR_MOTION_PROMPT,
+) -> bool:
     """True while a cached Kling Avatar clip still matches its reference frame.
 
     An avatar clip is defined by two things: the frame it was staged from and
@@ -5868,7 +5988,7 @@ def _avatar_clip_cache_valid(clip_path: str, reference_path: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return True
     stored_prompt = ((meta.get("payload") or {}).get("prompt") or "").strip()
-    if stored_prompt and stored_prompt != _AVATAR_MOTION_PROMPT:
+    if stored_prompt and stored_prompt != motion_prompt:
         return False
     stored = meta.get("reference_fingerprint")
     if not isinstance(stored, str) or not stored:
@@ -6314,6 +6434,23 @@ _AVATAR_FRAMINGS = (
      "Tight close-up, the face filling the frame, shoulders cropped, background softly "
      "out of focus"),
 )
+_AVATAR_HUSH_FRAMING = (
+    "hush",
+    "Tight intimate close-up, leaning slightly toward the camera, chin lowered, one hand "
+    "resting near the mouth, restrained confidential expression",
+)
+
+
+def _avatar_framing_for_shot(shot: dict, framing_index: int) -> tuple:
+    if _shot_performance(shot) == "whisper":
+        return _AVATAR_HUSH_FRAMING
+    return _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
+
+
+def _avatar_motion_prompt_for_shot(shot: dict) -> str:
+    if _shot_performance(shot) == "whisper":
+        return _AVATAR_WHISPER_MOTION_PROMPT
+    return _AVATAR_MOTION_PROMPT
 
 
 def _framing_plate_path(output_dir: str, title_slug: str, key: str) -> str:
@@ -6436,6 +6573,7 @@ def generate_sliced_avatar_clips(
     if not slices:
         raise ValueError("Sliced-avatar mode requires at least one shot with speech")
     pre_split = len(slices)
+    slices = _split_performance_slices(slices, words)
     slices = _split_long_slices(
         slices, words,
         cuts_by_shot={k: v.get("cuts") for k, v in voice_manifest.items() if v.get("cuts")},
@@ -6475,9 +6613,9 @@ def generate_sliced_avatar_clips(
                 generate_actor_image(desc, fal_key, fallback_actor_img)
         return fallback_actor_img
 
-    def _framing_plate(framing_index):
+    def _framing_plate(framing_spec):
         """Staged frame for one camera of the pinned set, generated once per reel."""
-        key, framing_line = _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
+        key, framing_line = framing_spec
         if key in plates:
             return plates[key]
         plate_path = _framing_plate_path(output_dir, title_slug, key)
@@ -6491,7 +6629,12 @@ def generate_sliced_avatar_clips(
             log(f"  Ракурс «{key}» готов — он держится на всех говорящих кадрах.")
         return made
 
-    def _resolve_image(sl, index, framing_index):
+    def _resolve_image(sl, index, framing_spec, framing_index):
+        whisper = _shot_performance(sl["shot"]) == "whisper"
+        if whisper and avatar_image_first:
+            plate = _framing_plate(framing_spec)
+            if plate:
+                return plate
         # A frame the user picked or generated for this shot always wins — but a
         # split shot must not play the same framing twice in a row, so every other
         # talking clip gets a punch-in of it.
@@ -6507,7 +6650,7 @@ def generate_sliced_avatar_clips(
             punch_path = os.path.join(output_dir, f"{title_slug}_shot_ref_{index:02d}.png")
             return _avatar_reference_variant(ref, punch_path, 2)
         if avatar_image_first:
-            plate = _framing_plate(framing_index)
+            plate = _framing_plate(framing_spec)
             if plate:
                 return plate
         # Fallback: vary the crop of the shared photo so cuts read as camera changes.
@@ -6541,42 +6684,50 @@ def generate_sliced_avatar_clips(
                 actor_ref = _shared_actor_photo()
         else:
             # Two talking shots may sit back to back, but never on the same camera.
-            image = _resolve_image(sl, index, framing_cursor)
+            framing_spec = _avatar_framing_for_shot(sl["shot"], framing_cursor)
+            image = _resolve_image(sl, index, framing_spec, framing_cursor)
             framing_cursor += 1
         jobs.append({
             "index": index,
+            "shot_number": sl["shot"].get("shot_number") or index,
+            "part": part,
             "slice": sl,
             "audio": slice_audio,
             "image": image,
             "clip_path": clip_path,
             "broll": broll,
             "actor_ref": actor_ref,
+            "motion_prompt": _avatar_motion_prompt_for_shot(sl["shot"]),
         })
         # Keep overlay/subtitle timing aligned with the real audio timeline
         sl["shot"]["start"] = sl["start"]
         sl["shot"]["end"] = sl["end"]
 
+    def _job_label(job):
+        label = f"Кадр {job['shot_number']}"
+        if job["part"] > 1:
+            label += f", фрагмент {job['part']}"
+        return label
+
     def _gen_clip(job):
         # Cache checks are prompt-aware (a bare exists() would silently ignore
         # edited Kling prompts on retry), so the request prompt is built first.
+        job_label = _job_label(job)
         if job["broll"]:
             slice_duration = job["slice"]["end"] - job["slice"]["start"]
             v3_shot = _broll_slice_shot(job["slice"]["shot"], slice_duration)
             if _storyboard_clip_cache_valid(v3_shot, job["clip_path"]):
-                log(f"  B-roll shot {job['index']} cached.")
+                log(f"[{job_label} | B-roll] Видео уже готово — беру из кэша.")
                 return job["clip_path"]
-            log(
-                f"  Generating b-roll shot {job['index']}/{len(jobs)} "
-                f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
-            )
+            frame_source = "Стартовый PNG не используется"
             if broll_image_first:
                 # Кадр, одобренный в предпросмотре, уже оплачен. Рисовать его
                 # заново — это второй счёт за ту же картинку и другой сэмпл
                 # вместо того, что человек посмотрел и утвердил.
                 approved = _existing_shot_frame(v3_shot, _job_output_root(output_dir))
                 if approved:
-                    log(f"  B-roll shot {job['index']}: кадр одобрен в предпросмотре — не перерисовываю.")
                     v3_shot["image_path"] = approved
+                    frame_source = "Стартовый PNG взят из предпросмотра"
                 else:
                     ref = _broll_reference_image(
                         v3_shot, fal_key,
@@ -6587,17 +6738,26 @@ def generate_sliced_avatar_clips(
                     )
                     if ref:
                         v3_shot["image_path"] = ref
+                        frame_source = "Стартовый PNG подготовлен"
+            log(
+                f"[{job_label} | B-roll] {frame_source}; создаю новое видео Kling V3 "
+                f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f} с)."
+            )
             return generate_storyboard_shot_clip(
                 v3_shot,
                 fal_key,
                 job["clip_path"],
                 tier=broll_tier,
             )
-        if _avatar_clip_cache_valid(job["clip_path"], job["image"]):
-            log(f"  Avatar shot {job['index']} cached.")
+        if _avatar_clip_cache_valid(
+            job["clip_path"],
+            job["image"],
+            motion_prompt=job["motion_prompt"],
+        ):
+            log(f"[{job_label} | ведущий] Lip-sync видео уже готово — беру из кэша.")
             return job["clip_path"]
         if _nonempty(job["clip_path"]):
-            log(f"  Avatar shot {job['index']}: референсный кадр изменился — перегенерация.")
+            log(f"[{job_label} | ведущий] Референсный кадр изменился — старый клип не подходит.")
             for stale in (
                 job["clip_path"],
                 f"{job['clip_path']}.review.json",
@@ -6609,8 +6769,8 @@ def generate_sliced_avatar_clips(
                 except OSError:
                     pass
         log(
-            f"  Generating avatar shot {job['index']}/{len(jobs)} "
-            f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f}s)..."
+            f"[{job_label} | ведущий] создаю новое lip-sync видео Kling Avatar "
+            f"({job['slice']['start']:.1f}-{job['slice']['end']:.1f} с)."
         )
         return generate_talking_head(
             job["image"],
@@ -6618,6 +6778,7 @@ def generate_sliced_avatar_clips(
             fal_key,
             job["clip_path"],
             tier=tier,
+            motion_prompt=job["motion_prompt"],
         )
 
     errors = []
@@ -6692,9 +6853,24 @@ def _speech_shots_numbered(shots: list) -> list:
 
 
 def read_voice_manifest(output_dir: str, title_slug: str) -> dict:
-    """Where each shot's own audio sits inside the master track, by shot number."""
+    """Active shot audio inside the master track, keyed by the current number."""
+    return {
+        str(entry.get("shot_number")): entry
+        for entry in read_voice_manifest_entries(output_dir, title_slug)
+        if not entry.get("retired") and not entry.get("invalidated")
+    }
+
+
+def read_voice_manifest_entries(output_dir: str, title_slug: str) -> list:
+    """All known voice pieces, including shots temporarily removed in the editor."""
     manifest = _read_json_file(_voice_manifest_path(output_dir, title_slug)) or {}
-    return {str(entry.get("shot_number")): entry for entry in (manifest.get("shots") or [])}
+    return [entry for entry in (manifest.get("shots") or []) if isinstance(entry, dict)]
+
+
+def _manifest_voice_piece_path(output_dir: str, entry: dict) -> str:
+    """Resolve a manifest-owned piece without allowing it to escape the job dir."""
+    name = os.path.basename(str((entry or {}).get("piece") or "").strip())
+    return os.path.join(output_dir, name) if name else ""
 
 
 def update_voice_cuts(output_dir: str, title_slug: str, cuts_by_shot: dict) -> None:
@@ -6704,6 +6880,8 @@ def update_voice_cuts(output_dir: str, title_slug: str, cuts_by_shot: dict) -> N
     if not manifest.get("shots"):
         return
     for entry in manifest["shots"]:
+        if entry.get("retired") or entry.get("invalidated"):
+            continue
         cuts = cuts_by_shot.get(str(entry.get("shot_number")))
         if cuts:
             entry["cuts"] = [round(float(c), 3) for c in cuts]
@@ -6764,6 +6942,45 @@ def _voice_piece_path(output_dir: str, title_slug: str, shot_number) -> str:
     # contribute its own encoder delay as a gap inside what used to be one
     # continuous take.
     return os.path.join(output_dir, f"{title_slug}_speech_{int(shot_number):02d}.wav")
+
+
+def _voice_piece_for_shot(
+    output_dir: str,
+    title_slug: str,
+    manifest: dict,
+    shot_number,
+) -> str:
+    """The piece currently mapped to a shot, with a legacy filename fallback."""
+    entry = (manifest or {}).get(str(shot_number)) or {}
+    mapped = _manifest_voice_piece_path(output_dir, entry)
+    if mapped:
+        return mapped
+    return _voice_piece_path(output_dir, title_slug, shot_number)
+
+
+def _new_voice_piece_path(
+    output_dir: str,
+    title_slug: str,
+    shot_number,
+    signature: str,
+    take_seq: int,
+    take_index: int,
+) -> str:
+    """Allocate a piece without overwriting audio retained for another script state.
+
+    The readable numbered name remains the first choice for a brand-new shot.
+    Once that name is occupied, a signature-derived name is used instead and
+    the manifest owns the number -> file mapping. This is what lets an inserted
+    or reordered shot reuse its old take even though its display number changed.
+    """
+    numbered = _voice_piece_path(output_dir, title_slug, shot_number)
+    if not _nonempty(numbered):
+        return numbered
+    fingerprint = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(
+        output_dir,
+        f"{title_slug}_speech_{fingerprint}_t{int(take_seq):02d}_{int(take_index):02d}.wav",
+    )
 
 
 def _read_wav_samples(path: str):
@@ -6952,6 +7169,7 @@ def build_incremental_voiceover(
         "actor_gender": actor_gender,
     }
     stored = _read_json_file(_voice_manifest_path(output_dir, title_slug)) or {}
+    stored_entries = read_voice_manifest_entries(output_dir, title_slug)
     known = read_voice_manifest(output_dir, title_slug)
     master_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
     narration = " ".join((shot.get("speech") or "").strip() for shot, _ in numbered)
@@ -7005,26 +7223,65 @@ def build_incremental_voiceover(
         if _read_tts_metadata(master_path).get("signature") == whole_signature:
             return whole_take()
 
+    candidates_by_signature: dict = {}
+    for stored_index, stored_entry in enumerate(stored_entries):
+        signature = stored_entry.get("signature")
+        piece_path = _manifest_voice_piece_path(output_dir, stored_entry)
+        if (
+            signature
+            and not stored_entry.get("invalidated")
+            and _nonempty(piece_path)
+        ):
+            candidates_by_signature.setdefault(signature, []).append(
+                (stored_index, stored_entry, piece_path)
+            )
+
+    used_candidates = set()
+    forced_numbers = {
+        str(entry.get("shot_number"))
+        for entry in stored_entries
+        if not entry.get("retired") and entry.get("force_revoice")
+    }
     entries = []
     for shot, number in numbered:
-        piece_path = _voice_piece_path(output_dir, title_slug, number)
         signature = _shot_speech_signature(shot, **tts_settings)
         previous = known.get(str(number)) or {}
-        reusable = (
-            not revoice_all
-            and previous.get("signature") == signature
-            and _nonempty(piece_path)
-        )
+        candidate = None
+        if not revoice_all and str(number) not in forced_numbers:
+            matching = candidates_by_signature.get(signature) or []
+            # Prefer the current number's exact entry, then any retired/moved
+            # entry with the same full TTS recipe.
+            matching = sorted(
+                matching,
+                key=lambda item: 0
+                if item[1] is previous or str(item[1].get("shot_number")) == str(number)
+                else 1,
+            )
+            candidate = next(
+                (item for item in matching if item[0] not in used_candidates),
+                None,
+            )
+        reusable = candidate is not None
+        if candidate:
+            source_index, source_entry, piece_path = candidate
+            used_candidates.add(source_index)
+        else:
+            source_index, source_entry, piece_path = None, {}, ""
         entries.append({
             "shot": shot, "shot_number": number, "piece": piece_path,
             "signature": signature, "reusable": reusable,
-            "take_seq": previous.get("take_seq", 0) if reusable else 0,
+            "take_seq": source_entry.get("take_seq", 0) if reusable else 0,
             # A re-voiced shot's jump cuts belong to audio that no longer exists.
-            "cuts": previous.get("cuts") if reusable else None,
+            "cuts": source_entry.get("cuts") if reusable else None,
+            "source_index": source_index,
         })
 
     runs = _voice_runs(entries)
-    next_seq = max([e["take_seq"] for e in entries] + [0]) + 1
+    next_seq = max(
+        [int(entry.get("take_seq") or 0) for entry in stored_entries]
+        + [e["take_seq"] for e in entries]
+        + [0]
+    ) + 1
     provider_used = stored.get("provider") or provider
     model_used = stored.get("model") or ""
 
@@ -7061,7 +7318,15 @@ def build_incremental_voiceover(
                 salvage=take_path if covers_reel else "",
                 used=result,
             )
-        for entry, piece in zip(run, pieces):
+        for take_index, (entry, piece) in enumerate(zip(run, pieces), start=1):
+            entry["piece"] = _new_voice_piece_path(
+                output_dir,
+                title_slug,
+                entry["shot_number"],
+                entry["signature"],
+                next_seq,
+                take_index,
+            )
             _write_wav_samples(entry["piece"], piece)
             entry["take_seq"] = next_seq
         next_seq += 1
@@ -7105,19 +7370,39 @@ def build_incremental_voiceover(
         1 for i in range(1, len(entries))
         if entries[i]["take_seq"] != entries[i - 1]["take_seq"]
     )
+    active_records = [
+        {
+            "signature": entry["signature"],
+            "take_seq": entry["take_seq"],
+            "piece": os.path.basename(entry["piece"]),
+            **({"cuts": entry["cuts"]} if entry["cuts"] else {}),
+            **bound,
+        }
+        for entry, bound in zip(entries, bounds)
+    ]
+    retired_records = []
+    retained = {
+        (record.get("signature"), record.get("piece"))
+        for record in active_records
+    }
+    for stored_index, stored_entry in enumerate(stored_entries):
+        if stored_index in used_candidates:
+            continue
+        piece_path = _manifest_voice_piece_path(output_dir, stored_entry)
+        identity = (stored_entry.get("signature"), os.path.basename(piece_path))
+        if not stored_entry.get("signature") or not _nonempty(piece_path) or identity in retained:
+            continue
+        retired = dict(stored_entry)
+        retired["piece"] = os.path.basename(piece_path)
+        retired["retired"] = True
+        retired.pop("force_revoice", None)
+        retired_records.append(retired)
+        retained.add(identity)
+
     _write_json_file(_voice_manifest_path(output_dir, title_slug), {
         "provider": provider_used,
         "model": model_used,
-        "shots": [
-            {
-                "signature": entry["signature"],
-                "take_seq": entry["take_seq"],
-                "piece": os.path.basename(entry["piece"]),
-                **({"cuts": entry["cuts"]} if entry["cuts"] else {}),
-                **bound,
-            }
-            for entry, bound in zip(entries, bounds)
-        ],
+        "shots": active_records + retired_records,
     })
     if runs and changed != [e["shot_number"] for e in entries]:
         log(f"[1/5] Перезаписано кадров: {len(changed)} из {len(entries)}, швов в дорожке: {seams}.")
@@ -7239,11 +7524,36 @@ def adopt_job_artifacts(
             continue
         try:
             shutil.copy2(src, dst)
+            if (
+                source_slug
+                and target_slug
+                and source_slug != target_slug
+                and target_name.endswith("_voice_manifest.json")
+            ):
+                manifest = _read_json_file(dst) or {}
+                changed = False
+                for entry in manifest.get("shots") or []:
+                    piece = os.path.basename(str(entry.get("piece") or ""))
+                    if piece.startswith(source_slug):
+                        entry["piece"] = target_slug + piece[len(source_slug):]
+                        changed = True
+                if changed:
+                    _write_json_file(dst, manifest)
             copied += 1
         except OSError as e:
             log(f"  ⚠️ Файл {name} из {source_label} не скопирован: {e}")
     if copied:
-        log(f"[кадры] Взял {copied} файл(ов) из {source_label} — платим только за изменённые кадры.")
+        source_lower = source_label.lower()
+        if "озвуч" in source_lower:
+            scope = "озвучка"
+        elif "кадр" in source_lower:
+            scope = "кадры"
+        else:
+            scope = "кэш"
+        log(
+            f"[{scope}] Перенёс {copied} файл(ов) из {source_label}; "
+            "совместимые артефакты будут использованы повторно."
+        )
     return copied
 
 
@@ -7336,11 +7646,50 @@ def forget_shot_voice(
     and the slice check drops the clip that was lip-synced to the old take.
     """
     removed = []
+    wanted = set()
     for number in shot_numbers or []:
         try:
-            piece = _voice_piece_path(output_dir, title_slug, int(number))
+            wanted.add(str(int(number)))
         except (TypeError, ValueError):
             continue
+    if not wanted:
+        return removed
+
+    manifest_path = _voice_manifest_path(output_dir, title_slug)
+    manifest = _read_json_file(manifest_path) or {}
+    entries = [entry for entry in (manifest.get("shots") or []) if isinstance(entry, dict)]
+    matched = set()
+    for entry in entries:
+        number = str(entry.get("shot_number"))
+        if number not in wanted or entry.get("retired"):
+            continue
+        matched.add(number)
+        entry["force_revoice"] = True
+        entry["invalidated"] = True
+        piece = _manifest_voice_piece_path(output_dir, entry)
+        if not piece:
+            continue
+        basename = os.path.basename(piece)
+        # A duplicate line may legitimately share a piece in an imported
+        # manifest. Keep the file while another valid entry points at it; the
+        # force flag still prevents this shot from borrowing that take again.
+        shared = any(
+            other is not entry
+            and not other.get("invalidated")
+            and os.path.basename(str(other.get("piece") or "")) == basename
+            for other in entries
+        )
+        try:
+            if os.path.isfile(piece) and not shared:
+                os.remove(piece)
+            removed.append(basename)
+            log(f"[озвучка] Кадр {number}: перезаписываю реплику заново.")
+        except OSError:
+            pass
+
+    # Legacy jobs have no usable manifest; retain the old numbered fallback.
+    for number in sorted(wanted - matched):
+        piece = _voice_piece_path(output_dir, title_slug, int(number))
         try:
             if os.path.isfile(piece):
                 os.remove(piece)
@@ -7348,6 +7697,9 @@ def forget_shot_voice(
                 log(f"[озвучка] Кадр {number}: перезаписываю реплику заново.")
         except OSError:
             pass
+    if entries:
+        manifest["shots"] = entries
+        _write_json_file(manifest_path, manifest)
     return removed
 
 
@@ -7495,9 +7847,10 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
         if broll:
             frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
         else:
-            key, framing = _AVATAR_FRAMINGS[
-                talking_order.get(id(shot), 0) % len(_AVATAR_FRAMINGS)
-            ]
+            key, framing = _avatar_framing_for_shot(
+                shot,
+                talking_order.get(id(shot), 0),
+            )
             frame_path = _framing_plate_path(output_dir, title_slug, key)
         if only is None:
             # Reopened storyboard: this shot already carries a frame (or a
@@ -7606,9 +7959,9 @@ def _storyboard_voice_only_result(
     language: str,
     full_narration: str,
     voiced_text: str,
-    voice_id: str,
     tts_provider_used: str,
     tts_model_used: str,
+    voice_provenance: dict,
     log: Callable[[str], None] = print,
 ) -> dict:
     """Hand back the finished voiceover and the shoot it implies — no paid video.
@@ -7646,6 +7999,7 @@ def _storyboard_voice_only_result(
 
     if not covered:
         slices, _skipped = _align_shots_to_voiceover(shots, words, audio_duration)
+    slices = _split_performance_slices(slices, words)
     # Тот же раскрой, что сделает рендер, но в манифест он не пишется: манифест
     # описывает снятое, а это ещё прогноз — иначе рендер повторил бы разрезы,
     # посчитанные по расшифровке, которая здесь могла и не получиться.
@@ -7668,7 +8022,11 @@ def _storyboard_voice_only_result(
     for shot in shots:
         number = numbered.get(id(shot))
         span = spans.get(str(shot.get("shot_number"))) or {}
-        piece = _voice_piece_path(output_dir, title_slug, number) if number is not None else ""
+        piece = (
+            _voice_piece_for_shot(output_dir, title_slug, voice_manifest, number)
+            if number is not None
+            else ""
+        )
         seconds = round(max(0.0, span.get("end", 0.0) - span.get("start", 0.0)), 2)
         # Кладём на сам кадр: редактор раскадровки читает шоты, и без этого
         # длительность реплики некуда показать рядом с самой репликой.
@@ -7748,8 +8106,7 @@ def _storyboard_voice_only_result(
         "voice_shots": voice_shots,
         "voice_clips_planned": len(slices),
         "voice_provider": tts_provider_used,
-        "voice_model": tts_model_used,
-        "voice_id": voice_id,
+        **voice_provenance,
         # Что уже потрачено на дубли — и отдельно во что обойдётся съёмка по этой
         # дорожке: смешивать их в одну сумму значит показать счёт за то, чего ещё
         # не было.
@@ -7889,6 +8246,13 @@ def generate_storyboard_video(
         "voice_id": voice_id,
         "model": tts_model_used,
     })
+    voice_provenance = _voice_provenance(
+        config,
+        provider_used=tts_provider_used,
+        model_used=tts_model_used,
+        elevenlabs_voice_id=voice_id,
+        minimax_voice_id=minimax_voice_id,
+    )
 
     voiceover_preparation = (
         already_prepared_voiceover(audio_path) if voice_manifest
@@ -7946,9 +8310,9 @@ def generate_storyboard_video(
             language,
             full_narration,
             voiced_text,
-            voice_id,
             tts_provider_used,
             tts_model_used,
+            voice_provenance,
             log=log,
         )
 
@@ -8135,6 +8499,7 @@ def generate_storyboard_video(
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
         "tts_model": tts_model_used,
+        **voice_provenance,
         "broll_mode": "storyboard",
         "head_source": "storyboard",
         "head_template_id": None,
@@ -8562,6 +8927,13 @@ def generate_full_video(
     else:
         cost["broll_disabled"] = 0.00
     cost["total"] = round(sum(cost.values()), 2)
+    voice_provenance = _voice_provenance(
+        config,
+        provider_used=tts_provider_used,
+        model_used=tts_model_used,
+        elevenlabs_voice_id=voice_id,
+        minimax_voice_id=minimax_voice_id,
+    )
 
     return {
         "video_path": final_path,
@@ -8572,6 +8944,7 @@ def generate_full_video(
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
         "tts_model": tts_model_used,
+        **voice_provenance,
         "broll_mode": broll_mode,
         "head_source": "template" if use_reusable_head else "generated",
         "head_template_id": reusable_head_template_id,
