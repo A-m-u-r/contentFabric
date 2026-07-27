@@ -5471,20 +5471,29 @@ def composite_storyboard_video(
         "crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
         "fps=30,setsar=1"
     )
+    whisper_punch = (
+        "crop=iw/1.08:ih/1.08:(iw-ow)/2:(ih-oh)*0.42,"
+        "scale=1080:1920,setsar=1"
+    )
     filter_parts = []
     concat_parts = []
     for index, clip in enumerate(clips):
         actual = _get_media_duration(clip["path"])
         duration = max(0.1, float(clip.get("duration") or actual))
+        shot = clip.get("shot") or {}
+        whisper = _shot_performance(shot) == "whisper"
+        try:
+            whisper_start = float(shot.get("_whisper_start") or 0.0)
+        except (TypeError, ValueError):
+            whisper_start = 0.0
+        if not (whisper and 0.05 < whisper_start < duration - 0.05):
+            whisper_start = 0.0
         clip_norm = norm
-        if _shot_performance(clip.get("shot") or {}) == "whisper":
+        if whisper and not whisper_start:
             # Free pattern interrupt for the hush shot. This changes only the
             # crop: slowing a lip-synced clip would move its mouth off the
             # untouched master voiceover.
-            clip_norm += (
-                ",crop=iw/1.08:ih/1.08:(iw-ow)/2:(ih-oh)*0.42,"
-                "scale=1080:1920"
-            )
+            clip_norm += f",{whisper_punch}"
         # A lip-synced clip can open with the head of silence its driving audio
         # carried (see _mp3_encoder_delay): skipping it puts the lips back on
         # the master voiceover instead of that many milliseconds behind it.
@@ -5513,9 +5522,32 @@ def composite_storyboard_video(
             # instead of silently shifting every later shot off-sync.
             if usable > 0 and deficit > 0.05:
                 chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
-        filter_parts.append(chain + f"[v{index}]")
+        output_label = f"v{index}base" if whisper_start else f"v{index}"
+        filter_parts.append(chain + f"[{output_label}]")
+        if whisper_start:
+            # Short inline whisper: use one paid lip-sync take, then create the
+            # edit locally. The cut lands inside the existing pause and only
+            # the post-marker picture is punched; audio and PTS stay untouched.
+            filter_parts.append(
+                f"[{output_label}]split=2[v{index}pre][v{index}whisper]"
+            )
+            filter_parts.append(
+                f"[v{index}pre]trim=start=0:end={whisper_start:.3f},"
+                f"setpts=PTS-STARTPTS[v{index}pretrim]"
+            )
+            filter_parts.append(
+                f"[v{index}whisper]trim=start={whisper_start:.3f}:end={duration:.3f},"
+                f"setpts=PTS-STARTPTS,{whisper_punch}[v{index}whisperzoom]"
+            )
+            filter_parts.append(
+                f"[v{index}pretrim][v{index}whisperzoom]"
+                f"concat=n=2:v=1:a=0[v{index}]"
+            )
         concat_parts.append(f"[v{index}]")
-    filter_parts.append(f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0[vout]")
+    filter_parts.append(
+        f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0,"
+        "fps=30,settb=expr=1/30,setpts=N/(30*TB),setsar=1[vout]"
+    )
     filter_parts.append(f"[vout]{sub_filter}[finalv]")
     voice_input = str(len(clips))
     music_input = str(len(clips) + 1) if music_path else None
@@ -5823,12 +5855,6 @@ def _split_performance_slices(slices: list, words: list) -> list:
 
         start, end = float(sl["start"]), float(sl["end"])
         duration = end - start
-        if duration < 2 * _MIN_TALKING_SLICE_SECONDS:
-            whispered = dict(shot)
-            whispered["_performance"] = "whisper"
-            result.append({**sl, "shot": whispered})
-            continue
-
         before_count = len(before.split())
         local_words = [
             word for word in (words or [])
@@ -5842,6 +5868,21 @@ def _split_performance_slices(slices: list, words: list) -> list:
         else:
             spoken_count = max(1, before_count + len(after.split()))
             target = start + duration * before_count / spoken_count
+
+        if duration < 2 * _MIN_TALKING_SLICE_SECONDS:
+            whispered = dict(shot)
+            whispered["_performance"] = "whisper"
+            # One short Kling take is more reliable (and cheaper) than two tiny
+            # paid takes. Keep the natural pause in the master voiceover and
+            # tell the local compositor where to punch in inside this clip.
+            if duration > 0.2:
+                whispered["_whisper_start"] = round(min(
+                    max(target - start, 0.1),
+                    duration - 0.1,
+                ), 3)
+            result.append({**sl, "shot": whispered})
+            continue
+
         cut = round(min(
             max(target, start + _MIN_TALKING_SLICE_SECONDS),
             end - _MIN_TALKING_SLICE_SECONDS,

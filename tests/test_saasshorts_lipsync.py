@@ -1009,6 +1009,32 @@ class SlicedAvatarTests(unittest.TestCase):
         self.assertGreaterEqual(parts[0]["end"] - parts[0]["start"], 2.0)
         self.assertGreaterEqual(parts[1]["end"] - parts[1]["start"], 2.0)
 
+    def test_short_inline_whisper_keeps_one_paid_clip_and_marks_the_punch_boundary(self):
+        shot = {
+            "shot_number": 1,
+            "visual_type": "talking",
+            "speech": "Живот растет не от лишней еды. [whispers] Вообще нет.",
+        }
+        words = [
+            {"word": "Живот", "start": 0.00, "end": 0.30},
+            {"word": "растет", "start": 0.35, "end": 0.65},
+            {"word": "не", "start": 0.70, "end": 0.80},
+            {"word": "от", "start": 0.85, "end": 0.95},
+            {"word": "лишней", "start": 1.00, "end": 1.25},
+            {"word": "еды.", "start": 1.30, "end": 1.72},
+            {"word": "Вообще", "start": 2.22, "end": 2.70},
+            {"word": "нет.", "start": 2.75, "end": 3.08},
+        ]
+
+        parts = saasshorts._split_performance_slices(
+            [{"shot": shot, "start": 0.0, "end": 3.38}],
+            words,
+        )
+
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["shot"]["_performance"], "whisper")
+        self.assertAlmostEqual(parts[0]["shot"]["_whisper_start"], 2.14, places=3)
+
     def test_whisper_forces_hush_framing_instead_of_camera_rotation(self):
         whisper = {"speech": "[whispers] Только между нами.", "_performance": "whisper"}
         normal = {"speech": "Обычная речь."}
@@ -1052,7 +1078,52 @@ class SlicedAvatarTests(unittest.TestCase):
             whisper_chain = next(part for part in filter_graph.split(";") if part.endswith("[v1]"))
             self.assertNotIn("crop=iw/1.08", normal_chain)
             self.assertIn("crop=iw/1.08", whisper_chain)
+            self.assertIn("scale=1080:1920,setsar=1", whisper_chain)
             self.assertNotIn("*PTS", whisper_chain)
+
+    def test_inline_whisper_punches_only_after_its_marker_in_one_clip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "clip.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"clip")
+            captured = {}
+
+            def fake_run(cmd, check=True, **kwargs):
+                captured["cmd"] = cmd
+
+            clips = [{
+                "path": clip,
+                "duration": 3.38,
+                "shot": {
+                    "_performance": "whisper",
+                    "_whisper_start": 2.14,
+                },
+            }]
+            with patch("saasshorts._get_media_duration", return_value=3.38), \
+                 patch("saasshorts._measure_final_loudness", return_value=None), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_run):
+                saasshorts.composite_storyboard_video(
+                    clips,
+                    os.path.join(tmp, "voice.mp3"),
+                    os.path.join(tmp, "subs.ass"),
+                    os.path.join(tmp, "final.mp4"),
+                )
+
+            filter_graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+            self.assertIn("split=2[v0pre][v0whisper]", filter_graph)
+            self.assertIn("[v0pre]trim=start=0:end=2.140", filter_graph)
+            self.assertIn("[v0whisper]trim=start=2.140:end=3.380", filter_graph)
+            whisper_chain = next(
+                part for part in filter_graph.split(";")
+                if part.startswith("[v0whisper]")
+            )
+            self.assertIn("crop=iw/1.08", whisper_chain)
+            self.assertNotIn("*PTS", whisper_chain)
+            self.assertIn(
+                "concat=n=1:v=1:a=0,fps=30,settb=expr=1/30,"
+                "setpts=N/(30*TB),setsar=1[vout]",
+                filter_graph,
+            )
 
     def test_align_proportional_without_words(self):
         shots = [
