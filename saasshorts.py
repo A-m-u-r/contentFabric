@@ -3874,6 +3874,15 @@ def _strip_pictographs(text: str) -> str:
     return re.sub(r"\s{2,}", " ", _PICTOGRAPH_RE.sub("", str(text or ""))).strip()
 
 
+_CAPTION_QUIET_PUNCTUATION_RE = re.compile(r"[;…]|(?<!\d)[.,:]|[.,:](?!\d)")
+
+
+def _format_caption_display_text(text: str) -> str:
+    """Remove low-signal punctuation from kinetic captions, preserving numeric separators."""
+    cleaned = _CAPTION_QUIET_PUNCTUATION_RE.sub("", str(text or ""))
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
 def _escape_ass_text(text: str) -> str:
     """Escape user text for ASS while keeping it readable."""
     return (
@@ -4660,7 +4669,9 @@ def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 1, 
 
     chunks = []
     for group in _chunk_caption_words(words, max_words):
-        text = _strip_pictographs(" ".join(w["word"] for w in group)).upper()
+        text = _format_caption_display_text(
+            _strip_pictographs(" ".join(w["word"] for w in group))
+        ).upper()
         if not text:
             continue
         start = group[0]["start"]
@@ -4716,7 +4727,9 @@ def generate_storyboard_ass_subtitles(
         words = transcribe_audio_for_subs(audio_path)
     chunks = []
     for group in _chunk_caption_words(words, max_words):
-        text = _strip_pictographs(" ".join(w["word"] for w in group)).upper()
+        text = _format_caption_display_text(
+            _strip_pictographs(" ".join(w["word"] for w in group))
+        ).upper()
         if not text:
             continue
         chunks.append({

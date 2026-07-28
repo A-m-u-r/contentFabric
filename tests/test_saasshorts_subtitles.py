@@ -120,8 +120,12 @@ class StoryboardAssTest(unittest.TestCase):
     def test_tiktok_default_emits_one_dialogue_per_word(self):
         words = [
             _w("ONE,", 0.0, 0.3),
-            _w("TWO", 0.3, 0.6),
-            _w("THREE.", 0.6, 1.0),
+            _w("TWO.", 0.3, 0.6),
+            _w("WHY?", 0.6, 1.0),
+            _w("STOP!", 1.0, 1.3),
+            _w("PAUSE…", 1.3, 1.6),
+            _w("VALUE:", 1.6, 1.9),
+            _w("NEXT;", 1.9, 2.2),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "subs.ass")
@@ -130,16 +134,22 @@ class StoryboardAssTest(unittest.TestCase):
                 content = f.read()
 
         dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
-        self.assertEqual(len(dialogue), 3)
-        self.assertTrue(any("ONE," in line for line in dialogue))
-        for line in dialogue:
-            self.assertEqual(sum(token in line for token in ("ONE,", "TWO", "THREE.")), 1)
+        self.assertEqual(len(dialogue), 7)
+        rendered = "\n".join(dialogue)
+        for hidden in ("ONE,", "TWO.", "PAUSE…", "VALUE:", "NEXT;"):
+            self.assertNotIn(hidden, rendered)
+        for visible in ("ONE", "TWO", "WHY?", "STOP!", "PAUSE", "VALUE", "NEXT"):
+            self.assertIn(visible, rendered)
 
     def test_storyboard_default_emits_one_dialogue_per_word(self):
         words = [
             _w("ONE,", 0.0, 0.3),
-            _w("TWO", 0.3, 0.6),
-            _w("THREE.", 0.6, 1.0),
+            _w("TWO.", 0.3, 0.6),
+            _w("WHY?", 0.6, 1.0),
+            _w("STOP!", 1.0, 1.3),
+            _w("PAUSE…", 1.3, 1.6),
+            _w("VALUE:", 1.6, 1.9),
+            _w("NEXT;", 1.9, 2.2),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "subs.ass")
@@ -149,10 +159,12 @@ class StoryboardAssTest(unittest.TestCase):
                 content = f.read()
 
         dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
-        self.assertEqual(len(dialogue), 3)
-        self.assertTrue(any("ONE," in line for line in dialogue))
-        for line in dialogue:
-            self.assertEqual(sum(token in line for token in ("ONE,", "TWO", "THREE.")), 1)
+        self.assertEqual(len(dialogue), 7)
+        rendered = "\n".join(dialogue)
+        for hidden in ("ONE,", "TWO.", "PAUSE…", "VALUE:", "NEXT;"):
+            self.assertNotIn(hidden, rendered)
+        for visible in ("ONE", "TWO", "WHY?", "STOP!", "PAUSE", "VALUE", "NEXT"):
+            self.assertIn(visible, rendered)
 
     def test_ass_uses_bundled_font_no_overlays_no_emoji(self):
         shots = [{
@@ -176,8 +188,8 @@ class StoryboardAssTest(unittest.TestCase):
         self.assertNotIn("ТЫ НЕ СЛАБАЯ", content)
         dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
         self.assertEqual(len(dialogue), 2)
-        self.assertTrue(any("СТОП," in line for line in dialogue))
-        self.assertTrue(any("СТОП!" in line for line in dialogue))
+        self.assertTrue(any(line.endswith("СТОП") for line in dialogue))
+        self.assertTrue(any(line.endswith("СТОП!") for line in dialogue))
 
 
 class SubtitleFilterTest(unittest.TestCase):
