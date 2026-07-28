@@ -128,6 +128,8 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(payload["image_url"], "https://fal/up.png")
             self.assertIn("kitchen close-up", payload["prompt"])
             self.assertIn("same person", payload["prompt"].lower())
+            self.assertIn("lips gently closed", payload["prompt"].lower())
+            self.assertIn("neutral resting mouth", payload["prompt"].lower())
             self.assertTrue(os.path.exists(f"{out}.prompt.txt"))
 
     def test_avatar_reference_image_falls_back_to_empty_on_failure(self):
@@ -904,6 +906,78 @@ class SlicedAvatarTests(unittest.TestCase):
         dead_air = words[10]["start"] - slices[1]["start"]
         self.assertLessEqual(dead_air, saasshorts._SLICE_LEAD_IN + 0.001)
         self.assertGreaterEqual(dead_air, 0.0)
+
+    def test_manifest_dead_air_moves_to_previous_broll_before_avatar_generation(self):
+        """Инкрементальный манифест не должен открывать ведущего на немой паузе."""
+
+        def fake_slice(audio_path, start, end, output_path):
+            with open(output_path, "wb") as f:
+                f.write(b"slice")
+            return output_path
+
+        def fake_clip(*args, **kwargs):
+            output_path = args[3] if len(args) > 3 else args[2]
+            with open(output_path, "wb") as f:
+                f.write(b"clip")
+            return output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = os.path.join(tmp, "ref.png")
+            with open(ref, "wb") as f:
+                f.write(b"image")
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "speech": "Первая фраза",
+                 "image_path": ref, "generation_prompt": "presenter in a kitchen"},
+                {"shot_number": 2, "visual_type": "broll", "speech": "Вторая фраза",
+                 "generation_prompt": "kitchen detail"},
+                {"shot_number": 3, "visual_type": "talking", "speech": "Третья фраза",
+                 "image_path": ref, "generation_prompt": "presenter in a kitchen"},
+            ]
+            manifest = {
+                "1": {"start": 0.0, "end": 2.0, "signature": "one"},
+                "2": {"start": 2.0, "end": 4.2, "signature": "two"},
+                "3": {"start": 4.2, "end": 6.5, "signature": "three"},
+            }
+            words = [
+                {"word": "Первая", "start": 0.04, "end": 0.4},
+                {"word": "фраза", "start": 0.4, "end": 1.8},
+                {"word": "Вторая", "start": 2.05, "end": 2.5},
+                {"word": "фраза", "start": 2.5, "end": 4.0},
+                {"word": "Третья", "start": 4.4, "end": 4.9},
+                {"word": "фраза", "start": 4.9, "end": 6.3},
+            ]
+            voiced = [True] * 650
+            for index in range(420, 440):
+                voiced[index] = False
+
+            with patch("saasshorts._get_media_duration", return_value=6.5), \
+                 patch("saasshorts._speech_onset_mask", return_value=voiced), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
+                 patch("saasshorts._mp3_encoder_delay", return_value=0.0), \
+                 patch("saasshorts.generate_talking_head", side_effect=fake_clip), \
+                 patch("saasshorts.generate_storyboard_shot_clip", side_effect=fake_clip):
+                clips = saasshorts.generate_sliced_avatar_clips(
+                    shots,
+                    os.path.join(tmp, "voice.mp3"),
+                    words,
+                    "key",
+                    tmp,
+                    "job",
+                    voice_manifest=manifest,
+                    broll_image_first=False,
+                    avatar_image_first=False,
+                    log=lambda *_: None,
+                )
+
+        self.assertEqual([round(clip["start"], 2) for clip in clips], [0.0, 2.0, 4.36])
+        self.assertEqual([round(clip["end"], 2) for clip in clips], [2.0, 4.36, 6.5])
+        self.assertAlmostEqual(
+            clips[2]["start"],
+            words[4]["start"] - saasshorts._AVATAR_SPEECH_PREROLL,
+            places=3,
+        )
+        for previous, current in zip(clips, clips[1:]):
+            self.assertEqual(previous["end"], current["start"])
 
     def test_boundary_never_cuts_into_the_previous_word(self):
         # Пауза короче разгона: режем сразу за последним словом, а не по нему.

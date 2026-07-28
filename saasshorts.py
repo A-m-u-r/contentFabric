@@ -5601,6 +5601,11 @@ def _normalize_align_token(token: str) -> str:
 # and the lips visibly settling through it. So a cut lands just before the next
 # phrase and the pause stays with the shot that has just finished talking.
 _SLICE_LEAD_IN = 0.08
+# ASR word starts are approximate, so leave one video frame plus a little
+# safety before the first audible consonant. This is short enough to avoid the
+# "mouth moving over silence" failure while not cutting into the word.
+_AVATAR_SPEECH_PREROLL = 0.04
+_AVATAR_ONSET_SEARCH_SECONDS = 1.5
 
 
 def _phrase_boundary(prev_end: float, next_start: float) -> float:
@@ -5679,6 +5684,74 @@ def _align_shots_to_voiceover(shots: list, words: list, audio_duration: float) -
     return slices, skipped
 
 
+def _retime_talking_slices_to_speech(
+    slices: list,
+    words: list,
+    audio_path: str,
+) -> int:
+    """Move a talking shot's leading dead air into the previous visual.
+
+    Incremental voice manifests deliberately preserve per-shot audio pieces,
+    including the pause between separately recorded takes. Those exact bounds
+    are right for the master voiceover cache but wrong for an avatar request:
+    Kling starts animating its reference pose during the pause. This pass keeps
+    the master untouched and only moves the shared render boundary.
+    """
+    if len(slices) < 2:
+        return 0
+
+    hop = 0.01
+    voiced = _speech_onset_mask(audio_path) or []
+    moved = 0
+    for index in range(1, len(slices)):
+        current = slices[index]
+        if _is_broll_shot(current.get("shot") or {}):
+            continue
+        start = float(current["start"])
+        end = float(current["end"])
+        if end - start <= 0.5:
+            continue
+
+        candidates = []
+        if voiced:
+            first = max(0, int(start / hop))
+            limit = min(
+                len(voiced),
+                int(min(end - 0.4, start + _AVATAR_ONSET_SEARCH_SECONDS) / hop) + 1,
+            )
+            onset_index = next((i for i in range(first, limit) if voiced[i]), None)
+            if onset_index is not None:
+                candidates.append(onset_index * hop)
+
+        first_word = next(
+            (
+                float(word["start"])
+                for word in (words or [])
+                if float(word.get("end", 0.0)) > start
+                and float(word.get("start", end)) < end
+            ),
+            None,
+        )
+        if first_word is not None:
+            # A word already in progress at the manifest boundary means there is
+            # no leading pause to hand away.
+            candidates.append(max(start, first_word))
+        if not candidates:
+            continue
+
+        target = max(start, min(candidates) - _AVATAR_SPEECH_PREROLL)
+        if target - start <= 0.02 or end - target < 0.4:
+            continue
+
+        previous = slices[index - 1]
+        previous["end"] = round(target, 3)
+        current["start"] = round(target, 3)
+        previous["_speech_onset_shifted"] = True
+        current["_speech_onset_shifted"] = True
+        moved += 1
+    return moved
+
+
 # libmp3lame writes 576 samples of encoder lookahead plus 529 samples of
 # decoder delay ahead of the first real sample and declares them in the LAME
 # info tag.
@@ -5741,6 +5814,7 @@ def _ensure_slice_audio(
     clip_path: str,
     log: Callable[[str], None] = print,
     identity: str = "",
+    invalidate_video: bool = True,
 ) -> str:
     """Cut the voiceover slice, invalidating stale audio when it no longer fits.
 
@@ -5771,14 +5845,18 @@ def _ensure_slice_audio(
             f"границы сместились ({actual:.2f}s -> {expected:.2f}s)"
             if abs(actual - expected) > 0.08 else "звук кадра изменился"
         )
-        log(
-            f"  Слайс {os.path.basename(output_path)}: {reason} — "
-            "пересечка звука и перегенерация клипа."
+        action = (
+            "пересечка звука и перегенерация lip-sync клипа"
+            if invalidate_video
+            else "пересечка служебного аудио; готовое B-roll видео сохраняю"
         )
-        for stale in (
+        log(f"  Слайс {os.path.basename(output_path)}: {reason} — {action}.")
+        stale_audio = (
             identity_path,
             output_path,
             f"{output_path}.fal_url.txt",
+        )
+        stale_video = (
             clip_path,
             clip_path.replace(".mp4", "_base.mp4"),
             clip_path.replace(".mp4", "_base_fal.json"),
@@ -5786,7 +5864,8 @@ def _ensure_slice_audio(
             f"{clip_path}.review.json",
             f"{clip_path}.review.jpg",
             f"{clip_path}.fal_url.txt",
-        ):
+        )
+        for stale in stale_audio + (stale_video if invalidate_video else ()):
             try:
                 if os.path.exists(stale):
                     os.remove(stale)
@@ -6463,7 +6542,9 @@ def _avatar_reference_image(
         f"{scene + '. ' if scene else ''}"
         f"{framing + '. ' if framing else ''}"
         "Vertical 9:16 portrait, one single person only, centered and fully inside the frame, "
-        "photorealistic phone-camera look, natural light. Never duplicate the person, never add a "
+        "photorealistic phone-camera look, natural light. A still moment before speech begins: "
+        "calm expression, lips gently closed, neutral resting mouth. "
+        "Never duplicate the person, never add a "
         "second face, keep the frame edges free of any extra person. Plain unbranded clothing "
         "and background."
     )
@@ -6626,6 +6707,12 @@ def generate_sliced_avatar_clips(
         )
     if not slices:
         raise ValueError("Sliced-avatar mode requires at least one shot with speech")
+    onset_adjustments = _retime_talking_slices_to_speech(slices, words, audio_path)
+    if onset_adjustments:
+        log(
+            f"  Липсинк: {onset_adjustments} говорящих кадр(а) начинаются у речи; "
+            "ведущая пауза осталась предыдущему визуалу."
+        )
     pre_split = len(slices)
     slices = _split_performance_slices(slices, words)
     slices = _split_long_slices(
@@ -6728,6 +6815,7 @@ def generate_sliced_avatar_clips(
         _ensure_slice_audio(
             audio_path, sl["start"], sl["end"], slice_audio, clip_path, log,
             identity=_slice_identity(sl, voice_manifest or {}, part),
+            invalidate_video=not broll,
         )
         actor_ref = ""
         if broll:
@@ -8053,6 +8141,8 @@ def _storyboard_voice_only_result(
 
     if not covered:
         slices, _skipped = _align_shots_to_voiceover(shots, words, audio_duration)
+    if generation_mode == "sliced_avatar":
+        _retime_talking_slices_to_speech(slices, words, audio_path)
     slices = _split_performance_slices(slices, words)
     # Тот же раскрой, что сделает рендер, но в манифест он не пишется: манифест
     # описывает снятое, а это ещё прогноз — иначе рендер повторил бы разрезы,

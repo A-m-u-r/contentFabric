@@ -11,6 +11,7 @@ from saasshorts import (
     _broll_reference_image,
     _broll_slice_shot,
     _chunk_request_prompts,
+    _ensure_slice_audio,
     _file_fingerprint,
     _mp3_encoder_delay,
     _parse_review_issues,
@@ -604,6 +605,43 @@ class SlicedAvatarCacheTest(unittest.TestCase):
                 clips = self._run(tmp, self._shots(ref),
                                   head_mock=fake_clip, v3_mock=fake_clip)
         self.assertEqual([clip["speech_offset"] for clip in clips], [0.025, 0.0])
+
+    def test_broll_audio_reslice_does_not_delete_reusable_video(self):
+        """B-roll не липсинкается, поэтому смена его аудиограниц не портит видео."""
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_slice = os.path.join(tmp, "slice.mp3")
+            clip = os.path.join(tmp, "broll.mp4")
+            identity = f"{audio_slice}.id.txt"
+            for path, data in (
+                (audio_slice, b"old-audio"),
+                (clip, b"paid-video"),
+                (f"{clip}.meta.json", b"{}"),
+            ):
+                with open(path, "wb") as f:
+                    f.write(data)
+            with open(identity, "w", encoding="utf-8") as f:
+                f.write("old")
+
+            def fake_slice(source, start, end, output):
+                with open(output, "wb") as f:
+                    f.write(b"new-audio")
+                return output
+
+            with patch("saasshorts._get_media_duration", return_value=1.0), \
+                 patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice):
+                _ensure_slice_audio(
+                    os.path.join(tmp, "voice.mp3"),
+                    0.0,
+                    1.2,
+                    audio_slice,
+                    clip,
+                    identity="new",
+                    invalidate_video=False,
+                    log=lambda *_: None,
+                )
+
+            self.assertTrue(os.path.exists(clip))
+            self.assertTrue(os.path.exists(f"{clip}.meta.json"))
 
 
 class ApprovedFrameReuseTest(unittest.TestCase):
