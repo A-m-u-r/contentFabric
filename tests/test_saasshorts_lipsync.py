@@ -1076,8 +1076,8 @@ class SlicedAvatarTests(unittest.TestCase):
             filter_graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
             normal_chain = next(part for part in filter_graph.split(";") if part.endswith("[v0]"))
             whisper_chain = next(part for part in filter_graph.split(";") if part.endswith("[v1]"))
-            self.assertNotIn("crop=iw/1.08", normal_chain)
-            self.assertIn("crop=iw/1.08", whisper_chain)
+            self.assertNotIn("crop=iw/1.18", normal_chain)
+            self.assertIn("crop=iw/1.18", whisper_chain)
             self.assertIn("scale=1080:1920,setsar=1", whisper_chain)
             self.assertNotIn("*PTS", whisper_chain)
 
@@ -1117,7 +1117,7 @@ class SlicedAvatarTests(unittest.TestCase):
                 part for part in filter_graph.split(";")
                 if part.startswith("[v0whisper]")
             )
-            self.assertIn("crop=iw/1.08", whisper_chain)
+            self.assertIn("crop=iw/1.18", whisper_chain)
             self.assertNotIn("*PTS", whisper_chain)
             self.assertIn(
                 "concat=n=1:v=1:a=0,fps=30,settb=expr=1/30,"

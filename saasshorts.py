@@ -5472,7 +5472,7 @@ def composite_storyboard_video(
         "fps=30,setsar=1"
     )
     whisper_punch = (
-        "crop=iw/1.08:ih/1.08:(iw-ow)/2:(ih-oh)*0.42,"
+        "crop=iw/1.18:ih/1.18:(iw-ow)/2:(ih-oh)*0.42,"
         "scale=1080:1920,setsar=1"
     )
     filter_parts = []
