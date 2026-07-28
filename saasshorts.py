@@ -4641,11 +4641,11 @@ def _snap_captions_to_speech(
     return moved
 
 
-def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 3, words: Optional[list] = None) -> str:
+def generate_tiktok_subs(audio_path: str, output_path: str, max_words: int = 1, words: Optional[list] = None) -> str:
     """
     Generate TikTok-style ASS subtitles from audio using Whisper transcription.
 
-    Style: Big bold centered text, 1-3 words at a time, white with black outline.
+    Style: Big bold centered text, one word at a time, white with black outline.
     Matches actual spoken words with precise timestamps.
 
     Pass precomputed `words` to reuse an existing transcription.
@@ -4700,7 +4700,7 @@ def generate_storyboard_ass_subtitles(
     audio_path: str,
     shots: list,
     output_path: str,
-    max_words: int = 3,
+    max_words: int = 1,
     words: Optional[list] = None,
     caption_keywords: Optional[list] = None,
 ) -> str:
@@ -8475,7 +8475,7 @@ def generate_storyboard_video(
         except Exception as e:
             log(f"  ⚠️ Transcription failed, subtitles limited to overlays: {e}")
     generate_storyboard_ass_subtitles(
-        audio_path, shots, srt_path, max_words=2, words=spoken_words or None,
+        audio_path, shots, srt_path, max_words=1, words=spoken_words or None,
         caption_keywords=script.get("caption_keywords"),
     )
 
@@ -8904,7 +8904,7 @@ def generate_full_video(
         spoken_words = []
     if spoken_words:
         spoken_words = _align_asr_words_to_script(spoken_words, full_narration, log=log)
-    generate_tiktok_subs(audio_path, srt_path, max_words=2, words=spoken_words)
+    generate_tiktok_subs(audio_path, srt_path, max_words=1, words=spoken_words)
 
     # ── Step 6: Composite final video ──
     log("[6/6] Compositing final video with FFmpeg...")

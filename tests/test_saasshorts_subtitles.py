@@ -17,6 +17,7 @@ from saasshorts import (
     _subtitle_filter,
     composite_storyboard_video,
     generate_storyboard_ass_subtitles,
+    generate_tiktok_subs,
 )
 
 
@@ -116,6 +117,43 @@ class StripPictographsTest(unittest.TestCase):
 
 
 class StoryboardAssTest(unittest.TestCase):
+    def test_tiktok_default_emits_one_dialogue_per_word(self):
+        words = [
+            _w("ONE,", 0.0, 0.3),
+            _w("TWO", 0.3, 0.6),
+            _w("THREE.", 0.6, 1.0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "subs.ass")
+            generate_tiktok_subs("unused.mp3", out, words=words)
+            with open(out, encoding="utf-8") as f:
+                content = f.read()
+
+        dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+        self.assertEqual(len(dialogue), 3)
+        self.assertTrue(any("ONE," in line for line in dialogue))
+        for line in dialogue:
+            self.assertEqual(sum(token in line for token in ("ONE,", "TWO", "THREE.")), 1)
+
+    def test_storyboard_default_emits_one_dialogue_per_word(self):
+        words = [
+            _w("ONE,", 0.0, 0.3),
+            _w("TWO", 0.3, 0.6),
+            _w("THREE.", 0.6, 1.0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "subs.ass")
+            with patch("saasshorts._snap_captions_to_speech", return_value=0):
+                generate_storyboard_ass_subtitles("unused.mp3", [], out, words=words)
+            with open(out, encoding="utf-8") as f:
+                content = f.read()
+
+        dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+        self.assertEqual(len(dialogue), 3)
+        self.assertTrue(any("ONE," in line for line in dialogue))
+        for line in dialogue:
+            self.assertEqual(sum(token in line for token in ("ONE,", "TWO", "THREE.")), 1)
+
     def test_ass_uses_bundled_font_no_overlays_no_emoji(self):
         shots = [{
             "shot_number": 1,
@@ -136,7 +174,10 @@ class StoryboardAssTest(unittest.TestCase):
         self.assertNotIn("🔥", content)
         # Top plates are gone: overlay_text must not reach the video.
         self.assertNotIn("ТЫ НЕ СЛАБАЯ", content)
-        self.assertIn("СТОП, СТОП!", content)
+        dialogue = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+        self.assertEqual(len(dialogue), 2)
+        self.assertTrue(any("СТОП," in line for line in dialogue))
+        self.assertTrue(any("СТОП!" in line for line in dialogue))
 
 
 class SubtitleFilterTest(unittest.TestCase):
