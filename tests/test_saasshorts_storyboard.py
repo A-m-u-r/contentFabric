@@ -492,6 +492,39 @@ class SaaSFillShotDetailsTests(unittest.TestCase):
         shots = [{"shot_number": 1, "speech": "Реплика"}]
         self.assertIs(saasshorts.fill_storyboard_shot_details({}, shots, ""), shots)
 
+    def test_actor_appearance_is_not_sent_back_to_gemini(self):
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                pass
+
+        script = {
+            "title": "Диеты после 30",
+            "actor_description": "UNIQUE BLONDE ACTOR DESCRIPTION",
+        }
+        reply = [{
+            "shot_number": 1,
+            "scene": "Светлая кухня.",
+            "camera": "Средний план.",
+            "actor_action": "Спокойно смотрит в камеру.",
+            "generation_prompt": "the actor looks calmly into camera in a bright kitchen",
+        }]
+        with patch("google.genai.Client", FakeClient), \
+             patch(
+                 "saasshorts._generate_gemini_content",
+                 return_value=SimpleNamespace(text=json.dumps(reply, ensure_ascii=False)),
+             ) as generate:
+            saasshorts.fill_storyboard_shot_details(
+                script,
+                [{"shot_number": 1, "speech": "Короткая реплика."}],
+                "key",
+            )
+
+        request = generate.call_args.kwargs["contents"][0]
+        self.assertNotIn("UNIQUE BLONDE ACTOR DESCRIPTION", request)
+        self.assertIn("reference image is the only source", request)
+
 
 class SaaSExistingShotFrameTests(unittest.TestCase):
     """Кадр, за который уже заплатили, не должен генериться заново."""
@@ -1132,6 +1165,30 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertNotIn("18-22 seconds total", prompt)
         self.assertEqual(scripts[0]["target_duration_seconds"], 30)
 
+    def test_storyboard_model_does_not_define_actor_appearance(self):
+        answer = _storyboard_answer("Identity from reference", 6)
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+
+        with patch("google.genai.Client", return_value=client), \
+             patch(
+                 "saasshorts.refine_storyboard_broll_alignment",
+                 side_effect=lambda scripts, *_args, **_kwargs: scripts,
+             ):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="storyboard_v3",
+            )
+
+        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        self.assertIn("reference image is the only source", prompt)
+        self.assertIn("pose, position, gaze, expression, emotion", prompt)
+        self.assertNotIn('"actor_description": "English physical description only"', prompt)
+        self.assertNotIn("actor_description must describe", prompt)
+        self.assertNotIn("actor_description", scripts[0])
+
     def test_storyboard_prompt_does_not_expose_experimental_pacing_profile(self):
         answer = _storyboard_answer("Previous rhythm", 6)
         client = MagicMock()
@@ -1253,6 +1310,40 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertIn('"end": 45', prompt)
         self.assertNotIn("18-22 seconds total", prompt)
         self.assertEqual(scripts[0]["target_duration_seconds"], 45)
+
+    def test_ugc_model_does_not_define_actor_appearance(self):
+        answer = json.dumps([{
+            "title": "Reference actor",
+            "hook_type": "result_first",
+            "actor_description": "a generated blonde woman in a white top",
+            "segments": [
+                {
+                    "type": kind,
+                    "start": index * 4,
+                    "end": (index + 1) * 4,
+                    "narration": f"Unique segment {index} explains the point.",
+                    "visual": "broll" if index in (1, 3) else "actor_talking",
+                    "broll_prompt": "relevant insert" if index in (1, 3) else None,
+                }
+                for index, kind in enumerate(("hook", "problem", "solution", "demo", "cta"))
+            ],
+        }])
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+
+        with patch("google.genai.Client", return_value=client):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="ugc",
+            )
+
+        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        self.assertIn("reference image is the only source", prompt)
+        self.assertNotIn('"actor_description": "Specific person description', prompt)
+        self.assertNotIn("Vary actor look", prompt)
+        self.assertNotIn("actor_description", scripts[0])
 
     def test_custom_scripts_do_not_store_experimental_pacing_profile(self):
         script = build_custom_script(
@@ -1822,9 +1913,12 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
         class FakeResp:
             text = '[{"n": 0, "prompt": "a bright kitchen, woman smiling to camera"}]'
 
-        with patch("saasshorts._generate_gemini_content", return_value=FakeResp()):
+        with patch("saasshorts._generate_gemini_content", return_value=FakeResp()) as generate:
             saasshorts._rebuild_prompts_from_scene(shots, "gkey", actor_description="woman")
 
+        request = generate.call_args.kwargs["contents"][0]
+        self.assertNotIn("Actor: woman", request)
+        self.assertIn("reference image is the only source", request)
         self.assertIn("bright kitchen", shots[0]["generation_prompt"])
         self.assertEqual(shots[0]["_prompt_source_scene"], "новая сцена")
         self.assertEqual(shots[1]["generation_prompt"], "keep me")

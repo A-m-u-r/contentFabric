@@ -739,8 +739,21 @@ def _script_spoken_text(script: dict) -> str:
     return (script.get("full_narration") or "").strip()
 
 
+_ACTOR_DIRECTION_ONLY_RULES = """ACTOR IDENTITY AND APPEARANCE:
+- The selected reference image is the only source of the actor's identity and appearance.
+- Never describe or invent age, nationality, ethnicity, skin tone, facial features, body
+  type, hair, hairstyle, makeup, clothing, outfit, jewelry, or accessories.
+- Refer to the person only as "the actor" or "the same actor from the reference image".
+- You may describe only pose, position, gaze, expression, emotion, gesture, movement,
+  and the actor's relationship to the camera or nearby objects.
+- Describe the location, background, props, lighting, and camera separately from the actor."""
+
+
 def _finalize_generated_script(script: dict) -> dict:
-    """Replace unreliable generated metadata with narration-derived values."""
+    """Replace generated metadata with narration-derived, identity-neutral values."""
+    # Actor identity belongs to the user's selected/uploaded reference, never to
+    # the script model. Drop the field even if a model returns an old schema.
+    script.pop("actor_description", None)
     narration = _script_spoken_text(script)
     script["full_narration"] = narration
     script["duration_seconds"] = _estimate_speech_duration(narration)
@@ -801,6 +814,10 @@ def refine_storyboard_broll_alignment(
 Review every B-roll shot below in one batch. The exact `speech` is the source of truth.
 Target UI language: {target_language}. Write scene, camera, and actor_action only in
 {target_language}. Write generation_prompt only in English.
+
+{_ACTOR_DIRECTION_ONLY_RULES}
+Apply the identity rule to every replacement. `actor_in_frame` may control pose and
+visibility, but it never permits you to invent or restate the presenter's appearance.
 
 Keep the visual only when it directly demonstrates the spoken claim or uses one immediately
 understandable visual analogy. Reject generic niche filler unrelated to the nouns, action, or
@@ -1282,12 +1299,11 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
         "overlay_text": "Short text on screen",
         "visual_type": "talking",
         "actor_in_frame": false,
-        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same woman, scene, action, camera, lighting"
+        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same actor from the reference image, scene, action, camera, lighting"
       }}
     ],
     "full_narration": "All shot speech joined exactly",
     "caption_keywords": ["2-4 emotionally loaded words from the narration, in the script language, for subtitle color-accents"],
-    "actor_description": "English physical description only",
     "hashtags": ["#reels"],
     "caption": "Suggested caption"
   }}
@@ -1306,7 +1322,9 @@ RULES:
 - role must be one of: hook, problem, explanation, solution, proof, cta.
 - transition should be "cut" or "smooth_0.3s".
 - speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
-- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor/character, natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
+{_ACTOR_DIRECTION_ONLY_RULES}
+- Apply the identity rule to EVERY output field, including scene, actor_action, and generation_prompt. Do not return an actor_description field.
+- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor from the reference image, natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
@@ -1315,7 +1333,7 @@ RULES:
 - Match the selected total duration and word budget while keeping every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
-- Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
+- Actor gender is {actor_gender}; use it only for grammar when necessary, never to invent appearance.
 - Avoid laptops, monitors, headset, microphones, studio AI background unless the product explicitly needs them.
 """
         config = types.GenerateContentConfig(
@@ -1450,7 +1468,6 @@ Return a JSON array:
             }}
         ],
         "full_narration": "ALL segment narration joined in timeline order",
-        "actor_description": "Specific person description: age, gender, ethnicity, hair style, clothing. Casual everyday look.",
         "hashtags": ["#reels", "#product", "#ugc"],
         "caption": "Suggested Instagram/TikTok caption"
     }}
@@ -1462,19 +1479,14 @@ RULES:
 - full_narration = ALL segment narration joined in timeline order, including b-roll voiceover lines.
 - Follow the selected target duration and total spoken-word budget above.
 - Keep narrations punchy, conversational, with contractions
-- Actor descriptions: casual, real-person look (NOT model/influencer)
+{_ACTOR_DIRECTION_ONLY_RULES}
+- Apply the identity rule to every segment and broll_prompt. Do not return an actor_description field.
 - B-roll prompts: cinematic, specific, detailed visual descriptions
 - Each script should use a different pain point / angle
-- Vary actor look (hair color/style, outfit, age within range) across scripts
 - CTA MUST be natural for the selected language. For English/Spanish, mention "link in bio" / "enlace en la bio". For Russian, use a DM CTA if the product context suggests it, e.g. "Напиши НЕДЕЛЯ — пришлю чеклист", otherwise use "ссылка в профиле".
 - Write ALL text in {lang_name}
-- Actor gender: {actor_gender}. ALL actor_description fields MUST describe a {actor_gender} person.
-- IMPORTANT: actor_description MUST ALWAYS be in ENGLISH regardless of script language. Only describe physical appearance: age, gender, ethnicity, hair, clothing. NO actions, NO background, NO scene description.
-- Actors must look European, attractive but natural, trustworthy premium wellness / UGC creator vibe. Vary across: blonde, brunette, redhead. Ages 24-38.
-- Avoid office/tech-worker cues in actor_description: no laptop, no monitor, no headset, no headphones, no microphone, no gaming chair, no visible screens.
-- If female: minimalist premium casual look (turtleneck, simple tee, blazer, knit top). If male: clean premium casual tee, knit, blazer, or overshirt.
-- Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
-- Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
+- Actor gender is {actor_gender}; use it only for grammar when necessary, never to invent appearance.
+- Avoid laptops, monitors, headsets, microphones, gaming chairs, and visible screens unless the product explicitly needs them. """
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -1808,7 +1820,6 @@ def build_custom_storyboard_script(
 
     shots = normalize_storyboard_shots({"shots": shots})
     full_narration = " ".join(shot.get("speech", "") for shot in shots if shot.get("speech")).strip()
-    actor_noun = "woman" if actor_gender == "female" else "man"
     return {
         "title": title,
         "format": "storyboard_v3",
@@ -1818,10 +1829,6 @@ def build_custom_storyboard_script(
         "hook_text": (shots[0].get("overlay_text") or shots[0].get("speech", "")[:50]) if shots else title,
         "shots": shots,
         "full_narration": full_narration or text,
-        "actor_description": (
-            f"a 30 year old natural looking european {actor_noun}, casual premium wellness outfit, "
-            "friendly trustworthy face, minimal styling, authentic UGC look"
-        ),
         "hashtags": ["#reels", "#shorts", "#ugc"] if language != "ru" else ["#рилс", "#привычки", "#питание"],
         "caption": topic or analysis.get("description") or title,
         "custom_script": True,
@@ -1858,12 +1865,6 @@ def build_custom_script(
 
     hook_words = re.sub(r"\s+", " ", narration).split(" ")[:6]
     hook_text = " ".join(hook_words).strip(" .,!?") or title
-
-    actor_noun = "woman" if actor_gender == "female" else "man"
-    actor_description = (
-        f"a 30 year old natural looking european {actor_noun}, casual everyday outfit, "
-        "friendly trustworthy face, minimal styling, authentic UGC look"
-    )
 
     broll_problem = (
         f"Vertical smartphone-style b-roll showing the problem behind: {topic or product_desc}. "
@@ -1940,7 +1941,6 @@ def build_custom_script(
             },
         ],
         "full_narration": narration,
-        "actor_description": actor_description,
         "hashtags": ["#reels", "#shorts", "#ugc"] if language != "ru" else ["#рилс", "#привычки", "#питание"],
         "caption": topic or product_desc,
         "custom_script": True,
@@ -2825,7 +2825,9 @@ def _rebuild_prompts_from_scene(
     So editing «Что в кадре» actually changes the rendered shot. Only shots whose
     scene drifted (and whose prompt isn't hand-pinned) are rebuilt, in a single
     batched Gemini call. Every shot without a baseline gets one stamped so future
-    scene edits are detectable. On any failure the existing prompts are kept.
+    scene edits are detectable. `actor_description` remains in the signature for
+    saved callers but is intentionally never sent to Gemini. On any failure the
+    existing prompts are kept.
     """
     stale = [s for s in shots if _needs_prompt_rebuild(s)]
     # Stamp a baseline for shots that never had one (AI scripts stamp at creation;
@@ -2856,7 +2858,9 @@ def _rebuild_prompts_from_scene(
         prompt = (
             "You convert Russian shot descriptions into English video-generation prompts "
             "for Kling V3 (vertical 9:16 realistic phone video).\n"
-            f"Actor: {actor_description or 'a consistent real person, same across all shots'}.\n"
+            f"{_ACTOR_DIRECTION_ONLY_RULES}\n"
+            "Apply the identity rule even when an input scene contains appearance details: "
+            "omit those details from the output prompt.\n"
             "For each shot, write ONE English prompt that fully describes the scene, action "
             "and camera on its own. Rules: vertical 9:16, same actor/character across shots, "
             "natural light, authentic smartphone footage. Describe only what IS in frame — "
@@ -2950,7 +2954,7 @@ def fill_storyboard_shot_details(
 
 Video: "{script.get('title') or ''}"
 Topic: {script.get('_video_topic') or script.get('topic') or ''}
-Actor: {script.get('actor_description') or f'a consistent {actor_gender} person, same in every shot'}
+{_ACTOR_DIRECTION_ONLY_RULES}
 
 Full storyboard for context (already existing shots):
 {json.dumps(context, ensure_ascii=False, indent=1)}
@@ -2960,6 +2964,8 @@ already filled in — only replace empty ones):
 {json.dumps(payload, ensure_ascii=False, indent=1)}
 
 RULES:
+- Apply the identity rule to every returned field. If an input scene contains
+  appearance details, omit them instead of copying them into the result.
 - scene, camera, actor_action must be written in {lang_name} — the user reads them in the app.
 - visual_type: "talking" (the actor speaks to camera, lips visible) or "broll"
   (insert shot over the voiceover). B-roll must be grounded in that exact speech:
@@ -2984,7 +2990,8 @@ RULES:
 - No readable text anywhere: no labels, signs, numbers, stickers, no phone/laptop
   screens facing camera — video models render text as garbage glyphs.
 - generation_prompt MUST be English and fully describe scene, action and camera on
-  its own: vertical 9:16, realistic phone video, same actor, natural light. Describe only
+  its own: vertical 9:16, realistic phone video, same actor from the reference image,
+  natural light. Describe only
   what IS in frame — never write "no text", "no watermark" or any other ban, those
   reach the model in a separate field and inside the description they only make it
   draw them. For "broll" pick subjects with no identifiable face and nothing written
@@ -6618,7 +6625,10 @@ def _avatar_reference_image(
     scene = scene.strip().rstrip(".")
     framing = (framing or "").strip().rstrip(".")
     prompt = (
-        "Keep the exact same person, face, hairstyle and outfit as in the reference image. "
+        "The reference image is the only source of identity and appearance. Keep the exact "
+        "same person, face, hairstyle, body, outfit and accessories. Treat the scene text "
+        "only as direction for pose, position, gaze, expression, action, location, lighting "
+        "and camera; ignore any appearance wording it may contain. "
         f"{scene + '. ' if scene else ''}"
         f"{framing + '. ' if framing else ''}"
         "Vertical 9:16 portrait, one single person only, centered and fully inside the frame, "
