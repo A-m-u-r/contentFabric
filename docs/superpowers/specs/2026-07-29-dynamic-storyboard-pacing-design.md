@@ -63,8 +63,24 @@ appearance.
 
 For every generated frame containing the presenter, the selected reference
 image remains the only source of identity and appearance. Frame generation
-must preserve the same face, hairstyle, hair color, body, outfit, jewelry, and
-accessories while changing only staging and camera direction.
+must preserve the same face, hairstyle, body, outfit, jewelry, and accessories
+while changing only staging and camera direction. The wording of the existing
+frame prompt stays stable so approved paid-frame caches remain reusable.
+
+For neutral B-roll (`actor_in_frame=false`), a clean English model prompt stays
+available to the video model. If it binds the frame to an actor, presenter,
+avatar, or reference photo, those identity bindings are removed from the
+English prompt. If safe sanitization is impossible, the pipeline uses a neutral
+English fallback instead of localized UI text. When no model prompt exists,
+scene, action, and camera are sanitized before assembly, and the final automatic
+prompt passes the same English-language guard. A prompt explicitly pinned by
+the user remains user-owned.
+
+The language guard uses explicit provenance instead of guessing from words.
+Generated scripts retain their requested language, and model-generated English
+frame prompts are tagged as English. For a non-English script, an untagged
+automatic neutral B-roll prompt is treated as untrusted and replaced with the
+neutral English fallback. This does not apply to a manual user prompt.
 
 The normal-to-whisper transition remains supported as two talking beats:
 
@@ -91,8 +107,9 @@ The profile applies only to newly generated AI storyboard scripts. Existing
 saved scripts, approved frames, cached voiceovers, and generated clips are not
 invalidated.
 
-The generated script stores `storyboard_pacing: "dynamic"` as provenance.
-Custom scripts do not receive this field.
+The generated script stores `storyboard_pacing: "dynamic"` and its requested
+language as provenance. Model-generated frame prompts store internal English
+provenance. Custom scripts do not receive the dynamic pacing field.
 
 ## Testing
 

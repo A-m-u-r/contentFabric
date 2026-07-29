@@ -294,7 +294,7 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
         client.assert_not_called()
         generate.assert_not_called()
 
-    def test_generate_scripts_invokes_one_batched_refinement_for_broll(self):
+    def test_generate_scripts_does_not_run_automatic_broll_refinement(self):
         answer = json.dumps([{
             "title": "B-roll", "hook_type": "result_first", "shots": [
                 {**_storyboard_shot(1, "Start with the useful result."), "visual_type": "talking"},
@@ -304,14 +304,22 @@ class SaaSBrollSpeechAlignmentTests(unittest.TestCase):
         client = MagicMock()
         client.models.generate_content.return_value = MagicMock(text=answer)
         with patch("google.genai.Client", return_value=client), \
-             patch("saasshorts.refine_storyboard_broll_alignment", side_effect=lambda scripts, *_args, **_kwargs: scripts) as refine, \
+             patch(
+                 "saasshorts.refine_storyboard_broll_alignment",
+                 side_effect=AssertionError("automatic semantic repair must stay disabled"),
+             ) as refine, \
              patch("builtins.print"):
-            saasshorts.generate_scripts(
+            scripts = saasshorts.generate_scripts(
                 analysis={"product_name": "Test"}, gemini_key="key", num_scripts=1,
                 script_format="storyboard_v3", language="ru",
             )
-        refine.assert_called_once()
-        self.assertEqual(refine.call_args.kwargs["language"], "ru")
+        refine.assert_not_called()
+        self.assertEqual(scripts[0]["storyboard_pacing"], "dynamic")
+        self.assertEqual(scripts[0]["language"], "ru")
+        self.assertTrue(all(
+            shot["_generation_prompt_language"] == "en"
+            for shot in scripts[0]["shots"]
+        ))
 
     def test_storyboard_prompt_no_longer_bans_all_people_from_broll(self):
         source = saasshorts.generate_scripts.__code__.co_consts
@@ -524,6 +532,18 @@ class SaaSFillShotDetailsTests(unittest.TestCase):
         request = generate.call_args.kwargs["contents"][0]
         self.assertNotIn("UNIQUE BLONDE ACTOR DESCRIPTION", request)
         self.assertIn("reference image is the only source", request)
+        self.assertNotIn(
+            "generation_prompt MUST be English and fully describe scene, action and camera on\n"
+            "  its own: vertical 9:16, realistic phone video, same actor from the reference image",
+            request,
+        )
+        self.assertIn("For talking shots", request)
+        self.assertIn("B-roll with actor_in_frame=true", request)
+        self.assertIn("identify the same actor from the reference image", request)
+        self.assertIn(
+            "For B-roll with actor_in_frame=false, do not mention the actor or reference image",
+            request,
+        )
 
 
 class SaaSExistingShotFrameTests(unittest.TestCase):
@@ -1138,6 +1158,19 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertEqual(saasshorts.normalize_target_duration(29), 20)
         self.assertEqual(saasshorts.normalize_target_duration(None), 20)
 
+    def test_storyboard_duration_presets_use_dynamic_visual_beat_ranges(self):
+        expected = {
+            15: "6-8 visual beats",
+            20: "8-10 visual beats",
+            30: "11-15 visual beats",
+            45: "16-22 visual beats",
+        }
+
+        for target, guidance in expected.items():
+            with self.subTest(target=target):
+                prompt = saasshorts._target_duration_prompt(target, storyboard=True)
+                self.assertIn(guidance, prompt)
+
     def test_storyboard_duration_prompt_uses_selected_target_only(self):
         answer = _storyboard_answer("Thirty", 12)
         client = MagicMock()
@@ -1159,11 +1192,39 @@ class SaaSStoryboardTests(unittest.TestCase):
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
         self.assertIn("28-32 seconds", prompt)
         self.assertIn("59-63 spoken words", prompt)
-        self.assertIn("8-10 visual beats", prompt)
-        self.assertIn('Make 1-2 middle shots "broll"', prompt)
-        self.assertNotIn("30-40 percent", prompt)
+        self.assertIn("11-15 visual beats", prompt)
+        self.assertIn("STORYBOARD PACING PROFILE", prompt)
+        self.assertIn("35-45% of the spoken timeline", prompt)
+        self.assertIn("25-50% is an acceptable soft range", prompt)
+        self.assertIn("10-20% may show the same actor", prompt)
+        self.assertIn("15-30% may show a product, object, process, space, result", prompt)
+        self.assertIn("Never place two B-roll shots next to each other", prompt)
+        self.assertIn("The first shot and the last shot MUST be talking", prompt)
+        self.assertIn("Vary B-roll subject types", prompt)
+        self.assertIn(
+            '"actor_action": "what the visible subject does; for talking shots, what the actor does',
+            prompt,
+        )
+        self.assertIn(
+            "Every talking generation_prompt MUST identify the same actor from the reference image",
+            prompt,
+        )
+        self.assertIn(
+            "For a B-roll shot with actor_in_frame=true, generation_prompt MUST identify the same actor from the reference image",
+            prompt,
+        )
+        self.assertIn(
+            "For a B-roll shot with actor_in_frame=false, generation_prompt MUST NOT mention the actor or reference image",
+            prompt,
+        )
+        self.assertNotIn('Make 1-2 middle shots "broll"', prompt)
+        self.assertNotIn(
+            "generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor",
+            prompt,
+        )
         self.assertNotIn("18-22 seconds total", prompt)
         self.assertEqual(scripts[0]["target_duration_seconds"], 30)
+        self.assertEqual(scripts[0]["storyboard_pacing"], "dynamic")
 
     def test_storyboard_model_does_not_define_actor_appearance(self):
         answer = _storyboard_answer("Identity from reference", 6)
@@ -1189,8 +1250,8 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertNotIn("actor_description must describe", prompt)
         self.assertNotIn("actor_description", scripts[0])
 
-    def test_storyboard_prompt_does_not_expose_experimental_pacing_profile(self):
-        answer = _storyboard_answer("Previous rhythm", 6)
+    def test_storyboard_prompt_exposes_dynamic_pacing_profile(self):
+        answer = _storyboard_answer("Dynamic rhythm", 8)
         client = MagicMock()
         client.models.generate_content.return_value = MagicMock(text=answer)
 
@@ -1208,10 +1269,10 @@ class SaaSStoryboardTests(unittest.TestCase):
             )
 
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
-        self.assertIn("5-7 visual beats", prompt)
-        self.assertIn("about 3 seconds (5 at the absolute limit)", prompt)
-        self.assertNotIn("STORYBOARD PACING PROFILE", prompt)
-        self.assertNotIn("storyboard_pacing", prompt)
+        self.assertIn("8-10 visual beats", prompt)
+        self.assertIn("about 1.5-3 seconds (5 at the absolute limit)", prompt)
+        self.assertIn("STORYBOARD PACING PROFILE", prompt)
+        self.assertIn('"storyboard_pacing": "dynamic"', prompt)
 
     def test_target_duration_metadata_applies_to_every_script_in_batch(self):
         scripts_answer = []
@@ -1900,6 +1961,242 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             # 4 spoken words over 20s: the 2-word shot gets double the 1-word shots.
             self.assertEqual(durations, [5, 5, 10])
 
+    def test_prompt_fallback_mentions_reference_only_for_actor_shots(self):
+        neutral_broll = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "a pendulum gradually slows",
+            "actor_action": "the pendulum keeps moving",
+            "camera": "locked close-up",
+        })
+        actor_broll = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": True,
+            "scene": "the actor walks through a quiet room",
+            "actor_action": "walks away from camera",
+            "camera": "rear medium shot",
+        })
+        talking = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "talking",
+            "scene": "quiet room",
+            "actor_action": "looks into camera",
+            "camera": "medium shot",
+        })
+
+        self.assertNotIn("actor", neutral_broll.lower())
+        self.assertNotIn("reference", neutral_broll.lower())
+        self.assertIn("same actor from the reference image", actor_broll.lower())
+        self.assertIn("same actor from the reference image", talking.lower())
+
+    def test_model_prompt_cannot_reintroduce_actor_into_neutral_broll(self):
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "a pendulum gradually slows",
+            "actor_action": "the pendulum keeps moving",
+            "camera": "locked close-up",
+            "generation_prompt": (
+                "vertical 9:16, the actor watches "
+                "a pendulum gradually slow, natural light"
+            ),
+        })
+
+        self.assertNotIn("actor", prompt.lower())
+        self.assertIn("pendulum gradually slow", prompt.lower())
+        self.assertIn("faceless person", prompt.lower())
+
+    def test_actor_neutral_english_broll_prompt_is_preserved(self):
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "a pendulum gradually slows",
+            "actor_action": "the pendulum keeps moving",
+            "camera": "locked close-up",
+            "generation_prompt": (
+                "vertical 9:16, generic old product shot, "
+                "cinematic studio portrait"
+            ),
+        })
+
+        self.assertIn("generic old product shot", prompt.lower())
+        self.assertIn("cinematic studio portrait", prompt.lower())
+        self.assertNotIn("pendulum gradually slows", prompt.lower())
+
+    def test_identity_detection_does_not_match_inside_clean_words(self):
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "a factory process",
+            "generation_prompt": (
+                "vertical 9:16, same manufacturing process repeats, "
+                "steady close-up, natural light"
+            ),
+        })
+
+        self.assertIn("same manufacturing process repeats", prompt.lower())
+
+    def test_contaminated_english_prompt_is_sanitized_without_localized_rebuild(self):
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "Маятник постепенно замедляется.",
+            "actor_action": "Ведущая наблюдает за маятником.",
+            "camera": "Крупный план лица актрисы.",
+            "generation_prompt": (
+                "vertical 9:16, the actor from the reference image watches "
+                "a pendulum gradually slow, locked close-up, natural light"
+            ),
+        })
+
+        lowered = prompt.lower()
+        self.assertTrue(prompt.isascii())
+        self.assertNotIn("actor", lowered)
+        self.assertNotIn("reference image", lowered)
+        self.assertIn("pendulum gradually slow", lowered)
+        self.assertIn("locked close-up", lowered)
+
+    def test_nonmanual_neutral_broll_rejects_localized_generation_prompts(self):
+        for language, localized_prompt in (
+            ("ru", "vertical 9:16, маятник постепенно замедляется, мягкий дневной свет"),
+            ("es", "vertical 9:16, video realista de un pendulo, plano cercano, luz natural"),
+        ):
+            with self.subTest(prompt=localized_prompt):
+                prompt = saasshorts._build_storyboard_generation_prompt({
+                    "visual_type": "broll",
+                    "actor_in_frame": False,
+                    "_script_language": language,
+                    "generation_prompt": localized_prompt,
+                })
+                self.assertTrue(prompt.isascii())
+                self.assertNotEqual(prompt, localized_prompt)
+                self.assertIn("single relevant object or process", prompt.lower())
+
+    def test_script_language_rejects_ascii_spanish_without_guessing_tokens(self):
+        localized_prompt = "edificio moderno bajo cielo nocturno"
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "_script_language": "es",
+            "generation_prompt": localized_prompt,
+        })
+
+        self.assertNotEqual(prompt, f"{localized_prompt}, vertical 9:16")
+        self.assertIn("single relevant object or process", prompt.lower())
+
+    def test_script_language_preserves_contract_compliant_english_prompt(self):
+        english_prompt = (
+            "vertical 9:16 realistic phone video, a modern building under a "
+            "night sky, natural light"
+        )
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "_script_language": "es",
+            "_generation_prompt_language": "en",
+            "generation_prompt": english_prompt,
+        })
+
+        self.assertEqual(prompt, english_prompt)
+
+    def test_normalize_propagates_script_language_to_shots(self):
+        shots = saasshorts.normalize_storyboard_shots({
+            "language": "es",
+            "shots": [{
+                "shot_number": 1,
+                "visual_type": "broll",
+                "actor_in_frame": False,
+                "scene": "edificio moderno bajo cielo nocturno",
+                "speech": "Una escena breve.",
+            }],
+        })
+
+        self.assertEqual(shots[0]["_script_language"], "es")
+        self.assertIn(
+            "single relevant object or process",
+            shots[0]["generation_prompt"].lower(),
+        )
+
+    def test_missing_neutral_prompt_does_not_use_localized_ui_fields(self):
+        for language, fields in (
+            ("ru", {
+                "scene": "Маятник постепенно замедляется.",
+                "actor_action": "Маятник продолжает качаться.",
+                "camera": "Крупный план сбоку.",
+            }),
+            ("es", {
+                "scene": "Un péndulo se ralentiza poco a poco.",
+                "actor_action": "El péndulo sigue moviéndose.",
+                "camera": "Primer plano lateral.",
+            }),
+        ):
+            with self.subTest(scene=fields["scene"]):
+                prompt = saasshorts._build_storyboard_generation_prompt({
+                    "visual_type": "broll",
+                    "actor_in_frame": False,
+                    "_script_language": language,
+                    **fields,
+                })
+                self.assertTrue(prompt.isascii())
+                self.assertNotIn(fields["scene"].lower(), prompt.lower())
+                self.assertIn("single relevant object or process", prompt.lower())
+
+    def test_neutral_broll_sanitizes_all_structured_prompt_fields(self):
+        prompt = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "scene": "same person from the source photo walks through a room",
+            "actor_action": "the presenter points toward the table",
+            "camera": "close-up on the actor's face",
+        })
+
+        lowered = prompt.lower()
+        self.assertNotIn("same person", lowered)
+        self.assertNotIn("source photo", lowered)
+        self.assertNotIn("presenter", lowered)
+        self.assertNotIn("actor", lowered)
+        self.assertIn("realistic social video scene", lowered)
+        self.assertIn("steady handheld smartphone video", lowered)
+
+    def test_neutral_broll_sanitizes_supported_language_actor_terms(self):
+        for fields in (
+            {
+                "scene": "Ведущая стоит у окна.",
+                "actor_action": "Актриса показывает рукой на стол.",
+                "camera": "Крупный план лица персонажа.",
+            },
+            {
+                "scene": "La presentadora está junto a la ventana.",
+                "actor_action": "La actriz señala la mesa.",
+                "camera": "Primer plano del personaje.",
+            },
+        ):
+            with self.subTest(scene=fields["scene"]):
+                prompt = saasshorts._build_storyboard_generation_prompt({
+                    "visual_type": "broll",
+                    "actor_in_frame": False,
+                    **fields,
+                })
+                lowered = prompt.lower()
+                self.assertNotIn(fields["scene"].lower(), lowered)
+                self.assertNotIn(fields["actor_action"].lower(), lowered)
+                self.assertNotIn(fields["camera"].lower(), lowered)
+                self.assertIn("realistic social video scene", lowered)
+                self.assertIn("steady handheld smartphone video", lowered)
+
+    def test_manual_neutral_broll_prompt_remains_user_owned(self):
+        prompt = (
+            "vertical 9:16, same actor from the reference image, "
+            "user intentionally pinned this composition"
+        )
+        result = saasshorts._build_storyboard_generation_prompt({
+            "visual_type": "broll",
+            "actor_in_frame": False,
+            "generation_prompt": prompt,
+            "prompt_manual": True,
+        })
+
+        self.assertEqual(result, prompt)
+
     def test_scene_edit_rebuilds_generation_prompt(self):
         # «Что в кадре» drives the picture: editing scene rebuilds the English
         # prompt, but a hand-pinned prompt is left alone.
@@ -1919,6 +2216,9 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
         request = generate.call_args.kwargs["contents"][0]
         self.assertNotIn("Actor: woman", request)
         self.assertIn("reference image is the only source", request)
+        self.assertNotIn("Rules: vertical 9:16, same actor/character across shots", request)
+        self.assertIn("For talking shots, identify the same actor from the reference image", request)
+        self.assertIn("For B-roll with actor_in_frame=false, do not mention the actor or reference image", request)
         self.assertIn("bright kitchen", shots[0]["generation_prompt"])
         self.assertEqual(shots[0]["_prompt_source_scene"], "новая сцена")
         self.assertEqual(shots[1]["generation_prompt"], "keep me")

@@ -128,6 +128,7 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(payload["image_url"], "https://fal/up.png")
             self.assertIn("kitchen close-up", payload["prompt"])
             self.assertIn("same person", payload["prompt"].lower())
+            self.assertIn("hairstyle", payload["prompt"].lower())
             self.assertIn("lips gently closed", payload["prompt"].lower())
             self.assertIn("neutral resting mouth", payload["prompt"].lower())
             self.assertTrue(os.path.exists(f"{out}.prompt.txt"))
@@ -1546,6 +1547,11 @@ class SlicedAvatarTests(unittest.TestCase):
                     {"shot_number": 2, "role": "solution", "start": 4, "end": 8,
                      "speech": "Пять шесть семь восемь.",
                      "scene": "hands chopping vegetables on a wooden board",
+                     "generation_prompt": (
+                         "vertical 9:16 realistic phone video, hands chopping "
+                         "vegetables on a wooden board, natural light"
+                     ),
+                     "_generation_prompt_language": "en",
                      "overlay_text": "", "transition": "cut",
                      "visual_type": "broll"},
                     {"shot_number": 3, "role": "cta", "start": 8, "end": 12,

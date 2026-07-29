@@ -4,7 +4,7 @@
 
 **Goal:** Make new AI storyboards use a denser, varied prompt-only rhythm without automatic semantic repair requests or actor-appearance drift.
 
-**Architecture:** Keep the change in `generate_scripts` and the existing duration-preset table. Gemini receives one complete creative contract that defines beat density, soft B-roll composition, first/last talking shots, and non-adjacent B-roll. Existing image-conditioned frame generation remains the sole appearance authority and receives one explicit hair-color continuity phrase.
+**Architecture:** Keep the creative pacing change in `generate_scripts` and the existing duration-preset table. Gemini receives one complete contract that defines beat density, soft B-roll composition, first/last talking shots, and non-adjacent B-roll. Existing image-conditioned frame generation remains the sole appearance authority. Clean English prompts remain usable; actor bindings are removed from contaminated neutral B-roll prompts without substituting localized UI text. Script language and model-prompt language are carried as explicit provenance so the pipeline does not guess language from prompt vocabulary.
 
 **Tech Stack:** Python 3, `unittest`, mocked Google GenAI and fal.ai adapters.
 
@@ -70,38 +70,56 @@ script["storyboard_pacing"] = "dynamic"
 
 Run the command from Step 3 and expect all selected tests to pass.
 
-### Task 2: Presenter Hair Continuity
+### Task 2: Neutral B-Roll Identity Boundary
 
 **Files:**
-- Modify: `tests/test_saasshorts_lipsync.py`
+- Modify: `tests/test_saasshorts_storyboard.py`
 - Modify: `saasshorts.py`
 
 **Interfaces:**
-- Consumes: `_avatar_reference_image()`
-- Produces: a reference-conditioned still prompt that explicitly preserves hair color as well as hairstyle
+- Consumes: `_build_storyboard_generation_prompt()`
+- Produces: actor-conditioned prompts only for talking and presenter B-roll shots
 
-- [ ] **Step 1: Add a failing prompt assertion**
+- [ ] **Step 1: Add failing tests for model-supplied and fallback prompts**
 
-In `test_avatar_reference_image_conditions_on_photo_and_scene`, assert that
-the captured prompt contains `hair color`.
+Assert that a neutral B-roll shot with `actor_in_frame=false` removes actor
+bindings from a contaminated English model prompt without substituting
+localized UI fields. Actor references must also be removed from all three
+structured fields when no model prompt exists, while a clean English prompt
+remains usable. Talking and presenter B-roll must still identify the selected
+actor, while a hand-pinned user prompt remains unchanged.
 
-- [ ] **Step 2: Run the test and verify RED**
+- [ ] **Step 2: Run the tests and verify RED**
 
 Run:
 
 ```powershell
-python -m unittest tests.test_saasshorts_lipsync.SaaSLipsyncTests.test_avatar_reference_image_conditions_on_photo_and_scene
+python -m unittest discover -s tests -p "test_saasshorts_storyboard.py"
 ```
 
-Expected: failure because the current prompt preserves hairstyle but does not
-name hair color explicitly.
+Expected: a contaminated neutral model prompt is still reused unchanged, and
+actor references inside structured fields are still passed through.
 
-- [ ] **Step 3: Add the minimal continuity phrase**
+- [ ] **Step 3: Enforce the structured identity boundary**
 
-Update `_avatar_reference_image()` so the appearance list includes
-`hairstyle, hair color`.
+For non-manual neutral B-roll, detect actor/reference bindings with
+word-boundary patterns for supported UI languages. Remove identity bindings
+from a contaminated English model prompt and fall back to a neutral English
+prompt if it cannot be sanitized safely. Sanitize scene, action, and camera
+when no model prompt exists, then apply the same English-language guard to the
+assembled result. Use explicit script and prompt language provenance: for a
+non-English script, only a model prompt tagged as English may bypass the
+fallback. Preserve clean provenanced English prompts and manual user prompts.
+Remove the global `same actor/character across shots` rule from prompt rebuild
+and fill paths.
 
-- [ ] **Step 4: Run the test and verify GREEN**
+- [ ] **Step 4: Preserve paid frame caches**
+
+Keep `_avatar_reference_image()`'s existing appearance wording unchanged. It
+already preserves the exact hairstyle, and changing the full prompt would
+invalidate legacy `.prompt.txt` cache keys.
+
+- [ ] **Step 5: Run the tests and verify GREEN**
 
 Run the command from Step 2 and expect it to pass without a network request.
 
@@ -129,7 +147,7 @@ python -m unittest discover -s tests
 - [ ] **Step 3: Inspect the diff and confirm scope**
 
 Verify that only the approved documentation, prompt contract, provenance,
-automatic-refinement removal, continuity phrase, and tests changed.
+automatic-refinement removal, identity boundary, and tests changed.
 
 - [ ] **Step 4: Commit the implementation**
 

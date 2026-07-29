@@ -932,6 +932,12 @@ Return ONLY a JSON array:
         # presenter is in it — a replaced visual must not keep the old answer.
         if decision.get("actor_in_frame") is not None:
             shot["actor_in_frame"] = _shot_wants_actor(decision)
+        shot["_script_language"] = (
+            shot.get("_script_language")
+            or scripts[script_index].get("language")
+            or language
+        )
+        shot["_generation_prompt_language"] = "en"
         shot["generation_prompt"] = _build_storyboard_generation_prompt({
             **shot,
             "generation_prompt": generation_prompt,
@@ -1096,19 +1102,19 @@ TARGET_VIDEO_DURATION_DEFAULT = 20
 TARGET_VIDEO_DURATION_PRESETS = {
     15: {
         "minimum": 13, "maximum": 17, "words": "26-30",
-        "visual_beats": "4-5",
+        "visual_beats": "6-8",
     },
     20: {
         "minimum": 18, "maximum": 22, "words": "37-41",
-        "visual_beats": "5-7",
+        "visual_beats": "8-10",
     },
     30: {
         "minimum": 28, "maximum": 32, "words": "59-63",
-        "visual_beats": "8-10",
+        "visual_beats": "11-15",
     },
     45: {
         "minimum": 43, "maximum": 47, "words": "92-96",
-        "visual_beats": "11-15",
+        "visual_beats": "16-22",
     },
 }
 
@@ -1279,6 +1285,7 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
     "title": "Short internal title",
     "hook_type": "result_first",
     "format": "storyboard_v3",
+    "storyboard_pacing": "dynamic",
     "style": "{style}",
     "duration_seconds": {target_duration_seconds},
     "target_duration_seconds": {target_duration_seconds},
@@ -1292,7 +1299,7 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
         "role": "hook",
         "scene": "Where the shot happens and what we see, written in {lang_name}",
         "camera": "shot type and camera movement, written in {lang_name}",
-        "actor_action": "what the actor does, written in {lang_name}",
+        "actor_action": "what the visible subject does; for talking shots, what the actor does, written in {lang_name}",
         "transition": "cut",
         "speech": "Exact line the actor says",
         "emotion": "excited",
@@ -1311,12 +1318,22 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
 
 RULES:
 {duration_instructions}
-- One shot = one short beat of about 3 seconds (5 at the absolute limit). Generate as many shots as the script needs so NO shot runs long. Use the visual-beat count selected above for this duration; never compress a long script into few long shots.
+STORYBOARD PACING PROFILE:
+- Set storyboard_pacing to "dynamic".
+- One shot = one short visual beat of about 1.5-3 seconds (5 at the absolute limit). Hooks, whispers, reactions, and transitions may be shorter. Use the visual-beat count selected above for this duration; never compress a long script into a few long shots.
+- The first shot and the last shot MUST be talking. The first shot delivers the hook; the last shot delivers the CTA or closing payoff.
+- Never place two B-roll shots next to each other. Return to a talking shot between B-roll inserts.
+- Treat B-roll shares as soft creative guidance, never as quotas: aim for approximately 35-45% of the spoken timeline; 25-50% is an acceptable soft range when the exact subject needs less or more visual demonstration.
+- Approximately 10-20% may show the same actor from the reference image performing a directly relevant action. Approximately 15-30% may show a product, object, process, space, result, or immediately understandable visual analogy without the actor.
+- Vary B-roll subject types across the script. Do not repeatedly show the actor from behind, the actor's hands, food preparation, or the same prop. Presenter B-roll must earn its place by making the exact spoken claim easier to understand.
+- A visual change does not have to be B-roll. A medium talking shot followed by a closer whisper or hush shot is a strong pattern interrupt and MUST preserve the same actor, hairstyle, outfit, and setting.
 - Every shot must be visually distinct from its neighbours (new scene, angle or subject) — the point of many short shots is variety, not the same framing repeated.
-- Use visual variety: close-up, kitchen/lifestyle, exercise/home, product close-up, final CTA.
-- Do NOT rely only on talking head. Use the actor as a consistent character across shots.
-- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference. The first shot (hook) and the last shot (cta) MUST be "talking". Make 1-2 middle shots "broll" for visual dynamics.
+- Build visual variety from framing, camera distance, meaningful action, environment, objects, processes, and B-roll that supports the narration. Never force kitchen, exercise, food, or product imagery when the exact speech is about something else.
+- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference.
 - actor_in_frame per shot: true ONLY when a "broll" shot shows the SAME person who speaks in the talking shots (seen from behind, over the shoulder, her hands, her silhouette), false when the insert shows objects, food, an interior or anybody else. It is the difference between our presenter walking into her own kitchen and a random stranger appearing mid-reel — say it explicitly, we cannot guess it from the scene text. Always false for "talking" shots.
+- Every talking generation_prompt MUST identify the same actor from the reference image and describe only pose, action, scene, lighting, and camera.
+- For a B-roll shot with actor_in_frame=true, generation_prompt MUST identify the same actor from the reference image and describe only pose, action, scene, lighting, and camera.
+- For a B-roll shot with actor_in_frame=false, generation_prompt MUST NOT mention the actor or reference image. Describe only the product, object, process, space, result, or visual analogy required by that exact speech.
 - Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
 - Each shot MUST include emotion — one of: excited, warm, confident, calm, urgent, playful. Vary it across shots to follow the narrative arc.
 - role must be one of: hook, problem, explanation, solution, proof, cta.
@@ -1324,12 +1341,12 @@ RULES:
 - speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
 {_ACTOR_DIRECTION_ONLY_RULES}
 - Apply the identity rule to EVERY output field, including scene, actor_action, and generation_prompt. Do not return an actor_description field.
-- generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor from the reference image, natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
+- generation_prompt MUST be in English and MUST say vertical 9:16, realistic phone video, and natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Mention the same actor from the reference image only for talking shots and B-roll with actor_in_frame=true. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
 - Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
-- Each shot's speech is ONE short sentence of about 8-10 words (~3-4 seconds spoken), 11 words HARD max — a shot must NEVER carry more than 5 seconds of speech (spoken Russian runs ~2.3 words/sec, so 12+ words already overflows 5s). If the script has more to say, add another shot; never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
+- Each shot's speech is ONE compact spoken phrase, normally 4-8 words and 10 words HARD max. Split narration at natural phrase boundaries so most beats last about 1.5-3 seconds. If the script has more to say, add another shot; never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
 - Match the selected total duration and word budget while keeping every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
@@ -1355,7 +1372,12 @@ RULES:
 
         for script in scripts:
             script["format"] = "storyboard_v3"
+            script["storyboard_pacing"] = "dynamic"
+            script["language"] = language
             script["target_duration_seconds"] = target_duration_seconds
+            for shot in script.get("shots") or []:
+                if (shot.get("generation_prompt") or "").strip():
+                    shot["_generation_prompt_language"] = "en"
             script["shots"] = normalize_storyboard_shots(script)
             # The AI writes scene and generation_prompt together, so the prompt
             # matches this scene: stamp it as the baseline. Later, if the user
@@ -1363,12 +1385,6 @@ RULES:
             for shot in script["shots"]:
                 shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
             _finalize_generated_script(script)
-        refine_storyboard_broll_alignment(
-            scripts,
-            gemini_key,
-            text_model=text_model,
-            language=language,
-        )
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 
@@ -1818,11 +1834,12 @@ def build_custom_storyboard_script(
             })
             cursor += shot_duration
 
-    shots = normalize_storyboard_shots({"shots": shots})
+    shots = normalize_storyboard_shots({"shots": shots, "language": language})
     full_narration = " ".join(shot.get("speech", "") for shot in shots if shot.get("speech")).strip()
     return {
         "title": title,
         "format": "storyboard_v3",
+        "language": language,
         "style": style,
         "duration_seconds": int(max((shot.get("end", 0) for shot in shots), default=0)),
         "target_platform": "instagram",
@@ -2770,30 +2787,179 @@ def _shot_duration(shot: dict) -> int:
     return max(3, min(15, int(round(duration or 5))))
 
 
+_ACTOR_REFERENCE_PROMPT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\b(?:actor|actors|presenter|presenters|avatar|avatars)\b",
+    r"\b(?:the|this|same|selected|our)\s+(?:character|person|woman|man|girl|guy)\b",
+    r"\b(?:character|person|woman|man|girl|guy)\s+from\s+"
+    r"(?:the\s+)?(?:reference|source)\b",
+    r"\b(?:reference|source)\s+(?:image|photo|portrait)\b",
+    r"\b(?:акт[её]р\w*|актрис\w*|ведущ\w*|аватар\w*|персонаж\w*|"
+    r"героин\w*|геро(?:й|я|ю|ем|е|и))\b",
+    r"\b(?:тот\s+же|та\s+же|тот\s+самый|та\s+самая|выбранн\w*|наш\w*)\s+"
+    r"(?:человек\w*|женщин\w*|мужчин\w*|девушк\w*)\b",
+    r"\b(?:референс\w*|исходн\w*)\s+(?:изображен\w*|фото|портрет\w*)\b",
+    r"\b(?:actriz|actrices|presentador\w*|personaje\w*)\b",
+    r"\b(?:mism\w*|seleccionad\w*|nuestr\w*)\s+"
+    r"(?:persona\w*|mujer\w*|hombre\w*|chic[oa]s?)\b",
+    r"\b(?:imagen|foto|retrato)\s+(?:de\s+)?(?:referencia|origen)\b",
+))
+
+_NEUTRAL_BROLL_ENGLISH_IDENTITY_REPLACEMENTS = tuple(
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in (
+        (
+            r"\b(?:the|this|same|selected|our)\s+"
+            r"(?:actor|presenter|avatar|character)"
+            r"(?:\s+from\s+(?:the\s+)?(?:reference|source)"
+            r"(?:\s+(?:image|photo|portrait))?)?\b",
+            "a faceless person",
+        ),
+        (
+            r"\b(?:actor|presenter|avatar|character)\s+from\s+"
+            r"(?:the\s+)?(?:reference|source)"
+            r"(?:\s+(?:image|photo|portrait))?\b",
+            "a faceless person",
+        ),
+        (
+            r"\b(?:same|selected|our|reference|source)\s+"
+            r"(?:person|woman|man|girl|guy)"
+            r"(?:\s+from\s+(?:the\s+)?(?:reference|source)"
+            r"(?:\s+(?:image|photo|portrait))?)?\b",
+            "a faceless person",
+        ),
+        (
+            r"\b(?:person|woman|man|girl|guy)\s+from\s+"
+            r"(?:the\s+)?(?:reference|source)"
+            r"(?:\s+(?:image|photo|portrait))?\b",
+            "a faceless person",
+        ),
+        (
+            r"\b(?:actor|presenter|avatar)\b",
+            "a faceless person",
+        ),
+        (
+            r"\b(?:reference|source)\s+(?:image|photo|portrait)\b",
+            "",
+        ),
+    )
+)
+
+_NEUTRAL_BROLL_ENGLISH_FALLBACK = (
+    "vertical 9:16 realistic phone video, a single relevant object or process "
+    "in natural motion, steady handheld smartphone camera, natural light, "
+    "authentic smartphone footage"
+)
+
+
+def _mentions_selected_actor_reference(value: str) -> bool:
+    """Whether prompt text explicitly binds a subject to the saved presenter."""
+    return any(pattern.search(value or "") for pattern in _ACTOR_REFERENCE_PROMPT_PATTERNS)
+
+
+def _ensure_neutral_broll_english_prompt(
+    value: str,
+    script_language: str = "",
+    prompt_language: str = "",
+) -> str:
+    """Keep automatic neutral prompts English; localized UI text must not reach video."""
+    prompt = (value or "").strip(" ,;")
+    words = re.findall(r"[A-Za-z]+", prompt)
+    source_language = (script_language or "").strip().lower().split("-", 1)[0]
+    declared_prompt_language = (prompt_language or "").strip().lower().split("-", 1)[0]
+    if (
+        not prompt.isascii()
+        or len(words) < 4
+        or (
+            source_language
+            and source_language != "en"
+            and declared_prompt_language != "en"
+        )
+    ):
+        return _NEUTRAL_BROLL_ENGLISH_FALLBACK
+    if "9:16" not in prompt:
+        prompt = f"{prompt}, vertical 9:16"
+    return prompt
+
+
+def _sanitize_neutral_broll_english_prompt(
+    value: str,
+    script_language: str = "",
+    prompt_language: str = "",
+) -> str:
+    """Remove selected-presenter bindings without translating localized UI fields."""
+    sanitized = value or ""
+    for pattern, replacement in _NEUTRAL_BROLL_ENGLISH_IDENTITY_REPLACEMENTS:
+        sanitized = pattern.sub(replacement, sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    sanitized = re.sub(r"\s+([,;])", r"\1", sanitized)
+    sanitized = re.sub(r"([,;])(?:\s*\1)+", r"\1", sanitized).strip(" ,;")
+    if _mentions_selected_actor_reference(sanitized):
+        return _NEUTRAL_BROLL_ENGLISH_FALLBACK
+    return _ensure_neutral_broll_english_prompt(
+        sanitized,
+        script_language=script_language,
+        prompt_language=prompt_language,
+    )
+
+
 def _build_storyboard_generation_prompt(shot: dict) -> str:
     existing = (shot.get("generation_prompt") or "").strip()
+    neutral_broll = _is_broll_shot(shot) and not _shot_wants_actor(shot)
+    script_language = shot.get("_script_language") or ""
+    prompt_language = shot.get("_generation_prompt_language") or ""
     if existing:
         # Уважать промпт пользователя (он редактируется в UI): гардрейлы формата
         # дописываем, а не заменяем ими весь текст. Идемпотентно — повторный
         # normalize не меняет строку, иначе кэш клипов считал бы её «новым промптом».
-        additions = []
-        if "9:16" not in existing:
-            additions.append("vertical 9:16")
-        return ", ".join([existing] + additions)
+        if shot.get("prompt_manual") or not neutral_broll:
+            additions = []
+            if "9:16" not in existing:
+                additions.append("vertical 9:16")
+            return ", ".join([existing] + additions)
+        if not _mentions_selected_actor_reference(existing):
+            return _ensure_neutral_broll_english_prompt(
+                existing,
+                script_language=script_language,
+                prompt_language=prompt_language,
+            )
+        return _sanitize_neutral_broll_english_prompt(
+            existing,
+            script_language=script_language,
+            prompt_language=prompt_language,
+        )
 
     scene = (shot.get("scene") or shot.get("visual") or "realistic social video scene").strip()
     actor_action = (shot.get("actor_action") or shot.get("action") or "natural movement").strip()
     camera = (shot.get("camera") or "vertical 9:16 steady handheld smartphone video").strip()
+    if neutral_broll:
+        if _mentions_selected_actor_reference(scene):
+            scene = "realistic social video scene"
+        if _mentions_selected_actor_reference(actor_action):
+            actor_action = ""
+        if _mentions_selected_actor_reference(camera):
+            camera = "vertical 9:16 steady handheld smartphone video"
+    identity = (
+        "same actor from the reference image"
+        if not neutral_broll
+        else ""
+    )
     bits = [
         "vertical 9:16 realistic phone video",
-        "same actor/character across shots",
+        identity,
         scene,
         actor_action,
         camera,
         "natural light",
         "authentic smartphone footage",
     ]
-    return ", ".join(bit for bit in bits if bit)
+    prompt = ", ".join(bit for bit in bits if bit)
+    if neutral_broll:
+        return _ensure_neutral_broll_english_prompt(
+            prompt,
+            script_language=script_language,
+            prompt_language=prompt_language,
+        )
+    return prompt
 
 
 def _needs_prompt_rebuild(shot: dict) -> bool:
@@ -2862,8 +3028,12 @@ def _rebuild_prompts_from_scene(
             "Apply the identity rule even when an input scene contains appearance details: "
             "omit those details from the output prompt.\n"
             "For each shot, write ONE English prompt that fully describes the scene, action "
-            "and camera on its own. Rules: vertical 9:16, same actor/character across shots, "
-            "natural light, authentic smartphone footage. Describe only what IS in frame — "
+            "and camera on its own. Rules: vertical 9:16, natural light, authentic smartphone "
+            "footage. For talking shots, identify the same actor from the reference image. "
+            "For B-roll with actor_in_frame=true, identify the same actor from the reference "
+            "image while keeping the face away from camera. For B-roll with "
+            "actor_in_frame=false, do not mention the actor or reference image. Describe only "
+            "what IS in frame — "
             "never write 'no text', 'no watermark' or any other ban, those go to the model in "
             "a separate field and in the description they only make it draw them. "
             "For visual_type 'broll', use the exact speech as the visual source of "
@@ -2871,10 +3041,7 @@ def _rebuild_prompts_from_scene(
             "generic wellness filler (avocado, salad, measuring tape, yoga mat, supplements, "
             "scales or food prep) unless the speech explicitly concerns it. A faceless human "
             "action is allowed when conceptually necessary (back view, cropped body/hands, "
-            "silhouette, non-identifiable profile); never request an identifiable face. When "
-            "actor_in_frame is true the person in that insert IS the presenter herself — write "
-            "'the same woman from the reference' (or man) and keep her face away from camera; "
-            "when it is false do not put any recognisable person in the shot. Never "
+            "silhouette, non-identifiable profile); never request an identifiable face. Never "
             "request readable on-screen text, numbers, charts or screens.\n"
             f"Shots JSON: {json.dumps(payload, ensure_ascii=False)}\n"
             'Return ONLY a JSON array: [{"n": <n>, "prompt": "<english prompt>"}].'
@@ -2895,6 +3062,7 @@ def _rebuild_prompts_from_scene(
         for i, s in enumerate(stale):
             new_prompt = by_n.get(i)
             if new_prompt:
+                s["_generation_prompt_language"] = "en"
                 s["generation_prompt"] = _build_storyboard_generation_prompt(
                     {**s, "generation_prompt": new_prompt}
                 )
@@ -2990,8 +3158,10 @@ RULES:
 - No readable text anywhere: no labels, signs, numbers, stickers, no phone/laptop
   screens facing camera — video models render text as garbage glyphs.
 - generation_prompt MUST be English and fully describe scene, action and camera on
-  its own: vertical 9:16, realistic phone video, same actor from the reference image,
-  natural light. Describe only
+  its own: vertical 9:16, realistic phone video, natural light. For talking shots
+  and B-roll with actor_in_frame=true, identify the same actor from the reference image.
+  For B-roll with actor_in_frame=false, do not mention the actor or reference image.
+  Describe only
   what IS in frame — never write "no text", "no watermark" or any other ban, those
   reach the model in a separate field and inside the description they only make it
   draw them. For "broll" pick subjects with no identifiable face and nothing written
@@ -3042,9 +3212,21 @@ Return ONLY a JSON array:
         # The prompt is what the video model actually renders — always (re)build it
         # through the shared builder so the guardrails stay attached.
         if not merged.get("prompt_manual"):
+            generated_prompt = (item.get("generation_prompt") or "").strip()
+            merged["_script_language"] = (
+                merged.get("_script_language")
+                or script.get("language")
+                or language
+            )
+            if generated_prompt:
+                merged["_generation_prompt_language"] = "en"
             merged["generation_prompt"] = _build_storyboard_generation_prompt(
-                {**merged, "generation_prompt": (item.get("generation_prompt") or "").strip()
-                 or merged.get("generation_prompt") or ""}
+                {
+                    **merged,
+                    "generation_prompt": generated_prompt
+                    or merged.get("generation_prompt")
+                    or "",
+                }
             )
             merged["_prompt_source_scene"] = (merged.get("scene") or "").strip()
         out.append(merged)
@@ -3054,6 +3236,7 @@ Return ONLY a JSON array:
 def normalize_storyboard_shots(script: dict) -> list:
     """Normalize shot dictionaries for Kling V3 generation and UI edits."""
     raw_shots = script.get("shots") or []
+    script_language = (script.get("language") or "").strip().lower()
     if not raw_shots and script.get("segments"):
         raw_shots = []
         for index, segment in enumerate(script.get("segments") or [], start=1):
@@ -3113,6 +3296,9 @@ def normalize_storyboard_shots(script: dict) -> list:
             "transition": transition,
             "visual_type": (shot.get("visual_type") or ("talking" if speech else "broll")).strip().lower(),
         }
+        shot_language = (shot.get("_script_language") or script_language).strip().lower()
+        if shot_language:
+            normalized["_script_language"] = shot_language
         # Only coerce when the storyboard actually stated it: an absent flag must
         # stay absent so `fill_storyboard_shot_details` can still decide, while a
         # user's explicit "no" is never re-decided for them.
@@ -8378,7 +8564,7 @@ def generate_storyboard_video(
     )
 
     title_slug = storyboard_title_slug(script.get("title", "storyboard"))
-    shots = normalize_storyboard_shots(script)
+    shots = normalize_storyboard_shots({**script, "language": language})
     if not shots:
         raise ValueError("Storyboard script has no shots")
 
