@@ -1075,6 +1075,70 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
     return scripts
 
 
+TARGET_VIDEO_DURATION_DEFAULT = 20
+TARGET_VIDEO_DURATION_PRESETS = {
+    15: {
+        "minimum": 13, "maximum": 17, "words": "26-30",
+        "visual_beats": "4-5",
+    },
+    20: {
+        "minimum": 18, "maximum": 22, "words": "37-41",
+        "visual_beats": "5-7",
+    },
+    30: {
+        "minimum": 28, "maximum": 32, "words": "59-63",
+        "visual_beats": "8-10",
+    },
+    45: {
+        "minimum": 43, "maximum": 47, "words": "92-96",
+        "visual_beats": "11-15",
+    },
+}
+
+
+def normalize_target_duration(
+    value,
+    default: int = TARGET_VIDEO_DURATION_DEFAULT,
+) -> int:
+    """Return a supported approximate script-duration target."""
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = default
+    return normalized if normalized in TARGET_VIDEO_DURATION_PRESETS else default
+
+
+def _target_duration_prompt(
+    target: int,
+    storyboard: bool,
+) -> str:
+    """Prompt-only duration guidance shared by UGC and storyboard scripts."""
+    target = normalize_target_duration(target)
+    preset = TARGET_VIDEO_DURATION_PRESETS[target]
+    format_line = (
+        f"- Use {preset['visual_beats']} visual beats across the reel. One visual beat is one "
+        "complete shot."
+        if storyboard
+        else "- Use exactly five segments. Their combined narration, not each segment, must fit "
+        "the word budget."
+    )
+    return f"""
+TARGET VIDEO DURATION:
+- Every script in this batch should be approximately {target} seconds.
+- Keep the finished narration within {preset['minimum']}-{preset['maximum']} seconds.
+- Aim for {preset['words']} spoken words total, excluding audio-direction tags. Audio tags and
+  marked pauses consume part of the available time, so do not fill that space with extra words.
+{format_line}
+- Apply this same duration target independently to every script in the batch.
+"""
+
+
+def _target_duration_timeline(target: int) -> list:
+    """Five illustrative UGC segment boundaries ending at the selected target."""
+    target = normalize_target_duration(target)
+    return [round(target * index / 5) for index in range(6)]
+
+
 def generate_scripts(
     analysis: dict,
     gemini_key: str,
@@ -1085,12 +1149,14 @@ def generate_scripts(
     topic: str = None,
     script_format: str = "ugc",
     text_model: Optional[str] = None,
+    target_duration_seconds: int = TARGET_VIDEO_DURATION_DEFAULT,
 ) -> list:
     """Generate video scripts based on product/business analysis."""
     from google import genai
     from google.genai import types
 
     lang_name = {"es": "Spanish", "ru": "Russian"}.get(language, "English")
+    target_duration_seconds = normalize_target_duration(target_duration_seconds)
     print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang_name})...")
 
     client = genai.Client(api_key=gemini_key)
@@ -1176,6 +1242,10 @@ HOOK REQUIREMENTS:
 """
 
     if script_format == "storyboard_v3":
+        duration_instructions = _target_duration_prompt(
+            target_duration_seconds,
+            storyboard=True,
+        )
         prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
 Generate {num_scripts} storyboard-based video scripts for this product/business.
 {lang_instructions}
@@ -1193,7 +1263,8 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
     "hook_type": "result_first",
     "format": "storyboard_v3",
     "style": "{style}",
-    "duration_seconds": 18,
+    "duration_seconds": {target_duration_seconds},
+    "target_duration_seconds": {target_duration_seconds},
     "target_platform": "instagram",
     "hook_text": "2-6 word overlay hook",
     "shots": [
@@ -1223,7 +1294,8 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
 ]
 
 RULES:
-- One shot = one short beat of about 3 seconds (5 at the absolute limit). Generate as many shots as the script needs so NO shot runs long: a ~30-second video needs about 8-10 shots, a ~20-second one about 6-7. Never compress a long script into few long shots.
+{duration_instructions}
+- One shot = one short beat of about 3 seconds (5 at the absolute limit). Generate as many shots as the script needs so NO shot runs long. Use the visual-beat count selected above for this duration; never compress a long script into few long shots.
 - Every shot must be visually distinct from its neighbours (new scene, angle or subject) — the point of many short shots is variety, not the same framing repeated.
 - Use visual variety: close-up, kitchen/lifestyle, exercise/home, product close-up, final CTA.
 - Do NOT rely only on talking head. Use the actor as a consistent character across shots.
@@ -1239,8 +1311,8 @@ RULES:
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
-- Each shot's speech is ONE short sentence of about 8-10 words (~3-4 seconds spoken), 11 words HARD max — a shot must NEVER carry more than 5 seconds of speech (spoken Russian runs ~2.3 words/sec, so 12+ words already overflows 5s). If the script has more to say, add another shot (more, shorter shots are fine); never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
-- A reel is ~20-25 seconds, so aim for roughly 5-7 shots and keep every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
+- Each shot's speech is ONE short sentence of about 8-10 words (~3-4 seconds spoken), 11 words HARD max — a shot must NEVER carry more than 5 seconds of speech (spoken Russian runs ~2.3 words/sec, so 12+ words already overflows 5s). If the script has more to say, add another shot; never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
+- Match the selected total duration and word budget while keeping every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender: {actor_gender}. actor_description must describe a {actor_gender} person in English.
@@ -1265,6 +1337,7 @@ RULES:
 
         for script in scripts:
             script["format"] = "storyboard_v3"
+            script["target_duration_seconds"] = target_duration_seconds
             script["shots"] = normalize_storyboard_shots(script)
             # The AI writes scene and generation_prompt together, so the prompt
             # matches this scene: stamp it as the baseline. Later, if the user
@@ -1281,6 +1354,11 @@ RULES:
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 
+    duration_instructions = _target_duration_prompt(
+        target_duration_seconds,
+        storyboard=False,
+    )
+    ugc_bounds = _target_duration_timeline(target_duration_seconds)
     prompt = f"""You are a viral short-form video scriptwriter for TikTok/Instagram Reels.
 Generate {num_scripts} video scripts to promote this product/business.
 {lang_instructions}
@@ -1291,20 +1369,20 @@ PRODUCT ANALYSIS:
 
 STYLE: {style_guide.get(style, style_guide['ugc'])}
 
-Each script MUST be 18-22 seconds total. NEVER longer than 22 seconds.
+{duration_instructions}
 
 YOU MUST USE EXACTLY THIS 5-SEGMENT STRUCTURE. NO EXCEPTIONS:
-1. HOOK (0-4s): type="hook", visual="actor_talking", broll_prompt=null — Avatar says a punchy hook.
-2. B-ROLL 1 (4-8s): type="problem", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the problem.
-3. BODY (8-14s): type="solution", visual="actor_talking", broll_prompt=null — Avatar presents the solution.
-4. B-ROLL 2 (14-18s): type="demo", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the product.
-5. CTA (18-22s): type="cta", visual="actor_talking", broll_prompt=null — Avatar says CTA with link in bio.
+1. HOOK ({ugc_bounds[0]}-{ugc_bounds[1]}s): type="hook", visual="actor_talking", broll_prompt=null — Avatar says a punchy hook.
+2. B-ROLL 1 ({ugc_bounds[1]}-{ugc_bounds[2]}s): type="problem", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the problem.
+3. BODY ({ugc_bounds[2]}-{ugc_bounds[3]}s): type="solution", visual="actor_talking", broll_prompt=null — Avatar presents the solution.
+4. B-ROLL 2 ({ugc_bounds[3]}-{ugc_bounds[4]}s): type="demo", visual="broll", broll_prompt="..." (REQUIRED) — Visual of the product.
+5. CTA ({ugc_bounds[4]}-{ugc_bounds[5]}s): type="cta", visual="actor_talking", broll_prompt=null — Avatar says CTA with link in bio.
 
 CRITICAL — READ CAREFULLY:
 - EXACTLY 5 segments. Not 3, not 4, not 6. FIVE.
 - Segments 2 and 4 MUST have visual="broll" and a non-null broll_prompt string.
 - Segments 1, 3, 5 MUST have visual="actor_talking" and broll_prompt=null.
-- duration_seconds MUST be between 18 and 22.
+- duration_seconds should reflect the selected approximate {target_duration_seconds}-second target.
 - full_narration = all narration text joined together.
 
 Return a JSON array:
@@ -1313,14 +1391,15 @@ Return a JSON array:
         "title": "Short internal title",
         "hook_type": "result_first",
         "style": "{style}",
-        "duration_seconds": 21,
+        "duration_seconds": {target_duration_seconds},
+        "target_duration_seconds": {target_duration_seconds},
         "target_platform": "tiktok",
         "hook_text": "Hook overlay text (2-5 words max)",
         "segments": [
             {{
                 "type": "hook",
-                "start": 0,
-                "end": 4,
+                "start": {ugc_bounds[0]},
+                "end": {ugc_bounds[1]},
                 "narration": "Punchy hook the actor says",
                 "visual": "actor_talking",
                 "broll_prompt": null,
@@ -1329,8 +1408,8 @@ Return a JSON array:
             }},
             {{
                 "type": "problem",
-                "start": 4,
-                "end": 8,
+                "start": {ugc_bounds[1]},
+                "end": {ugc_bounds[2]},
                 "narration": "Voiceover describing the pain point",
                 "visual": "broll",
                 "broll_prompt": "REQUIRED: visual of the problem relevant to the product, e.g. realistic everyday close-up of objects/food/hands showing the pain point. No people, no faces. No readable screens or text.",
@@ -1340,8 +1419,8 @@ Return a JSON array:
             }},
             {{
                 "type": "solution",
-                "start": 8,
-                "end": 14,
+                "start": {ugc_bounds[2]},
+                "end": {ugc_bounds[3]},
                 "narration": "Actor introduces the product naturally",
                 "visual": "actor_talking",
                 "broll_prompt": null,
@@ -1350,8 +1429,8 @@ Return a JSON array:
             }},
             {{
                 "type": "demo",
-                "start": 14,
-                "end": 18,
+                "start": {ugc_bounds[3]},
+                "end": {ugc_bounds[4]},
                 "narration": "Voiceover showing the product in action",
                 "visual": "broll",
                 "broll_prompt": "REQUIRED: visual of the product/result, e.g. real-world result or product in use, close-up of objects/hands. No people, no faces. No readable screens, UI or text.",
@@ -1361,8 +1440,8 @@ Return a JSON array:
             }},
             {{
                 "type": "cta",
-                "start": 18,
-                "end": 21,
+                "start": {ugc_bounds[4]},
+                "end": {ugc_bounds[5]},
                 "narration": "Short CTA mentioning link in bio",
                 "visual": "actor_talking",
                 "broll_prompt": null,
@@ -1381,7 +1460,7 @@ RULES:
 - EXACTLY 5 segments in order: actor, broll, actor, broll, actor
 - EXACTLY 2 broll segments with detailed broll_prompt (NOT null)
 - full_narration = ALL segment narration joined in timeline order, including b-roll voiceover lines.
-- Total duration MUST be 18-22 seconds, never more
+- Follow the selected target duration and total spoken-word budget above.
 - Keep narrations punchy, conversational, with contractions
 - Actor descriptions: casual, real-person look (NOT model/influencer)
 - B-roll prompts: cinematic, specific, detailed visual descriptions
@@ -1415,6 +1494,7 @@ RULES:
     )
 
     for script in scripts:
+        script["target_duration_seconds"] = target_duration_seconds
         _finalize_generated_script(script)
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")

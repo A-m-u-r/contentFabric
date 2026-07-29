@@ -37,6 +37,13 @@ const SCRIPT_FORMAT_OPTIONS = [
   { id: 'storyboard_v3', label: 'Раскадровка (рекомендуем)', desc: 'ИИ распишет ролик по кадрам: сцены, реплики, движение камеры' },
 ];
 
+const TARGET_DURATION_OPTIONS = [
+  { value: 15, label: '≈15 сек', desc: 'Короткий охватный ролик' },
+  { value: 20, label: '≈20 сек', desc: 'Основной формат' },
+  { value: 30, label: '≈30 сек', desc: 'Больше пользы и аргументов' },
+  { value: 45, label: '≈45 сек', desc: 'История или экспертный разбор' },
+];
+
 const TEXT_MODEL_OPTIONS = [
   { id: 'fast', label: 'Gemini 3.5 Flash', desc: 'Максимальная бесплатная модель для генерации текста и сценариев' },
   { id: 'pro', label: 'Gemini 3.1 Pro', desc: 'Платный режим для оффера, раскадровки и сложной логики' },
@@ -418,11 +425,14 @@ function splitStoryboardSeconds(script, totalSeconds) {
   return { talking: totalSeconds * 0.7, broll: totalSeconds * 0.3, brollShots: 2, talkingShots: 3 };
 }
 
-function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null, storyboardGenerationMode = 'sliced_avatar' }) {
+function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSelectedActor, hasReusableHead = false, lipsyncModel = 'sync-3', script = null, storyboardGenerationMode = 'sliced_avatar', fallbackSeconds = TYPICAL_VIDEO_SECONDS }) {
   // Длительность: реальные кадры сценария > оценка по тексту озвучки > типичный ролик.
   // Описание бизнеса — не текст озвучки, по нему длительность не считаем.
   const hasNarration = Boolean((text || '').trim());
-  const seconds = hasNarration ? estimateSpeechSeconds(text) : TYPICAL_VIDEO_SECONDS;
+  const safeFallbackSeconds = Number.isFinite(Number(fallbackSeconds))
+    ? Math.max(5, Math.min(90, Number(fallbackSeconds)))
+    : TYPICAL_VIDEO_SECONDS;
+  const seconds = hasNarration ? estimateSpeechSeconds(text) : safeFallbackSeconds;
   const storyboardSeconds = Array.isArray(script?.shots) && script.shots.length > 0
     ? estimateStoryboardSeconds(script, text)
     : seconds;
@@ -669,6 +679,9 @@ export default function SaaShortsTab({
   ));
   const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || 'ai'); // "ai" or "custom"
   const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || 'ugc');
+  const [targetDurationSeconds, setTargetDurationSeconds] = useState(
+    () => initialCache?.targetDurationSeconds || 20,
+  );
   const [textModel, setTextModel] = useState(() => initialCache?.textModel || 'fast');
   const [customScript, setCustomScript] = useState(() => initialCache?.customScript || '');
   const [style, setStyle] = useState('ugc');
@@ -813,6 +826,7 @@ export default function SaaShortsTab({
     setSelectedBusinessProfileId(snapshot.businessProfileId || activeContentPlanContext?.profileId || '');
     setScriptMode(snapshot.scriptMode || 'ai');
     setScriptFormat(snapshot.scriptFormat || 'ugc');
+    setTargetDurationSeconds(snapshot.targetDurationSeconds || 20);
     setTextModel(snapshot.textModel || 'fast');
     setCustomScript(snapshot.customScript || '');
     setAnalysis(snapshot.analysis || null);
@@ -836,6 +850,7 @@ export default function SaaShortsTab({
     topic: topic.trim(),
     scriptMode,
     scriptFormat,
+    targetDurationSeconds,
     textModel,
     customScript: scriptMode === 'custom' ? customScript.trim() : '',
     analysis,
@@ -926,6 +941,7 @@ export default function SaaShortsTab({
         topic: snapshot.topic,
         scriptMode: snapshot.scriptMode,
         scriptFormat: snapshot.scriptFormat,
+        targetDurationSeconds: snapshot.targetDurationSeconds,
         textModel: snapshot.textModel,
         customScript: snapshot.customScript,
       },
@@ -999,6 +1015,7 @@ export default function SaaShortsTab({
     selectedBusinessProfileId,
     scriptMode,
     scriptFormat,
+    targetDurationSeconds,
     textModel,
     customScript,
     analysis,
@@ -1340,6 +1357,9 @@ export default function SaaShortsTab({
     setTopic(profile.topic || '');
     if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
     if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
+    if (profile.targetDurationSeconds || profile.target_duration_seconds) {
+      setTargetDurationSeconds(Number(profile.targetDurationSeconds || profile.target_duration_seconds) || 20);
+    }
     if (profile.textModel || profile.text_model) setTextModel(profile.textModel || profile.text_model);
     if (profile.style) setStyle(profile.style);
     if (profile.language) setLanguage(profile.language);
@@ -1372,6 +1392,7 @@ export default function SaaShortsTab({
           topic: topic.trim() || undefined,
           script_mode: scriptMode,
           script_format: scriptFormat,
+          target_duration_seconds: targetDurationSeconds,
           text_model: textModel,
           custom_script: isCustom ? customScript.trim() : undefined,
           num_scripts: numScripts,
@@ -2406,6 +2427,7 @@ export default function SaaShortsTab({
     hasSelectedActor: Boolean(selectedActor),
     script: scripts[selectedScript],
     storyboardGenerationMode,
+    fallbackSeconds: targetDurationSeconds,
   });
 
   const estimateModePriceLabel = (modeId) => `~${formatUsd(estimateForMode(modeId).total)}`;
@@ -3321,6 +3343,41 @@ export default function SaaShortsTab({
                       <div className="text-[10px] text-zinc-500 mt-0.5">{s.desc}</div>
                     </button>
                   ))}
+                </div>
+              </div>
+
+              <div data-section="target-duration-section">
+                <div id="target-duration-label" className="block text-sm font-medium text-zinc-300 mb-1">Длина ролика</div>
+                <p className="text-[11px] text-zinc-500 mb-3">
+                  {scriptMode === 'custom'
+                    ? 'Для своего текста длительность определяется фактической озвучкой.'
+                    : 'Применяется ко всем вариантам сценария. Итог может отличаться на пару секунд из-за темпа озвучки.'}
+                </p>
+                <div
+                  role="group"
+                  aria-labelledby="target-duration-label"
+                  className="grid grid-cols-2 sm:grid-cols-4 gap-2"
+                >
+                  {TARGET_DURATION_OPTIONS.map((option) => {
+                    const active = targetDurationSeconds === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        aria-pressed={active}
+                        disabled={scriptMode === 'custom'}
+                        onClick={() => setTargetDurationSeconds(option.value)}
+                        className={`min-h-[64px] rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                          active
+                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                        }`}
+                      >
+                        <span className="block text-sm font-medium">{option.label}</span>
+                        <span className="mt-1 block text-[10px] leading-4 text-zinc-500">{option.desc}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 

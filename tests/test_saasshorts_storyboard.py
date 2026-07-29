@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import saasshorts
@@ -1097,6 +1098,172 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
 
 
 class SaaSStoryboardTests(unittest.TestCase):
+    def test_target_duration_normalizes_supported_presets_and_falls_back_to_twenty(self):
+        for value in (15, 20, 30, 45):
+            self.assertEqual(saasshorts.normalize_target_duration(value), value)
+        self.assertEqual(saasshorts.normalize_target_duration("45"), 45)
+        self.assertEqual(saasshorts.normalize_target_duration(29), 20)
+        self.assertEqual(saasshorts.normalize_target_duration(None), 20)
+
+    def test_storyboard_duration_prompt_uses_selected_target_only(self):
+        answer = _storyboard_answer("Thirty", 12)
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+
+        with patch("google.genai.Client", return_value=client), \
+             patch(
+                 "saasshorts.refine_storyboard_broll_alignment",
+                 side_effect=lambda scripts, *_args, **_kwargs: scripts,
+             ):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="storyboard_v3",
+                target_duration_seconds=30,
+            )
+
+        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        self.assertIn("28-32 seconds", prompt)
+        self.assertIn("59-63 spoken words", prompt)
+        self.assertIn("8-10 visual beats", prompt)
+        self.assertIn('Make 1-2 middle shots "broll"', prompt)
+        self.assertNotIn("30-40 percent", prompt)
+        self.assertNotIn("18-22 seconds total", prompt)
+        self.assertEqual(scripts[0]["target_duration_seconds"], 30)
+
+    def test_storyboard_prompt_does_not_expose_experimental_pacing_profile(self):
+        answer = _storyboard_answer("Previous rhythm", 6)
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+
+        with patch("google.genai.Client", return_value=client), \
+             patch(
+                 "saasshorts.refine_storyboard_broll_alignment",
+                 side_effect=lambda scripts, *_args, **_kwargs: scripts,
+             ):
+            saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="storyboard_v3",
+                target_duration_seconds=20,
+            )
+
+        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        self.assertIn("5-7 visual beats", prompt)
+        self.assertIn("about 3 seconds (5 at the absolute limit)", prompt)
+        self.assertNotIn("STORYBOARD PACING PROFILE", prompt)
+        self.assertNotIn("storyboard_pacing", prompt)
+
+    def test_target_duration_metadata_applies_to_every_script_in_batch(self):
+        scripts_answer = []
+        for index, hook_type in enumerate(("result_first", "data_point"), start=1):
+            script = json.loads(_storyboard_answer(f"Script {index}", 6))[0]
+            script["hook_type"] = hook_type
+            script["shots"][0]["speech"] = f"Unique opening {index} proves the point."
+            scripts_answer.append(script)
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(
+            text=json.dumps(scripts_answer),
+        )
+
+        with patch("google.genai.Client", return_value=client), \
+             patch(
+                 "saasshorts.refine_storyboard_broll_alignment",
+                 side_effect=lambda scripts, *_args, **_kwargs: scripts,
+             ):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=2,
+                script_format="storyboard_v3",
+                target_duration_seconds=15,
+            )
+
+        self.assertEqual(len(scripts), 2)
+        self.assertEqual(
+            [script["target_duration_seconds"] for script in scripts],
+            [15, 15],
+        )
+
+    def test_ugc_duration_prompt_scales_five_segments_to_selected_target(self):
+        answer = json.dumps([{
+            "title": "Long explainer",
+            "hook_type": "result_first",
+            "segments": [
+                {
+                    "type": "hook",
+                    "start": 0,
+                    "end": 9,
+                    "narration": "A useful opening.",
+                    "visual": "actor_talking",
+                    "broll_prompt": None,
+                },
+                {
+                    "type": "problem",
+                    "start": 9,
+                    "end": 18,
+                    "narration": "The concrete problem.",
+                    "visual": "broll",
+                    "broll_prompt": "A relevant object demonstrates the problem.",
+                },
+                {
+                    "type": "solution",
+                    "start": 18,
+                    "end": 27,
+                    "narration": "The practical solution.",
+                    "visual": "actor_talking",
+                    "broll_prompt": None,
+                },
+                {
+                    "type": "demo",
+                    "start": 27,
+                    "end": 36,
+                    "narration": "The result in use.",
+                    "visual": "broll",
+                    "broll_prompt": "A relevant object demonstrates the result.",
+                },
+                {
+                    "type": "cta",
+                    "start": 36,
+                    "end": 45,
+                    "narration": "One direct call to action.",
+                    "visual": "actor_talking",
+                    "broll_prompt": None,
+                },
+            ],
+        }])
+        client = MagicMock()
+        client.models.generate_content.return_value = MagicMock(text=answer)
+
+        with patch("google.genai.Client", return_value=client):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Test"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="ugc",
+                target_duration_seconds=45,
+            )
+
+        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        self.assertIn("43-47 seconds", prompt)
+        self.assertIn("92-96 spoken words", prompt)
+        self.assertIn("five segments", prompt.casefold())
+        self.assertIn('"end": 45', prompt)
+        self.assertNotIn("18-22 seconds total", prompt)
+        self.assertEqual(scripts[0]["target_duration_seconds"], 45)
+
+    def test_custom_scripts_do_not_store_experimental_pacing_profile(self):
+        script = build_custom_script(
+            "Первая короткая фраза. Вторая короткая фраза.",
+            {"product_name": "Test"},
+            language="ru",
+            script_format="storyboard_v3",
+        )
+
+        self.assertNotIn("storyboard_pacing", script)
+
     def test_power_text_model_resolves_to_gemini_31_pro_with_flash_fallback(self):
         resolver = getattr(saasshorts, "resolve_gemini_text_model", None)
         chain_builder = getattr(saasshorts, "gemini_text_model_chain", None)
@@ -1195,6 +1362,69 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertEqual(script["shots"][0]["transition"], "cut")
         self.assertEqual(script["shots"][1]["role"], "problem")
         self.assertIn("После 30 тело меняется", script["full_narration"])
+
+
+class SaaSAnalyzePacingContractTests(unittest.TestCase):
+    def test_analyze_request_defaults_target_duration_to_twenty(self):
+        import app
+
+        self.assertEqual(
+            app.SaaSAnalyzeRequest(description="Test").target_duration_seconds,
+            20,
+        )
+
+    def test_analyze_request_normalizes_unsupported_target_duration(self):
+        import app
+
+        for value in (None, 29, "not-a-preset"):
+            request = app.SaaSAnalyzeRequest(
+                description="Test",
+                target_duration_seconds=value,
+            )
+            self.assertEqual(request.target_duration_seconds, 20)
+
+    def test_analyze_request_passes_target_duration_to_ai_generation(self):
+        import app
+
+        request = app.SaaSAnalyzeRequest(
+            description="Test product",
+            script_format="storyboard_v3",
+            target_duration_seconds=45,
+        )
+        with patch("app.resolve_effective_api_key", return_value="key"), \
+             patch("app.generate_scripts", return_value=[]) as generate:
+            asyncio.run(app.saasshorts_analyze(
+                request,
+                x_gemini_key="key",
+                authorization=None,
+            ))
+
+        self.assertEqual(
+            generate.call_args.kwargs["target_duration_seconds"],
+            45,
+        )
+
+    def test_custom_script_is_not_fitted_to_target_duration(self):
+        import app
+
+        narration = "Первая фраза. Вторая фраза остаётся без изменений."
+        request = app.SaaSAnalyzeRequest(
+            description="Test product",
+            script_mode="custom",
+            script_format="ugc",
+            custom_script=narration,
+            target_duration_seconds=15,
+            language="ru",
+        )
+        with patch("app.resolve_effective_api_key", return_value=""):
+            result = asyncio.run(app.saasshorts_analyze(
+                request,
+                x_gemini_key=None,
+                authorization=None,
+            ))
+
+        self.assertEqual(result["scripts"][0]["full_narration"], narration)
+        self.assertNotIn("target_duration_seconds", result["scripts"][0])
 
     def test_storyboard_ass_has_no_top_overlay_plates(self):
         # User decision 2026-07-10: top hook/overlay plates are visual clutter.

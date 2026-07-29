@@ -337,6 +337,35 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("script_format", tab)
         self.assertIn("STORYBOARD_GENERATION_OPTIONS", tab)
         self.assertIn("storyboard_generation_mode", tab)
+        self.assertNotIn("STORYBOARD_PACING_OPTIONS", tab)
+        self.assertNotIn("storyboard_pacing: storyboardPacing", tab)
+        self.assertIn("talkingShots * FLUX_FRAME_COST", tab)
+
+    def test_ai_shorts_exposes_and_persists_target_duration_presets(self):
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("TARGET_DURATION_OPTIONS", tab)
+        for value in ("15", "20", "30", "45"):
+            self.assertIn(f"value: {value}", tab)
+        self.assertIn(
+            "const [targetDurationSeconds, setTargetDurationSeconds]",
+            tab,
+        )
+        self.assertIn("initialCache?.targetDurationSeconds || 20", tab)
+        self.assertIn(
+            "targetDurationSeconds: snapshot.targetDurationSeconds",
+            tab,
+        )
+        self.assertIn(
+            "target_duration_seconds: targetDurationSeconds",
+            tab,
+        )
+        self.assertIn("fallbackSeconds: targetDurationSeconds", tab)
+        self.assertIn("fallbackSeconds = TYPICAL_VIDEO_SECONDS", tab)
+        self.assertIn('role="group"', tab)
+        self.assertIn('aria-labelledby="target-duration-label"', tab)
+        self.assertIn("Длина ролика", tab)
+        self.assertIn("Применяется ко всем вариантам сценария", tab)
 
     def test_storyboard_editor_can_generate_frames_before_paid_video(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")

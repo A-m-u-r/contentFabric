@@ -25,7 +25,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Hea
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
 load_dotenv()
@@ -3174,6 +3174,7 @@ from saasshorts import (
     resolve_saas_lipsync_assets,
     generate_actor_images,
     get_elevenlabs_voices,
+    normalize_target_duration,
     AVATAR_EDIT_MODELS,
     DEFAULT_AVATAR_EDIT_MODEL,
     DEFAULT_VOICES,
@@ -3215,6 +3216,7 @@ class SaaSAnalyzeRequest(BaseModel):
     topic: Optional[str] = None
     script_mode: str = "ai"  # "ai" or "custom"
     script_format: str = "ugc"  # "ugc" or "storyboard_v3"
+    target_duration_seconds: int = 20  # approximate prompt target: 15, 20, 30, or 45
     text_model: str = "fast"  # "fast" or "pro"
     custom_script: Optional[str] = None
     num_scripts: int = 3
@@ -3222,6 +3224,11 @@ class SaaSAnalyzeRequest(BaseModel):
     language: str = "en"
     actor_gender: str = "female"
     use_platform_keys: bool = False
+
+    @field_validator("target_duration_seconds", mode="before")
+    @classmethod
+    def normalize_target_duration_seconds(cls, value):
+        return normalize_target_duration(value)
 
 
 @app.post("/api/saasshorts/analyze")
@@ -3294,6 +3301,7 @@ async def saasshorts_analyze(
                     topic=req.topic,
                     script_format=req.script_format,
                     text_model=req.text_model,
+                    target_duration_seconds=req.target_duration_seconds,
                 )
             else:
                 # Manual description: build analysis from description
@@ -3318,6 +3326,7 @@ async def saasshorts_analyze(
                     topic=req.topic,
                     script_format=req.script_format,
                     text_model=req.text_model,
+                    target_duration_seconds=req.target_duration_seconds,
                 )
             return {
                 "analysis": analysis,

@@ -31,7 +31,7 @@
 - Produces: `_target_duration_prompt(target: int, storyboard: bool) -> str`
 - Changes: `generate_scripts(..., target_duration_seconds: int = 20) -> list`
 
-- [ ] **Step 1: Write failing normalization and prompt tests**
+- [x] **Step 1: Write failing normalization and prompt tests**
 
 Add tests to `SaaSStoryboardTests` that assert:
 
@@ -76,17 +76,17 @@ self.assertIn("five segments", prompt.casefold())
 self.assertEqual(scripts[0]["target_duration_seconds"], 45)
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
 ```powershell
-docker compose exec -T -e PYTHONPATH=/app backend python -m unittest tests.test_saasshorts_storyboard.SaaSStoryboardTests
+docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s tests -p "test_saasshorts_storyboard.py"
 ```
 
 Expected: failures because `normalize_target_duration` and the new argument do not exist.
 
-- [ ] **Step 3: Add the duration preset helper**
+- [x] **Step 3: Add the duration preset helper**
 
 Add near the storyboard pacing constants:
 
@@ -107,9 +107,9 @@ def normalize_target_duration(value, default=TARGET_VIDEO_DURATION_DEFAULT):
     return normalized if normalized in TARGET_VIDEO_DURATION_PRESETS else default
 ```
 
-Implement `_target_duration_prompt` so both formats receive the same target and word budget. For storyboard, append the selected visual-beat count and repeat the three-B-roll ceiling. For UGC, state that all five segment narrations together must fit the word budget.
+Implement `_target_duration_prompt` so both formats receive the same target and word budget. For storyboard, append the selected visual-beat count while retaining the established 1-2 middle B-roll rule. For UGC, state that all five segment narrations together must fit the word budget.
 
-- [ ] **Step 4: Thread the target through `generate_scripts`**
+- [x] **Step 4: Thread the target through `generate_scripts`**
 
 Add:
 
@@ -133,7 +133,7 @@ script["target_duration_seconds"] = target_duration_seconds
 
 Do this before or after `_finalize_generated_script`; never overwrite its narration-derived `duration_seconds`.
 
-- [ ] **Step 5: Run focused tests and verify GREEN**
+- [x] **Step 5: Run focused tests and verify GREEN**
 
 Run the Task 1 command again. Expected: all `SaaSStoryboardTests` pass and Gemini remains mocked.
 
@@ -149,7 +149,7 @@ Run the Task 1 command again. Expected: all `SaaSStoryboardTests` pass and Gemin
 - Consumes: `generate_scripts(..., target_duration_seconds: int)`
 - Produces: `SaaSAnalyzeRequest.target_duration_seconds: int = 20`
 
-- [ ] **Step 1: Write failing API propagation tests**
+- [x] **Step 1: Write failing API propagation tests**
 
 Extend `SaaSAnalyzePacingContractTests`:
 
@@ -177,17 +177,17 @@ def test_analyze_request_passes_target_duration_to_ai_generation(self):
 
 Add a custom-script test that posts `target_duration_seconds=15` and asserts the returned custom narration is unchanged and has no duration-based trimming.
 
-- [ ] **Step 2: Run the API contract tests and verify RED**
+- [x] **Step 2: Run the API contract tests and verify RED**
 
 Run:
 
 ```powershell
-docker compose exec -T -e PYTHONPATH=/app backend python -m unittest tests.test_saasshorts_storyboard.SaaSAnalyzePacingContractTests
+docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s tests -p "test_saasshorts_storyboard.py"
 ```
 
 Expected: field/propagation assertions fail.
 
-- [ ] **Step 3: Implement the FastAPI field and AI-only propagation**
+- [x] **Step 3: Implement the FastAPI field and AI-only propagation**
 
 Add to `SaaSAnalyzeRequest`:
 
@@ -203,7 +203,7 @@ target_duration_seconds=req.target_duration_seconds,
 
 Do not pass it to `build_custom_script`, because the custom-script path must not imply that the user text was fitted to a target.
 
-- [ ] **Step 4: Run API tests and verify GREEN**
+- [x] **Step 4: Run API tests and verify GREEN**
 
 Run the Task 2 command. Expected: all contract tests pass.
 
@@ -219,7 +219,7 @@ Run the Task 2 command. Expected: all contract tests pass.
 - Produces: `targetDurationSeconds` React state with default `20`
 - Sends: `target_duration_seconds: targetDurationSeconds`
 
-- [ ] **Step 1: Write a failing frontend source-contract test**
+- [x] **Step 1: Write a failing frontend source-contract test**
 
 Add:
 
@@ -237,17 +237,17 @@ def test_ai_shorts_exposes_and_persists_target_duration_presets(self):
     self.assertIn("Применяется ко всем вариантам сценария", tab)
 ```
 
-- [ ] **Step 2: Run the source-contract test and verify RED**
+- [x] **Step 2: Run the source-contract test and verify RED**
 
 Run:
 
 ```powershell
-docker compose exec -T -e PYTHONPATH=/app backend python -m unittest tests.test_ui_layout_polish
+docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s tests -p "test_ui_layout_polish.py"
 ```
 
 Expected: the new test fails because the options and state are absent.
 
-- [ ] **Step 3: Add duration options and state**
+- [x] **Step 3: Add duration options and state**
 
 Define:
 
@@ -268,7 +268,7 @@ Initialize state from cache with a 20-second fallback. Include it in:
 - workspace persistence effect dependencies;
 - the analyze request payload.
 
-- [ ] **Step 4: Add the first-screen control**
+- [x] **Step 4: Add the first-screen control**
 
 Place the control between `Стиль ролика` and `Количество вариантов сценария`.
 Use a four-option segmented/button grid with `aria-pressed`, stable responsive
@@ -286,12 +286,12 @@ Otherwise show:
 Применяется ко всем вариантам сценария. Итог зависит от темпа озвучки.
 ```
 
-- [ ] **Step 5: Run frontend source tests and production build**
+- [x] **Step 5: Run frontend source tests and production build**
 
 Run:
 
 ```powershell
-docker compose exec -T -e PYTHONPATH=/app backend python -m unittest tests.test_ui_layout_polish
+docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s tests -p "test_ui_layout_polish.py"
 docker compose exec -T frontend npm run build
 ```
 
@@ -307,7 +307,7 @@ Expected: tests pass and Vite completes the production build.
 **Interfaces:**
 - Consumes the completed backend, API, and frontend contracts.
 
-- [ ] **Step 1: Run the complete backend suite**
+- [x] **Step 1: Run the complete backend suite**
 
 ```powershell
 docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s tests -p "test_*.py"
@@ -315,7 +315,7 @@ docker compose exec -T -e PYTHONPATH=/app backend python -m unittest discover -s
 
 Expected: all tests pass without real provider calls.
 
-- [ ] **Step 2: Check formatting and review the diff**
+- [x] **Step 2: Check formatting and review the diff**
 
 ```powershell
 git diff --check
@@ -324,7 +324,7 @@ git diff --stat
 
 Confirm no credentials, generated media, provider calls, or unrelated changes were added.
 
-- [ ] **Step 3: Restart backend and frontend**
+- [x] **Step 3: Restart backend and frontend**
 
 ```powershell
 docker compose restart backend frontend
@@ -333,7 +333,7 @@ docker compose ps
 
 Expected: both services are `Up`.
 
-- [ ] **Step 4: Verify the live local contract**
+- [x] **Step 4: Verify the live local contract**
 
 Check `http://localhost:8000/openapi.json` and confirm
 `SaaSAnalyzeRequest.target_duration_seconds.default == 20`. Submit one custom
@@ -343,7 +343,20 @@ without calling Gemini or fal.ai.
 Open `http://localhost:5175/index.html#app` and verify the four duration choices
 appear on the setup screen with `≈20 сек` selected by default.
 
-- [ ] **Step 5: Mark this plan complete**
+- [x] **Step 5: Mark this plan complete**
 
 Change every completed checkbox in this document to `[x]` and record any
 pre-existing tooling limitation separately from feature failures.
+
+## Verification Record
+
+- Backend: `408` tests passed after removing the reverted dynamic-pacing experiment tests.
+- Frontend: Vite production build passed.
+- Live API: `target_duration_seconds` defaults to `20`; the custom-script path
+  accepted the field without changing narration or adding target metadata.
+- Live UI: all four presets rendered; `20` was selected by default and a changed
+  selection survived reload. Preliminary prices changed between the `15` and
+  `45` second presets.
+- Pre-existing tooling limitation: `npm run lint` stops before linting because
+  the package script still passes the unsupported ESLint flat-config flag
+  `--ext`. This is separate from the duration feature.
