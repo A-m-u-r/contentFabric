@@ -22,11 +22,13 @@ import difflib
 import hashlib
 import shutil
 import subprocess
+import threading
 import httpx
 import numpy as np
 import textwrap
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable, Any
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -761,6 +763,32 @@ def _finalize_generated_script(script: dict) -> dict:
     return script
 
 
+def _record_duration_verdict(script: dict) -> dict:
+    """Сверить оценку длины с выбранным хронометражом и записать вердикт.
+
+    До этого `minimum`/`maximum` существовали только внутри текста промпта: ни
+    одной проверки в коде, `duration_seconds` считался и молча писался. Человек
+    выбирал 15 секунд, получал 24 и узнавал об этом уже по готовому ролику.
+    Проверка ничего не переписывает — она делает расхождение видимым.
+    """
+    target = normalize_target_duration(script.get("target_duration_seconds"))
+    preset = TARGET_VIDEO_DURATION_PRESETS[target]
+    estimate = script.get("duration_seconds") or 0
+    if estimate < preset["minimum"]:
+        script["duration_target_status"] = "short"
+    elif estimate > preset["maximum"]:
+        script["duration_target_status"] = "long"
+    else:
+        script["duration_target_status"] = "ok"
+    if script["duration_target_status"] != "ok":
+        print(
+            f"[SaaSShorts] ⚠️ «{script.get('title') or 'сценарий'}»: просили ~{target} с, "
+            f"текста набралось на {estimate} с "
+            f"(допуск {preset['minimum']}-{preset['maximum']} с)."
+        )
+    return script
+
+
 def refine_storyboard_broll_alignment(
     scripts: list,
     gemini_key: str,
@@ -1099,23 +1127,99 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
 
 
 TARGET_VIDEO_DURATION_DEFAULT = 20
+_TARGET_DURATION_TOLERANCE = 2
+# Во что обходится речь. Единственный источник этих коэффициентов: и бюджет,
+# который просят у модели, и замер готового сценария считаются по ним, иначе
+# просить одно, а мерить другим — и удивляться, что 15 секунд вышли 24.
+_SPEECH_WORDS_PER_SECOND = 2.2
+_SPEECH_TAG_SECONDS = 0.8
+_SPEECH_PAUSE_SECONDS = 0.4
+
+# Пол клипа у каждой модели свой, и он не «минимум на всякий случай», а цена
+# любого кадра: короче его модель не отдаёт и короче не считает. Кадр, которому
+# досталось меньше пола, оплачивается целиком, а на экране живёт свою короткую
+# долю — разница и есть деньги за воздух.
+#
+# Kling V3 (перебивки) — три секунды.
+#
+# Kling Avatar (говорящие) — замерено по всем 24 клипам на диске (прогоны от
+# 4e4f6776 до d6b674c6, оба разрешения — 720x1280 и 1072x1920). Длина клипа
+# ведёт себя так: пол в 64 кадра при 30 fps, а выше пола длина округляется
+# вверх до блока в 8 кадров. Пять клипов с аудио 1.228 / 1.672 / 1.698 / 1.750 с
+# вернулись ровно 2.133 с; 2.247 → 2.400; 2.612 → 2.667; 4.389 → 4.533. Модель
+# описывает 21 клип из 24.
+#
+# Три несходящихся — 5.538 / 6.609 / 6.792 с аудио, все вернулись ровно 7.200 с.
+# Общего у них только разрешение 720x1280, но в той же группе 16 клипов модели
+# подчиняются, так что объяснения у выброса пока нет. На счёт он влияет в нашу
+# пользу — модель занижает, а не завышает.
+_KLING_MIN_CLIP_SECONDS = 3
+_KLING_MAX_CLIP_SECONDS = 15
+_KLING_AVATAR_FPS = 30
+_KLING_AVATAR_BLOCK_FRAMES = 8
+_KLING_AVATAR_MIN_FRAMES = 64
+_KLING_AVATAR_MIN_CLIP_SECONDS = _KLING_AVATAR_MIN_FRAMES / _KLING_AVATAR_FPS
+
+
+def _affordable_beats(target: int) -> int:
+    """Сколько склеек ролик такой длины оплачивает без переплаты.
+
+    Смесь берём из правила раскадровки — не больше одной перебивки на два
+    говорящих кадра, — и по ней считаем средний пол бита. Больше этого числа
+    склеек не помещается: не в хронометраж, а в счёт.
+    """
+    average_floor = (2 * _KLING_AVATAR_MIN_CLIP_SECONDS + _KLING_MIN_CLIP_SECONDS) / 3
+    return max(2, int(target / average_floor))
+
+
+def _duration_preset(target: int, beats: tuple, audio_tags: int, pauses: int) -> dict:
+    """Бюджеты одного хронометража, посчитанные той же формулой, что и замер.
+
+    Раньше бюджет слов и число визуальных битов жили отдельными числами,
+    подобранными руками, — и разъехались: битов стало почти вдвое больше, слова
+    не тронули, а каждый бит приносит свой аудиотег и свою паузу. На «15 секунд»
+    выходило 24: `_estimate_speech_duration` берёт 0.8 с за тег и 0.4 с за паузу,
+    и восемь битов — это десять секунд поверх слов. Теперь бюджет слов — это
+    остаток от цели после оплаты тегов и паузе, посчитанный по тем же
+    коэффициентам, которыми длину потом и измеряют.
+
+    Слова на реплику — тоже не отдельное правило, а то же деление на биты. Пока
+    в промпте стояло «4-8 слов на реплику» рядом с «6-8 битов», модель имела
+    полное право написать 48 слов при бюджете 26 и формально всё соблюсти.
+
+    Сверху биты упираются в то, что ролик может оплатить. Каждый бит — отдельный
+    клип, а клип короче своего пола не бывает: биту, которому досталось меньше,
+    всё равно выставят пол. На верхней границе прежних диапазонов это выходило
+    боком — 15 секунд при восьми битах оплачивались как 19.7, а 45 при двадцати
+    двух как 53.1. Разница — воздух, и на десяти роликах в день она заметна.
+    """
+    low, high = beats
+    high = min(high, _affordable_beats(target))
+    # Диапазон должен остаться диапазоном: схлопнувшись в одно число, он даёт и
+    # слова на реплику одним числом («4-4»), а это уже не бюджет, а приказ.
+    low = max(2, min(low, high - 1))
+    speech_seconds = (
+        target - audio_tags * _SPEECH_TAG_SECONDS - pauses * _SPEECH_PAUSE_SECONDS
+    )
+    words = round(speech_seconds * _SPEECH_WORDS_PER_SECOND)
+    return {
+        "minimum": target - _TARGET_DURATION_TOLERANCE,
+        "maximum": target + _TARGET_DURATION_TOLERANCE,
+        "words": f"{words}-{words + 4}",
+        "visual_beats": f"{low}-{high}",
+        "audio_tags": audio_tags,
+        "pauses": pauses,
+        "words_per_beat": f"{max(2, round(words / high))}-{max(3, round(words / low))}",
+    }
+
+
+# Биты — сколько склеек держит ритм на этой длине; теги и паузы — сколько
+# актёрских ремарок и многоточий ролик может себе позволить, они стоят времени.
 TARGET_VIDEO_DURATION_PRESETS = {
-    15: {
-        "minimum": 13, "maximum": 17, "words": "26-30",
-        "visual_beats": "6-8",
-    },
-    20: {
-        "minimum": 18, "maximum": 22, "words": "37-41",
-        "visual_beats": "8-10",
-    },
-    30: {
-        "minimum": 28, "maximum": 32, "words": "59-63",
-        "visual_beats": "11-15",
-    },
-    45: {
-        "minimum": 43, "maximum": 47, "words": "92-96",
-        "visual_beats": "16-22",
-    },
+    15: _duration_preset(15, (6, 8), audio_tags=3, pauses=2),
+    20: _duration_preset(20, (8, 10), audio_tags=4, pauses=3),
+    30: _duration_preset(30, (11, 15), audio_tags=6, pauses=4),
+    45: _duration_preset(45, (16, 22), audio_tags=9, pauses=6),
 }
 
 
@@ -1140,18 +1244,27 @@ def _target_duration_prompt(
     preset = TARGET_VIDEO_DURATION_PRESETS[target]
     format_line = (
         f"- Use {preset['visual_beats']} visual beats across the reel. One visual beat is one "
-        "complete shot."
+        f"complete shot, carrying {preset['words_per_beat']} spoken words."
         if storyboard
         else "- Use exactly five segments. Their combined narration, not each segment, must fit "
         "the word budget."
     )
+    # Теги и паузы названы поимённо и с ценой. Без этого модель считала их
+    # бесплатными украшениями и ставила по одному на каждый кадр — это и есть те
+    # девять лишних секунд, из-за которых «15 секунд» превращались в 24.
     return f"""
 TARGET VIDEO DURATION:
 - Every script in this batch should be approximately {target} seconds.
 - Keep the finished narration within {preset['minimum']}-{preset['maximum']} seconds.
-- Aim for {preset['words']} spoken words total, excluding audio-direction tags. Audio tags and
-  marked pauses consume part of the available time, so do not fill that space with extra words.
+- Aim for {preset['words']} spoken words total, excluding audio-direction tags.
+- Audio tags and marked pauses are spent time, not decoration: a bracketed tag such as
+  [whispers] costs about {_SPEECH_TAG_SECONDS} s of the reel and an ellipsis or dash pause about
+  {_SPEECH_PAUSE_SECONDS} s. This target already pays for at most {preset['audio_tags']} tags and
+  {preset['pauses']} marked pauses in the whole script — do not add more, and never put one on
+  every shot.
 {format_line}
+- The word budget is the total for the whole script. Beats × words-per-beat must land inside it:
+  more beats means shorter lines, never more words.
 - Apply this same duration target independently to every script in the batch.
 """
 
@@ -1269,6 +1382,11 @@ HOOK REQUIREMENTS:
             target_duration_seconds,
             storyboard=True,
         )
+        # Из пресета, а не отдельной константой: «4-8 слов на реплику» рядом с
+        # «6-8 битов» разрешало 48 слов при бюджете 26 — и правило, и бюджет
+        # обязаны считаться от одного числа.
+        shot_words = TARGET_VIDEO_DURATION_PRESETS[
+            normalize_target_duration(target_duration_seconds)]["words_per_beat"]
         prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
 Generate {num_scripts} storyboard-based video scripts for this product/business.
 {lang_instructions}
@@ -1320,18 +1438,23 @@ RULES:
 {duration_instructions}
 STORYBOARD PACING PROFILE:
 - Set storyboard_pacing to "dynamic".
-- One shot = one short visual beat of about 1.5-3 seconds (5 at the absolute limit). Hooks, whispers, reactions, and transitions may be shorter. Use the visual-beat count selected above for this duration; never compress a long script into a few long shots.
+- One shot = one visual beat of about 2.5-4 seconds (5 at the absolute limit). Nothing shorter: the video model has no clip below two seconds, so a beat under that is paid for in full and still flashes past. Use the visual-beat count selected above for this duration — it is a ceiling as much as a target.
 - The first shot and the last shot MUST be talking. The first shot delivers the hook; the last shot delivers the CTA or closing payoff.
 - Never place two B-roll shots next to each other. Return to a talking shot between B-roll inserts.
 - Treat B-roll shares as soft creative guidance, never as quotas: aim for approximately 35-45% of the spoken timeline; 25-50% is an acceptable soft range when the exact subject needs less or more visual demonstration.
 - Approximately 10-20% may show the same actor from the reference image performing a directly relevant action. Approximately 15-30% may show a product, object, process, space, result, or immediately understandable visual analogy without the actor.
 - Vary B-roll subject types across the script. Do not repeatedly show the actor from behind, the actor's hands, food preparation, or the same prop. Presenter B-roll must earn its place by making the exact spoken claim easier to understand.
-- A visual change does not have to be B-roll. A medium talking shot followed by a closer whisper or hush shot is a strong pattern interrupt and MUST preserve the same actor, hairstyle, outfit, and setting.
-- Every shot must be visually distinct from its neighbours (new scene, angle or subject) — the point of many short shots is variety, not the same framing repeated.
+- A visual change does not have to be B-roll. The app already cuts between a medium and a close camera on the same set, so a run of talking shots is not monotonous by itself — do not invent scenery changes to break it up.
+- Every B-roll shot must be visually distinct from its neighbours (new subject or action) — the point of many short shots is variety, not the same insert repeated.
+- ALL talking shots happen in ONE place. The first talking shot defines the location, the light and the props; every later talking shot stays in exactly that place. Never write a new room, a new window, a new time of day or a changed angle for a talking shot — the app stages the talking shots itself and rotates the camera between them, so a scene text asking for a different angle only describes something the viewer will never see.
+- A talking shot's scene and generation_prompt therefore describe the MOMENT, not the place and not the camera: what the posture, the gaze and the hands are doing right then (a small nod, a glance away and back, a hand settling near the chest). This is the one thing that reaches the picture.
 - Build visual variety from framing, camera distance, meaningful action, environment, objects, processes, and B-roll that supports the narration. Never force kitchen, exercise, food, or product imagery when the exact speech is about something else.
 - visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference.
+- A "broll" shot is the most expensive shot there is: the video model has no clip shorter than three seconds, so an insert carrying half a second of speech is billed as three full seconds and then flashes past. Give every B-roll shot a COMPLETE thought of its own — one whole sentence of 7-12 words — so it fills the time it costs. If a beat is too short for that, keep it on camera.
+- B-roll is therefore the exception, not the rhythm. Never two B-roll shots in a row, and no more than one B-roll for every two talking shots.
+- A sentence that starts on camera finishes on camera. Cutting away mid-sentence is a deliberate accent, not a default: use it at most ONCE in the whole script, where the break itself is the point. Every other cut lands on a full stop.
 - actor_in_frame per shot: true ONLY when a "broll" shot shows the SAME person who speaks in the talking shots (seen from behind, over the shoulder, her hands, her silhouette), false when the insert shows objects, food, an interior or anybody else. It is the difference between our presenter walking into her own kitchen and a random stranger appearing mid-reel — say it explicitly, we cannot guess it from the scene text. Always false for "talking" shots.
-- Every talking generation_prompt MUST identify the same actor from the reference image and describe only pose, action, scene, lighting, and camera.
+- Every talking generation_prompt MUST identify the same actor from the reference image and describe only pose, action and gaze. Only the FIRST talking shot also states the location and the lighting; the rest inherit it and must not restate or change it, and none of them state a shot type or camera move.
 - For a B-roll shot with actor_in_frame=true, generation_prompt MUST identify the same actor from the reference image and describe only pose, action, scene, lighting, and camera.
 - For a B-roll shot with actor_in_frame=false, generation_prompt MUST NOT mention the actor or reference image. Describe only the product, object, process, space, result, or visual analogy required by that exact speech.
 - Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
@@ -1346,8 +1469,9 @@ STORYBOARD PACING PROFILE:
 - Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
 - In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
 - In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
-- Each shot's speech is ONE compact spoken phrase, normally 4-8 words and 10 words HARD max. Split narration at natural phrase boundaries so most beats last about 1.5-3 seconds. If the script has more to say, add another shot; never grow one shot's speech, because any shot over 5 seconds gets chopped into jump-cut takes and the shot count stops matching the clips produced.
-- Match the selected total duration and word budget while keeping every shot at or under 5 seconds of speech; prefer more short shots over fewer long ones.
+- Each TALKING shot's speech is ONE spoken phrase of {shot_words} words, 8 words HARD max ("broll" shots are the exception and carry a whole sentence, as above). Stay at the top of that range rather than the bottom: the video model never returns a clip shorter than about two seconds, so a two-word beat is billed as a full clip and then flashes past. Split narration at natural phrase boundaries so beats normally last about 2.5-4 seconds. One authored talking shot is one paid Avatar take; never request an internal jump cut or framing change inside it.
+- Do not buy variety with extra shots. The app already adds a slow local camera push inside a talking shot, and that costs nothing, while one more shot costs a whole clip. Use the fewest shots that carry the meaning.
+- Adding a shot does NOT add words: the total word budget above stays the same, the lines just get shorter. Match the selected total duration and word budget while keeping every talking shot at or under 8 seconds of speech, the practical limit of one Avatar take; when in doubt use fewer, fuller shots rather than more, thinner ones.
 - Do not ask Kling to generate Russian audio. The app adds Russian voiceover later.
 - Keep marketing copy punchy. If the user provided exact topic wording, preserve it.
 - Actor gender is {actor_gender}; use it only for grammar when necessary, never to invent appearance.
@@ -1385,6 +1509,7 @@ STORYBOARD PACING PROFILE:
             for shot in script["shots"]:
                 shot["_prompt_source_scene"] = (shot.get("scene") or "").strip()
             _finalize_generated_script(script)
+            _record_duration_verdict(script)
         print(f"[SaaSShorts] Generated {len(scripts)} storyboard scripts")
         return scripts
 
@@ -1524,6 +1649,7 @@ RULES:
     for script in scripts:
         script["target_duration_seconds"] = target_duration_seconds
         _finalize_generated_script(script)
+        _record_duration_verdict(script)
 
     print(f"[SaaSShorts] ✅ Generated {len(scripts)} scripts")
     return scripts
@@ -1653,7 +1779,11 @@ def _estimate_speech_duration(text: str) -> int:
     pauses = len(re.findall(r"\.{3}|…|—", raw))
     if not words and not tags:
         return 0
-    seconds = len(words) / 2.2 + len(tags) * 0.8 + pauses * 0.4
+    seconds = (
+        len(words) / _SPEECH_WORDS_PER_SECOND
+        + len(tags) * _SPEECH_TAG_SECONDS
+        + pauses * _SPEECH_PAUSE_SECONDS
+    )
     return max(5, min(90, round(seconds)))
 
 
@@ -2784,7 +2914,8 @@ def _shot_duration(shot: dict) -> int:
         duration = 0
     if duration <= 0:
         duration = float(shot.get("duration", 0) or 0)
-    return max(3, min(15, int(round(duration or 5))))
+    return max(_KLING_MIN_CLIP_SECONDS,
+               min(_KLING_MAX_CLIP_SECONDS, int(round(duration or 5))))
 
 
 _ACTOR_REFERENCE_PROMPT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
@@ -3151,14 +3282,20 @@ RULES:
 - In "talking" shots the actor holds a steady selfie pose: subtle expressions and
   small head movement only. No exercising, walking, drinking or big gestures —
   motion breaks lip-sync.
-- Every shot must be visually distinct from its neighbours in the storyboard above.
+- Every "broll" shot must be visually distinct from its neighbours in the storyboard above.
+- ALL talking shots happen in ONE place, the one the first talking shot above is
+  set in. Never write a new room, a new window, a new time of day or a changed
+  angle for a talking shot: the app stages them itself and rotates the camera
+  between them, so such a line describes something the viewer will never see.
+  A talking scene describes the MOMENT instead — posture, gaze, what the hands do.
 - role: one of hook, problem, explanation, solution, proof, cta.
 - emotion: one of excited, warm, confident, calm, urgent, playful.
 - transition: "cut" or "smooth_0.3s".
 - No readable text anywhere: no labels, signs, numbers, stickers, no phone/laptop
   screens facing camera — video models render text as garbage glyphs.
-- generation_prompt MUST be English and fully describe scene, action and camera on
-  its own: vertical 9:16, realistic phone video, natural light. For talking shots
+- generation_prompt MUST be English and fully describe scene and action on its own:
+  vertical 9:16, realistic phone video, natural light. State a shot type only for
+  "broll"; for talking shots the app owns the camera. For talking shots
   and B-roll with actor_in_frame=true, identify the same actor from the reference image.
   For B-roll with actor_in_frame=false, do not mention the actor or reference image.
   Describe only
@@ -5673,9 +5810,13 @@ def _final_audio_filter_parts(
     `music_gain_db` comes from `_music_bed_gain_db` and puts the bed at a known
     level whatever the track; `music_volume` is a plain trim on top of that.
     """
+    # Either an input index ("3") or a label already built in the graph
+    # ("[voicecat]"), which is what the sliced-avatar edit hands over: its voice
+    # is stitched from the takes' own audio, not read from one file.
+    voice_src = voice_input if voice_input.startswith("[") else f"[{voice_input}:a]"
     parts = []
     if music_input:
-        parts.append(f"[{voice_input}:a]aresample=48000,asplit=2[vo][vosc]")
+        parts.append(f"{voice_src}aresample=48000,asplit=2[vo][vosc]")
         # Normalize the bed to a known level first, then apply the (optional) trim.
         parts.append(
             f"[{music_input}:a]aresample=48000,volume={music_gain_db:.2f}dB,volume={music_volume}[mus]"
@@ -5687,7 +5828,7 @@ def _final_audio_filter_parts(
         parts.append("[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mix]")
         mix_src = "[mix]"
     else:
-        mix_src = f"[{voice_input}:a]"
+        mix_src = voice_src
     parts.append(f"{mix_src}{_loudnorm_filter(measured, print_json)},aresample=48000[aout]")
     return parts
 
@@ -5699,15 +5840,19 @@ def _measure_final_loudness(
     music_volume: float,
     log: Callable[[str], None] = print,
     music_gain_db: float = 0.0,
+    voice_parts: Optional[list] = None,
 ) -> Optional[dict]:
     """Pass 1 of the two-pass loudnorm: measure the finished mix, decode only.
 
     Runs the exact audio graph of the real render against `-f null`, so the
     numbers describe the mix that will actually be encoded (music bed and
-    ducking included). Returns None on any trouble — the caller then falls back
-    to one-pass, which is worse for dynamics but never fails the render.
+    ducking included). `voice_parts` builds the voice stream when it is not a
+    plain input — the sliced-avatar edit stitches it from the takes. Returns
+    None on any trouble — the caller then falls back to one-pass, which is worse
+    for dynamics but never fails the render.
     """
-    parts = _final_audio_filter_parts(
+    parts = list(voice_parts or [])
+    parts += _final_audio_filter_parts(
         voice_input, music_input, music_volume, print_json=True, music_gain_db=music_gain_db,
     )
     cmd = [
@@ -5730,6 +5875,280 @@ def _measure_final_loudness(
         return None
 
 
+# Насколько «дышит» говорящий кадр за свою длину. 6% глаз читает как движение и
+# не читает как приём; больше — аттракцион, меньше — незаметно.
+_TALKING_PUSH_ZOOM = 0.06
+# Короче этого наезд не успевает прочитаться, а на джамп-катах только мельтешит.
+_TALKING_PUSH_MIN_SECONDS = 1.6
+# Запас разрешения под зум: zoompan округляет смещение окна до целых пикселей
+# входа, и без запаса медленный наезд идёт заметными ступеньками.
+_TALKING_PUSH_OVERSAMPLE = "scale=1620:2880"
+
+
+def _talking_push_in(index: int, duration: float) -> str:
+    """Медленный наезд внутри одного говорящего клипа. "" — если он не нужен.
+
+    Kling оживляет неподвижное фото: мимика есть, камера стоит намертво. Две-три
+    секунды такого кадра читаются как фотография с говорящим ртом — отсюда
+    ощущение, что ролик тянется. Наезд эти секунды держит и ничего не стоит:
+    он трогает только картинку, не PTS и не звук, поэтому липсинк не уезжает.
+
+    Направление чередуется — два соседних кадра, ползущих в одну сторону,
+    склеиваются в один длинный, вместо того чтобы читаться как два.
+    """
+    frames = int(round(max(0.0, duration) * 30))
+    if duration < _TALKING_PUSH_MIN_SECONDS or frames < 2:
+        return ""
+    span = frames - 1
+    zoom = (
+        f"{1 + _TALKING_PUSH_ZOOM:.3f}-{_TALKING_PUSH_ZOOM}*on/{span}"
+        if index % 2 else
+        f"1+{_TALKING_PUSH_ZOOM}*on/{span}"
+    )
+    # Центр наезда чуть выше середины: на вертикальном портрете лицо живёт в
+    # верхней части кадра, и наезд «в центр» уводит камеру в грудь.
+    return (
+        f"{_TALKING_PUSH_OVERSAMPLE},"
+        f"zoompan=z='{zoom}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*0.35':"
+        "d=1:s=1080x1920:fps=30,setsar=1"
+    )
+
+
+def _self_voiced_clip(clip: dict) -> bool:
+    """A take the avatar model returned with its own lip-synced audio.
+
+    Such a take is used exactly as delivered — whole, sound included. Cutting it
+    to the slot and playing the master track under it is arithmetically the same
+    picture against the same waveform, but it chops the mouth mid-word at every
+    cut: the model always returns a little more picture than audio, and that tail
+    is where the lips finish the phrase and close. B-roll has no audio of its own
+    and keeps taking the master track.
+    """
+    if _is_broll_shot(clip.get("shot") or {}):
+        return False
+    if not clip.get("audio_slice"):
+        return False
+    try:
+        return _get_media_stream_duration(clip["path"], "audio") > 0
+    except Exception:
+        return False
+
+
+_REEL_FPS = 30
+
+
+def _trim_end(seconds: float) -> str:
+    """Конец trim'а, попадающий внутрь последнего нужного кадра.
+
+    `trim` пропускает кадры с PTS < end, а запись времени с тремя знаками легко
+    перепрыгивает границу кадра: замер на реальном клипе — `end=1.867` отдаёт 57
+    кадров (1.900 с) вместо 56 (1.867 с). Лишний кадр на каждой склейке и есть
+    тот дрейф, из-за которого монтаж уползал от озвучки. Полкадра назад — и
+    попадаем ровно в тот кадр, который просили.
+    """
+    return f"{max(0.0, seconds - 0.5 / _REEL_FPS):.3f}"
+
+
+# Скругление на самой склейке. Дубль и мастер несут одни и те же слова, но
+# разный кодек и разный шум, и стык двух волн в середине фразы щёлкает.
+# Десять миллисекунд снимают щелчок и не читаются как пауза.
+_TAKE_SPLICE_FADE_SECONDS = 0.01
+
+
+def _take_level_match_db(clip: dict, master_path: str, master_start: float,
+                         window: float, head: float) -> float:
+    """Gain that puts a take's own audio at the level of the master voiceover.
+
+    The model re-encodes the audio we sent and hands it back 2-3 dB quieter
+    (measured on job saas_d6b674c6: takes peak at -9.0 dB against the master's
+    -6.7). Cutting between the two is heard as the voice stepping up and down at
+    every edit — «выраженные окончания и начала». Both sides carry the same
+    words, so one measured gain per take lines them up.
+    """
+    def mean_volume(path: str, start: float, length: float) -> Optional[float]:
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-v", "info", "-ss", f"{start:.3f}", "-i", path,
+                 "-t", f"{length:.3f}", "-af", "volumedetect", "-f", "null", "-"],
+                capture_output=True, text=True, errors="replace", timeout=120,
+            )
+            match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB", proc.stderr or "")
+            return float(match.group(1)) if match else None
+        except Exception:
+            return None
+
+    theirs = mean_volume(clip["path"], head, window)
+    ours = mean_volume(master_path, master_start, window)
+    if theirs is None or ours is None:
+        return 0.0
+    # A big correction means the two are not the same words after all — trust
+    # the take rather than shout it into place.
+    return max(-6.0, min(6.0, ours - theirs))
+
+
+def _reel_layout(clips: list, master_path: str = "") -> list:
+    """Where every clip sits in the edit, and where its words sit in the master.
+
+    One timeline, snapped to the frame grid: shot boundaries are rounded to a
+    whole frame once, off the running master time, so a segment is always a
+    whole number of frames and nothing accumulates. Reel time and master time
+    stay the same time, which is what lets a take's own audio and the master
+    take turns without a gap or a repeat at the seam.
+
+    A self-voiced take gives up exactly the picture the model drew around its
+    words: the head of silence its driving mp3 carried (`speech_offset`) and
+    everything past the last word. Both ends are cut from picture and sound
+    together, so the model's own lip sync is untouched — but the sentence runs
+    on without the hole that padding used to punch into it.
+    """
+    layout = []
+    master_cursor = 0.0
+    frame_cursor = 0
+    for index, clip in enumerate(clips):
+        actual = _get_media_duration(clip["path"])
+        window = max(0.1, float(clip.get("duration") or actual))
+        self_voiced = _self_voiced_clip(clip)
+        try:
+            offset = float(clip.get("speech_offset") or 0.0)
+        except (TypeError, ValueError):
+            offset = 0.0
+        master_start = master_cursor
+        master_cursor += window
+        reel_start = frame_cursor / _REEL_FPS
+        frame_cursor = int(round(master_cursor * _REEL_FPS))
+        duration = frame_cursor / _REEL_FPS - reel_start
+        own_audio = 0.0
+        gain_db = 0.0
+        head = 0.0
+        if self_voiced:
+            own_audio = _get_media_stream_duration(clip["path"], "audio")
+            head = max(0.0, min(reel_start - master_start + offset,
+                                max(0.0, actual - duration)))
+            if master_path:
+                gain_db = _take_level_match_db(
+                    clip, master_path, master_start, window, offset,
+                )
+        layout.append({
+            "index": index,
+            "clip": clip,
+            "actual": actual,
+            "window": window,
+            "self_voiced": self_voiced,
+            "own_audio": own_audio,
+            "gain_db": gain_db,
+            "duration": duration,
+            "head": head,
+            "master_start": master_start,
+            "master_end": master_cursor,
+            "reel_start": reel_start,
+        })
+    return layout
+
+
+_VOICE_STITCH_FORMAT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+
+# Ровный фон под всей дорожкой. Каждый источник несёт свой шум (astats на job
+# saas_d6b674c6: дубли -72.9...-83.4 dB, мастер -78.4), а дописанная тишина и
+# паузы самой озвучки — ровный ноль, -240 dB. Обрыв шума в ноль слышно не как
+# паузу, а как пропавшую связь: «как будто наушники отключились на доли
+# секунды». Фон чуть ниже самого шумного источника убирает и провалы, и
+# ступеньки шума на склейках.
+_ROOM_TONE_HEADROOM_DB = 3.0
+_ROOM_TONE_FLOOR_DB = -80.0
+_ROOM_TONE_CEILING_DB = -66.0
+# Уровень самого генератора: замер astats на
+# `anoisesrc=color=pink:amplitude=1,lowpass=f=6000` даёт RMS -14.5 dB.
+_ROOM_TONE_SOURCE_RMS_DB = -14.5
+
+
+def _noise_floor_db(path: str) -> Optional[float]:
+    """Уровень самого тихого места дорожки (astats)."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", path, "-vn",
+             "-af", "astats=metadata=1:reset=0", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=180,
+        )
+        floors = re.findall(r"Noise floor dB:\s*(-?\d+(?:\.\d+)?)", proc.stderr or "")
+    except Exception:
+        return None
+    return max(float(value) for value in floors) if floors else None
+
+
+def _room_tone_db(paths: list) -> float:
+    """Уровень фона, который не выдаёт себя, но не даёт дорожке замолчать."""
+    floors = [floor for floor in (_noise_floor_db(path) for path in paths if path)
+              if floor is not None]
+    if not floors:
+        return _ROOM_TONE_FLOOR_DB
+    return max(_ROOM_TONE_FLOOR_DB,
+               min(_ROOM_TONE_CEILING_DB, max(floors) - _ROOM_TONE_HEADROOM_DB))
+
+
+def _room_tone_filter_parts(seconds: float, room_tone_db: float) -> list:
+    """Фон нужной длины и нужного уровня, подмешанный под голос."""
+    return [
+        f"anoisesrc=color=pink:sample_rate=48000:amplitude=1:seed=1:"
+        f"duration={seconds:.3f},lowpass=f=6000,"
+        f"volume={room_tone_db - _ROOM_TONE_SOURCE_RMS_DB:.1f}dB,"
+        f"{_VOICE_STITCH_FORMAT}[roomtone]",
+        "[voicedry][roomtone]amix=inputs=2:duration=first:normalize=0[voicecat]",
+    ]
+
+
+def _stitched_voice_filter_parts(layout: list, master_input: str,
+                                 room_tone_db: Optional[float] = None) -> list:
+    """Voice track for an edit whose talking takes carry their own audio.
+
+    A self-voiced take contributes its own sound for exactly the stretch of the
+    sentence its picture covers. Every other shot takes the same stretch of the
+    master voiceover, which is what keeps the sentence running over b-roll —
+    the two sources hand the sentence over at the frame boundary, with nothing
+    inserted between them. The whole result rides on a room tone bed, so no
+    seam ever falls into a silence deeper than the material around it.
+    """
+    parts = []
+    from_master = [segment for segment in layout if not segment["self_voiced"]]
+    if len(from_master) == 1:
+        parts.append(f"[{master_input}:a]{_VOICE_STITCH_FORMAT}[m{from_master[0]['index']}]")
+    elif from_master:
+        parts.append(
+            f"[{master_input}:a]{_VOICE_STITCH_FORMAT},asplit={len(from_master)}"
+            + "".join(f"[m{segment['index']}]" for segment in from_master)
+        )
+    for segment in layout:
+        index, duration = segment["index"], segment["duration"]
+        if segment["self_voiced"]:
+            fade = _TAKE_SPLICE_FADE_SECONDS
+            source = (
+                f"[{index}:a]{_VOICE_STITCH_FORMAT},"
+                f"volume={segment['gain_db']:.2f}dB,"
+                f"atrim=start={segment['head']:.3f}:"
+                f"end={segment['head'] + duration:.3f},asetpts=PTS-STARTPTS,"
+                f"afade=t=in:st=0:d={fade},"
+                f"afade=t=out:st={max(0.0, duration - fade):.3f}:d={fade},"
+            )
+        else:
+            source = (
+                f"[m{index}]atrim=start={segment['reel_start']:.3f}:"
+                f"end={segment['reel_start'] + duration:.3f},asetpts=PTS-STARTPTS,"
+            )
+        parts.append(
+            f"{source}apad,atrim=end={duration:.3f},"
+            f"asetpts=PTS-STARTPTS[a{index}]"
+        )
+    parts.append(
+        "".join(f"[a{segment['index']}]" for segment in layout)
+        + f"concat=n={len(layout)}:v=0:a=1"
+        + ("[voicedry]" if room_tone_db is not None else "[voicecat]")
+    )
+    if room_tone_db is not None:
+        parts.extend(_room_tone_filter_parts(
+            sum(segment["duration"] for segment in layout), room_tone_db,
+        ))
+    return parts
+
+
 def composite_storyboard_video(
     clips: list,
     audio_path: str,
@@ -5739,10 +6158,19 @@ def composite_storyboard_video(
     # Бед нормализуется к _MUSIC_BED_DBFS, так что это просто подстройка сверху.
     music_volume: float = 1.0,
 ) -> str:
-    """Concatenate Kling V3 storyboard clips and lay the voiceover/subtitles on top."""
+    """Concatenate storyboard clips and lay the voiceover/subtitles on top.
+
+    A take that came back from the avatar model with its own audio keeps that
+    audio under its own picture (see `_self_voiced_clip`); the master voiceover
+    fills the shots that were generated mute. Both are cut on the same frame
+    grid as the master the captions were timed on, so the sentence runs through
+    the seams and the captions still land on it.
+    """
     if not clips:
         raise ValueError("Storyboard composite requires at least one clip")
 
+    layout = _reel_layout(clips, audio_path)
+    stitched_voice = any(segment["self_voiced"] for segment in layout)
     sub_filter = _subtitle_filter(srt_path)
     inputs = []
     for clip in clips:
@@ -5762,10 +6190,16 @@ def composite_storyboard_video(
         "scale=1080:1920,setsar=1"
     )
     filter_parts = []
+    # Наезд считается по номеру говорящего кадра, а не по индексу клипа: вставки
+    # между ними живут своей жизнью и сбивать чередование не должны.
+    talking_index = 0
     concat_parts = []
-    for index, clip in enumerate(clips):
-        actual = _get_media_duration(clip["path"])
-        duration = max(0.1, float(clip.get("duration") or actual))
+    for segment in layout:
+        index, clip = segment["index"], segment["clip"]
+        actual = segment["actual"]
+        # A self-voiced take owns its whole length: the slot only says where its
+        # words sit in the master, not how much picture the model returned.
+        duration = segment["duration"]
         shot = clip.get("shot") or {}
         whisper = _shot_performance(shot) == "whisper"
         try:
@@ -5780,15 +6214,37 @@ def composite_storyboard_video(
             # crop: slowing a lip-synced clip would move its mouth off the
             # untouched master voiceover.
             clip_norm += f",{whisper_punch}"
+        elif not whisper and not _is_broll_shot(shot):
+            # Медленный наезд внутри говорящего кадра. Kling оживляет неподвижное
+            # фото: мимика есть, камера стоит намертво — и кадр на две-три секунды
+            # читается как фотография с говорящим ртом. Наезд эти секунды держит,
+            # и он бесплатный: трогает только картинку, PTS и звук не касается,
+            # так что липсинк не уезжает.
+            push = _talking_push_in(talking_index, duration)
+            talking_index += 1
+            if push:
+                clip_norm += f",{push}"
         # A lip-synced clip can open with the head of silence its driving audio
-        # carried (see _mp3_encoder_delay): skipping it puts the lips back on
-        # the master voiceover instead of that many milliseconds behind it.
-        head = min(max(0.0, float(clip.get("speech_offset") or 0.0)), max(0.0, actual - 0.1))
+        # carried (see _mp3_encoder_delay). When the take keeps its own sound
+        # that head is harmless — picture and audio carry it together — so only
+        # a clip played against the master track gets it skipped.
+        head = segment["head"] if segment["self_voiced"] else min(
+            max(0.0, float(clip.get("speech_offset") or 0.0)), max(0.0, actual - 0.1),
+        )
         head_arg = f"{head:.3f}" if head else "0"
         usable = max(0.1, actual - head)
         deficit = duration - usable
         stretchable = _is_broll_shot(clip.get("shot") or {})
-        if usable > 0 and 0.05 < deficit <= usable * 0.15 and stretchable:
+        if segment["self_voiced"]:
+            # Never re-synced: picture and sound are cut at the same two points,
+            # so the model's own lip sync survives whole. What goes is only the
+            # picture around the words — the head of silence the driving mp3
+            # carried, and the tail past the last word, which has nothing to
+            # sound and would open a hole in the middle of the sentence.
+            chain = (f"[{index}:v]trim=start={head_arg}:"
+                     f"end={_trim_end(head + duration)},"
+                     f"setpts=PTS-STARTPTS,{clip_norm}")
+        elif usable > 0 and 0.05 < deficit <= usable * 0.15 and stretchable:
             # Short b-roll: slow the whole clip a touch instead of a visible
             # end-freeze — motion carries through and the seam disappears.
             # Talking shots keep the freeze: stretching them would drag the
@@ -5797,11 +6253,11 @@ def composite_storyboard_video(
             head_chain = f"trim=start={head_arg},setpts=PTS-STARTPTS," if head else ""
             chain = (
                 f"[{index}:v]{head_chain}setpts={ratio:.6f}*PTS,{clip_norm},"
-                f"trim=start=0:end={duration:.3f},setpts=PTS-STARTPTS"
+                f"trim=start=0:end={_trim_end(duration)},setpts=PTS-STARTPTS"
             )
         else:
             chain = (
-                f"[{index}:v]trim=start={head_arg}:end={head + duration:.3f},"
+                f"[{index}:v]trim=start={head_arg}:end={_trim_end(head + duration)},"
                 f"setpts=PTS-STARTPTS,{clip_norm}"
             )
             # Clip came back shorter than its slot: freeze the last frame
@@ -5818,11 +6274,11 @@ def composite_storyboard_video(
                 f"[{output_label}]split=2[v{index}pre][v{index}whisper]"
             )
             filter_parts.append(
-                f"[v{index}pre]trim=start=0:end={whisper_start:.3f},"
+                f"[v{index}pre]trim=start=0:end={_trim_end(whisper_start)},"
                 f"setpts=PTS-STARTPTS[v{index}pretrim]"
             )
             filter_parts.append(
-                f"[v{index}whisper]trim=start={whisper_start:.3f}:end={duration:.3f},"
+                f"[v{index}whisper]trim=start={whisper_start:.3f}:end={_trim_end(duration)},"
                 f"setpts=PTS-STARTPTS,{whisper_punch}[v{index}whisperzoom]"
             )
             filter_parts.append(
@@ -5835,15 +6291,23 @@ def composite_storyboard_video(
         "fps=30,settb=expr=1/30,setpts=N/(30*TB),setsar=1[vout]"
     )
     filter_parts.append(f"[vout]{sub_filter}[finalv]")
-    voice_input = str(len(clips))
+    master_input = str(len(clips))
     music_input = str(len(clips) + 1) if music_path else None
     music_gain_db = _music_bed_gain_db(music_path) if music_path else 0.0
+    voice_parts = _stitched_voice_filter_parts(
+        layout, master_input,
+        _room_tone_db([audio_path] + [segment["clip"]["path"] for segment in layout
+                                      if segment["self_voiced"]]),
+    ) if stitched_voice else []
+    voice_input = "[voicecat]" if stitched_voice else master_input
+    filter_parts.extend(voice_parts)
     filter_parts.extend(_final_audio_filter_parts(
         voice_input,
         music_input,
         music_volume,
         _measure_final_loudness(
-            inputs, voice_input, music_input, music_volume, music_gain_db=music_gain_db,
+            inputs, voice_input, music_input, music_volume,
+            music_gain_db=music_gain_db, voice_parts=voice_parts,
         ),
         music_gain_db=music_gain_db,
     ))
@@ -6153,22 +6617,6 @@ def _ensure_slice_audio(
 
 _MIN_TALKING_SLICE_SECONDS = 2.0
 _MAX_TALKING_SLICE_SECONDS = 8.0
-# Cut fast on the hook, let the body breathe. Measured off the reel that broke
-# through (16 shots / 72s): 2.2 2.2 2.8 on the hook, then 4.3-8.2, median 4.7.
-_HOOK_WINDOW_SECONDS = 8.0
-_HOOK_SLICE_SECONDS = 2.6
-_BODY_WINDOW_SECONDS = 30.0
-_BODY_SLICE_SECONDS = 5.0
-_LATE_SLICE_SECONDS = 6.5
-
-
-def _target_slice_seconds(start: float) -> float:
-    """How long one talking shot may run at this point in the reel."""
-    if start < _HOOK_WINDOW_SECONDS:
-        return _HOOK_SLICE_SECONDS
-    if start < _BODY_WINDOW_SECONDS:
-        return _BODY_SLICE_SECONDS
-    return _LATE_SLICE_SECONDS
 
 
 def _stored_slice_cuts(shot: dict, duration: float, cuts_by_shot: Optional[dict]) -> list:
@@ -6186,6 +6634,132 @@ def _stored_slice_cuts(shot: dict, duration: float, cuts_by_shot: Optional[dict]
     if any(b - a < _MIN_TALKING_SLICE_SECONDS for a, b in zip([0.0] + cuts, cuts + [duration])):
         return []
     return cuts
+
+
+def _billed_avatar_seconds(window: float) -> float:
+    """Сколько секунд говорящего клипа попадёт в счёт при таком куске речи.
+
+    Не длина речи: Avatar не отдаёт клип короче своего пола и не отдаёт длину
+    произвольную — она округляется вверх до блока в 8 кадров. Проверено на
+    прошлом ролике: пять кусков речи 1.72 / 1.64 / 2.58 / 1.66 / 2.26 с по этой
+    формуле дают 11.466 с, и ровно столько лежит на диске.
+    """
+    block = _KLING_AVATAR_BLOCK_FRAMES / _KLING_AVATAR_FPS
+    return max(_KLING_AVATAR_MIN_CLIP_SECONDS,
+               math.ceil(max(0.0, float(window)) / block) * block)
+
+
+def _billed_broll_seconds(window: float) -> float:
+    """Сколько секунд перебивки попадёт в счёт при таком окне в монтаже.
+
+    Ровно то, что уедет в запрос: `_broll_slice_shot` округляет окно вверх до
+    секунды, а `_shot_duration` поднимает результат до пола Kling. Считать смету
+    по самому окну — значит обещать полсекунды там, где будут оплачены три.
+    """
+    return float(_shot_duration({"start": 0, "end": math.ceil(max(1.0, window))}))
+
+
+def _billed_clip_seconds(clip: dict) -> float:
+    """Сколько секунд снятого клипа попадёт в счёт.
+
+    Не длина окна: сборка обрежет клип до окна, но модель уже сняла и посчитала
+    своё — она никогда не отдаёт меньше своего пола и округляет длину вверх.
+    Поэтому меряем файл; окно остаётся запасным ответом, если файла нет.
+    """
+    path = clip.get("path") or ""
+    # Мерить можно только то, что есть: ffprobe на пустом пути читает не тот
+    # поток и возвращает правдоподобное число, которое молча уедет в счёт.
+    if path and os.path.exists(path):
+        actual = _get_media_duration(path)
+        if actual and actual > 0:
+            return actual
+    window = float(clip.get("duration") or 0.0)
+    if _is_broll_shot(clip.get("shot") or {}):
+        return _billed_broll_seconds(window)
+    return _billed_avatar_seconds(window)
+
+
+def _slice_silence_at_edges(sl: dict, words: list) -> tuple:
+    """Сколько немого времени у куска в начале и в конце.
+
+    Речь здесь единственная неприкосновенная величина: слова кадра сняты вместе
+    с его губами. Тишина по краям — нет, её можно отдать соседу.
+    """
+    inside = [
+        w for w in words
+        if float(w.get("start", 0.0)) < sl["end"] and float(w.get("end", 0.0)) > sl["start"]
+    ]
+    if not inside:
+        return sl["end"] - sl["start"], sl["end"] - sl["start"]
+    first = min(float(w.get("start", 0.0)) for w in inside)
+    last = max(float(w.get("end", 0.0)) for w in inside)
+    # Разгон оставляем говорящему: губы должны тронуться чуть раньше слова, а не
+    # ровно по нему, иначе первый слог выходит уже открытым ртом.
+    head = first - _AVATAR_SPEECH_PREROLL - sl["start"]
+    return max(0.0, head), max(0.0, sl["end"] - last)
+
+
+def _clip_floor_of(sl: dict) -> float:
+    """Пол клипа, которым снимут этот кусок, — короче модель не отдаст и не сочтёт."""
+    return (float(_KLING_MIN_CLIP_SECONDS) if _is_broll_shot(sl["shot"])
+            else _KLING_AVATAR_MIN_CLIP_SECONDS)
+
+
+def _fill_slices_to_clip_floor(slices: list, words: list) -> tuple:
+    """Отдать кадру всё время, за которое всё равно заплачено.
+
+    Клипов короче своего пола ни одна из моделей не отдаёт: под перебивку с
+    полусекундой речи Kling V3 снимет три секунды и три возьмёт в счёт, под
+    полуторасекундную реплику Avatar отдаст свои 2.14. Сборка обрежет клип до
+    окна — зритель видит вспышку, касса видит полный клип.
+
+    Поэтому короткий кадр добирает недостающее у соседей: его окно растёт,
+    соседнее на столько же сжимается, общая длина дорожки не меняется. Липсинк
+    это не задевает — говорящий клип снимается по своему куску озвучки, а кусок
+    режется уже по новым границам, так что губы и звук по-прежнему одно целое.
+
+    Но берётся только тишина по краям соседа, не его слова. Иначе кадр съедал бы
+    первый слог следующего — ровно ту паузу перед речью, ради которой существует
+    `_retime_talking_slices_to_speech`, — и лечение вышло бы хуже болезни. Когда
+    тишины не хватает, кадр остаётся коротким: склеивать соседние кадры или
+    менять их тип значило бы молча переписать раскадровку, а это решение автора —
+    ему об этом и скажут.
+
+    Возвращает (сколько добрали, сколько так и осталось короткими).
+    """
+    floor_of = _clip_floor_of
+
+    # Меньше этого не двигаем: пара кадров на экране ничего не меняет, а границы
+    # кусков озвучки от такого шевеления поедут.
+    epsilon = 0.05
+    filled = short = 0
+    for index, sl in enumerate(slices):
+        need = floor_of(sl) - (sl["end"] - sl["start"])
+        if need <= epsilon:
+            continue
+        # Сначала вперёд: тишина перед следующей мыслью принадлежит ей меньше,
+        # чем хвост уже сказанной — предыдущей.
+        for neighbour_index, forward in ((index + 1, True), (index - 1, False)):
+            if need <= epsilon or not 0 <= neighbour_index < len(slices):
+                continue
+            neighbour = slices[neighbour_index]
+            head, tail = _slice_silence_at_edges(neighbour, words)
+            room = (neighbour["end"] - neighbour["start"]) - floor_of(neighbour)
+            take = min(need, max(0.0, room), head if forward else tail)
+            if take <= epsilon:
+                continue
+            if forward:
+                sl["end"] += take
+                neighbour["start"] += take
+            else:
+                sl["start"] -= take
+                neighbour["end"] -= take
+            need -= take
+        if need > epsilon:
+            short += 1
+        else:
+            filled += 1
+    return filled, short
 
 
 def _split_performance_slices(slices: list, words: list) -> list:
@@ -6272,20 +6846,18 @@ def _split_long_slices(
     max_len: Optional[float] = None,
     cuts_by_shot: Optional[dict] = None,
 ) -> list:
-    """Split talking slices into jump-cut sub-slices on a rhythm curve.
+    """Split only talking takes that exceed Kling Avatar's practical limit.
 
-    Kling Avatar lip-sync drifts over long takes and a long static monologue
-    reads dead, so shots stay short — shortest on the hook, where attention is
-    won or lost. Pass max_len to override the curve with one flat limit, or
-    cuts_by_shot to replay the cuts a shot already got. Cuts snap to inter-word
-    pauses; each sub-slice carries a copy of the shot, so the alternating
-    framings render the splits as natural angle changes. B-roll slices pass
-    through: the master voiceover plays over them, no lip-sync involved.
+    An authored shot at or below the limit stays one paid generation. Splitting
+    a short take creates another minimum-billed Kling request and a visible
+    pose/framing reset at the seam. Pass max_len to use a stricter explicit
+    limit. Stored cuts are replayed only while a take still exceeds that limit.
+    B-roll slices pass through because the master voiceover plays over them.
     """
     result = []
     for sl in slices:
         duration = sl["end"] - sl["start"]
-        limit = max_len if max_len is not None else _target_slice_seconds(sl["start"])
+        limit = float(max_len) if max_len is not None else _MAX_TALKING_SLICE_SECONDS
         if _is_broll_shot(sl["shot"]) or duration <= limit + 0.01:
             result.append(sl)
             continue
@@ -6523,6 +7095,12 @@ def _blank_model_memo(photo_path: str) -> str:
     return f"{photo_path}.blank_models.json"
 
 
+_BLANK_MEMO_LOCK = threading.Lock()
+# Столько же, сколько у съёмки клипов: fal держит очередь на аккаунт, и гнать
+# шире значит только дольше стоять в ней.
+_FRAME_WORKERS = 3
+
+
 def _models_that_blanked(photo_path: str) -> set:
     """Редакторы, уже вернувшие чёрный кадр на это фото.
 
@@ -6539,12 +7117,16 @@ def _models_that_blanked(photo_path: str) -> set:
 
 
 def _remember_blank_model(photo_path: str, model: str) -> None:
-    known = _models_that_blanked(photo_path) | {model}
-    try:
-        with open(_blank_model_memo(photo_path), "w", encoding="utf-8") as f:
-            json.dump(sorted(known), f)
-    except OSError:
-        pass
+    # Кадры рисуются в несколько потоков, а память вердиктов — один файл на фото:
+    # без замка два отказа одновременно перетирают друг друга, и второй платный
+    # чёрный квадрат покупается заново.
+    with _BLANK_MEMO_LOCK:
+        known = _models_that_blanked(photo_path) | {model}
+        try:
+            with open(_blank_model_memo(photo_path), "w", encoding="utf-8") as f:
+                json.dump(sorted(known), f)
+        except OSError:
+            pass
 
 
 def _drop_frame_files(output_path: str) -> None:
@@ -6749,13 +7331,19 @@ def _broll_reference_image(
     """
     base_prompt = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
     if _shot_wants_actor(shot) and actor_photo_path and os.path.exists(actor_photo_path):
+        # Композицию задаёт описание кадра, и только оно. Раньше здесь стояло
+        # «этого человека видно со спины, через плечо», и на просьбе «крупно руки»
+        # модель слушалась хвоста, а не описания: получался средний план со спины
+        # вместо кистей. Лицо за кадром — это требование (иначе вставка читается
+        # как новый герой), а не указание, откуда снимать.
         actor_prompt = (
-            "Keep the exact same person as in the reference image: same hairstyle, build "
-            f"and clothing. {base_prompt + '. ' if base_prompt else ''}"
-            "Single photographic frame, vertical 9:16, this person seen from behind, over "
-            "the shoulder or cropped so the face stays out of frame. One person only, "
-            "natural light, shallow depth of field, smartphone realism, plain unbranded "
-            "surfaces."
+            "The reference image is the only source of identity and appearance: keep the "
+            "exact same person, same hairstyle, build and clothing. Single photographic "
+            "frame, vertical 9:16, one person only, natural light, shallow depth of field, "
+            "smartphone realism, plain unbranded surfaces. This person's face stays out of "
+            "frame — a back view, an over-the-shoulder angle or a tight crop on the hands "
+            "and forearms are all fine, whichever the description asks for. "
+            f"Recompose the shot as described{': ' + base_prompt if base_prompt else ''}."
         )
         made = _flux_reference_frame(
             actor_prompt, fal_key, output_path, log=log,
@@ -6782,6 +7370,24 @@ def _broll_reference_image(
     )
 
 
+# Лицо на плите — это не портрет, а стартовая поза для Kling: он держит найденное
+# на кадре выражение всю реплику и возвращается к нему после каждого слога.
+# Широкая улыбка с зубами, растянутая на две секунды говорения, читается как
+# оскал — поэтому улыбка запрещена прямо, а не «спокойное лицо» намёком.
+#
+# Просить об этом приходится жёстко: у редактора изображений выражение ведёт себя
+# как композиция (см. комментарий к `_AVATAR_FRAMINGS`) — он тянет его из входного
+# фото, а фото актёра почти всегда улыбается в объектив. Мягкая формулировка
+# «calm expression, lips gently closed» стояла в обоих промптах и проиграла
+# исходнику: обе плиты последнего прогона вышли с открытой улыбкой.
+_AVATAR_RESTING_FACE = (
+    "A still moment before speech begins. Override the expression of the reference photo: "
+    "the mouth is closed, the lips rest together, no teeth are visible anywhere, the jaw is "
+    "relaxed and the cheeks are not raised. No smile, no grin, no laugh. A composed, neutral, "
+    "attentive face; any warmth lives in the eyes alone."
+)
+
+
 def _avatar_reference_image(
     shot: dict,
     actor_photo_path: str,
@@ -6802,8 +7408,16 @@ def _avatar_reference_image(
     a punch-in crop of the shared photo: a plainer frame beats a failed job.
 
     scene_override pins one set for every talking shot of a reel; framing asks
-    for a specific crop of that set, so the reel reads as two cameras on one
-    take instead of a new room behind every cut.
+    for a specific staging of that set, so the reel reads as several cameras on
+    one take instead of a new room behind every cut.
+
+    Порядок слов в промпте — не косметика. Строка ракурса идёт последней и
+    приказом, потому что раньше она стояла в середине и проигрывала двум соседям:
+    закреплённый сет сам заканчивался словами «medium shot», а хвост требовал
+    держать человека «целиком в кадре». Из-за этого medium, close и hush выходили
+    одним и тем же средним планом. Здесь же сказано, что камеру описание сцены не
+    задаёт вовсе, — иначе первый же кадр раскадровки навязывает свой план всем
+    остальным.
     """
     if not (actor_photo_path and os.path.exists(actor_photo_path)):
         return ""
@@ -6812,17 +7426,15 @@ def _avatar_reference_image(
     framing = (framing or "").strip().rstrip(".")
     prompt = (
         "The reference image is the only source of identity and appearance. Keep the exact "
-        "same person, face, hairstyle, body, outfit and accessories. Treat the scene text "
-        "only as direction for pose, position, gaze, expression, action, location, lighting "
-        "and camera; ignore any appearance wording it may contain. "
+        "same person, face, hairstyle, body, outfit and accessories: one single person, no "
+        "second face, no extra person at the frame edges. Treat the scene text only as "
+        "direction for location, lighting, props, position, gaze and action; ignore any "
+        "appearance or camera wording it may contain — the staging line below is the only "
+        "camera instruction. "
         f"{scene + '. ' if scene else ''}"
-        f"{framing + '. ' if framing else ''}"
-        "Vertical 9:16 portrait, one single person only, centered and fully inside the frame, "
-        "photorealistic phone-camera look, natural light. A still moment before speech begins: "
-        "calm expression, lips gently closed, neutral resting mouth. "
-        "Never duplicate the person, never add a "
-        "second face, keep the frame edges free of any extra person. Plain unbranded clothing "
-        "and background."
+        "Vertical 9:16, photorealistic phone-camera look, natural light, plain unbranded "
+        f"clothing and background. {_AVATAR_RESTING_FACE} "
+        f"{'Restage the shot: ' + framing + '.' if framing else ''}"
     )
     return _flux_reference_frame(
         prompt, fal_key, output_path, log=log,
@@ -6834,25 +7446,92 @@ def _avatar_reference_image(
     )
 
 
-# Two cameras on one set, alternating — the whole trick behind reels that read as
-# a filmed interview: the background never changes, only the framing does, so the
-# pose reset every generated clip starts with lands between two different angles
-# and stops registering as a jump.
+def _avatar_moment_image(
+    base_path: str,
+    fal_key: str,
+    output_path: str,
+    moment: str,
+    log: Callable[[str], None] = print,
+    billing: Optional[dict] = None,
+    edit_model: str = "",
+) -> str:
+    """Другой момент того же дубля: кадрирование берём из картинки, а не из слов.
+
+    Вход — уже обрезанная базовая плита, то есть нужная крупность на входе. От
+    модели требуется ровно одно: сменить позу, взгляд и руки, не трогая ни
+    человека, ни комнату, ни дистанцию. Это игра по правилам редактора, а не
+    против них: композицию входа он и так сохраняет — см. комментарий к
+    `_AVATAR_FRAMINGS`.
+    """
+    moment = (moment or "").strip().rstrip(".")
+    prompt = (
+        "The reference image already has the right framing, the right person and the right "
+        "place. Keep the person, face, hairstyle, outfit, the background behind them, the "
+        "light and the camera distance exactly as they are: do not zoom out, do not widen "
+        "the frame, do not restage the room. "
+        f"{'Change only the moment: ' + moment + '. ' if moment else ''}"
+        "Photorealistic phone-camera look, vertical 9:16, one single person, no second face. "
+        f"{_AVATAR_RESTING_FACE}"
+    )
+    return _flux_reference_frame(
+        prompt, fal_key, output_path, log=log,
+        actor_photo_path=base_path,
+        label="Avatar camera variant",
+        on_failure="; using the cropped frame instead",
+        billing=billing,
+        edit_model=edit_model,
+    )
+
+
+# Камеры одного сета, по кругу — весь фокус роликов, которые читаются как снятое
+# интервью: фон не меняется, меняется только план, и сброс позы в начале каждого
+# клипа попадает между двумя разными ракурсами и перестаёт читаться как рывок.
+#
+# Крупность задаёт кроп, а не слова. Проверено на диске: `close`, заказанный у
+# редактора изображений словами «the face fills the frame» последней строкой и
+# приказом, вышел тем же планом по бедро, что и `medium`. Дело не в формулировке
+# — это свойство инструмента: редактор меняет содержимое кадра, но композицию
+# входа сохраняет. Просить у него другую камеру значит просить не то.
+#
+# Поэтому производная камера получается в два шага: кроп базовой плиты даёт
+# гарантированную дистанцию (геометрия, модель в ней не участвует), а следующая
+# правка меняет момент — позу, взгляд, руку. Без второго шага это был бы наезд,
+# притворяющийся склейкой: другая крупность, но тот же миг. Собственная строка
+# ракурса у каждой камеры остаётся запасным путём на случай, когда базовой плиты
+# нет вовсе.
+#
+_AvatarCamera = namedtuple(
+    "_AvatarCamera", "key direction base crop moment", defaults=("", None, ""),
+)
+
 _AVATAR_FRAMINGS = (
-    ("medium",
-     "Medium shot from the chest up, the person centred with the room visible behind them"),
-    ("close",
-     "Tight close-up, the face filling the frame, shoulders cropped, background softly "
-     "out of focus"),
+    _AvatarCamera(
+        "medium",
+        "a medium shot from the chest up, the person centred with the set visible behind them",
+    ),
+    _AvatarCamera(
+        "close",
+        "a tight close-up: the face fills the frame, shoulders and the top of the head may "
+        "be cropped, the background soft and far behind",
+        base="medium",
+        crop=(2.2, 0.5, 0.08),
+        moment="the head turned a little to one side and the gaze coming back to the lens, "
+               "one hand raised near the chest as if picking the next word",
+    ),
 )
-_AVATAR_HUSH_FRAMING = (
+_AVATAR_HUSH_FRAMING = _AvatarCamera(
     "hush",
-    "Tight intimate close-up, leaning slightly toward the camera, chin lowered, one hand "
-    "resting near the mouth, restrained confidential expression",
+    "an intimate close-up: the person leaning slightly toward the camera, chin lowered, one "
+    "hand resting near the mouth, restrained confidential expression",
+    base="medium",
+    crop=(2.6, 0.5, 0.10),
+    moment="leaning slightly toward the lens, chin lowered, one hand resting near the mouth, "
+           "a restrained confidential expression",
 )
+_AVATAR_CAMERAS = {c.key: c for c in (*_AVATAR_FRAMINGS, _AVATAR_HUSH_FRAMING)}
 
 
-def _avatar_framing_for_shot(shot: dict, framing_index: int) -> tuple:
+def _avatar_framing_for_shot(shot: dict, framing_index: int) -> _AvatarCamera:
     if _shot_performance(shot) == "whisper":
         return _AVATAR_HUSH_FRAMING
     return _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
@@ -6914,6 +7593,29 @@ def _refuse_unusable_start_frame(photo_path: str) -> None:
     )
 
 
+def _crop_zoom_image(image_path: str, output_path: str, zoom: float, cx: float, cy: float) -> str:
+    """Кадр крупнее: кроп на `zoom` вокруг точки (`cx`, `cy`) и обратно в размер.
+
+    Разводит стартовые кадры, которые иначе совпали бы буквально (одна камера у
+    двух соседних клипов, одно фото у нескольких кадров). Не заменяет камеру:
+    крупность здесь — способ не повторить кадр, а не способ его получить.
+    Не получилось — отдаём исходник: одинаковый кадр лучше упавшей генерации.
+    """
+    if _nonempty(output_path):
+        return output_path
+    vf = (
+        f"crop=iw/{zoom}:ih/{zoom}:(iw-iw/{zoom})*{cx}:(ih-ih/{zoom})*{cy},"
+        f"scale=ceil(iw*{zoom}/2)*2:ceil(ih*{zoom}/2)*2"
+    )
+    cmd = ["ffmpeg", "-y", "-i", image_path, "-vf", vf, output_path]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_path
+    except Exception as e:
+        print(f"[SaaSShorts] ⚠️ Crop failed, using the frame as it is: {e}")
+        return image_path
+
+
 def _avatar_reference_variant(image_path: str, output_path: str, index: int) -> str:
     """Crop a slightly different framing of one actor photo per shot.
 
@@ -6924,20 +7626,169 @@ def _avatar_reference_variant(image_path: str, output_path: str, index: int) -> 
     variant = _AVATAR_REFERENCE_VARIANTS[(index - 1) % len(_AVATAR_REFERENCE_VARIANTS)]
     if variant is None:
         return image_path
-    if _nonempty(output_path):
-        return output_path
-    zoom, cx, cy = variant
-    vf = (
-        f"crop=iw/{zoom}:ih/{zoom}:(iw-iw/{zoom})*{cx}:(ih-ih/{zoom})*{cy},"
-        f"scale=ceil(iw*{zoom}/2)*2:ceil(ih*{zoom}/2)*2"
-    )
-    cmd = ["ffmpeg", "-y", "-i", image_path, "-vf", vf, output_path]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        return output_path
-    except Exception as e:
-        print(f"[SaaSShorts] ⚠️ Reference variant failed, using original photo: {e}")
-        return image_path
+    return _crop_zoom_image(image_path, output_path, *variant)
+
+
+_PLATE_IDENTITY_SUFFIX = ".set.txt"
+
+
+class _AvatarPlates:
+    """Постановочные кадры камер — по одному на камеру, общие на весь ролик.
+
+    Один источник правды для двух путей, которые раньше собирали плиты каждый
+    сам: предпросмотра кадров и платного рендера. Расхождение здесь означало бы,
+    что человек утвердил один кадр, а оживили другой.
+
+    Одна плита на камеру и на весь ролик: кадр на каждый шот — это и счёт за
+    каждый шот, и новая комната за каждой склейкой.
+
+    «На весь ролик», а не «на папку джоба». Каждое нажатие «сгенерить» заводит
+    новую папку, и раньше плита рисовалась в ней заново: три прогона давали три
+    разных `medium` — три комнаты на одной камере, оплаченные трижды, — а рендер
+    вдобавок рисовал четвёртую и оживлял её вместо утверждённой. Поэтому рядом с
+    плитой лежит `.set.txt`: чем этот кадр является (камера, её постановка,
+    закреплённый сет), а не как его попросили. Совпало — берём готовый файл из
+    любой папки, не платим и не расходимся с предпросмотром.
+    """
+
+    def __init__(self, output_dir: str, title_slug: str, pinned_set: str,
+                 actor_photo: Callable[[], str], fal_key: str,
+                 edit_model: str = "", billing: Optional[dict] = None,
+                 known_frames: Optional[List[str]] = None,
+                 log: Callable[[str], None] = print):
+        self._output_dir = output_dir
+        self._slug = title_slug
+        self._set = pinned_set
+        self._actor_photo = actor_photo
+        self._fal_key = fal_key
+        self._edit_model = edit_model
+        self._billing = billing
+        self._log = log
+        self._made: dict = {}
+        # Кадры, которые шоты уже носят, — в том числе из прошлых папок.
+        self._known: List[str] = [p for p in (known_frames or []) if p]
+        self._forgotten: set = set()
+
+    def path(self, camera: _AvatarCamera) -> str:
+        return _framing_plate_path(self._output_dir, self._slug, camera.key)
+
+    def _crop_path(self, camera: _AvatarCamera) -> str:
+        return f"{os.path.splitext(self.path(camera))[0]}_crop.png"
+
+    def identity(self, camera: _AvatarCamera) -> str:
+        """Чем эта плита является — по этой строке её узнают в чужой папке.
+
+        Не промпт: у производной камеры промпт правки ничего не знает о базовой
+        плите, и обновлённый `medium` не отменил бы устаревший `close`.
+
+        Но постановка лица сюда входит: она общая для обеих камер и решает, с
+        каким выражением Kling будет говорить всю реплику. Без неё плита,
+        нарисованная под прежнюю формулировку, усыновлялась бы как своя — и
+        улыбка, из-за которой всё затевалось, пережила бы правку промпта.
+        """
+        parts = [camera.key, camera.direction, camera.moment, str(camera.crop), self._set,
+                 _AVATAR_RESTING_FACE]
+        if camera.base:
+            parts.append(self.identity(_AVATAR_CAMERAS[camera.base]))
+        return "\n".join(parts)
+
+    def forget(self, camera: _AvatarCamera) -> None:
+        """Убрать плиту, чтобы «перерисовать» действительно перерисовало."""
+        self._made.pop(camera.key, None)
+        # Иначе тот же кадр вернётся из прошлой папки: он ведь всё ещё та камера
+        # того же сета, и «перерисовать» стало бы «показать то же самое».
+        self._forgotten.add(camera.key)
+        for path in (self.path(camera), self._crop_path(camera)):
+            _drop_frame_files(path)
+            for extra in (".prompt.txt", _PLATE_IDENTITY_SUFFIX):
+                try:
+                    os.remove(f"{path}{extra}")
+                except OSError:
+                    pass
+        # Плиты, снятые с этой: перерисовать базу и оставить производную значит
+        # выдать «другой ракурс» с прошлого дубля.
+        for other in _AVATAR_CAMERAS.values():
+            if other.base == camera.key:
+                self.forget(other)
+
+    def plate(self, camera: _AvatarCamera) -> str:
+        if camera.key not in self._made:
+            self._made[camera.key] = self._adopt(camera) or self._build(camera)
+        return self._made[camera.key]
+
+    def _adopt(self, camera: _AvatarCamera) -> str:
+        """Готовый кадр этой камеры — из этой папки или из той, где его утвердили."""
+        if camera.key in self._forgotten:
+            return ""
+        want = self.identity(camera)
+        target = self.path(camera)
+        for path in [target, *self._known]:
+            if not _nonempty(path):
+                continue
+            try:
+                with open(f"{path}{_PLATE_IDENTITY_SUFFIX}", encoding="utf-8") as f:
+                    if f.read() != want:
+                        continue
+            except OSError:
+                continue
+            if os.path.normpath(path) == os.path.normpath(target):
+                return target
+            shutil.copyfile(path, target)
+            for extra in (_PLATE_IDENTITY_SUFFIX, ".prompt.txt"):
+                try:
+                    shutil.copyfile(f"{path}{extra}", f"{target}{extra}")
+                except OSError:
+                    pass
+            self._log(f"  Ракурс «{camera.key}»: беру уже утверждённый кадр, не рисую заново.")
+            return target
+        return ""
+
+    def _build(self, camera: _AvatarCamera) -> str:
+        made = self._draw(camera)
+        if made and _nonempty(made):
+            try:
+                with open(f"{made}{_PLATE_IDENTITY_SUFFIX}", "w", encoding="utf-8") as f:
+                    f.write(self.identity(camera))
+            except OSError:
+                pass
+        return made
+
+    def _draw(self, camera: _AvatarCamera) -> str:
+        if camera.base:
+            base = self.plate(_AVATAR_CAMERAS[camera.base])
+            if base and _nonempty(base):
+                framed = _crop_zoom_image(base, self._crop_path(camera), *camera.crop)
+                made = _avatar_moment_image(
+                    framed, self._fal_key, self.path(camera), camera.moment,
+                    log=self._log, billing=self._billing, edit_model=self._edit_model,
+                )
+                # Правка не вышла — крупность уже в руках, отдаём кроп: другой
+                # план того же мига лучше, чем второй раз тот же кадр подряд.
+                return made or (framed if _nonempty(framed) else "")
+        return _avatar_reference_image(
+            {}, self._actor_photo(), self._fal_key, self.path(camera), log=self._log,
+            scene_override=self._set, framing=camera.direction,
+            billing=self._billing, edit_model=self._edit_model,
+        )
+
+
+def _point_shot_at_frame(shot: dict, frame_path: str, job_dir: str) -> None:
+    """Прицепить кадр к шоту всеми именами, под которыми его ищут интерфейс и рендер."""
+    url = f"/videos/{job_dir}/{os.path.basename(frame_path)}"
+    shot["image_path"] = frame_path
+    shot["local_url"] = url
+    shot["image_url"] = url
+    shot["preview_frame_url"] = url
+
+
+def _pinned_avatar_set(shots: list) -> str:
+    """Сет первого говорящего кадра — на нём стоят все остальные говорящие."""
+    for shot in shots:
+        if not _is_broll_shot(shot):
+            scene = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
+            if scene:
+                return scene
+    return ""
 
 
 def generate_sliced_avatar_clips(
@@ -6989,6 +7840,16 @@ def generate_sliced_avatar_clips(
             f"  Липсинк: {onset_adjustments} говорящих кадр(а) начинаются у речи; "
             "ведущая пауза осталась предыдущему визуалу."
         )
+    filled, short = _fill_slices_to_clip_floor(slices, words)
+    if filled:
+        log(f"  Кадры: {filled} шт. добрали время до полного клипа — "
+            "платим за него в любом случае.")
+    if short:
+        log(f"  Кадры: {short} шт. короче того, что модель вообще снимает "
+            f"(перебивка {_KLING_MIN_CLIP_SECONDS} с, говорящий "
+            f"{_KLING_AVATAR_MIN_CLIP_SECONDS} с), и занять время не у кого. "
+            "Клип оплачен целиком, а на экране мелькнёт: кадров в ролике больше, "
+            "чем эта длительность может оплатить — их стоит укрупнить.")
     pre_split = len(slices)
     slices = _split_performance_slices(slices, words)
     slices = _split_long_slices(
@@ -7000,22 +7861,14 @@ def generate_sliced_avatar_clips(
     if len(slices) != pre_split:
         log(
             f"  Ритм: {pre_split} кадров -> {len(slices)} клипов "
-            f"(хук по {_HOOK_SLICE_SECONDS:.1f}s, дальше {_BODY_SLICE_SECONDS:.0f}-{_LATE_SLICE_SECONDS:.1f}s — "
-            "частая склейка держит внимание, короткий дубль держит липсинк)."
+            f"(говорящий кадр длиннее {_MAX_TALKING_SLICE_SECONDS:.0f}s разделён по паузам; "
+            "короткие авторские кадры остаются одним дублем без двойной оплаты)."
         )
 
     fallback_actor_img = ""
-    plates: dict = {}
     # One set for the whole reel, taken from the first talking shot: every talking
     # clip is staged on it, only the framing alternates.
-    pinned_set = ""
-    for sl in slices:
-        if not _is_broll_shot(sl["shot"]):
-            pinned_set = (
-                sl["shot"].get("generation_prompt") or sl["shot"].get("scene") or ""
-            ).strip()
-            if pinned_set:
-                break
+    pinned_set = _pinned_avatar_set([sl["shot"] for sl in slices])
 
     def _shared_actor_photo():
         nonlocal fallback_actor_img
@@ -7030,26 +7883,28 @@ def generate_sliced_avatar_clips(
                 generate_actor_image(desc, fal_key, fallback_actor_img)
         return fallback_actor_img
 
-    def _framing_plate(framing_spec):
+    plates = _AvatarPlates(
+        output_dir, title_slug, pinned_set, _shared_actor_photo, fal_key,
+        edit_model=edit_model, billing=billing, log=log,
+        # Рендер идёт в своей папке, а утверждали кадры в папке предпросмотра.
+        # Без этого списка он нарисовал бы плиты заново — и оживил бы не то,
+        # что человек посмотрел и принял.
+        known_frames=_talking_frames_on_hand([sl["shot"] for sl in slices], _job_output_root(output_dir)),
+    )
+    reported_cameras: set = set()
+
+    def _framing_plate(camera):
         """Staged frame for one camera of the pinned set, generated once per reel."""
-        key, framing_line = framing_spec
-        if key in plates:
-            return plates[key]
-        plate_path = _framing_plate_path(output_dir, title_slug, key)
-        made = _avatar_reference_image(
-            {}, _shared_actor_photo(), fal_key, plate_path, log=log,
-            scene_override=pinned_set, framing=framing_line,
-            billing=billing, edit_model=edit_model,
-        )
-        plates[key] = made
-        if made:
-            log(f"  Ракурс «{key}» готов — он держится на всех говорящих кадрах.")
+        made = plates.plate(camera)
+        if made and camera.key not in reported_cameras:
+            reported_cameras.add(camera.key)
+            log(f"  Ракурс «{camera.key}» готов — он держится на всех говорящих кадрах.")
         return made
 
-    def _resolve_image(sl, index, framing_spec, framing_index):
+    def _resolve_image(sl, index, camera, framing_index):
         whisper = _shot_performance(sl["shot"]) == "whisper"
         if whisper and avatar_image_first:
-            plate = _framing_plate(framing_spec)
+            plate = _framing_plate(camera)
             if plate:
                 return plate
         # A frame the user picked or generated for this shot always wins — but a
@@ -7067,7 +7922,7 @@ def generate_sliced_avatar_clips(
             punch_path = os.path.join(output_dir, f"{title_slug}_shot_ref_{index:02d}.png")
             return _avatar_reference_variant(ref, punch_path, 2)
         if avatar_image_first:
-            plate = _framing_plate(framing_spec)
+            plate = _framing_plate(camera)
             if plate:
                 return plate
         # Fallback: vary the crop of the shared photo so cuts read as camera changes.
@@ -7078,6 +7933,7 @@ def generate_sliced_avatar_clips(
 
     jobs = []
     framing_cursor = 0
+    previous_talking_image = ""
     for index, sl in enumerate(slices, start=1):
         slice_audio = os.path.join(output_dir, f"{title_slug}_slice_{index:02d}.mp3")
         broll = _is_broll_shot(sl["shot"])
@@ -7102,8 +7958,20 @@ def generate_sliced_avatar_clips(
                 actor_ref = _shared_actor_photo()
         else:
             # Two talking shots may sit back to back, but never on the same camera.
-            framing_spec = _avatar_framing_for_shot(sl["shot"], framing_cursor)
-            image = _resolve_image(sl, index, framing_spec, framing_cursor)
+            camera = _avatar_framing_for_shot(sl["shot"], framing_cursor)
+            image = _resolve_image(sl, index, camera, framing_cursor)
+            # Ротация камер сама разводит соседние кадры, но не всегда: два шёпота
+            # подряд оба уходят на «hush», и склейка между ними читается как сбой
+            # генерации, а не как монтаж. Один и тот же кадр подряд не пускаем —
+            # второму даём наезд. Это по-прежнему та же камера и тот же сет, так
+            # что лицо не прыгает, но композиция уже другая.
+            if image and image == previous_talking_image:
+                punch_path = os.path.join(
+                    output_dir, f"{title_slug}_actor_punch_{index:02d}.png")
+                image = _avatar_reference_variant(image, punch_path, 2)
+                log(f"  Кадр {sl['shot'].get('shot_number', index)}: та же камера, "
+                    "что у предыдущего — даю наезд, чтобы склейка не читалась как сбой.")
+            previous_talking_image = image
             framing_cursor += 1
         jobs.append({
             "index": index,
@@ -8202,6 +9070,22 @@ def _existing_shot_frame(shot: dict, output_root: str) -> str:
     return ""
 
 
+def _talking_frames_on_hand(shots: list, output_root: str) -> List[str]:
+    """Кадры, которые говорящие шоты уже носят, — в том числе из прошлых папок.
+
+    Из них `_AvatarPlates` узнаёт свои плиты: раскадровку, утверждённую в одном
+    прогоне, рендер запускает в своей папке и иначе рисовал бы всё заново.
+    """
+    seen: List[str] = []
+    for shot in shots:
+        if _is_broll_shot(shot):
+            continue
+        frame = _existing_shot_frame(shot, output_root)
+        if frame and frame not in seen:
+            seen.append(frame)
+    return seen
+
+
 def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=print):
     """Generate just the per-shot Flux start frames — no paid Kling video.
 
@@ -8234,15 +9118,10 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
 
     output_root = _job_output_root(output_dir)
 
-    # Talking shots share two staged cameras of one set. A frame per shot is both
+    # Talking shots share the staged cameras of one set. A frame per shot is both
     # a Flux charge per shot and a new room behind every cut — which is exactly
     # what makes the avatar jump between scenes.
-    pinned_set = ""
-    for shot in shots:
-        if not _is_broll_shot(shot):
-            pinned_set = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
-            if pinned_set:
-                break
+    pinned_set = _pinned_avatar_set(shots)
     talking_order = {}
     for shot in shots:
         if not _is_broll_shot(shot):
@@ -8256,76 +9135,126 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
     # Сюда же складываются отказы редакторов (`blocked`) — из них интерфейс
     # собирает предупреждение с дословным ответом модели.
     billing = {"calls": 0, "blocked": []}
+    plates = _AvatarPlates(
+        output_dir, title_slug, pinned_set, _actor_photo, fal_key,
+        edit_model=edit_model, billing=billing, log=log,
+        known_frames=_talking_frames_on_hand(shots, output_root),
+    )
+    # Постановочные кадры ставим по очереди и до вставок: их на весь ролик один-два,
+    # они делят и файлы, и фото ведущего, и крупный план дорезается из среднего —
+    # то есть один из них ждёт другого по существу, а не из-за кода.
+    broll_jobs: list = []
     for shot in shots:
         num = shot.get("shot_number")
-        if only is not None and num != only:
-            continue
         broll = _is_broll_shot(shot)
-        framing = ""
+        # Кадр вставки принадлежит своему шоту: не он — не трогаем. Говорящие
+        # проходят всегда, даже когда перерисовывают чужой кадр: их картинка —
+        # общая плита, и после «перерисовать» на первом кадре второй обязан
+        # показать плиту с нового дубля, а не файл, который только что удалили.
+        # Готовая плита при этом ничего не стоит.
+        if only is not None and broll and num != only:
+            continue
+        camera = None
         if broll:
             frame_path = os.path.join(output_dir, f"{title_slug}_frame_{int(num or 0):02d}.png")
         else:
-            key, framing = _avatar_framing_for_shot(
-                shot,
-                talking_order.get(id(shot), 0),
-            )
-            frame_path = _framing_plate_path(output_dir, title_slug, key)
+            camera = _avatar_framing_for_shot(shot, talking_order.get(id(shot), 0))
+            frame_path = plates.path(camera)
         if only is None:
             # Reopened storyboard: this shot already carries a frame (or a
             # rendered clip) from an earlier job. Drawing it again is a fresh
             # Flux charge for a picture the user already paid for — skip it.
             # Per-shot "перегенерить" still forces a redraw.
+            #
+            # Говорящие кадры сюда не попадают: их картинка — общая плита камеры,
+            # и «уже есть» у них означало «оставить плиту прошлого прогона». Так
+            # три кадра на одной камере расходились по трём комнатам. Плита сама
+            # знает, что она уже нарисована (и находит себя в чужой папке), так
+            # что пройти по ним заново ничего не стоит.
             existing = _existing_shot_frame(shot, output_root)
-            if shot.get("clip_url") or existing:
+            if shot.get("clip_url") or (broll and existing):
                 if existing:
                     shot.setdefault("preview_frame_url", shot.get("local_url") or "")
                 log(f"[кадры] Кадр {num}: уже есть — пропускаю.")
                 reused += 1
                 continue
-        if only is not None:
+        if only is not None and num == only:
             # Explicit per-shot regenerate: drop the cached frame so a new one is drawn.
-            for stale in (frame_path, f"{frame_path}.prompt.txt", f"{frame_path}.fal_url.txt"):
-                try:
-                    if os.path.exists(stale):
-                        os.remove(stale)
-                except OSError:
-                    pass
-            if not broll:
-                log(f"[кадры] Кадр {num}: перерисовываю ракурс «{key}» — он общий "
-                    "для всех кадров на этой камере.")
+            if broll:
+                for stale in (frame_path, f"{frame_path}.prompt.txt", f"{frame_path}.fal_url.txt"):
+                    try:
+                        if os.path.exists(stale):
+                            os.remove(stale)
+                    except OSError:
+                        pass
+            else:
+                plates.forget(camera)
+                log(f"[кадры] Кадр {num}: перерисовываю ракурс «{camera.key}» — "
+                    "он общий для всех кадров на этой камере.")
+                for other in _AVATAR_CAMERAS.values():
+                    if other.base == camera.key:
+                        log(f"  Ракурс «{other.key}» снят с этого кадра — пересниму и его.")
         drawn_before = _nonempty(frame_path)
         if drawn_before and not broll:
-            log(f"[кадры] Кадр {num}: ракурс «{key}» уже отрисован — переиспользую.")
-        else:
-            log(f"[кадры] Генерирую кадр {num}...")
+            log(f"[кадры] Кадр {num}: ракурс «{camera.key}» уже отрисован — переиспользую.")
         if broll:
-            made_path = _broll_reference_image(
-                shot, fal_key, frame_path, log=log,
-                actor_photo_path=_actor_photo() if _shot_wants_actor(shot) else "",
-                billing=billing,
-                edit_model=edit_model,
-            )
-        else:
-            made_path = _avatar_reference_image(
-                {}, _actor_photo(), fal_key, frame_path, log=log,
-                scene_override=pinned_set, framing=framing,
-                billing=billing,
-                edit_model=edit_model,
-            )
+            # Вставки не делят между собой ни файлов, ни ленивого фото ведущего —
+            # значит, их незачем ждать по очереди. Фото резолвим здесь, до пула:
+            # `_actor_photo` при первом вызове может дорисовать запасного ведущего,
+            # и два потока нарисовали бы (и оплатили) его дважды.
+            broll_jobs.append({
+                "shot": shot,
+                "num": num,
+                "frame_path": frame_path,
+                "actor_photo": _actor_photo() if _shot_wants_actor(shot) else "",
+            })
+            continue
+        if not drawn_before:
+            log(f"[кадры] Генерирую кадр {num} — ракурс «{camera.key}».")
+        # Платили или нет — по кассе, а не по тому, лежал ли файл в этой папке:
+        # плиту могли принести из папки, где её утвердили, и это бесплатно.
+        paid_before = billing["calls"]
+        made_path = plates.plate(camera)
         if made_path and _nonempty(made_path):
-            url = f"/videos/{job_dir}/{os.path.basename(made_path)}"
-            shot["image_path"] = made_path
-            shot["local_url"] = url
-            shot["image_url"] = url
-            shot["preview_frame_url"] = url
-            # A second shot on an already-drawn camera costs nothing.
-            if drawn_before and not broll:
+            _point_shot_at_frame(shot, made_path, job_dir)
+            if billing["calls"] == paid_before:
                 reused += 1
             else:
                 made += 1
         else:
             failed += 1
             log(f"  ⚠️ Кадр {num}: не удалось сгенерировать.")
+
+    if broll_jobs:
+        log(f"[кадры] Рисую {len(broll_jobs)} кадр(ов) вставок "
+            f"параллельно (до {_FRAME_WORKERS} за раз).")
+
+    def _draw_broll(job: dict) -> dict:
+        # Своя касса на кадр: `billing["calls"] += 1` из нескольких потоков теряет
+        # обращения, а смета обязана совпадать со счётом. Сливаем после пула.
+        own = {"calls": 0, "blocked": []}
+        log(f"[кадры] Генерирую кадр {job['num']} — вставка.")
+        made_path = _broll_reference_image(
+            job["shot"], fal_key, job["frame_path"],
+            log=lambda message: log(f"[Кадр {job['num']}] {message.strip()}"),
+            actor_photo_path=job["actor_photo"],
+            billing=own,
+            edit_model=edit_model,
+        )
+        return {**job, "made_path": made_path, "billing": own}
+
+    if broll_jobs:
+        with ThreadPoolExecutor(max_workers=_FRAME_WORKERS) as pool:
+            drawn_broll = list(pool.map(_draw_broll, broll_jobs))
+        for done in drawn_broll:
+            billing["calls"] += done["billing"]["calls"]
+            billing["blocked"].extend(done["billing"]["blocked"])
+            if done["made_path"] and _nonempty(done["made_path"]):
+                _point_shot_at_frame(done["shot"], done["made_path"], job_dir)
+                made += 1
+            else:
+                failed += 1
+                log(f"  ⚠️ Кадр {done['num']}: не удалось сгенерировать.")
 
     log(f"[кадры] Готово: {made} кадр(ов)." + (f" Пропущено готовых: {reused}." if reused else "")
         + (f" Платных обращений к модели: {billing['calls']}." if billing["calls"] != made else ""))
@@ -8419,6 +9348,9 @@ def _storyboard_voice_only_result(
         slices, _skipped = _align_shots_to_voiceover(shots, words, audio_duration)
     if generation_mode == "sliced_avatar":
         _retime_talking_slices_to_speech(slices, words, audio_path)
+        # Тот же добор, что сделает рендер: иначе смета считала бы перебивки по
+        # исходным границам, а платили бы по раздвинутым.
+        _fill_slices_to_clip_floor(slices, words)
     slices = _split_performance_slices(slices, words)
     # Тот же раскрой, что сделает рендер, но в манифест он не пишется: манифест
     # описывает снятое, а это ещё прогноз — иначе рендер повторил бы разрезы,
@@ -8470,8 +9402,10 @@ def _storyboard_voice_only_result(
 
     talking = [sl for sl in slices if not _is_broll_shot(sl["shot"])]
     broll = [sl for sl in slices if _is_broll_shot(sl["shot"])]
-    talking_seconds = sum(sl["end"] - sl["start"] for sl in talking)
-    broll_seconds = sum(sl["end"] - sl["start"] for sl in broll)
+    # И то и другое тарифицируют по снятому клипу, а он не короче пола своей
+    # модели — иначе смета обещает полсекунды там, где счёт придёт за три.
+    talking_seconds = sum(_billed_avatar_seconds(sl["end"] - sl["start"]) for sl in talking)
+    broll_seconds = sum(_billed_broll_seconds(sl["end"] - sl["start"]) for sl in broll)
     forecast: dict = {}
     if generation_mode == "sliced_avatar":
         avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
@@ -8881,8 +9815,13 @@ def generate_storyboard_video(
         avatar_tier = tier if tier in KLING_AVATAR_TIERS else "pro"
         avatar_clips = [c for c in clips if not _is_broll_shot(c.get("shot") or {})]
         broll_clips = [c for c in clips if _is_broll_shot(c.get("shot") or {})]
-        avatar_seconds = sum(c["duration"] for c in avatar_clips)
-        broll_seconds = sum(c["duration"] for c in broll_clips)
+        # По снятому, а не по задуманному. `clip["duration"]` — это окно в
+        # монтаже, куда клип обрежут; модель же считает по тому, что отдала, а
+        # отдаёт она всегда не меньше своего пола и округляет вверх. Разница
+        # выходила заметная: 16-секундный ролик показывал $2.30 при 9.8 с речи,
+        # тогда как на диске лежало 11.5 с говорящих клипов и 12.2 с перебивок.
+        avatar_seconds = sum(_billed_clip_seconds(c) for c in avatar_clips)
+        broll_seconds = sum(_billed_clip_seconds(c) for c in broll_clips)
         video_cost_key = f"sliced_avatar_kling_{avatar_tier}"
         video_cost = round(avatar_seconds * kling_avatar_cost_per_second(avatar_tier), 2)
         if broll_seconds:
@@ -8890,14 +9829,11 @@ def generate_storyboard_video(
             extra_costs[f"sliced_broll_kling_v3_{broll_tier}"] = round(
                 broll_seconds * storyboard_video_cost_per_second(broll_tier), 2
             )
-        # Per-shot Flux reference frames (avatar scene + b-roll composition).
-        ref_frames = 0
-        if config.get("avatar_image_first", True):
-            ref_frames += len(avatar_clips)
-        if broll_seconds and config.get("broll_image_first", True):
-            ref_frames += len(broll_clips)
-        if ref_frames:
-            extra_costs["reference_frames_flux"] = round(ref_frames * 0.05, 2)
+        # Кадры считаем по кассе, а не по числу клипов: плита, принесённая из
+        # предпросмотра, ничего не стоит, и строка «reference frames» за неё
+        # выставляла деньги, которых этот прогон не тратил.
+        if frame_report.get("calls"):
+            extra_costs["reference_frames_flux"] = round(frame_report["calls"] * 0.05, 2)
     else:
         video_seconds = sum(_shot_duration(shot) for shot in shots)
         video_cost_key = f"storyboard_{storyboard_family}_{tier}"
@@ -8915,7 +9851,9 @@ def generate_storyboard_video(
         "video_filename": os.path.basename(final_path),
         "srt_path": srt_path,
         "actor_image": "",
-        "duration": audio_duration,
+        # Длина ролика, а не озвучки: говорящие дубли идут так, как их вернула
+        # модель, а картинки она отдаёт немного больше, чем звука.
+        "duration": round(_get_media_duration(final_path) or audio_duration, 2),
         "cost_estimate": cost,
         "tts_provider": tts_provider_used,
         "tts_model": tts_model_used,

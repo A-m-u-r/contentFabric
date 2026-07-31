@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import asyncio
 from unittest.mock import MagicMock, patch
@@ -30,6 +32,43 @@ def _charge(kwargs, output_path):
     billing = kwargs.get("billing")
     if billing is not None and not os.path.exists(output_path):
         billing["calls"] = billing.get("calls", 0) + 1
+
+
+def _actor_photo_in(tmp):
+    path = os.path.join(tmp, "actor.png")
+    with open(path, "wb") as f:
+        f.write(b"actor")
+    return path
+
+
+def _plate_fakes(draws, crops, moments):
+    """Фейки трёх шагов постановки: рисуем базу, режем её, переписываем момент.
+
+    Производная камера стоит ровно один платный запрос — как и рисованная, —
+    поэтому `_charge` висит на обоих рисующих шагах, а на кропе (ffmpeg) нет.
+    """
+
+    def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print, **kwargs):
+        draws.append((output_path, kwargs.get("framing", ""), kwargs.get("scene_override", "")))
+        _charge(kwargs, output_path)
+        with open(output_path, "wb") as f:
+            f.write(f"drawn-{len(draws)}".encode())
+        return output_path
+
+    def fake_crop(image_path, output_path, zoom, cx, cy):
+        crops.append((image_path, output_path, zoom))
+        with open(output_path, "wb") as f:
+            f.write(f"crop-{len(crops)}".encode())
+        return output_path
+
+    def fake_moment(base_path, fal_key, output_path, moment, log=print, **kwargs):
+        moments.append((base_path, output_path, moment))
+        _charge(kwargs, output_path)
+        with open(output_path, "wb") as f:
+            f.write(f"moment-{len(moments)}".encode())
+        return output_path
+
+    return fake_avatar, fake_crop, fake_moment
 
 
 class SaaSGeminiJsonRecoveryTests(unittest.TestCase):
@@ -1159,11 +1198,15 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertEqual(saasshorts.normalize_target_duration(None), 20)
 
     def test_storyboard_duration_presets_use_dynamic_visual_beat_ranges(self):
+        # Верх диапазона упирается в то, что ролик может оплатить: каждый бит —
+        # отдельный клип, а клип короче своего пола не бывает. Прежние верхние
+        # границы этот предел перешагивали — 15 секунд при восьми битах
+        # оплачивались как 19.7.
         expected = {
-            15: "6-8 visual beats",
-            20: "8-10 visual beats",
-            30: "11-15 visual beats",
-            45: "16-22 visual beats",
+            15: "5-6 visual beats",
+            20: "7-8 visual beats",
+            30: "11-12 visual beats",
+            45: "16-18 visual beats",
         }
 
         for target, guidance in expected.items():
@@ -1191,8 +1234,17 @@ class SaaSStoryboardTests(unittest.TestCase):
 
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
         self.assertIn("28-32 seconds", prompt)
-        self.assertIn("59-63 spoken words", prompt)
-        self.assertIn("11-15 visual beats", prompt)
+        # Бюджет слов — это остаток от 30 секунд после оплаты тегов и пауз, а не
+        # отдельное подобранное число: см. `_duration_preset`.
+        self.assertIn("52-56 spoken words", prompt)
+        self.assertIn("at most 6 tags", prompt)
+        self.assertIn("11-12 visual beats", prompt)
+        # Слова на реплику посчитаны от бюджета и битов. Пока правило жило само
+        # («4-8 слов»), 8 битов давали 48 слов при бюджете 26 — и это формально
+        # не нарушало ни одного пункта.
+        self.assertIn("carrying 4-5 spoken words", prompt)
+        self.assertIn("ONE spoken phrase of 4-5 words", prompt)
+        self.assertIn("Adding a shot does NOT add words", prompt)
         self.assertIn("STORYBOARD PACING PROFILE", prompt)
         self.assertIn("35-45% of the spoken timeline", prompt)
         self.assertIn("25-50% is an acceptable soft range", prompt)
@@ -1269,8 +1321,10 @@ class SaaSStoryboardTests(unittest.TestCase):
             )
 
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
-        self.assertIn("8-10 visual beats", prompt)
-        self.assertIn("about 1.5-3 seconds (5 at the absolute limit)", prompt)
+        self.assertIn("7-8 visual beats", prompt)
+        # Нижняя граница бита поднята до пола клипа: короче модель не снимает,
+        # а платит заказчик за полный клип.
+        self.assertIn("about 2.5-4 seconds (5 at the absolute limit)", prompt)
         self.assertIn("STORYBOARD PACING PROFILE", prompt)
         self.assertIn('"storyboard_pacing": "dynamic"', prompt)
 
@@ -1366,11 +1420,56 @@ class SaaSStoryboardTests(unittest.TestCase):
 
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
         self.assertIn("43-47 seconds", prompt)
-        self.assertIn("92-96 spoken words", prompt)
+        self.assertIn("78-82 spoken words", prompt)
         self.assertIn("five segments", prompt.casefold())
         self.assertIn('"end": 45', prompt)
         self.assertNotIn("18-22 seconds total", prompt)
         self.assertEqual(scripts[0]["target_duration_seconds"], 45)
+
+    def test_word_budget_and_the_duration_estimate_cannot_drift_apart(self):
+        """Сценарий ровно по бюджету должен попадать в заявленное окно.
+
+        Это и есть тот баг: бюджет слов и оценщик длины жили отдельными числами,
+        битов стало почти вдвое больше, слова не тронули — и «15 секунд»
+        выходили 24, потому что каждый бит приносит тег (0.8 с) и паузу (0.4 с).
+        Сложим сценарий по верхней границе бюджета и проверим арифметикой самого
+        пайплайна.
+        """
+        for target, preset in saasshorts.TARGET_VIDEO_DURATION_PRESETS.items():
+            with self.subTest(target=target):
+                low, high = (int(part) for part in preset["words"].split("-"))
+                for words in (low, high):
+                    # Паузы висят на словах, как в живой речи, а не стоят
+                    # отдельными токенами — иначе замер посчитал бы их словами.
+                    spoken = ["слово"] * words
+                    for i in range(preset["pauses"]):
+                        spoken[i] += "…"
+                    text = " ".join(["[whispers]"] * preset["audio_tags"] + spoken)
+                    estimate = saasshorts._estimate_speech_duration(text)
+                    self.assertGreaterEqual(estimate, preset["minimum"], words)
+                    self.assertLessEqual(estimate, preset["maximum"], words)
+
+    def test_duration_verdict_names_the_gap_instead_of_hiding_it(self):
+        """Просили 15 — вышло 24: расхождение записывается, а не молчит.
+
+        `minimum`/`maximum` существовали только внутри текста промпта: ни одной
+        проверки в коде. Человек узнавал о промахе по готовому ролику.
+        """
+        long_script = {
+            "target_duration_seconds": 15,
+            "full_narration": " ".join(["слово"] * 60),
+        }
+        saasshorts._finalize_generated_script(long_script)
+        saasshorts._record_duration_verdict(long_script)
+        self.assertEqual(long_script["duration_target_status"], "long")
+
+        on_target = {
+            "target_duration_seconds": 15,
+            "full_narration": " ".join(["слово"] * 30),
+        }
+        saasshorts._finalize_generated_script(on_target)
+        saasshorts._record_duration_verdict(on_target)
+        self.assertEqual(on_target["duration_target_status"], "ok")
 
     def test_ugc_model_does_not_define_actor_appearance(self):
         answer = json.dumps([{
@@ -2320,15 +2419,8 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                  "generation_prompt": f"p{i}"}
                 for i in range(1, 6)
             ]
-            avatar_calls = []
-
-            def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print, **kwargs):
-                avatar_calls.append((output_path, kwargs.get("framing", ""),
-                                     kwargs.get("scene_override", "")))
-                _charge(kwargs, output_path)
-                with open(output_path, "wb") as f:
-                    f.write(b"png")
-                return output_path
+            draws, crops, moments = [], [], []
+            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
 
             def fake_actor(desc, fal_key, output_path):
                 with open(output_path, "wb") as f:
@@ -2337,22 +2429,226 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             config = {"fal_key": "k", "selected_actor_path": "",
                       "storyboard_generation_mode": "sliced_avatar"}
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
+                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts._broll_reference_image",
                        side_effect=AssertionError("no b-roll in this script")), \
                  patch("saasshorts.generate_actor_image", side_effect=fake_actor):
                 result = saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
 
             # Five talking shots, two staged cameras — and only two are billed.
-            drawn = {path for path, _, _ in avatar_calls}
-            self.assertEqual(len(drawn), len(saasshorts._AVATAR_FRAMINGS))
+            staged = {path for path, _, _ in draws} | {path for _, path, _ in moments}
+            self.assertEqual(len(staged), len(saasshorts._AVATAR_FRAMINGS))
             self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.10)
             # Every talking shot got one of them, alternating, and they all sit on
             # the same set: the background must not change between cuts.
             used = [shot["image_path"] for shot in shots]
-            self.assertEqual(set(used), drawn)
+            self.assertEqual(set(used), staged)
             for a, b in zip(used, used[1:]):
                 self.assertNotEqual(a, b)
-            self.assertEqual({scene for _, _, scene in avatar_calls}, {"p1"})
+            self.assertEqual({scene for _, _, scene in draws}, {"p1"})
+
+    def test_close_up_is_cropped_for_distance_and_repainted_for_a_new_moment(self):
+        """Крупность — из кропа, новый миг — из правки. Порознь не работает ни то, ни другое.
+
+        Словами крупный план у редактора изображений не получается: он меняет
+        содержимое, но композицию входа сохраняет — проверено, `close` выходил
+        тем же планом, что и `medium`. Один кроп тоже не решение: те же пиксели,
+        та же поза, и монтажно это наезд, притворяющийся склейкой. Поэтому кроп
+        задаёт дистанцию, а следующая правка — позу, взгляд и руку.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
+            ]
+            draws, crops, moments = [], [], []
+            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
+                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
+                 patch("saasshorts.generate_actor_image",
+                       side_effect=AssertionError("actor photo is given")):
+                saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": _actor_photo_in(tmp)},
+                    tmp, "vid",
+                )
+
+            medium = os.path.join(tmp, "vid_actor_set_medium.png")
+            close = os.path.join(tmp, "vid_actor_set_close.png")
+            self.assertEqual(shots[0]["image_path"], medium)
+            self.assertEqual(shots[1]["image_path"], close)
+            # У модели заказан только средний план: крупность у неё не выпросить.
+            self.assertEqual([path for path, _, _ in draws], [medium])
+            # Крупный план режется из среднего, и режется заметно.
+            self.assertEqual(len(crops), 1)
+            cropped_from, cropped_to, zoom = crops[0]
+            self.assertEqual(cropped_from, medium)
+            self.assertGreater(zoom, 1.5)
+            # А поверх кропа — правка, которая меняет именно момент.
+            self.assertEqual([(base, out) for base, out, _ in moments], [(cropped_to, close)])
+            self.assertRegex(moments[0][2], "hand|gaze|head")
+
+    def test_a_plate_approved_in_one_job_is_reused_by_the_next_instead_of_redrawn(self):
+        """Плита живёт у ролика, а не у папки прогона.
+
+        Каждое нажатие «сгенерить» заводит новую папку. Пока плита искалась
+        только в ней, три прогона давали три разных `medium` — три комнаты на
+        одной камере, оплаченные трижды, — а платный рендер (он всегда идёт в
+        своей папке) рисовал четвёртую и оживлял её вместо утверждённой.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            first, second = os.path.join(root, "job1"), os.path.join(root, "job2")
+            os.makedirs(first)
+            os.makedirs(second)
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
+            ]
+            draws, crops, moments = [], [], []
+            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            config = {"fal_key": "k", "selected_actor_path": _actor_photo_in(root)}
+
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
+                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment):
+                saasshorts._generate_storyboard_frames_only(shots, config, first, "vid")
+                approved = [open(s["image_path"], "rb").read() for s in shots]
+                paid_once = len(draws) + len(moments)
+                again = saasshorts._generate_storyboard_frames_only(shots, config, second, "vid")
+
+            # Второй прогон не заплатил ничего и не нарисовал ничего нового.
+            self.assertEqual(len(draws) + len(moments), paid_once)
+            self.assertEqual(again["frames_charged"], 0)
+            self.assertEqual(again["cost_estimate"]["total"], 0)
+            # Кадры при этом переехали в свою папку — и это те же самые кадры.
+            self.assertEqual([open(s["image_path"], "rb").read() for s in shots], approved)
+            for shot in shots:
+                self.assertTrue(shot["image_path"].startswith(second))
+                self.assertIn("/videos/job2/", shot["local_url"])
+
+    def test_broll_frames_are_drawn_in_parallel_and_billed_exactly_once(self):
+        """Кадры вставок ничего не делят между собой — значит, и ждать нечего.
+
+        Раньше это был обычный `for`, хотя съёмка клипов давно ходит пулом: на
+        восьми кадрах человек сидел лишние минуты. Касса у каждого потока своя и
+        сливается после — `billing["calls"] += 1` из нескольких потоков теряет
+        обращения, а смета обязана совпадать со счётом.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": i, "visual_type": "broll", "generation_prompt": f"p{i}",
+                 "actor_in_frame": True}
+                for i in range(1, 5)
+            ]
+            live = {"now": 0, "peak": 0}
+            lock = threading.Lock()
+
+            def fake_broll(shot, fal_key, output_path, log=print, **kwargs):
+                with lock:
+                    live["now"] += 1
+                    live["peak"] = max(live["peak"], live["now"])
+                time.sleep(0.05)
+                _charge(kwargs, output_path)
+                with open(output_path, "wb") as f:
+                    f.write(b"png")
+                with lock:
+                    live["now"] -= 1
+                return output_path
+
+            actor_draws = []
+
+            def fake_actor(desc, fal_key, output_path):
+                actor_draws.append(output_path)
+                with open(output_path, "wb") as f:
+                    f.write(b"a")
+
+            with patch("saasshorts._broll_reference_image", side_effect=fake_broll), \
+                 patch("saasshorts._avatar_reference_image",
+                       side_effect=AssertionError("no talking shots here")), \
+                 patch("saasshorts.generate_actor_image", side_effect=fake_actor):
+                result = saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": ""}, tmp, "vid")
+
+            self.assertGreater(live["peak"], 1)
+            self.assertEqual(result["frames_made"], 4)
+            self.assertEqual(result["frames_charged"], 4)
+            self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.20)
+            # Запасной ведущий резолвится до пула — иначе его нарисуют и оплатят
+            # столько раз, сколько потоков одновременно его спросят.
+            self.assertEqual(len(actor_draws), 1)
+            self.assertTrue(all(shot.get("image_path") for shot in shots))
+
+    def test_regenerating_a_camera_actually_redraws_it(self):
+        """«Перерисовать» должно перерисовать, а не отдать кадр из кэша.
+
+        Плита кэшируется по промпту и общая на все кадры этой камеры — без
+        явного сброса кнопка вернула бы ту же картинку, и человек решил бы, что
+        генерация сломана.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
+            ]
+            actor = _actor_photo_in(tmp)
+            draws, crops, moments = [], [], []
+            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
+                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
+                 patch("saasshorts.generate_actor_image",
+                       side_effect=AssertionError("actor photo is given")):
+                saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": actor}, tmp, "vid")
+                before = open(shots[1]["image_path"], "rb").read()
+                saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": actor,
+                            "frames_only_shot": 2},
+                    tmp, "vid")
+                after = open(shots[1]["image_path"], "rb").read()
+
+            medium = os.path.join(tmp, "vid_actor_set_medium.png")
+            close = os.path.join(tmp, "vid_actor_set_close.png")
+            # Перерисована только своя камера — соседнюю трогать незачем.
+            self.assertEqual([path for path, _, _ in draws], [medium])
+            self.assertEqual([out for _, out, _ in moments], [close, close])
+            self.assertNotEqual(before, after)
+            self.assertTrue(os.path.exists(shots[0]["image_path"]))
+
+    def test_redrawing_the_base_camera_drops_the_close_up_taken_from_it(self):
+        """Крупный план снят со среднего — значит, новый средний отменяет старый крупный.
+
+        Иначе «перерисовать» на первом кадре оставляет второй кадр с прошлого
+        дубля: другая крупность, но миг из выброшенной картинки.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [
+                {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
+                {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
+            ]
+            actor = _actor_photo_in(tmp)
+            draws, crops, moments = [], [], []
+            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+
+            with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
+                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment):
+                saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": actor}, tmp, "vid")
+                close_before = open(shots[1]["image_path"], "rb").read()
+                saasshorts._generate_storyboard_frames_only(
+                    shots, {"fal_key": "k", "selected_actor_path": actor,
+                            "frames_only_shot": 1},
+                    tmp, "vid")
+
+            # Перерисовали средний — крупный пересняли с нового среднего.
+            self.assertEqual(len(draws), 2)
+            self.assertEqual(len(moments), 2)
+            self.assertEqual(crops[1][0], os.path.join(tmp, "vid_actor_set_medium.png"))
+            self.assertNotEqual(open(shots[1]["image_path"], "rb").read(), close_before)
 
     def test_frames_only_shot_filter_regenerates_single(self):
         with tempfile.TemporaryDirectory() as tmp:

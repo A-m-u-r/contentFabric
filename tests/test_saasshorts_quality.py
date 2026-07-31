@@ -15,6 +15,9 @@ from saasshorts import (
     _file_fingerprint,
     _mp3_encoder_delay,
     _parse_review_issues,
+    _reel_layout,
+    _room_tone_db,
+    _self_voiced_clip,
     _shot_request_prompt,
     build_kling_v3_storyboard_request,
     composite_storyboard_video,
@@ -56,7 +59,9 @@ class FreezeVsStretchTest(unittest.TestCase):
 
     def test_surplus_clip_still_trimmed(self):
         flt = self._filter_for({"visual_type": "broll"}, actual=5.5, slot=5.0)
-        self.assertIn("trim=start=0:end=5.000", flt)
+        # Конец режется на полкадра раньше: `end` ровно по границе кадра
+        # отдаёт кадр лишку (см. `_trim_end`).
+        self.assertIn("trim=start=0:end=4.983", flt)
         self.assertNotIn("tpad", flt)
 
 
@@ -82,7 +87,7 @@ class LipSyncHeadSkipTest(unittest.TestCase):
              "speech_offset": 0.025},
             actual=5.5,
         )
-        self.assertIn("trim=start=0.025:end=5.025", flt)
+        self.assertIn("trim=start=0.025:end=5.008", flt)
         self.assertNotIn("tpad", flt)
 
     def test_clip_without_offset_keeps_its_first_frame(self):
@@ -90,7 +95,7 @@ class LipSyncHeadSkipTest(unittest.TestCase):
             {"path": "/tmp/a.mp4", "duration": 5.0, "shot": {"visual_type": "talking"}},
             actual=5.5,
         )
-        self.assertIn("trim=start=0:end=5.000", flt)
+        self.assertIn("trim=start=0:end=4.983", flt)
 
     def test_head_skip_counts_against_the_usable_length(self):
         # 5.0s клип минус 0.2s головы не закрывает слот — добираем фризом,
@@ -100,7 +105,7 @@ class LipSyncHeadSkipTest(unittest.TestCase):
              "speech_offset": 0.2},
             actual=5.0,
         )
-        self.assertIn("trim=start=0.200:end=5.200", flt)
+        self.assertIn("trim=start=0.200:end=5.183", flt)
         self.assertIn("tpad=stop_mode=clone:stop_duration=0.200", flt)
 
     def test_offset_never_eats_the_whole_clip(self):
@@ -109,7 +114,7 @@ class LipSyncHeadSkipTest(unittest.TestCase):
              "speech_offset": 9.0},
             actual=3.0,
         )
-        self.assertIn("trim=start=2.900:end=5.900", flt)
+        self.assertIn("trim=start=2.900:end=5.883", flt)
 
 
 class Mp3EncoderDelayTest(unittest.TestCase):
@@ -304,9 +309,33 @@ class BrollReferenceImageTest(unittest.TestCase):
             )
         self.assertEqual(model, "fal-ai/flux-pro/kontext")
         self.assertEqual(args["image_url"], "https://fal.example/actor.png")
-        self.assertIn("same person as in the reference image", args["prompt"])
+        self.assertIn("keep the exact same person", args["prompt"])
         self.assertIn("face stays out of frame", args["prompt"])
         self.assertIn("closes the fridge door", args["prompt"])
+
+    def test_broll_lets_the_description_own_the_framing(self):
+        """«Крупно руки» должно давать кисти, а не средний план со спины.
+
+        Хвост промпта раньше диктовал композицию («этого человека видно со
+        спины, через плечо»), был конкретнее описания и стоял позже — модель
+        слушалась его. Лицо за кадром — требование, откуда снимать — нет.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            with open(photo, "wb") as f:
+                f.write(b"actor")
+            _, args = self._draw(
+                {"generation_prompt": "close up of her hands placing a berry on a plate",
+                 "visual_type": "broll", "actor_in_frame": True},
+                actor_photo_path=photo,
+            )
+        prompt = args["prompt"]
+        # Описание идёт последним и приказом — ему и принадлежит композиция.
+        self.assertTrue(prompt.rstrip().endswith("placing a berry on a plate."), prompt)
+        self.assertIn("Recompose the shot as described", prompt)
+        # Кроп по кистям разрешён наравне с видом со спины, а не вместо него.
+        self.assertIn("tight crop on the hands and forearms", prompt)
+        self.assertNotIn("this person seen from behind", prompt)
 
     def test_broll_without_the_flag_never_touches_the_actor_photo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -791,6 +820,150 @@ class ChunkCacheInvalidationTest(unittest.TestCase):
             with patch("saasshorts._fal_run", side_effect=AssertionError("must not call fal")):
                 result = generate_storyboard_chunk_clip(shots, "key", clip)
             self.assertEqual(result, clip)
+
+
+class TakeAsDeliveredTest(unittest.TestCase):
+    """Дубль звучит своим звуком под своей картинкой, но ровно по своим словам.
+
+    Юзер сравнил присланные модели mp4 с роликом и сказал прямо: присланные в
+    порядке, ролик — нет (2026-07-31). Свой звук вернул липсинк; а вот картинку
+    сверх слов оставлять нельзя. Модель округляет длину вверх (блок в 8 кадров,
+    пол 64 кадра), под этим хвостом звучать нечему, и дописанная тишина падает
+    в середину фразы: замер на variant_H — до 215 мс дыры там, где дубль
+    обрывался на -10 dB, то есть прямо на слове.
+    """
+
+    HEAD = 1105 / 44100.0
+
+    def _talking(self, slot=1.72):
+        return {"path": "/tmp/take.mp4", "duration": slot, "audio_slice": "/tmp/slice.mp3",
+                "speech_offset": self.HEAD, "shot": {"visual_type": "talking"}}
+
+    def _broll(self, slot=2.0):
+        return {"path": "/tmp/broll.mp4", "duration": slot,
+                "shot": {"visual_type": "broll"}}
+
+    def _filter_for(self, clips, actual=2.133):
+        with tempfile.TemporaryDirectory() as tmp:
+            subs = os.path.join(tmp, "subs.ass")
+            with open(subs, "w", encoding="utf-8") as f:
+                f.write("[Events]\nDialogue: 0,0:00:00.00,0:00:00.50,Subtitle,,0,0,0,,ХЭЙ\n")
+            with patch("saasshorts.subprocess.run") as run_mock, \
+                 patch("saasshorts._get_media_duration", return_value=actual), \
+                 patch("saasshorts._take_level_match_db", return_value=0.0), \
+                 patch("saasshorts._get_media_stream_duration", return_value=1.765):
+                composite_storyboard_video(clips, "/tmp/voice.mp3", subs, "/tmp/out.mp4")
+        cmd = run_mock.call_args[0][0]
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    def test_take_is_cut_around_its_words_on_both_streams(self):
+        flt = self._filter_for([self._talking()])
+        # Picture and sound are cut at the same two points — the head of silence
+        # the driving mp3 carried, and the end of the words — so the model's own
+        # lip sync survives untouched while the sentence keeps running.
+        self.assertIn("[0:v]trim=start=0.025:end=1.742", flt)
+        self.assertIn("[0:a]aresample=48000", flt)
+        self.assertIn("atrim=start=0.025:end=1.758", flt)
+        self.assertNotIn("tpad", flt)
+
+    def test_take_is_level_matched_and_faded_into_the_seam(self):
+        clips = [self._talking()]
+        with tempfile.TemporaryDirectory() as tmp:
+            subs = os.path.join(tmp, "subs.ass")
+            with open(subs, "w", encoding="utf-8") as f:
+                f.write("[Events]\n")
+            with patch("saasshorts.subprocess.run") as run_mock, \
+                 patch("saasshorts._get_media_duration", return_value=2.133), \
+                 patch("saasshorts._take_level_match_db", return_value=2.4), \
+                 patch("saasshorts._get_media_stream_duration", return_value=1.765):
+                composite_storyboard_video(clips, "/tmp/voice.mp3", subs, "/tmp/out.mp4")
+        cmd = run_mock.call_args[0][0]
+        flt = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("volume=2.40dB", flt)
+        # Скругление стыка, а не пауза: 10 мс снимают щелчок между двумя
+        # кодеками и не читаются как дырка в слове.
+        self.assertIn("afade=t=in:st=0:d=0.01", flt)
+        self.assertIn("afade=t=out:st=1.723:d=0.01", flt)
+
+    def test_the_master_picks_the_sentence_up_where_the_take_dropped_it(self):
+        flt = self._filter_for([self._talking(1.72), self._broll(2.0)])
+        # Дубль отдаёт звук ровно до 1.733 в ролике — оттуда же мастер и
+        # продолжает. Ничего между ними не вставлено: юзер услышал вставленную
+        # тишину как «связь пропала на доли секунды» (2026-07-31).
+        self.assertIn("atrim=end=1.733", flt)
+        self.assertIn("atrim=start=1.733:end=3.733", flt)
+        self.assertIn("concat=n=2:v=0:a=1[voicedry]", flt)
+
+    def test_the_stitched_track_never_falls_into_absolute_silence(self):
+        """Обрыв шума в ноль слышно как пропавшую связь, а не как паузу.
+
+        Дубли приходят со своим шумом (-72.9...-83.4 dB на job saas_d6b674c6),
+        мастер — со своим, а дописанная тишина и паузы озвучки это ровный ноль:
+        замер на variant_H дал провалы до -240 dB длиной до 215 мс. Юзер: «как
+        будто соединение с наушниками пропадает на доли секунды» (2026-07-31).
+        """
+        flt = self._filter_for([self._talking(1.72), self._broll(2.0)])
+        self.assertIn("anoisesrc=color=pink", flt)
+        # Длиной ровно в ролик: 1.7333 + 2.0.
+        self.assertIn("duration=3.733", flt)
+        # Тише самого тихого источника: -80 dB фона против -14.5 dB генератора.
+        self.assertIn("volume=-65.5dB", flt)
+        self.assertIn("[voicedry][roomtone]amix=inputs=2:duration=first:normalize=0"
+                      "[voicecat]", flt)
+
+    def test_room_tone_sits_just_under_the_noisiest_source(self):
+        with patch("saasshorts._noise_floor_db", side_effect=[-78.4, -72.9, -83.4]):
+            self.assertAlmostEqual(
+                _room_tone_db(["/tmp/voice.mp3", "/tmp/a.mp4", "/tmp/b.mp4"]), -75.9)
+        # Шумный дубль не тянет фон за собой на слышимый уровень.
+        with patch("saasshorts._noise_floor_db", return_value=-40.0):
+            self.assertAlmostEqual(_room_tone_db(["/tmp/voice.mp3"]), -66.0)
+
+    def test_clip_without_its_own_audio_keeps_the_master_and_the_head_skip(self):
+        """per_shot / multi_shot render mute clips — that path must not move."""
+        flt = self._filter_for([
+            {"path": "/tmp/a.mp4", "duration": 2.0, "speech_offset": 0.025,
+             "shot": {"visual_type": "talking"}},
+        ])
+        self.assertIn("trim=start=0.025:end=2.008", flt)
+        self.assertNotIn("voicecat", flt)
+
+    def test_reel_time_stays_master_time(self):
+        """Одна шкала на всех, иначе титры уезжают вслед за дублями.
+
+        Границы кадров округляются от текущего времени мастера, а не
+        накапливаются: сегмент всегда целое число кадров, а его начало в ролике
+        не отходит от мастера дальше половины кадра.
+        """
+        clips = [self._talking(1.72), self._broll(2.0), self._talking(1.64),
+                 self._broll(1.1), self._talking(2.58)]
+        with patch("saasshorts._get_media_duration", return_value=2.667), \
+             patch("saasshorts._get_media_stream_duration", return_value=2.624):
+            layout = _reel_layout(clips)
+        for segment in layout:
+            self.assertAlmostEqual(segment["duration"] * 30, round(segment["duration"] * 30))
+            self.assertLess(abs(segment["reel_start"] - segment["master_start"]), 1 / 60)
+        self.assertAlmostEqual(layout[0]["duration"], 1.7333, places=3)
+        self.assertAlmostEqual(layout[1]["reel_start"], 1.7333, places=3)
+        self.assertAlmostEqual(sum(s["duration"] for s in layout),
+                               layout[-1]["master_end"], delta=1 / 60)
+
+    def test_a_take_gives_up_the_picture_it_has_no_sound_for(self):
+        with patch("saasshorts._get_media_duration", return_value=2.133), \
+             patch("saasshorts._get_media_stream_duration", return_value=1.765):
+            layout = _reel_layout([self._talking(1.72), self._broll(2.0)])
+        self.assertTrue(layout[0]["self_voiced"])
+        self.assertFalse(layout[1]["self_voiced"])
+        # Модель нарисовала 2.133с картинки под 1.765с звука — в монтаж идёт
+        # 1.733с, ровно те кадры, под которыми звучат слова.
+        self.assertAlmostEqual(layout[0]["head"], self.HEAD, places=3)
+        self.assertAlmostEqual(layout[0]["duration"], 1.7333, places=3)
+        self.assertLessEqual(layout[0]["head"] + layout[0]["duration"], 1.765)
+
+    def test_a_take_without_a_readable_audio_stream_is_not_trusted(self):
+        clip = self._talking()
+        with patch("saasshorts._get_media_stream_duration", return_value=0.0):
+            self.assertFalse(_self_voiced_clip(clip))
 
 
 if __name__ == "__main__":
