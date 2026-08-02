@@ -1021,7 +1021,7 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
             photo = os.path.join(root, "actor.png")
             rng = np.random.default_rng(11)
             self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
-            plate = os.path.join(preview, "job_actor_set_medium.png")
+            plate = os.path.join(preview, "job_actor_set_front.png")
             bodies = iter([rng.integers(0, 256, size=(128, 72, 3))])
             staged = {"scene_override": "kitchen counter at golden hour",
                       "framing": "Medium shot from the chest up"}
@@ -1039,7 +1039,7 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
 
             # Рендер зовёт ту же камеру тем же промптом — и упирается в кэш,
             # переехавший вместе с картинкой.
-            adopted = os.path.join(render, "job_actor_set_medium.png")
+            adopted = os.path.join(render, "job_actor_set_front.png")
             with patch.object(saasshorts, "_fal_run",
                               side_effect=AssertionError("одобренный ракурс перерисовывать нельзя")):
                 reused = saasshorts._avatar_reference_image(
@@ -2466,13 +2466,18 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                     tmp, "vid",
                 )
 
-            medium = os.path.join(tmp, "vid_actor_set_medium.png")
-            close = os.path.join(tmp, "vid_actor_set_close.png")
-            self.assertEqual(shots[0]["image_path"], medium)
-            self.assertEqual(shots[1]["image_path"], close)
+            front = os.path.join(tmp, "vid_actor_set_front.png")
+            side = os.path.join(tmp, "vid_actor_set_side.png")
+            self.assertEqual(shots[0]["image_path"], front)
+            self.assertEqual(shots[1]["image_path"], side)
             # Обе плиты нарисованы, и каждая со своей строкой ракурса.
-            self.assertEqual([path for path, _, _ in draws], [medium, close])
-            self.assertIn("close-up", dict((p, f) for p, f, _ in draws)[close])
+            self.assertEqual([path for path, _, _ in draws], [front, side])
+            framings = dict((p, f) for p, f, _ in draws)
+            # Вторая камера — другая точка съёмки, а не другая крупность:
+            # дистанция у обеих названа одними и теми же словами.
+            self.assertIn("forty degrees off the straight-on axis", framings[side])
+            for path in (front, side):
+                self.assertIn(saasshorts._AVATAR_CAMERA_DISTANCE, framings[path])
             # И ни одна не срезана с другой.
             self.assertEqual(crops, [])
 
@@ -2594,18 +2599,18 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                     tmp, "vid")
                 after = open(shots[1]["image_path"], "rb").read()
 
-            medium = os.path.join(tmp, "vid_actor_set_medium.png")
-            close = os.path.join(tmp, "vid_actor_set_close.png")
+            front = os.path.join(tmp, "vid_actor_set_front.png")
+            side = os.path.join(tmp, "vid_actor_set_side.png")
             # Перерисована только своя камера — соседнюю трогать незачем.
-            self.assertEqual([path for path, _, _ in draws], [medium, close, close])
+            self.assertEqual([path for path, _, _ in draws], [front, side, side])
             self.assertNotEqual(before, after)
             self.assertTrue(os.path.exists(shots[0]["image_path"]))
 
     def test_redrawing_one_camera_leaves_the_other_alone(self):
         """Камеры независимы: у второй нет причин пересниматься за компанию.
 
-        Пока `close` выводился кропом `medium`, новый средний отменял старый
-        крупный — и «перерисовать» на первом кадре стоило двух платных запросов
+        Пока вторая камера выводилась кропом первой, новая первая отменяла старую
+        вторую — и «перерисовать» на первом кадре стоило двух платных запросов
         вместо одного.
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -2621,19 +2626,19 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop):
                 saasshorts._generate_storyboard_frames_only(
                     shots, {"fal_key": "k", "selected_actor_path": actor}, tmp, "vid")
-                close_before = open(shots[1]["image_path"], "rb").read()
-                medium_before = open(shots[0]["image_path"], "rb").read()
+                side_before = open(shots[1]["image_path"], "rb").read()
+                front_before = open(shots[0]["image_path"], "rb").read()
                 saasshorts._generate_storyboard_frames_only(
                     shots, {"fal_key": "k", "selected_actor_path": actor,
                             "frames_only_shot": 1},
                     tmp, "vid")
 
-            # Один платный запрос сверх первых двух — только средний.
+            # Один платный запрос сверх первых двух — только фронтальная камера.
             self.assertEqual([path for path, _, _ in draws].count(
-                os.path.join(tmp, "vid_actor_set_medium.png")), 2)
+                os.path.join(tmp, "vid_actor_set_front.png")), 2)
             self.assertEqual(len(draws), 3)
-            self.assertNotEqual(open(shots[0]["image_path"], "rb").read(), medium_before)
-            self.assertEqual(open(shots[1]["image_path"], "rb").read(), close_before)
+            self.assertNotEqual(open(shots[0]["image_path"], "rb").read(), front_before)
+            self.assertEqual(open(shots[1]["image_path"], "rb").read(), side_before)
 
     def test_frames_only_shot_filter_regenerates_single(self):
         with tempfile.TemporaryDirectory() as tmp:

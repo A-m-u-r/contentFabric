@@ -133,7 +133,7 @@ class StoryboardReshootSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = os.path.join(tmp, "saas_preview")
             os.makedirs(job_dir)
-            with open(os.path.join(job_dir, "moya_forma_30_actor_set_medium.png"), "wb") as f:
+            with open(os.path.join(job_dir, "moya_forma_30_actor_set_front.png"), "wb") as f:
                 f.write(b"plate")
             self.assertEqual(app._frames_slug_of_job(job_dir), "moya_forma_30")
 

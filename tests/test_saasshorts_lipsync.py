@@ -1130,8 +1130,8 @@ class SlicedAvatarTests(unittest.TestCase):
         normal = {"speech": "Обычная речь."}
 
         self.assertEqual(saasshorts._avatar_framing_for_shot(whisper, 0)[0], "hush")
-        self.assertEqual(saasshorts._avatar_framing_for_shot(normal, 0)[0], "medium")
-        self.assertEqual(saasshorts._avatar_framing_for_shot(normal, 1)[0], "close")
+        self.assertEqual(saasshorts._avatar_framing_for_shot(normal, 0)[0], "front")
+        self.assertEqual(saasshorts._avatar_framing_for_shot(normal, 1)[0], "side")
         self.assertEqual(
             saasshorts._avatar_motion_prompt_for_shot(whisper),
             saasshorts._AVATAR_WHISPER_MOTION_PROMPT,
@@ -1151,13 +1151,20 @@ class SlicedAvatarTests(unittest.TestCase):
         (2026-08-02, джоб saas_9440becb).
         """
         cameras = saasshorts._AVATAR_CAMERAS
-        self.assertEqual(set(cameras), {"medium", "close", "hush"})
+        self.assertEqual(set(cameras), {"front", "side", "hush"})
         for key, camera in cameras.items():
             with self.subTest(camera=key):
                 self.assertTrue(camera.direction.strip(), key)
                 # У камеры нет и не должно быть, с чего её снимать.
                 self.assertEqual(camera._fields, ("key", "direction"))
-        self.assertIn("close-up", cameras["close"].direction)
+                # Дистанция у всех одна и теми же словами: соседние кадры
+                # разводит точка съёмки, а не крупность, иначе склейка читается
+                # наездом (2026-08-02, джоб saas_bd4a6584: 18.0% против 21.4%
+                # высоты лица — на смену плана не хватило, на наезд хватило).
+                self.assertIn(saasshorts._AVATAR_CAMERA_DISTANCE, camera.direction)
+                self.assertIn("Camera position:", camera.direction)
+                self.assertNotIn("close-up", camera.direction)
+        self.assertIn("forty degrees off the straight-on axis", cameras["side"].direction)
         self.assertIn("chin lowered", cameras["hush"].direction)
 
     def test_framing_line_is_the_last_word_about_the_camera(self):
@@ -1215,15 +1222,24 @@ class SlicedAvatarTests(unittest.TestCase):
             self.assertNotIn(time_filter, push)
         # Короткий джамп-кат наезда не получает: там он только мельтешит.
         self.assertEqual(saasshorts._talking_push_in(0, 1.0), "")
-        # Направление чередуется — два соседа, ползущие в одну сторону,
-        # склеиваются в один длинный кадр вместо двух.
-        self.assertNotEqual(push, saasshorts._talking_push_in(1, 2.6))
+        # И он редкий — каждый третий говорящий кадр. Пока его давали всем,
+        # картинка ехала всегда, и ролик читался как непрерывная смена крупности
+        # вместо смены камер; крупность между кадрами меняться не должна вовсе.
+        self.assertEqual(saasshorts._talking_push_in(1, 2.6), "")
+        self.assertEqual(saasshorts._talking_push_in(2, 2.6), "")
+        self.assertEqual(saasshorts._talking_push_in(3, 2.6), push)
+        # Всегда внутрь: это наезд, а не «дыхание» туда-сюда.
+        self.assertIn("z='1+0.06*on/", push)
 
     def test_two_whispers_in_a_row_never_start_from_the_same_frame(self):
         """Один и тот же кадр подряд читается как сбой генерации, а не как монтаж.
 
         Ротация камер сама разводит соседей, но шёпот всегда уходит на «hush»:
         два шёпота подряд получали буквально одну картинку.
+
+        Разводит их вторая камера, а не наезд. Наезд здесь и стоял — и это ровно
+        то приближение между кадрами, которого быть не должно: одна и та же
+        картинка, просто ближе.
         """
         with tempfile.TemporaryDirectory() as tmp:
             actor = os.path.join(tmp, "avatar.png")
@@ -1273,14 +1289,19 @@ class SlicedAvatarTests(unittest.TestCase):
 
             used = [img for _, img in sorted(head_calls)]
             self.assertEqual(len(used), 2)
-            # Та же камера и тот же сет — но не тот же кадр: второму дан наезд.
+            # Тот же сет — но другая камера, а не тот же кадр покрупнее.
             self.assertNotEqual(used[0], used[1])
-            self.assertTrue(
-                os.path.basename(used[1]).startswith("job_actor_punch_"),
-                used[1],
-            )
+            self.assertEqual(os.path.basename(used[0]), "job_actor_set_hush.png")
+            self.assertEqual(os.path.basename(used[1]), "job_actor_set_front.png")
+            self.assertNotIn("actor_punch", used[1])
 
-    def test_whisper_clip_gets_a_local_punch_in_without_time_stretch(self):
+    def test_whisper_clip_comes_closer_by_moving_not_by_starting_closer(self):
+        """Шёпот подходит ближе — но приезжает туда сам, за время реплики.
+
+        Статичный кроп на весь клип давал ступеньку крупности ровно на склейке:
+        предыдущий кадр кончался на одном плане, шёпот начинался на другом. Между
+        кадрами меняется ракурс, крупность — только внутри кадра.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             normal = os.path.join(tmp, "normal.mp4")
             whisper = os.path.join(tmp, "whisper.mp4")
@@ -1309,9 +1330,12 @@ class SlicedAvatarTests(unittest.TestCase):
             filter_graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
             normal_chain = next(part for part in filter_graph.split(";") if part.endswith("[v0]"))
             whisper_chain = next(part for part in filter_graph.split(";") if part.endswith("[v1]"))
-            self.assertNotIn("crop=iw/1.18", normal_chain)
-            self.assertIn("crop=iw/1.18", whisper_chain)
-            self.assertIn("scale=1080:1920,setsar=1", whisper_chain)
+            # Ни ступеньки на входе в кадр: клип начинается там же, где кончился
+            # предыдущий, и уезжает ближе по ходу реплики.
+            self.assertNotIn("crop=iw/1.18", whisper_chain)
+            self.assertIn("zoompan=z='1+0.18*on/", whisper_chain)
+            self.assertNotIn("z='1+0.18", normal_chain)
+            self.assertIn("s=1080x1920", whisper_chain)
             self.assertNotIn("*PTS", whisper_chain)
 
     def test_push_in_lands_on_talking_clips_and_leaves_b_roll_alone(self):
@@ -1319,11 +1343,15 @@ class SlicedAvatarTests(unittest.TestCase):
 
         Kling V3 рисует вставке собственное движение, а Kling Avatar оживляет
         неподвижное фото — камера в говорящем кадре стоит намертво. Класть зум
-        на всё подряд значит превратить приём в шум.
+        на всё подряд значит превратить приём в шум: так и вышло, ролик читался
+        как непрерывная смена крупности. Наезд достаётся каждому третьему
+        говорящему кадру, и счёт ведут говорящие кадры, а не клипы — вставка
+        между ними живёт своей жизнью.
         """
         with tempfile.TemporaryDirectory() as tmp:
             paths = []
-            for name in ("talk_a.mp4", "insert.mp4", "talk_b.mp4"):
+            for name in ("talk_a.mp4", "insert.mp4", "talk_b.mp4",
+                         "talk_c.mp4", "talk_d.mp4"):
                 path = os.path.join(tmp, name)
                 with open(path, "wb") as f:
                     f.write(b"clip")
@@ -1337,6 +1365,8 @@ class SlicedAvatarTests(unittest.TestCase):
                 {"path": paths[0], "duration": 3.0, "shot": {"visual_type": "talking"}},
                 {"path": paths[1], "duration": 3.0, "shot": {"visual_type": "broll"}},
                 {"path": paths[2], "duration": 3.0, "shot": {"visual_type": "talking"}},
+                {"path": paths[3], "duration": 3.0, "shot": {"visual_type": "talking"}},
+                {"path": paths[4], "duration": 3.0, "shot": {"visual_type": "talking"}},
             ]
             with patch("saasshorts._get_media_duration", return_value=3.0), \
                  patch("saasshorts._measure_final_loudness", return_value=None), \
@@ -1351,16 +1381,20 @@ class SlicedAvatarTests(unittest.TestCase):
             graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
             chains = {
                 label: next(part for part in graph.split(";") if part.endswith(f"[{label}]"))
-                for label in ("v0", "v1", "v2")
+                for label in ("v0", "v1", "v2", "v3", "v4")
             }
             self.assertIn("zoompan", chains["v0"])
+            # Вставка своё движение уже несёт.
             self.assertNotIn("zoompan", chains["v1"])
-            self.assertIn("zoompan", chains["v2"])
-            # Соседние говорящие кадры ползут в разные стороны, иначе склеиваются
-            # в один длинный кадр — вставка между ними счёт не сбивает.
-            self.assertNotEqual(chains["v0"], chains["v2"])
+            # Соседние говорящие кадры стоят: между кадрами меняется ракурс, а
+            # не крупность.
+            self.assertNotIn("zoompan", chains["v2"])
+            self.assertNotIn("zoompan", chains["v3"])
+            # Третий по счёту говорящий после первого наезда — снова наезд, и
+            # вставка счёт не сбила.
+            self.assertIn("zoompan", chains["v4"])
             # И ни один из них не трогает время: губы держатся на общей озвучке.
-            for label in ("v0", "v2"):
+            for label in ("v0", "v4"):
                 self.assertNotIn("*PTS", chains[label])
 
     def test_inline_whisper_punches_only_after_its_marker_in_one_clip(self):
@@ -1694,14 +1728,14 @@ class SlicedAvatarTests(unittest.TestCase):
             self.assertEqual(len(head_calls), 2)
             # ...but the set is staged once per camera, not once per clip: the
             # background has to stay identical or every cut reads as a new room.
-            medium = os.path.join(tmp, "saved_actor_actor_set_medium.png")
-            close = os.path.join(tmp, "saved_actor_actor_set_close.png")
+            front = os.path.join(tmp, "saved_actor_actor_set_front.png")
+            side = os.path.join(tmp, "saved_actor_actor_set_side.png")
             # Каждая камера ставится с фото ведущего отдельно — как две камеры
             # на подкасте, а не кроп одной другой.
-            self.assertEqual([out for _, out, _ in scene_calls], [medium, close])
+            self.assertEqual([out for _, out, _ in scene_calls], [front, side])
             self.assertTrue(all(src == actor for src, _, _ in scene_calls))
             self.assertEqual(crop_calls, [])
-            self.assertEqual({img for _, img in head_calls}, {medium, close})
+            self.assertEqual({img for _, img in head_calls}, {front, side})
             # No two clips in a row play the same camera (clips render in
             # parallel, so order by file name).
             in_order = [img for _, img in sorted(head_calls)]

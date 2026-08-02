@@ -5879,7 +5879,12 @@ def _measure_final_loudness(
 # не читает как приём; больше — аттракцион, меньше — незаметно.
 _TALKING_PUSH_ZOOM = 0.06
 # Короче этого наезд не успевает прочитаться, а на джамп-катах только мельтешит.
-_TALKING_PUSH_MIN_SECONDS = 1.6
+_TALKING_PUSH_MIN_SECONDS = 2.4
+# Наезд достаётся каждому третьему говорящему кадру. Пока его давали всем, кадр
+# ехал всегда, и ролик читался как непрерывная смена крупности вместо смены
+# камер. Приём работает, только пока он редкий: крупность — движение по ходу
+# реплики, а между кадрами меняется ракурс (см. `_AVATAR_FRAMINGS`).
+_TALKING_PUSH_EVERY = 3
 # Запас разрешения под зум: zoompan округляет смещение окна до целых пикселей
 # входа, и без запаса медленный наезд идёт заметными ступеньками.
 _TALKING_PUSH_OVERSAMPLE = "scale=1620:2880"
@@ -5893,24 +5898,40 @@ def _talking_push_in(index: int, duration: float) -> str:
     ощущение, что ролик тянется. Наезд эти секунды держит и ничего не стоит:
     он трогает только картинку, не PTS и не звук, поэтому липсинк не уезжает.
 
-    Направление чередуется — два соседних кадра, ползущих в одну сторону,
-    склеиваются в один длинный, вместо того чтобы читаться как два.
+    Достаётся он каждому третьему говорящему кадру и всегда идёт внутрь.
+    Чередование «туда-сюда» было нужно, пока наезд стоял на каждом кадре и
+    соседи иначе склеивались в один длинный; у редкого соседей нет.
     """
     frames = int(round(max(0.0, duration) * 30))
-    if duration < _TALKING_PUSH_MIN_SECONDS or frames < 2:
+    if index % _TALKING_PUSH_EVERY or duration < _TALKING_PUSH_MIN_SECONDS or frames < 2:
         return ""
     span = frames - 1
-    zoom = (
-        f"{1 + _TALKING_PUSH_ZOOM:.3f}-{_TALKING_PUSH_ZOOM}*on/{span}"
-        if index % 2 else
-        f"1+{_TALKING_PUSH_ZOOM}*on/{span}"
-    )
+    zoom = f"1+{_TALKING_PUSH_ZOOM}*on/{span}"
     # Центр наезда чуть выше середины: на вертикальном портрете лицо живёт в
     # верхней части кадра, и наезд «в центр» уводит камеру в грудь.
     return (
         f"{_TALKING_PUSH_OVERSAMPLE},"
         f"zoompan=z='{zoom}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*0.35':"
         "d=1:s=1080x1920:fps=30,setsar=1"
+    )
+
+
+# Шёпот подходит ближе остальных кадров — это его смысл. Но приходит он туда
+# сам, за время реплики: статичный кроп на весь клип давал ступеньку крупности
+# ровно на склейке, а между кадрами меняется ракурс, не крупность.
+_WHISPER_PUSH_ZOOM = 0.18
+
+
+def _whisper_push_in(duration: float) -> str:
+    """Наезд на шёпот — движением внутри кадра, а не ступенькой на склейке."""
+    frames = int(round(max(0.0, duration) * 30))
+    if frames < 2:
+        return ""
+    span = frames - 1
+    return (
+        f"{_TALKING_PUSH_OVERSAMPLE},"
+        f"zoompan=z='1+{_WHISPER_PUSH_ZOOM}*on/{span}':x='(iw-iw/zoom)/2':"
+        "y='(ih-ih/zoom)*0.42':d=1:s=1080x1920:fps=30,setsar=1"
     )
 
 
@@ -6212,8 +6233,13 @@ def composite_storyboard_video(
         if whisper and not whisper_start:
             # Free pattern interrupt for the hush shot. This changes only the
             # crop: slowing a lip-synced clip would move its mouth off the
-            # untouched master voiceover.
-            clip_norm += f",{whisper_punch}"
+            # untouched master voiceover. Кадр приезжает ближе за свою длину, а
+            # не оказывается ближе с первого кадра: ступенька крупности на
+            # склейке — это то самое «приближение между кадрами», которого быть
+            # не должно.
+            push = _whisper_push_in(duration)
+            if push:
+                clip_norm += f",{push}"
         elif not whisper and not _is_broll_shot(shot):
             # Медленный наезд внутри говорящего кадра. Kling оживляет неподвижное
             # фото: мимика есть, камера стоит намертво — и кадр на две-три секунды
@@ -7447,33 +7473,58 @@ def _avatar_reference_image(
 
 
 # Камеры одного сета, по кругу — весь фокус роликов, которые читаются как снятое
-# интервью: фон не меняется, меняется только план, и сброс позы в начале каждого
+# интервью: фон не меняется, меняется точка съёмки, и сброс позы в начале каждого
 # клипа попадает между двумя разными ракурсами и перестаёт читаться как рывок.
+#
+# Камеры разводит угол, а не крупность, и это правило, а не вкус. Разная
+# крупность у соседних кадров читается не как вторая камера, а как наезд на
+# склейке: тот же человек в той же позе, просто ближе. Дистанция поэтому у всех
+# камер одна и сказана одними и теми же словами (`_AVATAR_CAMERA_DISTANCE`), а
+# крупность остаётся приёмом внутри кадра (`_talking_push_in`) — редко и по ходу
+# реплики, никогда на монтажном стыке.
 #
 # Каждая камера — своя постановка с фото ведущего, как две камеры на подкасте.
 # Выводить вторую кропом первой пробовали (2026-08-02, джоб saas_9440becb) — так
 # нельзя: кроп между двумя кадрами это не вторая камера, а наезд, и вдобавок
 # следующая за ним правка «смени только момент» отъезжала назад (лицо 37.5% ->
 # 28.3% кадра) и переодевала человека — в одном ролике кадр 5 в рубашке с
-# длинным рукавом, кадр 7 в футболке.
-#
+# длинным рукавом, кадр 7 в футболке. Разводить камеры словами про план
+# («medium shot» против «tight close-up») пробовали там же (джоб saas_bd4a6584):
+# редактор дал 18.0% и 21.4% высоты лица — на смену плана не хватило, а то, что
+# вышло, читалось наездом.
 _AvatarCamera = namedtuple("_AvatarCamera", "key direction")
+
+# Одна дистанция на все камеры, слово в слово. Доля кадра названа числом:
+# «средний» и «крупный» у редактора гуляют от плиты к плите, а «about a fifth of
+# the frame height» он повторяет.
+_AVATAR_CAMERA_DISTANCE = (
+    "the person framed from the chest up, the head about a fifth of the frame height; keep "
+    "this distance exactly — do not move the camera closer, do not crop tighter"
+)
 
 _AVATAR_FRAMINGS = (
     _AvatarCamera(
-        "medium",
-        "a medium shot from the chest up, the person centred with the set visible behind them",
+        "front",
+        f"{_AVATAR_CAMERA_DISTANCE}. Camera position: straight in front of the person at eye "
+        "level, the shoulders square to the lens, the person centred with the set behind "
+        "them. The eyes look straight into the lens",
     ),
     _AvatarCamera(
-        "close",
-        "a tight close-up: the face fills the frame, shoulders and the top of the head may "
-        "be cropped, the background soft and far behind",
+        "side",
+        f"{_AVATAR_CAMERA_DISTANCE}. Camera position: a second camera moved round to the "
+        "person's left, about forty degrees off the straight-on axis and a touch below eye "
+        "level, so the shoulders sit at an angle with one nearer the lens than the other and "
+        "another part of the same room opens up behind them. The person sits off to the "
+        "right of frame. The head is turned toward this camera and the eyes look straight "
+        "into the lens — not away, not down",
     ),
 )
 _AVATAR_HUSH_FRAMING = _AvatarCamera(
     "hush",
-    "an intimate close-up: the person leaning slightly toward the camera, chin lowered, one "
-    "hand resting near the mouth, restrained confidential expression",
+    f"{_AVATAR_CAMERA_DISTANCE}. Camera position: straight in front, dropped to just below "
+    "eye level so the person looks a little down into it. The person leans slightly toward "
+    "the camera, chin lowered, one hand resting near the mouth, the expression restrained "
+    "and confidential. The eyes look straight into the lens",
 )
 _AVATAR_CAMERAS = {c.key: c for c in (*_AVATAR_FRAMINGS, _AVATAR_HUSH_FRAMING)}
 
@@ -7830,9 +7881,11 @@ def generate_sliced_avatar_clips(
             plate = _framing_plate(camera)
             if plate:
                 return plate
-        # A frame the user picked or generated for this shot always wins — but a
-        # split shot must not play the same framing twice in a row, so every other
-        # talking clip gets a punch-in of it.
+        # A frame the user picked or generated for this shot always wins, as it
+        # is. Раньше каждый второй такой кадр отдавался кропом самого себя, чтобы
+        # разбитый джамп-катом кадр не сыграл дважды одну картинку, — но кроп
+        # между двумя кадрами это наезд на склейке. Повтор разводится сменой
+        # камеры ниже, а не крупностью.
         ref = _storyboard_avatar_reference_image(sl["shot"], output_dir, index)
         # A frame the storyboard already staged as one of our cameras is not a
         # per-shot choice — the cursor owns which camera plays, so that a shot
@@ -7840,10 +7893,7 @@ def generate_sliced_avatar_clips(
         if ref and _is_framing_plate(ref, title_slug):
             ref = ""
         if ref:
-            if framing_index % len(_AVATAR_FRAMINGS) == 0:
-                return ref
-            punch_path = os.path.join(output_dir, f"{title_slug}_shot_ref_{index:02d}.png")
-            return _avatar_reference_variant(ref, punch_path, 2)
+            return ref
         if avatar_image_first:
             plate = _framing_plate(camera)
             if plate:
@@ -7884,16 +7934,25 @@ def generate_sliced_avatar_clips(
             camera = _avatar_framing_for_shot(sl["shot"], framing_cursor)
             image = _resolve_image(sl, index, camera, framing_cursor)
             # Ротация камер сама разводит соседние кадры, но не всегда: два шёпота
-            # подряд оба уходят на «hush», и склейка между ними читается как сбой
-            # генерации, а не как монтаж. Один и тот же кадр подряд не пускаем —
-            # второму даём наезд. Это по-прежнему та же камера и тот же сет, так
-            # что лицо не прыгает, но композиция уже другая.
+            # подряд оба уходят на «hush», а кадр, разбитый джамп-катом, оба раза
+            # приносит свой собственный стартовый кадр. Один и тот же кадр подряд
+            # читается как сбой генерации, а не как монтаж, — но лечится он второй
+            # камерой, а не наездом: наезд на склейке это ровно то, чего между
+            # кадрами быть не должно. Кроп остаётся только там, где камер нет.
             if image and image == previous_talking_image:
-                punch_path = os.path.join(
-                    output_dir, f"{title_slug}_actor_punch_{index:02d}.png")
-                image = _avatar_reference_variant(image, punch_path, 2)
-                log(f"  Кадр {sl['shot'].get('shot_number', index)}: та же камера, "
-                    "что у предыдущего — даю наезд, чтобы склейка не читалась как сбой.")
+                spare = _AVATAR_FRAMINGS[(framing_cursor + 1) % len(_AVATAR_FRAMINGS)]
+                other = _framing_plate(spare) if avatar_image_first else ""
+                shot_label = sl["shot"].get("shot_number", index)
+                if other and other != image:
+                    image = other
+                    log(f"  Кадр {shot_label}: та же камера, что у предыдущего — "
+                        f"беру ракурс «{spare.key}», чтобы склейка не читалась как сбой.")
+                else:
+                    punch_path = os.path.join(
+                        output_dir, f"{title_slug}_actor_punch_{index:02d}.png")
+                    image = _avatar_reference_variant(image, punch_path, 2)
+                    log(f"  Кадр {shot_label}: та же камера, что у предыдущего, "
+                        "а второго ракурса нет — развожу кропом.")
             previous_talking_image = image
             framing_cursor += 1
         jobs.append({
