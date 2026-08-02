@@ -7446,63 +7446,18 @@ def _avatar_reference_image(
     )
 
 
-def _avatar_moment_image(
-    base_path: str,
-    fal_key: str,
-    output_path: str,
-    moment: str,
-    log: Callable[[str], None] = print,
-    billing: Optional[dict] = None,
-    edit_model: str = "",
-) -> str:
-    """Другой момент того же дубля: кадрирование берём из картинки, а не из слов.
-
-    Вход — уже обрезанная базовая плита, то есть нужная крупность на входе. От
-    модели требуется ровно одно: сменить позу, взгляд и руки, не трогая ни
-    человека, ни комнату, ни дистанцию. Это игра по правилам редактора, а не
-    против них: композицию входа он и так сохраняет — см. комментарий к
-    `_AVATAR_FRAMINGS`.
-    """
-    moment = (moment or "").strip().rstrip(".")
-    prompt = (
-        "The reference image already has the right framing, the right person and the right "
-        "place. Keep the person, face, hairstyle, outfit, the background behind them, the "
-        "light and the camera distance exactly as they are: do not zoom out, do not widen "
-        "the frame, do not restage the room. "
-        f"{'Change only the moment: ' + moment + '. ' if moment else ''}"
-        "Photorealistic phone-camera look, vertical 9:16, one single person, no second face. "
-        f"{_AVATAR_RESTING_FACE}"
-    )
-    return _flux_reference_frame(
-        prompt, fal_key, output_path, log=log,
-        actor_photo_path=base_path,
-        label="Avatar camera variant",
-        on_failure="; using the cropped frame instead",
-        billing=billing,
-        edit_model=edit_model,
-    )
-
-
 # Камеры одного сета, по кругу — весь фокус роликов, которые читаются как снятое
 # интервью: фон не меняется, меняется только план, и сброс позы в начале каждого
 # клипа попадает между двумя разными ракурсами и перестаёт читаться как рывок.
 #
-# Крупность задаёт кроп, а не слова. Проверено на диске: `close`, заказанный у
-# редактора изображений словами «the face fills the frame» последней строкой и
-# приказом, вышел тем же планом по бедро, что и `medium`. Дело не в формулировке
-# — это свойство инструмента: редактор меняет содержимое кадра, но композицию
-# входа сохраняет. Просить у него другую камеру значит просить не то.
+# Каждая камера — своя постановка с фото ведущего, как две камеры на подкасте.
+# Выводить вторую кропом первой пробовали (2026-08-02, джоб saas_9440becb) — так
+# нельзя: кроп между двумя кадрами это не вторая камера, а наезд, и вдобавок
+# следующая за ним правка «смени только момент» отъезжала назад (лицо 37.5% ->
+# 28.3% кадра) и переодевала человека — в одном ролике кадр 5 в рубашке с
+# длинным рукавом, кадр 7 в футболке.
 #
-# Поэтому производная камера получается в два шага: кроп базовой плиты даёт
-# гарантированную дистанцию (геометрия, модель в ней не участвует), а следующая
-# правка меняет момент — позу, взгляд, руку. Без второго шага это был бы наезд,
-# притворяющийся склейкой: другая крупность, но тот же миг. Собственная строка
-# ракурса у каждой камеры остаётся запасным путём на случай, когда базовой плиты
-# нет вовсе.
-#
-_AvatarCamera = namedtuple(
-    "_AvatarCamera", "key direction base crop moment", defaults=("", None, ""),
-)
+_AvatarCamera = namedtuple("_AvatarCamera", "key direction")
 
 _AVATAR_FRAMINGS = (
     _AvatarCamera(
@@ -7513,20 +7468,12 @@ _AVATAR_FRAMINGS = (
         "close",
         "a tight close-up: the face fills the frame, shoulders and the top of the head may "
         "be cropped, the background soft and far behind",
-        base="medium",
-        crop=(2.2, 0.5, 0.08),
-        moment="the head turned a little to one side and the gaze coming back to the lens, "
-               "one hand raised near the chest as if picking the next word",
     ),
 )
 _AVATAR_HUSH_FRAMING = _AvatarCamera(
     "hush",
     "an intimate close-up: the person leaning slightly toward the camera, chin lowered, one "
     "hand resting near the mouth, restrained confidential expression",
-    base="medium",
-    crop=(2.6, 0.5, 0.10),
-    moment="leaning slightly toward the lens, chin lowered, one hand resting near the mouth, "
-           "a restrained confidential expression",
 )
 _AVATAR_CAMERAS = {c.key: c for c in (*_AVATAR_FRAMINGS, _AVATAR_HUSH_FRAMING)}
 
@@ -7672,25 +7619,17 @@ class _AvatarPlates:
     def path(self, camera: _AvatarCamera) -> str:
         return _framing_plate_path(self._output_dir, self._slug, camera.key)
 
-    def _crop_path(self, camera: _AvatarCamera) -> str:
-        return f"{os.path.splitext(self.path(camera))[0]}_crop.png"
-
     def identity(self, camera: _AvatarCamera) -> str:
         """Чем эта плита является — по этой строке её узнают в чужой папке.
 
-        Не промпт: у производной камеры промпт правки ничего не знает о базовой
-        плите, и обновлённый `medium` не отменил бы устаревший `close`.
+        Не промпт: постановка камеры важна, а формулировка вокруг неё — нет.
 
         Но постановка лица сюда входит: она общая для обеих камер и решает, с
         каким выражением Kling будет говорить всю реплику. Без неё плита,
         нарисованная под прежнюю формулировку, усыновлялась бы как своя — и
         улыбка, из-за которой всё затевалось, пережила бы правку промпта.
         """
-        parts = [camera.key, camera.direction, camera.moment, str(camera.crop), self._set,
-                 _AVATAR_RESTING_FACE]
-        if camera.base:
-            parts.append(self.identity(_AVATAR_CAMERAS[camera.base]))
-        return "\n".join(parts)
+        return "\n".join([camera.key, camera.direction, self._set, _AVATAR_RESTING_FACE])
 
     def forget(self, camera: _AvatarCamera) -> None:
         """Убрать плиту, чтобы «перерисовать» действительно перерисовало."""
@@ -7698,18 +7637,13 @@ class _AvatarPlates:
         # Иначе тот же кадр вернётся из прошлой папки: он ведь всё ещё та камера
         # того же сета, и «перерисовать» стало бы «показать то же самое».
         self._forgotten.add(camera.key)
-        for path in (self.path(camera), self._crop_path(camera)):
-            _drop_frame_files(path)
-            for extra in (".prompt.txt", _PLATE_IDENTITY_SUFFIX):
-                try:
-                    os.remove(f"{path}{extra}")
-                except OSError:
-                    pass
-        # Плиты, снятые с этой: перерисовать базу и оставить производную значит
-        # выдать «другой ракурс» с прошлого дубля.
-        for other in _AVATAR_CAMERAS.values():
-            if other.base == camera.key:
-                self.forget(other)
+        path = self.path(camera)
+        _drop_frame_files(path)
+        for extra in (".prompt.txt", _PLATE_IDENTITY_SUFFIX):
+            try:
+                os.remove(f"{path}{extra}")
+            except OSError:
+                pass
 
     def plate(self, camera: _AvatarCamera) -> str:
         if camera.key not in self._made:
@@ -7754,17 +7688,6 @@ class _AvatarPlates:
         return made
 
     def _draw(self, camera: _AvatarCamera) -> str:
-        if camera.base:
-            base = self.plate(_AVATAR_CAMERAS[camera.base])
-            if base and _nonempty(base):
-                framed = _crop_zoom_image(base, self._crop_path(camera), *camera.crop)
-                made = _avatar_moment_image(
-                    framed, self._fal_key, self.path(camera), camera.moment,
-                    log=self._log, billing=self._billing, edit_model=self._edit_model,
-                )
-                # Правка не вышла — крупность уже в руках, отдаём кроп: другой
-                # план того же мига лучше, чем второй раз тот же кадр подряд.
-                return made or (framed if _nonempty(framed) else "")
         return _avatar_reference_image(
             {}, self._actor_photo(), self._fal_key, self.path(camera), log=self._log,
             scene_override=self._set, framing=camera.direction,
@@ -9191,9 +9114,6 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
                 plates.forget(camera)
                 log(f"[кадры] Кадр {num}: перерисовываю ракурс «{camera.key}» — "
                     "он общий для всех кадров на этой камере.")
-                for other in _AVATAR_CAMERAS.values():
-                    if other.base == camera.key:
-                        log(f"  Ракурс «{other.key}» снят с этого кадра — пересниму и его.")
         drawn_before = _nonempty(frame_path)
         if drawn_before and not broll:
             log(f"[кадры] Кадр {num}: ракурс «{camera.key}» уже отрисован — переиспользую.")

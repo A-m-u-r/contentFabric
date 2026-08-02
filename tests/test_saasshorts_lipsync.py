@@ -1144,12 +1144,19 @@ class SlicedAvatarTests(unittest.TestCase):
         та же рука, то же выражение. Монтажно это не склейка, а наезд, который
         притворяется склейкой. Крупность — приём внутри кадра
         (`_talking_push_in`), а не способ получить второй кадр.
+
+        Проверять надо саму постановку, а не только то, что строка ракурса
+        непустая: раньше здесь стояла именно такая проверка, а камера при этом
+        выводилась кропом соседней и правкой поверх — тест этого не заметил
+        (2026-08-02, джоб saas_9440becb).
         """
         cameras = saasshorts._AVATAR_CAMERAS
         self.assertEqual(set(cameras), {"medium", "close", "hush"})
         for key, camera in cameras.items():
             with self.subTest(camera=key):
                 self.assertTrue(camera.direction.strip(), key)
+                # У камеры нет и не должно быть, с чего её снимать.
+                self.assertEqual(camera._fields, ("key", "direction"))
         self.assertIn("close-up", cameras["close"].direction)
         self.assertIn("chin lowered", cameras["hush"].direction)
 
@@ -1241,11 +1248,6 @@ class SlicedAvatarTests(unittest.TestCase):
                     f.write(b"crop")
                 return dst
 
-            def fake_moment(base_path, fal_key, output_path, moment, log=print, **kwargs):
-                with open(output_path, "wb") as f:
-                    f.write(b"hush")
-                return output_path
-
             def fake_head(image_path, audio_path, fal_key, output_path, tier="standard", **kwargs):
                 head_calls.append((output_path, image_path))
                 with open(output_path, "wb") as f:
@@ -1261,7 +1263,6 @@ class SlicedAvatarTests(unittest.TestCase):
                  patch("saasshorts._slice_voiceover_segment", side_effect=fake_slice), \
                  patch("saasshorts._avatar_reference_image", side_effect=fake_avatar_ref), \
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts.generate_talking_head", side_effect=fake_head), \
                  patch("saasshorts.generate_actor_image",
                        side_effect=AssertionError("actor photo is given")):
@@ -1645,14 +1646,6 @@ class SlicedAvatarTests(unittest.TestCase):
                     f.write(b"crop")
                 return dst
 
-            moment_calls = []
-
-            def fake_moment(base_path, fal_key, output_path, moment, log=print, **kwargs):
-                moment_calls.append((base_path, output_path))
-                with open(output_path, "wb") as f:
-                    f.write(b"closeup")
-                return output_path
-
             def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
                 with open(output_path, "wb") as f:
                     f.write(b"final")
@@ -1690,7 +1683,6 @@ class SlicedAvatarTests(unittest.TestCase):
                  patch("saasshorts.generate_talking_head", side_effect=fake_talking_head), \
                  patch("saasshorts._avatar_reference_image", side_effect=fake_avatar_ref), \
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts.generate_storyboard_shot_clip",
                        side_effect=AssertionError("talking shots must not use Kling V3")), \
                  patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
@@ -1704,13 +1696,11 @@ class SlicedAvatarTests(unittest.TestCase):
             # background has to stay identical or every cut reads as a new room.
             medium = os.path.join(tmp, "saved_actor_actor_set_medium.png")
             close = os.path.join(tmp, "saved_actor_actor_set_close.png")
-            # У модели с нуля заказан только средний план: крупность словами не
-            # выпросить, её даёт кроп, а следующая правка меняет момент.
-            self.assertEqual([out for _, out, _ in scene_calls], [medium])
+            # Каждая камера ставится с фото ведущего отдельно — как две камеры
+            # на подкасте, а не кроп одной другой.
+            self.assertEqual([out for _, out, _ in scene_calls], [medium, close])
             self.assertTrue(all(src == actor for src, _, _ in scene_calls))
-            self.assertEqual([(src, out) for src, out in moment_calls],
-                             [(crop_calls[0][1], close)])
-            self.assertEqual(crop_calls[0][0], medium)
+            self.assertEqual(crop_calls, [])
             self.assertEqual({img for _, img in head_calls}, {medium, close})
             # No two clips in a row play the same camera (clips render in
             # parallel, so order by file name).

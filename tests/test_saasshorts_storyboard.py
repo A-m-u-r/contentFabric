@@ -41,11 +41,11 @@ def _actor_photo_in(tmp):
     return path
 
 
-def _plate_fakes(draws, crops, moments):
-    """Фейки трёх шагов постановки: рисуем базу, режем её, переписываем момент.
+def _plate_fakes(draws, crops):
+    """Фейки постановки: каждая камера рисуется с фото ведущего, кроп — запасной путь.
 
-    Производная камера стоит ровно один платный запрос — как и рисованная, —
-    поэтому `_charge` висит на обоих рисующих шагах, а на кропе (ffmpeg) нет.
+    Кроп остаётся только на запасном пути (`_avatar_reference_variant`), где
+    плит нет вовсе, и стоит он ноль: это ffmpeg. Плита — всегда платный запрос.
     """
 
     def fake_avatar(shot, actor_photo_path, fal_key, output_path, log=print, **kwargs):
@@ -61,14 +61,7 @@ def _plate_fakes(draws, crops, moments):
             f.write(f"crop-{len(crops)}".encode())
         return output_path
 
-    def fake_moment(base_path, fal_key, output_path, moment, log=print, **kwargs):
-        moments.append((base_path, output_path, moment))
-        _charge(kwargs, output_path)
-        with open(output_path, "wb") as f:
-            f.write(f"moment-{len(moments)}".encode())
-        return output_path
-
-    return fake_avatar, fake_crop, fake_moment
+    return fake_avatar, fake_crop
 
 
 class SaaSGeminiJsonRecoveryTests(unittest.TestCase):
@@ -2419,8 +2412,8 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                  "generation_prompt": f"p{i}"}
                 for i in range(1, 6)
             ]
-            draws, crops, moments = [], [], []
-            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            draws, crops = [], []
+            fake_avatar, fake_crop = _plate_fakes(draws, crops)
 
             def fake_actor(desc, fal_key, output_path):
                 with open(output_path, "wb") as f:
@@ -2430,14 +2423,13 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                       "storyboard_generation_mode": "sliced_avatar"}
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts._broll_reference_image",
                        side_effect=AssertionError("no b-roll in this script")), \
                  patch("saasshorts.generate_actor_image", side_effect=fake_actor):
                 result = saasshorts._generate_storyboard_frames_only(shots, config, tmp, "vid")
 
             # Five talking shots, two staged cameras — and only two are billed.
-            staged = {path for path, _, _ in draws} | {path for _, path, _ in moments}
+            staged = {path for path, _, _ in draws}
             self.assertEqual(len(staged), len(saasshorts._AVATAR_FRAMINGS))
             self.assertEqual(result["cost_estimate"]["reference_frames_flux"], 0.10)
             # Every talking shot got one of them, alternating, and they all sit on
@@ -2448,26 +2440,25 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                 self.assertNotEqual(a, b)
             self.assertEqual({scene for _, _, scene in draws}, {"p1"})
 
-    def test_close_up_is_cropped_for_distance_and_repainted_for_a_new_moment(self):
-        """Крупность — из кропа, новый миг — из правки. Порознь не работает ни то, ни другое.
+    def test_each_camera_is_staged_from_the_actor_photo_never_cropped_from_another(self):
+        """Две камеры — две постановки, как на подкасте. Кропа между кадрами нет.
 
-        Словами крупный план у редактора изображений не получается: он меняет
-        содержимое, но композицию входа сохраняет — проверено, `close` выходил
-        тем же планом, что и `medium`. Один кроп тоже не решение: те же пиксели,
-        та же поза, и монтажно это наезд, притворяющийся склейкой. Поэтому кроп
-        задаёт дистанцию, а следующая правка — позу, взгляд и руку.
+        Выводить `close` кропом `medium` пробовали (2026-08-02, джоб
+        saas_9440becb): кроп между двумя кадрами это наезд, а не вторая камера,
+        и правка «смени только момент» поверх него отъезжала назад (лицо 37.5%
+        -> 28.3% кадра) и переодевала человека — кадр 5 в рубашке с длинным
+        рукавом, кадр 7 в футболке.
         """
         with tempfile.TemporaryDirectory() as tmp:
             shots = [
                 {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
                 {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
             ]
-            draws, crops, moments = [], [], []
-            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            draws, crops = [], []
+            fake_avatar, fake_crop = _plate_fakes(draws, crops)
 
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts.generate_actor_image",
                        side_effect=AssertionError("actor photo is given")):
                 saasshorts._generate_storyboard_frames_only(
@@ -2479,16 +2470,11 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             close = os.path.join(tmp, "vid_actor_set_close.png")
             self.assertEqual(shots[0]["image_path"], medium)
             self.assertEqual(shots[1]["image_path"], close)
-            # У модели заказан только средний план: крупность у неё не выпросить.
-            self.assertEqual([path for path, _, _ in draws], [medium])
-            # Крупный план режется из среднего, и режется заметно.
-            self.assertEqual(len(crops), 1)
-            cropped_from, cropped_to, zoom = crops[0]
-            self.assertEqual(cropped_from, medium)
-            self.assertGreater(zoom, 1.5)
-            # А поверх кропа — правка, которая меняет именно момент.
-            self.assertEqual([(base, out) for base, out, _ in moments], [(cropped_to, close)])
-            self.assertRegex(moments[0][2], "hand|gaze|head")
+            # Обе плиты нарисованы, и каждая со своей строкой ракурса.
+            self.assertEqual([path for path, _, _ in draws], [medium, close])
+            self.assertIn("close-up", dict((p, f) for p, f, _ in draws)[close])
+            # И ни одна не срезана с другой.
+            self.assertEqual(crops, [])
 
     def test_a_plate_approved_in_one_job_is_reused_by_the_next_instead_of_redrawn(self):
         """Плита живёт у ролика, а не у папки прогона.
@@ -2506,20 +2492,19 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                 {"shot_number": 1, "visual_type": "talking", "generation_prompt": "p1"},
                 {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
             ]
-            draws, crops, moments = [], [], []
-            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            draws, crops = [], []
+            fake_avatar, fake_crop = _plate_fakes(draws, crops)
             config = {"fal_key": "k", "selected_actor_path": _actor_photo_in(root)}
 
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
-                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment):
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop):
                 saasshorts._generate_storyboard_frames_only(shots, config, first, "vid")
                 approved = [open(s["image_path"], "rb").read() for s in shots]
-                paid_once = len(draws) + len(moments)
+                paid_once = len(draws)
                 again = saasshorts._generate_storyboard_frames_only(shots, config, second, "vid")
 
             # Второй прогон не заплатил ничего и не нарисовал ничего нового.
-            self.assertEqual(len(draws) + len(moments), paid_once)
+            self.assertEqual(len(draws), paid_once)
             self.assertEqual(again["frames_charged"], 0)
             self.assertEqual(again["cost_estimate"]["total"], 0)
             # Кадры при этом переехали в свою папку — и это те же самые кадры.
@@ -2593,12 +2578,11 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                 {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
             ]
             actor = _actor_photo_in(tmp)
-            draws, crops, moments = [], [], []
-            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            draws, crops = [], []
+            fake_avatar, fake_crop = _plate_fakes(draws, crops)
 
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
                  patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment), \
                  patch("saasshorts.generate_actor_image",
                        side_effect=AssertionError("actor photo is given")):
                 saasshorts._generate_storyboard_frames_only(
@@ -2613,16 +2597,16 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             medium = os.path.join(tmp, "vid_actor_set_medium.png")
             close = os.path.join(tmp, "vid_actor_set_close.png")
             # Перерисована только своя камера — соседнюю трогать незачем.
-            self.assertEqual([path for path, _, _ in draws], [medium])
-            self.assertEqual([out for _, out, _ in moments], [close, close])
+            self.assertEqual([path for path, _, _ in draws], [medium, close, close])
             self.assertNotEqual(before, after)
             self.assertTrue(os.path.exists(shots[0]["image_path"]))
 
-    def test_redrawing_the_base_camera_drops_the_close_up_taken_from_it(self):
-        """Крупный план снят со среднего — значит, новый средний отменяет старый крупный.
+    def test_redrawing_one_camera_leaves_the_other_alone(self):
+        """Камеры независимы: у второй нет причин пересниматься за компанию.
 
-        Иначе «перерисовать» на первом кадре оставляет второй кадр с прошлого
-        дубля: другая крупность, но миг из выброшенной картинки.
+        Пока `close` выводился кропом `medium`, новый средний отменял старый
+        крупный — и «перерисовать» на первом кадре стоило двух платных запросов
+        вместо одного.
         """
         with tempfile.TemporaryDirectory() as tmp:
             shots = [
@@ -2630,25 +2614,26 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                 {"shot_number": 2, "visual_type": "talking", "generation_prompt": "p2"},
             ]
             actor = _actor_photo_in(tmp)
-            draws, crops, moments = [], [], []
-            fake_avatar, fake_crop, fake_moment = _plate_fakes(draws, crops, moments)
+            draws, crops = [], []
+            fake_avatar, fake_crop = _plate_fakes(draws, crops)
 
             with patch("saasshorts._avatar_reference_image", side_effect=fake_avatar), \
-                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop), \
-                 patch("saasshorts._avatar_moment_image", side_effect=fake_moment):
+                 patch("saasshorts._crop_zoom_image", side_effect=fake_crop):
                 saasshorts._generate_storyboard_frames_only(
                     shots, {"fal_key": "k", "selected_actor_path": actor}, tmp, "vid")
                 close_before = open(shots[1]["image_path"], "rb").read()
+                medium_before = open(shots[0]["image_path"], "rb").read()
                 saasshorts._generate_storyboard_frames_only(
                     shots, {"fal_key": "k", "selected_actor_path": actor,
                             "frames_only_shot": 1},
                     tmp, "vid")
 
-            # Перерисовали средний — крупный пересняли с нового среднего.
-            self.assertEqual(len(draws), 2)
-            self.assertEqual(len(moments), 2)
-            self.assertEqual(crops[1][0], os.path.join(tmp, "vid_actor_set_medium.png"))
-            self.assertNotEqual(open(shots[1]["image_path"], "rb").read(), close_before)
+            # Один платный запрос сверх первых двух — только средний.
+            self.assertEqual([path for path, _, _ in draws].count(
+                os.path.join(tmp, "vid_actor_set_medium.png")), 2)
+            self.assertEqual(len(draws), 3)
+            self.assertNotEqual(open(shots[0]["image_path"], "rb").read(), medium_before)
+            self.assertEqual(open(shots[1]["image_path"], "rb").read(), close_before)
 
     def test_frames_only_shot_filter_regenerates_single(self):
         with tempfile.TemporaryDirectory() as tmp:
