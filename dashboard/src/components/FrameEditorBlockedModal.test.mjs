@@ -27,6 +27,15 @@ function elements(node, found = []) {
   return found;
 }
 
+function textContent(node) {
+  if (typeof node === 'string') return node;
+  if (!node || typeof node !== 'object') return '';
+  const children = node.props?.children;
+  return (Array.isArray(children) ? children : [children])
+    .map(textContent)
+    .join(' ');
+}
+
 test('render and close never select a paid model; enabled click selects exactly once', () => {
   const picked = [];
   let closed = 0;
@@ -55,4 +64,25 @@ test('render and close never select a paid model; enabled click selects exactly 
   const modelButton = buttons.find((button) => button.key === 'next');
   modelButton.props.onClick();
   assert.deepEqual(picked, ['next']);
+});
+
+test('finished frame download failure never offers another paid model', () => {
+  const tree = Modal({
+    block: {
+      model: 'current',
+      title: 'Current',
+      reason: 'download',
+      charged: true,
+      alternatives: [
+        { id: 'next', title: 'Next', vendor: 'Vendor', note: '', blocked: false },
+      ],
+    },
+    models: [],
+    onPick: () => assert.fail('must not offer a new paid model'),
+    onClose: () => {},
+  });
+
+  assert.match(textContent(tree), /готовый кадр/i);
+  const buttons = elements(tree).filter((node) => node.type === 'button');
+  assert.equal(buttons.find((button) => button.key === 'next'), undefined);
 });

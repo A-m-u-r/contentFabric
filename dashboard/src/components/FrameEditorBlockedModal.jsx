@@ -20,6 +20,9 @@ const REASON_TEXT = {
   unreachable:
     'Запрос не дошёл до fal — оборвалась сеть или не разрешилось имя. Модель '
     + 'фотографию не видела и ничего не отклоняла, денег не списано.',
+  download:
+    'Готовый кадр уже был нарисован, но его файл не скачался из-за сбоя сети или DNS. '
+    + 'Приложение повторило скачивание без новых генераций.',
 };
 
 /**
@@ -48,7 +51,8 @@ export default function FrameEditorBlockedModal({
   const options = sourceModels.filter((m) => m.id !== block.model);
   // Сеть не чинится сменой модели. Предлагать здесь перебор — это звать
   // потратить $0.05 на попытку, которая упрётся ровно в то же место.
-  const unreachable = block.reason === 'unreachable';
+  const networkFailure = block.reason === 'unreachable' || block.reason === 'download';
+  const downloadFailure = block.reason === 'download';
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
@@ -65,7 +69,9 @@ export default function FrameEditorBlockedModal({
           <ShieldAlert size={20} className="text-amber-400 shrink-0 mt-0.5" />
           <div>
             <h3 className="text-[15px] font-semibold text-white">
-              {block.title} не стал рисовать кадр
+              {downloadFailure
+                ? `${block.title} нарисовал кадр, но файл не скачался`
+                : `${block.title} не стал рисовать кадр`}
             </h3>
             <p className="text-[12px] text-zinc-400 mt-1">
               {REASON_TEXT[block.reason] || REASON_TEXT.moderation}
@@ -85,17 +91,20 @@ export default function FrameEditorBlockedModal({
         )}
 
         <p className="text-[11px] text-zinc-500 mt-3">
-          {block.charged
+          {downloadFailure
+            ? `Генерация завершилась и оплачена${spentUsd ? `: списано ${spentUsd}` : ''}. Новый платный запрос автоматически не отправлялся.`
+            : block.charged
             ? `Пустой кадр стоит столько же, сколько нарисованный${spentUsd ? `: списано ${spentUsd}` : ''}.`
             : 'За эту попытку деньги не списаны.'}
         </p>
 
-        {unreachable ? (
+        {networkFailure ? (
           <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3 flex gap-2.5">
             <ImageOff size={16} className="text-zinc-400 shrink-0 mt-0.5" />
             <p className="text-[12px] text-zinc-300">
-              Другая модель не поможет — она живёт по тому же адресу. Проверь сеть
-              и нажми «Перегенерить» ещё раз той же моделью.
+              {downloadFailure
+                ? 'Другая модель не поможет и создаст новый платный запрос. Проверь сеть; повторная генерация возможна только после твоего ручного нажатия.'
+                : 'Другая модель не поможет — она живёт по тому же адресу. Проверь сеть и нажми «Перегенерить» ещё раз той же моделью.'}
             </p>
           </div>
         ) : options.length > 0 ? (

@@ -1319,6 +1319,102 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
             self.assertEqual(billing["calls"], 1)
             self.assertTrue(billing["blocked"][0]["charged"])
 
+    def test_completed_frame_retries_cdn_download_without_new_generation(self):
+        """A transient CDN DNS failure must not buy the finished frame again."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            ready = os.path.join(tmp, "ready.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(13)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            self._write_png(ready, rng.integers(0, 256, size=(128, 72, 3)))
+            with open(ready, "rb") as file:
+                image_bytes = file.read()
+
+            response = MagicMock(content=image_bytes)
+            response.raise_for_status.return_value = None
+            client = MagicMock()
+            client.__enter__ = lambda self_: self_
+            client.__exit__ = lambda *args: False
+            client.get = MagicMock(side_effect=[
+                saasshorts.httpx.ConnectError(
+                    "[Errno -5] No address associated with hostname"
+                ),
+                saasshorts.httpx.ConnectError(
+                    "[Errno -5] No address associated with hostname"
+                ),
+                response,
+            ])
+            billing = {}
+
+            with patch.object(
+                saasshorts,
+                "_fal_run",
+                return_value={"images": [{"url": "https://v3b.fal.media/frame.png"}]},
+            ) as fal_run, patch.object(
+                saasshorts, "_fal_upload_file", return_value="http://photo"
+            ), patch.object(
+                saasshorts.httpx, "Client", return_value=client
+            ), patch.object(saasshorts.time, "sleep"):
+                made = saasshorts._flux_reference_frame(
+                    "prompt",
+                    "key",
+                    out,
+                    log=lambda *_: None,
+                    actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, out)
+            fal_run.assert_called_once()
+            self.assertEqual(client.get.call_count, 3)
+            self.assertEqual(billing["calls"], 1)
+            self.assertNotIn("blocked", billing)
+
+    def test_exhausted_cdn_retry_is_not_reported_as_a_removed_endpoint(self):
+        """A finished paid frame with a broken download is a network failure."""
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(14)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            client = MagicMock()
+            client.__enter__ = lambda self_: self_
+            client.__exit__ = lambda *args: False
+            client.get = MagicMock(
+                side_effect=saasshorts.httpx.ConnectError(
+                    "[Errno -5] No address associated with hostname"
+                )
+            )
+            billing = {}
+
+            with patch.object(
+                saasshorts,
+                "_fal_run",
+                return_value={"images": [{"url": "https://v3b.fal.media/frame.png"}]},
+            ), patch.object(
+                saasshorts, "_fal_upload_file", return_value="http://photo"
+            ), patch.object(
+                saasshorts.httpx, "Client", return_value=client
+            ), patch.object(saasshorts.time, "sleep"):
+                made = saasshorts._flux_reference_frame(
+                    "prompt",
+                    "key",
+                    out,
+                    log=lambda *_: None,
+                    actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(billing["calls"], 1)
+            self.assertTrue(billing["blocked"][0]["charged"])
+            self.assertEqual(billing["blocked"][0]["reason"], "download")
+
     def test_editor_catalogue_ends_on_a_model_without_a_moderator(self):
         """Последним стоит редактор с открытыми весами — его никто не зарубит.
 

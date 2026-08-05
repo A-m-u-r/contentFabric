@@ -7963,11 +7963,23 @@ def _flux_reference_frame(
         if not images:
             raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
         img_url = images[0]["url"] if isinstance(images[0], dict) else images[0]
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.get(img_url)
-            resp.raise_for_status()
-            with open(output_path, "wb") as f:
-                f.write(resp.content)
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=120.0) as client:
+                    resp = client.get(img_url)
+                    resp.raise_for_status()
+                    with open(output_path, "wb") as f:
+                        f.write(resp.content)
+                break
+            except httpx.RequestError as download_error:
+                if attempt == 2:
+                    raise
+                wait = 3 * (attempt + 1)
+                log(
+                    f"  ⚠️ {label}: готовый кадр не скачался "
+                    f"({download_error}); повторяю через {wait} с."
+                )
+                time.sleep(wait)
         if _looks_blank(output_path):
             # Ответ модели — единственное место, где видно «зарубила модерация»
             # вместо «что-то пошло не так». Без него причина остаётся догадкой.
@@ -8009,11 +8021,13 @@ def _flux_reference_frame(
         # Сломалось после генерации (не скачалась готовая картинка) — fal своё
         # уже посчитал. Вычесть вызов здесь значит соврать в отчёте о тратах.
         unreachable = isinstance(e, FalUnreachable)
+        download_failed = generated and isinstance(e, httpx.RequestError)
         log(f"  ⚠️ {label}: {model} не отработал ({e}){on_failure}")
         if billing is not None and not generated:
             billing["calls"] = max(0, billing.get("calls", 1) - 1)
         if actor_photo_path:
-            _report_blocked_editor(billing, entry, "unreachable" if unreachable else "unavailable",
+            reason = "unreachable" if unreachable else "download" if download_failed else "unavailable"
+            _report_blocked_editor(billing, entry, reason,
                                    {"error": str(e)}, generated, actor_photo_path, prompt)
         return ""
 
