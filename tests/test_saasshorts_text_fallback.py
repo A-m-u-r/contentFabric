@@ -307,5 +307,30 @@ class GeminiFalAnalysisIntegrationTests(unittest.TestCase):
         self.assertEqual(fal_run.call_count, 1)
 
 
+class SaaSAnalyzeFalKeyTests(unittest.TestCase):
+    def test_analyze_resolves_and_forwards_fal_key(self):
+        import asyncio
+        import app
+
+        def resolve(provider, _user, _header, _use_platform_keys):
+            return {"gemini": "gemini-key", "fal": "fal-key"}[provider]
+
+        request = app.SaaSAnalyzeRequest(description="Test", text_model="pro")
+        with patch("app.resolve_effective_api_key", side_effect=resolve), patch(
+            "app.generate_scripts", return_value=[]
+        ) as generate:
+            asyncio.run(
+                app.saasshorts_analyze(
+                    request,
+                    x_gemini_key="gemini-header",
+                    x_fal_key="fal-header",
+                    authorization=None,
+                )
+            )
+
+        self.assertEqual(generate.call_args.kwargs["fal_key"], "fal-key")
+        self.assertTrue(generate.call_args.kwargs["fal_fallback_enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()

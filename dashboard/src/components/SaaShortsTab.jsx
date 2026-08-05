@@ -25,6 +25,19 @@ import {
   clearActiveContentPlanContext,
 } from '../lib/contentPlanWorkspaces';
 
+export function buildSaaSAnalyzeHeaders({
+  baseHeaders = {},
+  geminiApiKey,
+  falKey,
+  isManagedKey,
+}) {
+  return {
+    ...baseHeaders,
+    ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
+    ...(falKey && !isManagedKey(falKey) ? { 'X-Fal-Key': falKey } : {}),
+  };
+}
+
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'Разговор в камеру', desc: 'Живо и по-человечески, как сторис у знакомой' },
   { id: 'educational', label: 'Обучающий', desc: 'Проблема → 2-3 конкретных шага → вывод' },
@@ -1453,11 +1466,12 @@ export default function SaaShortsTab({
     try {
       const res = await fetch(getApiUrl('/api/saasshorts/analyze'), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...authHeaders(),
-          ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
-        },
+        headers: buildSaaSAnalyzeHeaders({
+          baseHeaders: { 'Content-Type': 'application/json', ...authHeaders() },
+          geminiApiKey,
+          falKey,
+          isManagedKey,
+        }),
         body: JSON.stringify({
           url: undefined,
           description: description.trim() || undefined,

@@ -3248,6 +3248,7 @@ class SaaSAnalyzeRequest(BaseModel):
 async def saasshorts_analyze(
     req: SaaSAnalyzeRequest,
     x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Analyze a URL or manual description and generate video scripts."""
@@ -3259,6 +3260,14 @@ async def saasshorts_analyze(
         raise HTTPException(status_code=402, detail=str(e))
     except PlatformKeyUnavailableError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    fal_key = None
+    if not is_custom:
+        try:
+            fal_key = resolve_effective_api_key(
+                "fal", user, x_fal_key, req.use_platform_keys
+            )
+        except PlatformKeyUnavailableError:
+            fal_key = None
     if not is_custom and not gemini_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key")
 
@@ -3300,8 +3309,21 @@ async def saasshorts_analyze(
             elif req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
-                web_research = research_saas_online(req.url, gemini_key, text_model=req.text_model)
-                analysis = analyze_saas(scraped, gemini_key, web_research=web_research, text_model=req.text_model)
+                web_research = research_saas_online(
+                    req.url,
+                    gemini_key,
+                    text_model=req.text_model,
+                    fal_key=fal_key,
+                    fal_fallback_enabled=True,
+                )
+                analysis = analyze_saas(
+                    scraped,
+                    gemini_key,
+                    web_research=web_research,
+                    text_model=req.text_model,
+                    fal_key=fal_key,
+                    fal_fallback_enabled=True,
+                )
                 if req.topic:
                     analysis["topic"] = req.topic
                 scripts = generate_scripts(
@@ -3317,6 +3339,8 @@ async def saasshorts_analyze(
                     target_duration_seconds=req.target_duration_seconds,
                     broll_between_talking=req.broll_between_talking,
                     changing_locations=req.changing_locations,
+                    fal_key=fal_key,
+                    fal_fallback_enabled=True,
                 )
             else:
                 # Manual description: build analysis from description
@@ -3344,6 +3368,8 @@ async def saasshorts_analyze(
                     target_duration_seconds=req.target_duration_seconds,
                     broll_between_talking=req.broll_between_talking,
                     changing_locations=req.changing_locations,
+                    fal_key=fal_key,
+                    fal_fallback_enabled=True,
                 )
             return {
                 "analysis": analysis,
