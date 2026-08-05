@@ -55,6 +55,25 @@ class GeminiFalTextRouterTests(unittest.TestCase):
             "google/gemini-3.1-pro-preview",
         )
 
+    def test_fal_request_enables_mandatory_reasoning(self):
+        client = MagicMock()
+        client.models.generate_content.side_effect = RuntimeError(
+            "429 RESOURCE_EXHAUSTED"
+        )
+
+        with patch.object(saasshorts, "GEMINI_MAX_RETRIES", 0), patch(
+            "saasshorts._fal_run", return_value={"output": "ok"}
+        ) as fal_run:
+            saasshorts._generate_analysis_content(
+                client,
+                contents=["prompt"],
+                text_model="pro",
+                fal_key="fal-key",
+                fal_fallback_enabled=True,
+            )
+
+        self.assertIs(fal_run.call_args.args[1]["reasoning"], True)
+
 
 class GeminiFalAnalysisIntegrationTests(unittest.TestCase):
     def test_url_research_forwards_fal_key_and_enables_web_search(self):

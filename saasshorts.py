@@ -241,7 +241,7 @@ def _is_retryable_fal_text_error(error: Exception) -> bool:
 
 
 def _fal_text_input(prompt: str, *, config=None, enable_web_search: bool = False) -> dict:
-    input_data = {"prompt": prompt}
+    input_data = {"prompt": prompt, "reasoning": True}
     max_output_tokens = getattr(config, "max_output_tokens", None)
     if isinstance(max_output_tokens, int) and max_output_tokens > 0:
         input_data["max_tokens"] = max_output_tokens
