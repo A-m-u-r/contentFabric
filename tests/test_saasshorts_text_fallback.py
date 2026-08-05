@@ -55,6 +55,121 @@ class GeminiFalTextRouterTests(unittest.TestCase):
             "google/gemini-3.1-pro-preview",
         )
 
+
+class GeminiFalAnalysisIntegrationTests(unittest.TestCase):
+    def test_url_research_forwards_fal_key_and_enables_web_search(self):
+        response = saasshorts.FalTextResponse('{"product_name": "Demo"}')
+
+        with patch("google.genai.Client"), patch(
+            "saasshorts._generate_analysis_content",
+            return_value=response,
+        ) as generate:
+            result = saasshorts.research_saas_online(
+                "https://example.com",
+                "gemini-key",
+                text_model="pro",
+                fal_key="fal-key",
+                fal_fallback_enabled=True,
+            )
+
+        self.assertEqual(result["product_name"], "Demo")
+        self.assertEqual(generate.call_args.kwargs["fal_key"], "fal-key")
+        self.assertTrue(generate.call_args.kwargs["fal_fallback_enabled"])
+        self.assertTrue(generate.call_args.kwargs["fal_enable_web_search"])
+        self.assertEqual(
+            generate.call_args.kwargs["direct_model_chain"],
+            ["gemini-3.1-pro-preview"],
+        )
+
+    def test_url_research_without_fal_preserves_direct_grounding_fallbacks(self):
+        response = SimpleNamespace(
+            text='{"product_name": "Demo"}',
+            candidates=[],
+        )
+
+        with patch("google.genai.Client"), patch(
+            "saasshorts._generate_analysis_content",
+            return_value=response,
+        ) as generate:
+            saasshorts.research_saas_online(
+                "https://example.com",
+                "gemini-key",
+                text_model="pro",
+            )
+
+        self.assertEqual(
+            generate.call_args.kwargs["direct_model_chain"],
+            ["gemini-3.1-pro-preview", "gemini-2.5-flash"],
+        )
+
+    def test_product_analysis_forwards_fal_fallback(self):
+        scraped = {
+            "url": "https://example.com",
+            "title": "Demo",
+            "meta_description": "Demo product",
+            "headings": [],
+            "main_content": "Product details",
+            "additional_pages": "",
+        }
+        response = saasshorts.FalTextResponse('{"product_name": "Demo"}')
+
+        with patch("google.genai.Client"), patch(
+            "saasshorts._generate_analysis_content",
+            return_value=response,
+        ) as generate:
+            result = saasshorts.analyze_saas(
+                scraped,
+                "gemini-key",
+                text_model="pro",
+                fal_key="fal-key",
+                fal_fallback_enabled=True,
+            )
+
+        self.assertEqual(result["product_name"], "Demo")
+        self.assertEqual(generate.call_args.kwargs["fal_key"], "fal-key")
+        self.assertTrue(generate.call_args.kwargs["fal_fallback_enabled"])
+        self.assertFalse(
+            generate.call_args.kwargs.get("fal_enable_web_search", False)
+        )
+
+    def test_script_generation_forwards_fal_fallback(self):
+        def request_once(ask, **_kwargs):
+            ask()
+            return []
+
+        with patch("google.genai.Client"), patch(
+            "saasshorts._generate_analysis_content",
+            return_value=SimpleNamespace(text="[]"),
+        ) as generate, patch(
+            "saasshorts._request_gemini_script_batch",
+            side_effect=request_once,
+        ):
+            result = saasshorts.generate_scripts(
+                {"product_name": "Demo"},
+                "gemini-key",
+                num_scripts=1,
+                text_model="pro",
+                fal_key="fal-key",
+                fal_fallback_enabled=True,
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(generate.call_args.kwargs["fal_key"], "fal-key")
+        self.assertTrue(generate.call_args.kwargs["fal_fallback_enabled"])
+
+    def test_malformed_paid_script_response_is_not_requested_twice(self):
+        ask = MagicMock(return_value=saasshorts.FalTextResponse("not json"))
+
+        with self.assertRaisesRegex(Exception, "broken scripts answer"):
+            saasshorts._request_gemini_script_batch(
+                ask,
+                num_scripts=1,
+                require_shots=False,
+                label="scripts",
+            )
+
+        self.assertEqual(ask.call_count, 1)
+
     def test_quota_exhaustion_without_fal_key_explains_missing_fallback(self):
         client = MagicMock()
         client.models.generate_content.side_effect = RuntimeError(

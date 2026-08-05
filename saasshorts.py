@@ -324,7 +324,13 @@ def _generate_analysis_content(
 # Phase 1: Website Scraping, Web Research & Analysis
 # ═══════════════════════════════════════════════════════════════════════
 
-def research_saas_online(url: str, gemini_key: str, text_model: Optional[str] = None) -> dict:
+def research_saas_online(
+    url: str,
+    gemini_key: str,
+    text_model: Optional[str] = None,
+    fal_key: Optional[str] = None,
+    fal_fallback_enabled: bool = False,
+) -> dict:
     """
     Use Gemini with Google Search grounding to deeply research a product or business
     across the internet: reviews, Reddit threads, Twitter, competitor comparisons,
@@ -379,13 +385,21 @@ Return a comprehensive JSON research report:
 
 Be thorough. Use REAL data from your search results, not made-up information."""
 
-    response = _generate_gemini_content(
+    response = _generate_analysis_content(
         client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
-        model_chain=gemini_grounding_model_chain(text_model),
+        direct_model_chain=(
+            [resolve_gemini_grounding_model(text_model)]
+            if fal_fallback_enabled
+            else gemini_grounding_model_chain(text_model)
+        ),
+        text_model=text_model,
+        fal_key=fal_key,
+        fal_fallback_enabled=fal_fallback_enabled,
+        fal_enable_web_search=True,
     )
 
     # Extract grounding sources
@@ -521,6 +535,8 @@ def analyze_saas(
     gemini_key: str,
     web_research: dict = None,
     text_model: Optional[str] = None,
+    fal_key: Optional[str] = None,
+    fal_fallback_enabled: bool = False,
 ) -> dict:
     """
     Deep analysis of a product or business combining website scraping + web research.
@@ -617,11 +633,13 @@ Return a JSON object:
 IMPORTANT: Use REAL pain points from user reviews when available. Real frustrations make the best UGC content.
 Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
-    response = _generate_gemini_content(
+    response = _generate_analysis_content(
         client,
         contents=[prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
         text_model=text_model,
+        fal_key=fal_key,
+        fal_fallback_enabled=fal_fallback_enabled,
     )
 
     raw = response.text
@@ -1533,6 +1551,8 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
         issues = tuple(batch_validator(scripts)) if scripts and batch_validator else ()
         if best is None or _script_batch_quality(scripts, note, issues) > _script_batch_quality(best[0], best[1], best[3]):
             best = (scripts, note, response, issues)
+        if getattr(response, "paid_provider", False) is True:
+            break
         if scripts and not issues and note not in (_JSON_TRUNCATED, _JSON_SALVAGED):
             break
         if attempt == 0 and not issues:
@@ -1550,6 +1570,11 @@ def _request_gemini_script_batch(ask, *, num_scripts: int, require_shots: bool, 
             f"[SaaSShorts] ❌ Unparseable {label} answer: "
             f"{_describe_gemini_json_failure(response.text or '', response)}"
         )
+        if getattr(response, "paid_provider", False) is True:
+            raise Exception(
+                f"Gemini via fal.ai returned a broken {label} answer. "
+                "Please try generating again."
+            )
         raise Exception(
             f"Gemini returned a broken {label} answer twice in a row. Please try generating again."
         )
@@ -1720,6 +1745,8 @@ def generate_scripts(
     target_duration_seconds: int = TARGET_VIDEO_DURATION_DEFAULT,
     broll_between_talking: bool = False,
     changing_locations: bool = False,
+    fal_key: Optional[str] = None,
+    fal_fallback_enabled: bool = False,
 ) -> list:
     """Generate video scripts based on product/business analysis.
 
@@ -1940,11 +1967,13 @@ STORYBOARD PACING PROFILE:
             max_output_tokens=32768,
         )
         scripts = _request_gemini_script_batch(
-            lambda: _generate_gemini_content(
+            lambda: _generate_analysis_content(
                 client,
                 contents=[prompt],
                 config=config,
                 text_model=text_model,
+                fal_key=fal_key,
+                fal_fallback_enabled=fal_fallback_enabled,
             ),
             num_scripts=num_scripts,
             require_shots=True,  # a script without shots is nothing to storyboard
@@ -2103,11 +2132,13 @@ RULES:
         max_output_tokens=32768,
     )
     scripts = _request_gemini_script_batch(
-        lambda: _generate_gemini_content(
+        lambda: _generate_analysis_content(
             client,
             contents=[prompt],
             config=config,
             text_model=text_model,
+            fal_key=fal_key,
+            fal_fallback_enabled=fal_fallback_enabled,
         ),
         num_scripts=num_scripts,
         require_shots=False,
