@@ -26,6 +26,7 @@ import threading
 import httpx
 import numpy as np
 import textwrap
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable, Any
 from collections import namedtuple
@@ -974,6 +975,308 @@ Return ONLY a JSON array:
     return scripts
 
 
+def _gemini_json_array(
+    prompt: str,
+    gemini_key: str,
+    text_model: Optional[str] = None,
+    label: str = "request",
+    max_output_tokens: int = 8192,
+) -> Optional[list]:
+    """Один текстовый запрос к Gemini, отдающий JSON-массив; None при любой беде.
+
+    Проходы по раскадровке не блокирующие: сорванный запрос обязан оставить
+    сценарий таким, каким он был, а не уронить генерацию.
+    """
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=gemini_key)
+        response = _generate_gemini_content(
+            client,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=max_output_tokens,
+            ),
+            text_model=text_model,
+        )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        parsed = json.loads(_repair_gemini_json(text))
+        if not isinstance(parsed, list):
+            raise ValueError("response is not a JSON array")
+        return parsed
+    except Exception as error:
+        print(f"[SaaSShorts] WARNING: {label} skipped: {error}")
+        return None
+
+
+# Место действия ролика — свой запрос и своё поле. Раньше сетом работал промпт
+# первого говорящего кадра целиком, и в плиты вместе с комнатой уезжало всё
+# остальное, что там оказалось: «holding a steady selfie pose» — и обе камеры
+# вышли одним анфасом (замер 03.08, разница поворота 0.005 против рабочих 0.30);
+# «a beautiful woman» — и редактор нарисовал своё лицо вместо выбранного (джоб
+# f14d08b1). Поле, у которого одна работа, нечем заполнить не по делу.
+_SET_WRITER_RULES = """WHAT A SET IS:
+- A set is a PLACE to shoot in: the room, the light, the surfaces, the props.
+- One or two sentences, concrete and photographable: what furniture, what surfaces, what stands on them, where the light comes from.
+- NO people. Do not mention the presenter, an actor, a woman, a man, hands or anyone else — the app puts the person into the picture itself.
+- NO appearance of anybody: no age, hair, skin, build, clothing or make-up.
+- NO camera: no shot type, no angle, no framing, no "static camera", no "looking at the camera", no aspect ratio.
+- NO action and NO moment: not what happens, only where it happens.
+- No readable text anywhere: no signs, labels, screens, numbers or writing on objects.
+- Ordinary, plausible, unbranded: a real home or workspace that suits the topic, never a studio and never stock-photo staging."""
+
+
+# «Одно место на ролик» — правило по умолчанию, а не закон: снятое в одной
+# комнате читается как одна съёмка и стоит две плиты. Опцией место меняется по
+# ходу — тогда мест несколько, и каждое стоит своих плит. Меняется не каждый
+# кадр: соседние шоты одной локации разводит вторая камера, а платит человек за
+# каждую новую комнату.
+_SHOTS_PER_LOCATION = 3
+_MAX_LOCATIONS = 3
+
+
+def generate_storyboard_sets(
+    scripts: list,
+    gemini_key: str,
+    text_model: Optional[str] = None,
+    language: str = "en",
+    locations: int = 1,
+) -> list:
+    """Дописать каждому сценарию место действия: `set_scene` (UI) и `set_prompt` (в плиты).
+
+    `locations` > 1 — опция «менять локации»: мест несколько, они лягут в
+    `set_prompts`/`set_scenes` списком, а первое дублируется в `set_prompt` для
+    всего, что умеет читать только одно место.
+    """
+    if not gemini_key:
+        return scripts
+    locations = max(1, min(int(locations or 1), _MAX_LOCATIONS))
+
+    payload = []
+    for index, script in enumerate(scripts):
+        if not isinstance(script, dict):
+            continue
+        lines = [
+            (shot.get("speech") or "").strip()
+            for shot in (script.get("shots") or [])
+            if isinstance(shot, dict) and (shot.get("speech") or "").strip()
+        ]
+        payload.append({
+            "script_index": index,
+            "title": (script.get("title") or "").strip(),
+            "speech": lines[:4],
+        })
+    if not payload:
+        return scripts
+
+    lang_name = {"ru": "Russian", "es": "Spanish"}.get(language, "English")
+    if locations > 1:
+        task = (
+            f"For each script below, pick {locations} places the reel moves between, in order. "
+            "They can be different parts of one home — another corner, the next room, the "
+            "balcony — or different places entirely, whichever suits the lines better. The "
+            "person wears the same clothes in all of them, so pick places where that holds."
+        )
+        shape = ('[{{"script_index": 0, "sets": [{{"set_scene": "...", "set_prompt": "..."}}]}}]'
+                 .replace("{{", "{").replace("}}", "}"))
+    else:
+        task = ("For each script below, pick ONE place the whole reel is shot in. It must suit "
+                "what the person is talking about, and it must stay believable for a phone video.")
+        shape = '[{"script_index": 0, "set_scene": "...", "set_prompt": "..."}]'
+    prompt = f"""You choose the location for vertical 9:16 social videos.
+{task}
+
+{_SET_WRITER_RULES}
+
+Write `set_scene` in {lang_name} — the user reads it in the app.
+Write `set_prompt` in English — it goes to the image model as is.
+Both describe the same place; `set_prompt` is not a translation but the same room
+written for a model: nouns, materials, colours, light.
+
+Scripts JSON:
+{json.dumps(payload, ensure_ascii=False, indent=1)}
+
+Return ONLY a JSON array:
+{shape}"""
+
+    decisions = _gemini_json_array(
+        prompt, gemini_key, text_model=text_model, label="Storyboard set", max_output_tokens=4096,
+    )
+    if not decisions:
+        return scripts
+
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        try:
+            index = int(decision.get("script_index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < len(scripts) or not isinstance(scripts[index], dict):
+            continue
+        # Несколько мест приезжают списком, одно — плоскими полями. Разбираем оба
+        # вида одним кодом: список из одного места и есть обычный случай.
+        chosen = decision.get("sets") if isinstance(decision.get("sets"), list) else [decision]
+        places = [
+            ((place.get("set_prompt") or "").strip(), (place.get("set_scene") or "").strip())
+            for place in chosen if isinstance(place, dict) and (place.get("set_prompt") or "").strip()
+        ][:locations]
+        if not places:
+            continue
+        set_prompt, set_scene = places[0]
+        scripts[index]["set_prompt"] = set_prompt
+        scripts[index]["set_scene"] = set_scene or set_prompt
+        if locations > 1:
+            scripts[index]["set_prompts"] = [prompt_text for prompt_text, _ in places]
+            scripts[index]["set_scenes"] = [scene or prompt_text for prompt_text, scene in places]
+            # Человек попросил менять места — значит, текст мест доезжает до плит.
+            # Без этого флага он был бы отброшен как сочинённый вслепую.
+            scripts[index]["set_changes"] = True
+        # Кто выбрал место, решает, попадёт ли текст в плиты. Написанное здесь
+        # сочинено вслепую: про фото ведущего эта модель ничего не знает, а на
+        # нём комната уже есть. Перебивать её выдумкой можно только по просьбе
+        # человека — иначе дневная кухня с фото переезжает в вечернюю из текста.
+        scripts[index]["set_source"] = "ai"
+    return scripts
+
+
+# Кадр говорящий и кадр-перебивка живут по противоположным правилам камеры: у
+# перебивки промпт уходит в Kling дословно и камера там нужна, у говорящего
+# камеру ставит сборка и любое слово о ней только мешает. Пока обе инструкции
+# лежали в одном запросе со всем остальным, модель их регулярно путала —
+# отсюда «static camera» в говорящем кадре. Здесь они разведены по разным
+# абзацам одного запроса, а сам запрос не занят больше ничем.
+def generate_storyboard_visuals(
+    scripts: list,
+    gemini_key: str,
+    text_model: Optional[str] = None,
+    language: str = "en",
+) -> list:
+    """Дописать кадрам картинку: `scene` для интерфейса и `generation_prompt` для модели."""
+    if not gemini_key:
+        return scripts
+
+    payload = []
+    for script_index, script in enumerate(scripts):
+        if not isinstance(script, dict):
+            continue
+        shots = script.get("shots")
+        if not isinstance(shots, list):
+            continue
+        for order, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict) or shot.get("prompt_manual"):
+                continue
+            payload.append({
+                "script_index": script_index,
+                "shot_number": shot.get("shot_number", order),
+                "set_prompt": (script.get("set_prompt") or "").strip(),
+                "visual_type": "broll" if _is_broll_shot(shot) else "talking",
+                "actor_in_frame": _shot_wants_actor(shot),
+                "role": (shot.get("role") or "").strip(),
+                "speech": (shot.get("speech") or "").strip(),
+            })
+    if not payload:
+        return scripts
+
+    lang_name = {"ru": "Russian", "es": "Spanish"}.get(language, "English")
+    prompt = f"""You turn a written storyboard into pictures for vertical 9:16 social videos.
+Every shot below already has its spoken line. Give each one what is in frame.
+
+{_ACTOR_DIRECTION_ONLY_RULES}
+
+Write `scene` in {lang_name} — the user reads and edits it in the app.
+Write `generation_prompt` in English — it is the only text the video model sees.
+Every generation_prompt says vertical 9:16, realistic phone video, natural light.
+Never request readable text of any kind: no labels, signs, numbers, dates, stickers or
+screens — video models render text as garbage glyphs. Write what IS in frame; a "no text"
+clause only makes the model draw text.
+
+TALKING SHOTS (visual_type "talking"):
+- The place is already chosen and is NOT yours. It is in `set_prompt`, it is the same for every
+  talking shot of the reel, and you must not restate it, change it, or invent a new room, window
+  or time of day.
+- `scene` is the MOMENT: posture, hands, expression — what changes in the person right now. One
+  short phrase.
+- `generation_prompt` is that same moment in English plus "the same actor from the reference
+  image", and nothing else.
+- NO camera wording at all: no shot type, no angle, no framing, no "static camera", no "looking
+  at the camera", no "selfie pose", no "facing the viewer". The app owns the camera here and
+  rotates its own cameras between talking shots; a prompt that fixes the pose or the gaze pins
+  the actor face-on and every camera comes back the same picture.
+- The person stays put: only facial expression and small head movement. No walking, drinking,
+  standing up or big arm gestures — motion breaks lip-sync.
+
+B-ROLL SHOTS (visual_type "broll"):
+- Here the camera IS yours: `generation_prompt` must state the shot type and any camera move,
+  because it goes to the video model as written.
+- The insert must demonstrate the exact spoken line: literally show the claim, or use one
+  immediately understandable visual analogy. One clear subject, one action. No generic wellness
+  filler — avocado, salad, measuring tape, yoga mat, supplements, scales, food prep — unless that
+  exact line is about it. Avoid objects with digital displays entirely.
+- With `actor_in_frame` true the insert shows the same presenter: identify the same actor from
+  the reference image, seen from behind, over the shoulder, her hands or her silhouette.
+- With `actor_in_frame` false there is no presenter: do not mention the actor or any reference
+  image, and pick subjects with no identifiable face.
+
+Shots JSON:
+{json.dumps(payload, ensure_ascii=False, indent=1)}
+
+Return ONLY a JSON array:
+[{{"script_index": 0, "shot_number": 1, "scene": "...", "generation_prompt": "...",
+  "camera": "shot type and move, {lang_name}, B-roll only — empty string for talking shots"}}]"""
+
+    decisions = _gemini_json_array(
+        prompt, gemini_key, text_model=text_model, label="Storyboard visuals",
+        max_output_tokens=16384,
+    )
+    if not decisions:
+        return scripts
+
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        try:
+            script_index = int(decision.get("script_index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= script_index < len(scripts) or not isinstance(scripts[script_index], dict):
+            continue
+        shots = scripts[script_index].get("shots")
+        if not isinstance(shots, list):
+            continue
+        shot_number = str(decision.get("shot_number", ""))
+        shot = next(
+            (item for item in shots
+             if isinstance(item, dict) and str(item.get("shot_number")) == shot_number),
+            None,
+        )
+        if shot is None or shot.get("prompt_manual"):
+            continue
+        scene = (decision.get("scene") or "").strip()
+        generation_prompt = (decision.get("generation_prompt") or "").strip()
+        if not scene or not generation_prompt:
+            continue
+        camera = (decision.get("camera") or "").strip()
+        shot["scene"] = scene
+        # Камера — поле интерфейса, и у говорящих кадров ей взяться неоткуда:
+        # ракурс там ставит сборка. Пустую строку не пишем, чтобы карточка не
+        # показывала пустую подпись вместо честного «камеру выбирает сборка».
+        if camera and _is_broll_shot(shot):
+            shot["camera"] = camera
+        shot["_script_language"] = (
+            shot.get("_script_language") or scripts[script_index].get("language") or language
+        )
+        shot["_generation_prompt_language"] = "en"
+        shot["generation_prompt"] = generation_prompt
+        shot["_prompt_source_scene"] = scene
+    return scripts
+
+
 def _normalized_hook_text(text: str) -> str:
     without_tags = re.sub(r"\[[^\]]+\]", " ", text or "")
     separated = re.sub(r"[-‐‑‒–—―]+", " ", without_tags)
@@ -1286,8 +1589,20 @@ def generate_scripts(
     script_format: str = "ugc",
     text_model: Optional[str] = None,
     target_duration_seconds: int = TARGET_VIDEO_DURATION_DEFAULT,
+    broll_between_talking: bool = False,
+    changing_locations: bool = False,
 ) -> list:
-    """Generate video scripts based on product/business analysis."""
+    """Generate video scripts based on product/business analysis.
+
+    `broll_between_talking` — не ставить два говорящих кадра подряд. Выключено
+    по умолчанию, и намеренно: перебивка это отдельный платный клип, который
+    тарифицируется от трёх секунд, так что чередование заметно поднимает смету.
+
+    `changing_locations` — менять место по ходу ролика. Тоже выключено и тоже
+    из-за денег: каждая новая комната это своя плита на каждую камеру, которая
+    в ней снимает. Заодно это единственный случай, когда сочинённое моделью
+    место доезжает до кадров: обычно комнату держит фото ведущего.
+    """
     from google import genai
     from google.genai import types
 
@@ -1387,6 +1702,31 @@ HOOK REQUIREMENTS:
         # обязаны считаться от одного числа.
         shot_words = TARGET_VIDEO_DURATION_PRESETS[
             normalize_target_duration(target_duration_seconds)]["words_per_beat"]
+        # Ритм перебивок — единственное место, где сценариста просят о другом.
+        # По умолчанию перебивка редкая: она стоит целый клип и тарифицируется
+        # от трёх секунд. Опцией — обязательная между говорящими кадрами: их
+        # чередование само по себе и есть монтаж, за который платят.
+        broll_rhythm, broll_run_rule, broll_cadence_rule = (
+            (
+                "- Roughly every other shot is a B-roll insert: the reel alternates between the "
+                "presenter and what she is talking about, so plan the beats in pairs.",
+                "- Two talking shots in a row are not allowed. If two consecutive beats both "
+                "belong on camera, merge them into one talking shot rather than leaving them "
+                "adjacent — a shorter reel beats a broken rhythm.",
+                "- Every B-roll insert still has to earn its place: it shows the thing that "
+                "exact line is about. If a line names nothing showable, that line belongs in "
+                "the neighbouring talking shot, not in an invented insert.",
+            ) if broll_between_talking else (
+                "- Treat B-roll shares as soft creative guidance, never as quotas: aim for "
+                "approximately 35-45% of the spoken timeline; 25-50% is an acceptable soft "
+                "range when the exact subject needs less or more visual demonstration.",
+                "- A visual change does not have to be B-roll. The app already cuts between a "
+                "medium and a close camera on the same set, so a run of talking shots is not "
+                "monotonous by itself — do not invent scenery changes to break it up.",
+                "- B-roll is therefore the exception, not the rhythm. Never two B-roll shots in "
+                "a row, and no more than one B-roll for every two talking shots.",
+            )
+        )
         prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
 Generate {num_scripts} storyboard-based video scripts for this product/business.
 {lang_instructions}
@@ -1415,16 +1755,12 @@ Return a JSON array. Each script MUST be a storyboard for Kling V3 video generat
         "start": 0,
         "end": 3,
         "role": "hook",
-        "scene": "Where the shot happens and what we see, written in {lang_name}",
-        "camera": "shot type and camera movement, written in {lang_name}",
-        "actor_action": "what the visible subject does; for talking shots, what the actor does, written in {lang_name}",
         "transition": "cut",
         "speech": "Exact line the actor says",
         "emotion": "excited",
         "overlay_text": "Short text on screen",
         "visual_type": "talking",
-        "actor_in_frame": false,
-        "generation_prompt": "English Kling V3 prompt: vertical 9:16 realistic social video, same actor from the reference image, scene, action, camera, lighting"
+        "actor_in_frame": false
       }}
     ],
     "full_narration": "All shot speech joined exactly",
@@ -1441,34 +1777,27 @@ STORYBOARD PACING PROFILE:
 - One shot = one visual beat of about 2.5-4 seconds (5 at the absolute limit). Nothing shorter: the video model has no clip below two seconds, so a beat under that is paid for in full and still flashes past. Use the visual-beat count selected above for this duration — it is a ceiling as much as a target.
 - The first shot and the last shot MUST be talking. The first shot delivers the hook; the last shot delivers the CTA or closing payoff.
 - Never place two B-roll shots next to each other. Return to a talking shot between B-roll inserts.
-- Treat B-roll shares as soft creative guidance, never as quotas: aim for approximately 35-45% of the spoken timeline; 25-50% is an acceptable soft range when the exact subject needs less or more visual demonstration.
+{broll_rhythm}
 - Approximately 10-20% may show the same actor from the reference image performing a directly relevant action. Approximately 15-30% may show a product, object, process, space, result, or immediately understandable visual analogy without the actor.
 - Vary B-roll subject types across the script. Do not repeatedly show the actor from behind, the actor's hands, food preparation, or the same prop. Presenter B-roll must earn its place by making the exact spoken claim easier to understand.
-- A visual change does not have to be B-roll. The app already cuts between a medium and a close camera on the same set, so a run of talking shots is not monotonous by itself — do not invent scenery changes to break it up.
+{broll_run_rule}
 - Every B-roll shot must be visually distinct from its neighbours (new subject or action) — the point of many short shots is variety, not the same insert repeated.
-- ALL talking shots happen in ONE place. The first talking shot defines the location, the light and the props; every later talking shot stays in exactly that place. Never write a new room, a new window, a new time of day or a changed angle for a talking shot — the app stages the talking shots itself and rotates the camera between them, so a scene text asking for a different angle only describes something the viewer will never see.
-- A talking shot's scene and generation_prompt therefore describe the MOMENT, not the place and not the camera: what the posture, the gaze and the hands are doing right then (a small nod, a glance away and back, a hand settling near the chest). This is the one thing that reaches the picture.
-- Build visual variety from framing, camera distance, meaningful action, environment, objects, processes, and B-roll that supports the narration. Never force kitchen, exercise, food, or product imagery when the exact speech is about something else.
-- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Every B-roll scene must be tied to that shot's exact speech: literally demonstrate the claim or use one immediately understandable visual analogy. A faceless person is allowed when the concept needs human action (back view, cropped body/hands, silhouette or non-identifiable profile); never request an identifiable face without an actor reference.
+- You write the TEXT of this reel, not its pictures. Do not return scene, camera, actor_action or generation_prompt: a separate pass draws every shot from your beats, and a location or a camera invented here would only be thrown away.
+- visual_type per shot: "talking" = the actor speaks to camera, lips visible; "broll" = an insert while the voiceover keeps playing. Choose it by the line itself — "talking" for the lines that carry the argument, "broll" for a line that names a thing, a process or a result, and only where a picture makes that exact line easier to understand.
+- ALL talking shots happen in ONE place, chosen once for the whole reel. Never build a beat around a change of scenery: the app stages the talking shots itself and rotates its own cameras between them.
 - A "broll" shot is the most expensive shot there is: the video model has no clip shorter than three seconds, so an insert carrying half a second of speech is billed as three full seconds and then flashes past. Give every B-roll shot a COMPLETE thought of its own — one whole sentence of 7-12 words — so it fills the time it costs. If a beat is too short for that, keep it on camera.
-- B-roll is therefore the exception, not the rhythm. Never two B-roll shots in a row, and no more than one B-roll for every two talking shots.
+{broll_cadence_rule}
 - A sentence that starts on camera finishes on camera. Cutting away mid-sentence is a deliberate accent, not a default: use it at most ONCE in the whole script, where the break itself is the point. Every other cut lands on a full stop.
 - actor_in_frame per shot: true ONLY when a "broll" shot shows the SAME person who speaks in the talking shots (seen from behind, over the shoulder, her hands, her silhouette), false when the insert shows objects, food, an interior or anybody else. It is the difference between our presenter walking into her own kitchen and a random stranger appearing mid-reel — say it explicitly, we cannot guess it from the scene text. Always false for "talking" shots.
-- Every talking generation_prompt MUST identify the same actor from the reference image and describe only pose, action and gaze. Only the FIRST talking shot also states the location and the lighting; the rest inherit it and must not restate or change it, and none of them state a shot type or camera move.
-- For a B-roll shot with actor_in_frame=true, generation_prompt MUST identify the same actor from the reference image and describe only pose, action, scene, lighting, and camera.
-- For a B-roll shot with actor_in_frame=false, generation_prompt MUST NOT mention the actor or reference image. Describe only the product, object, process, space, result, or visual analogy required by that exact speech.
-- Each shot MUST include role, actor_action, camera, overlay_text, speech, transition, and generation_prompt.
+- Each shot MUST include role, visual_type, actor_in_frame, overlay_text, speech and transition — and nothing about the picture.
 - Each shot MUST include emotion — one of: excited, warm, confident, calm, urgent, playful. Vary it across shots to follow the narrative arc.
 - role must be one of: hook, problem, explanation, solution, proof, cta.
 - transition should be "cut" or "smooth_0.3s".
-- speech, overlay_text, scene, camera and actor_action must be in {lang_name} — the user reads them in the app UI.
+- speech and overlay_text must be in {lang_name} — the user reads them in the app UI.
 {_ACTOR_DIRECTION_ONLY_RULES}
-- Apply the identity rule to EVERY output field, including scene, actor_action, and generation_prompt. Do not return an actor_description field.
-- generation_prompt MUST be in English and MUST say vertical 9:16, realistic phone video, and natural light. It must fully describe the scene, action and camera on its own — the {lang_name} fields are NOT passed to the video model. Mention the same actor from the reference image only for talking shots and B-roll with actor_in_frame=true. Write it as a plain description of what IS in frame: no "no text"/"no watermark"/"never show" clauses, those are sent to the model in a separate negative field and inside the description they only make the model draw exactly that. For B-roll, pick subjects with no identifiable face and nothing written on them; a faceless human action is allowed when the exact spoken claim needs it.
-- Screens and text props are forbidden in every shot: any phone/tablet/laptop screen must be off, turned away from camera, or out of focus; never show readable UI, documents, checklists or labels — video models render text as garbage glyphs.
-- Never request written text of ANY kind inside a shot: no labels, markings, signs, numbers, dates, stickers or captions on objects (a scene like "photo marked '20 years'" is forbidden). Express every comparison purely visually: size, amount, color, position, before/after composition.
-- In "broll" shots avoid objects with digital displays entirely (kitchen scales with screens, phones, smartwatches, monitors): the display will render as garbage glyphs. Do not use generic wellness stock filler such as avocado, salad, measuring tape, yoga mats, supplements, scales or food prep unless that exact spoken line is about it. Use one clear subject and action grounded in the claim.
-- In "talking" shots the actor holds a steady selfie pose: only subtle facial expressions and small head movement. NO exercising, walking, turning away, drinking, standing up or big hand/arm gestures — motion breaks lip-sync.
+- Apply the identity rule to every field you return. Do not return an actor_description field.
+- Never build a beat around readable text — a number on a label, a date on a photo, a screen: the pass that draws the shot cannot render text, so the comparison has to work as a picture or not exist.
+- Nothing in a "talking" beat may require the actor to move: no exercising, walking, drinking or standing up. Motion breaks lip-sync, and one authored talking shot is one paid take.
 - Each TALKING shot's speech is ONE spoken phrase of {shot_words} words, 8 words HARD max ("broll" shots are the exception and carry a whole sentence, as above). Stay at the top of that range rather than the bottom: the video model never returns a clip shorter than about two seconds, so a two-word beat is billed as a full clip and then flashes past. Split narration at natural phrase boundaries so beats normally last about 2.5-4 seconds. One authored talking shot is one paid Avatar take; never request an internal jump cut or framing change inside it.
 - Do not buy variety with extra shots. The app already adds a slow local camera push inside a talking shot, and that costs nothing, while one more shot costs a whole clip. Use the fewest shots that carry the meaning.
 - Adding a shot does NOT add words: the total word budget above stays the same, the lines just get shorter. Match the selected total duration and word budget while keeping every talking shot at or under 8 seconds of speech, the practical limit of one Avatar take; when in doubt use fewer, fuller shots rather than more, thinner ones.
@@ -1499,6 +1828,17 @@ STORYBOARD PACING PROFILE:
             script["storyboard_pacing"] = "dynamic"
             script["language"] = language
             script["target_duration_seconds"] = target_duration_seconds
+
+        # Место и картинка — отдельными запросами, каждый со своими правилами.
+        # Порядок обязателен: художник по кадрам должен видеть уже выбранный
+        # сет, иначе говорящий кадр опять начнёт описывать свою комнату.
+        scripts = generate_storyboard_sets(
+            scripts, gemini_key, text_model=text_model, language=language,
+            locations=_MAX_LOCATIONS if changing_locations else 1)
+        scripts = generate_storyboard_visuals(
+            scripts, gemini_key, text_model=text_model, language=language)
+
+        for script in scripts:
             for shot in script.get("shots") or []:
                 if (shot.get("generation_prompt") or "").strip():
                     shot["_generation_prompt_language"] = "en"
@@ -2098,6 +2438,16 @@ def build_custom_script(
 # Phase 2: Asset Generation
 # ═══════════════════════════════════════════════════════════════════════
 
+class FalUnreachable(Exception):
+    """Запрос не дошёл до fal: DNS, обрыв соединения, отказ сети.
+
+    Отдельный тип нужен ради двух решений выше по стеку, и оба про деньги.
+    Такую попытку нельзя записывать в вердикты модерации — модель фотографию не
+    видела, — и нельзя считать оплаченной: генерации не было. Всё остальное
+    (404, 422, FAILED, таймаут) до fal дошло и разбирается по-другому.
+    """
+
+
 def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) -> dict:
     """
     Submit a job to fal.ai queue, poll for completion, return result.
@@ -2133,12 +2483,12 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
             # Connect never happened, so the request did not reach fal:
             # retrying cannot enqueue a duplicate (paid) job.
             if attempt == 2:
-                raise Exception(f"fal.ai submit request failed for {model_id} at {submit_url}: {e}") from e
+                raise FalUnreachable(f"fal.ai submit request failed for {model_id} at {submit_url}: {e}") from e
             wait = 3 * (attempt + 1)
             print(f"[fal.ai] Submit connect failed ({e}), retrying in {wait}s...")
             time.sleep(wait)
         except httpx.RequestError as e:
-            raise Exception(f"fal.ai submit request failed for {model_id} at {submit_url}: {e}") from e
+            raise FalUnreachable(f"fal.ai submit request failed for {model_id} at {submit_url}: {e}") from e
 
     if resp.status_code >= 400:
         print(f"[fal.ai] Submit error: {resp.text[:500]}")
@@ -3279,9 +3629,10 @@ RULES:
   the talking shots (from behind, over the shoulder, her hands, her silhouette),
   false when the insert is objects, food, an interior or a different person. Always
   false for "talking" shots. This cannot be inferred from the scene text, so state it.
-- In "talking" shots the actor holds a steady selfie pose: subtle expressions and
+- In "talking" shots the actor stays put and stays calm: subtle expressions and
   small head movement only. No exercising, walking, drinking or big gestures —
-  motion breaks lip-sync.
+  motion breaks lip-sync. Say what the person is doing, never how they are filmed
+  or where they look — the app owns the camera for talking shots.
 - Every "broll" shot must be visually distinct from its neighbours in the storyboard above.
 - ALL talking shots happen in ONE place, the one the first talking shot above is
   set in. Never write a new room, a new window, a new time of day or a changed
@@ -3374,6 +3725,19 @@ def normalize_storyboard_shots(script: dict) -> list:
     """Normalize shot dictionaries for Kling V3 generation and UI edits."""
     raw_shots = script.get("shots") or []
     script_language = (script.get("language") or "").strip().lower()
+    set_prompt = (script.get("set_prompt") or "").strip()
+    set_prompts = [s.strip() for s in (script.get("set_prompts") or [])
+                   if isinstance(s, str) and s.strip()]
+    # Правка места руками бьёт по первой локации: человек редактирует одно поле,
+    # `set_prompt`, и оно обязано выиграть у списка, из которого выросло. Иначе
+    # первая комната ролика осталась бы той, что он только что переписал.
+    if set_prompts and set_prompt:
+        set_prompts = [set_prompt] + set_prompts[1:]
+    # Место доезжает до плит, когда его выбрал человек — или когда человек
+    # попросил их менять. И то и другое — его решение, а не догадка модели.
+    set_chosen = bool(set_prompt) and (
+        (script.get("set_source") or "").strip().lower() == "user"
+        or bool(script.get("set_changes")))
     if not raw_shots and script.get("segments"):
         raw_shots = []
         for index, segment in enumerate(script.get("segments") or [], start=1):
@@ -3436,6 +3800,13 @@ def normalize_storyboard_shots(script: dict) -> list:
         shot_language = (shot.get("_script_language") or script_language).strip().lower()
         if shot_language:
             normalized["_script_language"] = shot_language
+        # Сет — свойство сценария, но до плит доезжают одни кадры: и слайсер, и
+        # рендер получают список шотов без обёртки. Штампуем его сюда, чтобы
+        # `_pinned_avatar_set` не пришлось угадывать место по первой реплике.
+        if set_prompt:
+            normalized["_set_prompt"] = set_prompt
+        if set_chosen:
+            normalized["_set_chosen"] = True
         # Only coerce when the storyboard actually stated it: an absent flag must
         # stay absent so `fill_storyboard_shot_details` can still decide, while a
         # user's explicit "no" is never re-decided for them.
@@ -3443,7 +3814,25 @@ def normalize_storyboard_shots(script: dict) -> list:
             normalized["actor_in_frame"] = _shot_wants_actor(shot)
         normalized["generation_prompt"] = _build_storyboard_generation_prompt(normalized)
         shots.append(normalized)
+    _assign_shot_locations(shots, set_prompts if set_chosen else [])
     return shots
+
+
+def _assign_shot_locations(shots: list, set_prompts: List[str]) -> None:
+    """Раздать говорящим кадрам номер локации — по три кадра на место.
+
+    Меняем место не на каждом кадре: соседние шоты внутри локации разводит
+    вторая камера, а каждая новая комната — это ещё одна платная плита на
+    камеру. Локации по кругу: четвёртая тройка возвращается в первую комнату и
+    берёт её плиту даром.
+    """
+    if len(set_prompts) < 2:
+        return
+    for shot in shots:
+        shot["_set_prompts"] = set_prompts
+    talking = [shot for shot in shots if not _is_broll_shot(shot)]
+    for order, shot in enumerate(talking):
+        shot["_set_index"] = (order // _SHOTS_PER_LOCATION) % len(set_prompts)
 
 def split_storyboard_shots(shots: list, max_duration: int = 15) -> list:
     """Split storyboard shots into chunks that fit Kling V3 multi-shot limits."""
@@ -3628,22 +4017,58 @@ _AVATAR_PROMPT_BANNED_WORDS = (
 )
 
 # Short, positive, motion-only. The frame itself (scene, outfit, framing) comes
-# from the reference image, so the prompt's single job is to hold the body
-# still: with no prompt at all Kling invents leg-crossing and hand-shuffling
-# that reads as fidgeting. Length is deliberate — fal's own schema defaults this
-# field to "." and the comparable Longcat avatar endpoint defaults to a single
-# plain sentence, so two sentences is already the upper end of what these models
-# expect here.
+# from the reference image, so the prompt holds the body still: with no prompt at
+# all Kling invents leg-crossing and hand-shuffling that reads as fidgeting.
+# Length is deliberate — fal's own schema defaults this field to "." and the
+# comparable Longcat avatar endpoint defaults to a single plain sentence, so two
+# sentences is already the upper end of what these models expect here.
+#
+# Держать неподвижным тело и держать неподвижным лицо — разные задачи, и раньше
+# промпт не различал их. «Small head movements» и «one locked-off take» стояли
+# рядом с «hands resting calmly» и гасили заодно мимику: движение лица между
+# соседними кадрами вышло 2.70 и 3.09 против 4.94 и 3.66 на прежних дублях —
+# лицо читалось переколотым ботоксом. Поэтому неподвижность сказана только про
+# руки, ноги и камеру, а лицу движение прямо разрешено — перечислением того, что
+# должно двигаться: негативного промпта у Kling нет (см.
+# `_AVATAR_PROMPT_BANNED_WORDS`), «не замирай» он прочтёт как «замри».
+#
+# Но разрешать надо по одной вещи за раз. Первая редакция просила заодно щёки,
+# прищур «when the tone warms» и «the head turns and nods» — и рот перестал
+# попадать в звук: у Kling один бюджет движения, губы оказались одной задачей из
+# пяти, и он отработал выражение лица, держа рот в застывшей улыбке с зубами.
+# Замер на ролике 03.08 13:06 (`voice_test/lip_population_2026_08_03.py`):
+# раскрытие рта на самых громких кадрах МЕНЬШЕ, чем на самых тихих, −0.003 у
+# обоих дублей — единственные отрицательные значения за всю историю замеров
+# (прежние дубли и ручной клип 26.07: от 0.000 до +0.029). Ход рта у первого
+# дубля 4.2 против 6.0-9.3 у всех остальных.
+#
+# Отсюда порядок слов: губы названы первыми и отдельной фразой, «щёки поднимаются
+# и глаза щурятся» (анатомическое описание улыбки — рот, а не глаза) убрано, а
+# тормоз на голову возвращён. Брови и лоб остаются: мимика, ради которой правка и
+# делалась, живёт там и рта не занимает.
+#
+# «From the first sound to the last», а не «through every word»: `word` стоит в
+# `_AVATAR_PROMPT_BANNED_WORDS`, и назвать его — попросить нарисовать текст.
+#
+# Позу промпт не называет, а только запрещает менять. Раньше здесь стояло «stays
+# seated», хотя плита — единственный источник правды о позе — рисует человека
+# стоящим: закреплённый сет обоих роликов 03.08 начинается со «standing in a cozy
+# living room». Сесть модель всё равно не может, первый кадр задан плитой, так что
+# указание либо игнорировалось, либо тратило то самое внимание, которого не
+# хватило губам. Неподвижность рук и ног остаётся: без неё Kling придумывает
+# перекладывание ног и рук.
 _AVATAR_MOTION_PROMPT = (
-    "The person stays seated in the same pose, hands resting calmly, legs still, speaking "
-    "straight to the camera with a calm friendly expression. Only the face moves: the lips "
-    "follow the audio, natural blinking, small head movements, one locked-off take."
+    "The person holds the pose they are already in, hands resting calmly, legs still, speaking "
+    "straight to the camera. The lips follow the audio from the first sound to the last, the jaw "
+    "opens and closes with the syllables. The brows and forehead work with the meaning, natural blinking, "
+    "small head movements, one locked-off take. The camera stays where it is."
 )
 
 _AVATAR_WHISPER_MOTION_PROMPT = (
     "The person leans slightly closer to the camera, chin lowered, one hand resting near the "
-    "mouth, whispering confidentially with a restrained conspiratorial expression. The lips "
-    "follow the audio, natural blinking, tiny head movements, one locked-off take."
+    "mouth, whispering confidentially. The lips follow the audio from the first sound to the "
+    "last, the jaw opens and closes with the syllables. The brows draw in and lift with the meaning, natural "
+    "blinking, tiny head movements, one locked-off take. The camera stays where it is."
 )
 
 
@@ -7103,6 +7528,31 @@ DEFAULT_AVATAR_EDIT_MODEL = AVATAR_EDIT_MODELS[0]["id"]
 
 # Поля ответа, по которым видно, что кадр зарубила модерация, а не сбой сети.
 _FAL_MODERATION_FIELDS = ("has_nsfw_concepts", "nsfw_content_detected", "error", "message", "detail")
+_FAL_BOOLEAN_MODERATION_FIELDS = ("has_nsfw_concepts", "nsfw_content_detected")
+_MODERATION_WORDS = ("moderation", "nsfw", "safety policy", "content policy")
+
+
+def _moderation_value_is_true(value) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        return any(_moderation_value_is_true(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
+
+
+def _explicit_moderation_flags(result: dict) -> dict:
+    """Return only evidence that explicitly confirms provider moderation."""
+    flags = {
+        key: result[key] for key in _FAL_BOOLEAN_MODERATION_FIELDS
+        if key in result and _moderation_value_is_true(result[key])
+    }
+    for key in ("error", "message", "detail"):
+        value = result.get(key)
+        if isinstance(value, str) and any(word in value.lower() for word in _MODERATION_WORDS):
+            flags[key] = value
+    return flags
 
 
 def _avatar_edit_model(model_id: str = "") -> dict:
@@ -7127,31 +7577,92 @@ _BLANK_MEMO_LOCK = threading.Lock()
 _FRAME_WORKERS = 3
 
 
-def _models_that_blanked(photo_path: str) -> set:
-    """Редакторы, уже вернувшие чёрный кадр на это фото.
+def _photo_fingerprint(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    Пустой кадр fal тарифицирует как обычный: платим за чёрный квадрат ровно
-    столько же, сколько за картинку. Модерация срабатывает детерминированно —
-    повторный запрос той же моделью с тем же фото купит тот же квадрат. Поэтому
-    вердикт запоминается рядом с фотографией и переживает джобы.
+
+def _prompt_fingerprint(prompt: str) -> str:
+    return hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()
+
+
+def _read_moderation_memo(photo_path: str) -> dict:
+    """Read only verified, versioned moderation records.
+
+    Legacy model-only arrays did not preserve fal's verdict or the prompt that
+    caused it. They therefore cannot safely block a future paid request.
     """
     try:
-        with open(_blank_model_memo(photo_path), encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
+        with open(_blank_model_memo(photo_path), encoding="utf-8") as source:
+            data = json.load(source)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != 2:
+        return {}
+    if not isinstance(data.get("records"), list):
+        return {}
+    return data
+
+
+def _models_that_blanked(photo_path: str, prompt: str) -> set:
+    """Models with confirmed moderation for this exact photo and prompt."""
+    data = _read_moderation_memo(photo_path)
+    if data.get("version") != 2:
         return set()
+    try:
+        photo_sha = _photo_fingerprint(photo_path)
+    except OSError:
+        return set()
+    prompt_sha = _prompt_fingerprint(prompt)
+    return {
+        record["model"] for record in data.get("records", [])
+        if isinstance(record, dict)
+        if record.get("photo_sha256") == photo_sha
+        and record.get("prompt_sha256") == prompt_sha
+        and record.get("model")
+    }
 
 
-def _remember_blank_model(photo_path: str, model: str) -> None:
-    # Кадры рисуются в несколько потоков, а память вердиктов — один файл на фото:
-    # без замка два отказа одновременно перетирают друг друга, и второй платный
-    # чёрный квадрат покупается заново.
+def _remember_confirmed_moderation(
+    photo_path: str,
+    model: str,
+    prompt: str,
+    flags: dict,
+) -> None:
+    """Persist one vendor-confirmed verdict without exposing partial JSON."""
+    memo_path = _blank_model_memo(photo_path)
     with _BLANK_MEMO_LOCK:
-        known = _models_that_blanked(photo_path) | {model}
         try:
-            with open(_blank_model_memo(photo_path), "w", encoding="utf-8") as f:
-                json.dump(sorted(known), f)
+            data = _read_moderation_memo(photo_path)
+            records = list(data.get("records", []))
+            photo_sha = _photo_fingerprint(photo_path)
+            prompt_sha = _prompt_fingerprint(prompt)
+            records = [record for record in records if not (
+                isinstance(record, dict)
+                and record.get("model") == model
+                and record.get("photo_sha256") == photo_sha
+                and record.get("prompt_sha256") == prompt_sha
+            )]
+            records.append({
+                "model": model,
+                "photo_sha256": photo_sha,
+                "prompt_sha256": prompt_sha,
+                "flags": flags,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            temporary = f"{memo_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(temporary, "w", encoding="utf-8") as target:
+                    json.dump({"version": 2, "records": records}, target, ensure_ascii=False)
+                os.replace(temporary, memo_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
         except OSError:
+            # Memo persistence is an optimization and must not fail generation.
             pass
 
 
@@ -7171,6 +7682,7 @@ def _report_blocked_editor(
     flags: dict,
     charged: bool,
     photo_path: str,
+    prompt: str,
 ) -> None:
     """Записать отказ редактора так, чтобы интерфейс мог о нём рассказать.
 
@@ -7180,20 +7692,28 @@ def _report_blocked_editor(
     """
     if billing is None:
         return
-    tried = _models_that_blanked(photo_path) if photo_path else set()
+    tried = _models_that_blanked(photo_path, prompt) if photo_path else set()
     billing.setdefault("blocked", []).append({
         "model": entry["id"],
         "title": entry["title"],
         "vendor": entry["vendor"],
         # "moderation" — модель зарубила кадр, "known" — уже рубила его раньше,
-        # "unavailable" — эндпоинт не ответил (404/422), это не про модерацию.
+        # "unavailable" — эндпоинт ответил ошибкой (404/422), это не про
+        # модерацию, "unreachable" — запрос до fal вообще не дошёл, и тогда
+        # смена модели не поможет: чинить надо сеть.
         "reason": reason,
         "flags": flags,
         "charged": charged,
         "alternatives": [
-            {"id": m["id"], "title": m["title"], "vendor": m["vendor"], "note": m["note"]}
+            {
+                "id": m["id"],
+                "title": m["title"],
+                "vendor": m["vendor"],
+                "note": m["note"],
+                "blocked": m["id"] in tried,
+            }
             for m in AVATAR_EDIT_MODELS
-            if m["id"] not in tried and m["id"] != entry["id"]
+            if m["id"] != entry["id"]
         ],
     })
 
@@ -7208,6 +7728,7 @@ def _flux_reference_frame(
     on_failure: str = "",
     billing: Optional[dict] = None,
     edit_model: str = "",
+    extra_photo_paths: Optional[List[str]] = None,
 ) -> str:
     """Draw one Flux still for a shot, cached by prompt. "" on any failure.
 
@@ -7219,6 +7740,13 @@ def _flux_reference_frame(
     `edit_model` — какой редактор из `AVATAR_EDIT_MODELS` позвать (пусто = дефолт).
     Отказ никогда не переходит на другую модель сам: он попадает в `billing`
     отчётом, а выбор остаётся за пользователем.
+
+    `actor_photo_path` — главный референс: он уходит первым и по нему же ведётся
+    память об отказах модерации. `extra_photo_paths` — остальные, и доходят они
+    не до всех: поле под картинку у половины каталога одиночное (см. `field` в
+    `AVATAR_EDIT_MODELS`). Обещать модели картинку там, где мы её не отправляем,
+    — значит просить выдумать её содержимое, поэтому решение «идут лишние
+    референсы или нет» принимает вызывающий, а не текст промпта.
     """
     prompt_sidecar = f"{output_path}.prompt.txt"
     if _nonempty(output_path):
@@ -7237,31 +7765,40 @@ def _flux_reference_frame(
     # тратить чужие деньги на догадку. Отказ уходит наверх, решение — за юзером.
     entry = _avatar_edit_model(edit_model)
     if actor_photo_path:
-        blanked = _models_that_blanked(actor_photo_path)
+        blanked = _models_that_blanked(actor_photo_path, prompt)
         if entry["id"] in blanked:
             # Бесплатный отказ: модерация детерминированна, тот же редактор с тем
             # же фото купит тот же чёрный квадрат.
             log(f"  ⚠️ {label}: {entry['title']} на это фото уже вернул пустой кадр. "
                 "Повторный запрос не делаю — он платный и вернёт то же самое. "
                 "Нужна другая модель или другое фото ведущего.")
-            _report_blocked_editor(billing, entry, "known", {}, False, actor_photo_path)
+            _report_blocked_editor(
+                billing, entry, "known", {}, False, actor_photo_path, prompt,
+            )
             return ""
         model, image_field, extra = entry["id"], entry["field"], entry["args"]
-        image_url = _fal_upload_file(_flux_condition_photo(actor_photo_path), fal_key)
+        photos = [actor_photo_path]
+        if image_field == "image_urls":
+            photos.extend(p for p in (extra_photo_paths or []) if p)
+        image_urls = [_fal_upload_file(_flux_condition_photo(p), fal_key) for p in photos]
     else:
         model, image_field, extra = "fal-ai/flux-2-pro", "", {"image_size": "portrait_16_9", "safety_tolerance": 5}
-        image_url = ""
+        image_urls = []
 
     args = {"prompt": prompt, **extra}
     if image_field == "image_urls":
-        args["image_urls"] = [image_url]
+        args["image_urls"] = image_urls
     elif image_field:
-        args[image_field] = image_url
+        args[image_field] = image_urls[0]
 
+    # Граница, за которой картинка уже нарисована и уже оплачена. Всё, что
+    # ломается после неё, цену не отменяет.
+    generated = False
     try:
         if billing is not None:
             billing["calls"] = billing.get("calls", 0) + 1
         result = _fal_run(model, args, fal_key, timeout=600)
+        generated = True
         images = result.get("images") or result.get("output", [])
         if not images:
             raise RuntimeError(f"no images in Flux result: {list(result.keys())}")
@@ -7274,15 +7811,21 @@ def _flux_reference_frame(
         if _looks_blank(output_path):
             # Ответ модели — единственное место, где видно «зарубила модерация»
             # вместо «что-то пошло не так». Без него причина остаётся догадкой.
-            flags = {k: result[k] for k in _FAL_MODERATION_FIELDS if k in result}
+            flags = _explicit_moderation_flags(result)
+            reason = "moderation" if flags else "blank"
             log(f"  ⚠️ {label}: {model} вернул пустой кадр"
                 + (f" — ответ модели: {flags}" if flags else " (модель не назвала причину)"))
             _drop_frame_files(output_path)
             if actor_photo_path:
-                _remember_blank_model(actor_photo_path, model)
-                _report_blocked_editor(billing, entry, "moderation", flags, True, actor_photo_path)
+                if flags:
+                    _remember_confirmed_moderation(
+                        actor_photo_path, model, prompt, flags,
+                    )
+                _report_blocked_editor(
+                    billing, entry, reason, flags, True, actor_photo_path, prompt,
+                )
                 left = [m["title"] for m in AVATAR_EDIT_MODELS
-                        if m["id"] not in _models_that_blanked(actor_photo_path)]
+                        if m["id"] not in _models_that_blanked(actor_photo_path, prompt)]
                 log(f"  {label}: не пробовали на этом фото: {', '.join(left)} — выбор за тобой."
                     if left else f"  {label}: редакторы кончились — нужно другое фото ведущего.")
             return ""
@@ -7292,16 +7835,26 @@ def _flux_reference_frame(
             f.write(prompt)
         return output_path
     except Exception as e:
-        # Отказ эндпоинта деньгами не пахнет (fal берёт только за генерацию), но
-        # и повторять его незачем: сетевые сбои переигрывает сам `_fal_run`, а
-        # 404/422 значит, что модель переехала — запоминаем и идём дальше.
+        # Три разных случая, и путать их дорого.
+        #
+        # Запрос не дошёл до fal — модель фотографию не видела, платить не за
+        # что, и повторять надо ту же самую модель. Именно этот случай раньше
+        # записывался в вердикты модерации: 2026-08-05 резолвер в контейнере
+        # перестал разрешать queue.fal.run, и два редактора из четырёх оказались
+        # вычеркнуты навсегда, ни разу не увидев фото (см. `FalUnreachable`).
+        #
+        # Эндпоинт ответил ошибкой — модель переехала или её сняли; запоминаем,
+        # чтобы не платить за тот же 404 второй раз.
+        #
+        # Сломалось после генерации (не скачалась готовая картинка) — fal своё
+        # уже посчитал. Вычесть вызов здесь значит соврать в отчёте о тратах.
+        unreachable = isinstance(e, FalUnreachable)
         log(f"  ⚠️ {label}: {model} не отработал ({e}){on_failure}")
-        if billing is not None:
+        if billing is not None and not generated:
             billing["calls"] = max(0, billing.get("calls", 1) - 1)
         if actor_photo_path:
-            _remember_blank_model(actor_photo_path, model)
-            _report_blocked_editor(billing, entry, "unavailable", {"error": str(e)}, False,
-                                   actor_photo_path)
+            _report_blocked_editor(billing, entry, "unreachable" if unreachable else "unavailable",
+                                   {"error": str(e)}, generated, actor_photo_path, prompt)
         return ""
 
 
@@ -7399,19 +7952,61 @@ def _broll_reference_image(
 # Лицо на плите — это не портрет, а стартовая поза для Kling: он держит найденное
 # на кадре выражение всю реплику и возвращается к нему после каждого слога.
 # Широкая улыбка с зубами, растянутая на две секунды говорения, читается как
-# оскал — поэтому улыбка запрещена прямо, а не «спокойное лицо» намёком.
+# оскал — поэтому улыбка запрещена прямо («mouth closed, no smile»), а не
+# «спокойное лицо» намёком: мягкое «calm expression, lips gently closed» уже
+# проигрывало улыбающемуся исходнику.
 #
-# Просить об этом приходится жёстко: у редактора изображений выражение ведёт себя
-# как композиция (см. комментарий к `_AVATAR_FRAMINGS`) — он тянет его из входного
-# фото, а фото актёра почти всегда улыбается в объектив. Мягкая формулировка
-# «calm expression, lips gently closed» стояла в обоих промптах и проиграла
-# исходнику: обе плиты последнего прогона вышли с открытой улыбкой.
-_AVATAR_RESTING_FACE = (
-    "A still moment before speech begins. Override the expression of the reference photo: "
-    "the mouth is closed, the lips rest together, no teeth are visible anywhere, the jaw is "
-    "relaxed and the cheeks are not raised. No smile, no grin, no laugh. A composed, neutral, "
-    "attentive face; any warmth lives in the eyes alone."
-)
+# Просили об этом целым абзацем — «override the expression of the reference
+# photo», «no teeth are visible anywhere», «any warmth lives in the eyes alone».
+# Абзац съеден вместе с личностью, светом и фотореализмом: четыре слова в хвосте
+# делают ту же работу, а всё остальное только глушило строку камеры.
+
+# Комната приезжает картинкой, а не словами. На фото ведущего место уже снято —
+# со своим светом, мебелью и временем суток, — а текст сета пишется вслепую: та
+# модель фото не видела. Пока описание подставлялось всегда, оно эту комнату
+# перекрашивало. 2026-08-04, джоб 244d4ef0: на фото светлая дневная кухня, сет
+# просил «soft evening ambient lighting, warm glow» — и кадр вышел в чужой
+# вечерней кухне с тёмными фасадами. Текст поэтому вступает в дело только когда
+# место выбрал человек: тогда он и правда хочет другую комнату.
+#
+# Сохранять надо место, а не фон, и сказать это надо одним словом. Первая
+# редакция просила «ту же мебель и поверхности за человеком» — и камера
+# перестала двигаться вовсе: модель развернула человека на месте, оставив кадр
+# за ним нетронутым (2026-08-04, джоб 6c5e990d). Вторая объясняла разницу между
+# местом и фоном тремя предложениями и одним «не копируй» — сработало, но это
+# были сто восемнадцать слов там, где хватает двух: «the same photo». Фраза сама
+# несёт и комнату, и свет, и время суток, и то, что снимок другой.
+_AVATAR_PLATE_TAIL = "Chest up, mouth closed, no smile, vertical 9:16."
+
+
+def _avatar_plate_prompt(framing: str, set_text: str = "", face_first: bool = False,
+                         room_last: bool = False) -> str:
+    """Плита одной фразой: что снимаем, откуда — и хвост из трёх требований.
+
+    В хвосте только то, за что уже платили ошибкой. «Chest up» — дистанция,
+    общая для всех камер: разная крупность на стыке читается наездом, а не
+    второй камерой (2026-08-02, джоб saas_bd4a6584). «Mouth closed, no smile» —
+    плита становится первым кадром клипа, и улыбка на ней улыбается всю реплику.
+    «Vertical 9:16» — формат ролика. Личность, свет, фотореализм и «один человек
+    в кадре» не названы намеренно: всё это приезжает картинкой, и слова о ней
+    только мешают (2026-08-05, проверка руками — фраза в двенадцать слов дала
+    ракурс с первого раза).
+    """
+    # Ракурс может и не приехать: этой же функцией рисуют кадр, где камеру никто
+    # не заказывал. Тогда фраза просто короче — но не «..., . Chest up».
+    where = f", {framing}" if framing else ""
+    if face_first:
+        opening = "The first photo is this person's face. " + (
+            f"Photograph them in {set_text}{where}. " if set_text else
+            f"The second photo again{where}. ")
+    else:
+        opening = (f"The same person, in {set_text}{where}. " if set_text else
+                   f"The same photo{where}. ")
+    # Про картинку говорим, только если она едет. Обещанная и неотправленная —
+    # это просьба её выдумать.
+    if room_last:
+        opening += "The last photo is the room. "
+    return opening + _AVATAR_PLATE_TAIL
 
 
 def _avatar_reference_image(
@@ -7424,6 +8019,8 @@ def _avatar_reference_image(
     framing: str = "",
     billing: Optional[dict] = None,
     edit_model: str = "",
+    face_photo_path: str = "",
+    set_photo_path: str = "",
 ) -> str:
     """Avatar frame from the actor photo + a scene description.
 
@@ -7433,38 +8030,42 @@ def _avatar_reference_image(
     toward the frame edges. Returns "" on any failure so the caller falls back to
     a punch-in crop of the shared photo: a plainer frame beats a failed job.
 
-    scene_override pins one set for every talking shot of a reel; framing asks
-    for a specific staging of that set, so the reel reads as several cameras on
-    one take instead of a new room behind every cut.
+    scene_override pins one set for every talking shot of a reel, и попадает в
+    промпт только когда место выбрал человек: иначе комната приезжает картинкой,
+    а не словами. framing — точка съёмки, одна короткая фраза (`_AVATAR_FRAMINGS`).
 
-    Порядок слов в промпте — не косметика. Строка ракурса идёт последней и
-    приказом, потому что раньше она стояла в середине и проигрывала двум соседям:
-    закреплённый сет сам заканчивался словами «medium shot», а хвост требовал
-    держать человека «целиком в кадре». Из-за этого medium, close и hush выходили
-    одним и тем же средним планом. Здесь же сказано, что камеру описание сцены не
-    задаёт вовсе, — иначе первый же кадр раскадровки навязывает свой план всем
-    остальным.
+    Весь промпт собирает `_avatar_plate_prompt`, и он короткий. Длинный —
+    объяснения, запреты и перечисление того, что и так есть на фото, — камеру
+    глушит: 0.060 против 0.633 по повороту головы.
     """
-    if not (actor_photo_path and os.path.exists(actor_photo_path)):
+    face = face_photo_path if (face_photo_path and os.path.exists(face_photo_path)) else ""
+    if not face and not (actor_photo_path and os.path.exists(actor_photo_path)):
         return ""
+    # Личность держит портрет, поэтому он идёт первым — и первым же его получат
+    # редакторы с одиночным входом. Общий план едет вторым и только туда, где для
+    # него есть место: иначе промпт рассказывал бы про картинку, которой нет.
+    primary = face or actor_photo_path
+    # Второй и третий референсы доходят не до всех редакторов: поле под картинку
+    # у половины каталога одиночное. Что не отправляем — о том и не рассказываем.
+    multi = _avatar_edit_model(edit_model)["field"] == "image_urls"
+    body = ""
+    if multi and face and actor_photo_path and os.path.exists(actor_photo_path):
+        if os.path.normpath(actor_photo_path) != os.path.normpath(face):
+            body = actor_photo_path
+    room = ""
+    if multi and set_photo_path and os.path.exists(set_photo_path):
+        if os.path.normpath(set_photo_path) not in (os.path.normpath(primary),
+                                                    os.path.normpath(body) if body else ""):
+            room = set_photo_path
     scene = (scene_override or shot.get("generation_prompt") or shot.get("scene") or "")
     scene = scene.strip().rstrip(".")
     framing = (framing or "").strip().rstrip(".")
-    prompt = (
-        "The reference image is the only source of identity and appearance. Keep the exact "
-        "same person, face, hairstyle, body, outfit and accessories: one single person, no "
-        "second face, no extra person at the frame edges. Treat the scene text only as "
-        "direction for location, lighting, props, position, gaze and action; ignore any "
-        "appearance or camera wording it may contain — the staging line below is the only "
-        "camera instruction. "
-        f"{scene + '. ' if scene else ''}"
-        "Vertical 9:16, photorealistic phone-camera look, natural light, plain unbranded "
-        f"clothing and background. {_AVATAR_RESTING_FACE} "
-        f"{'Restage the shot: ' + framing + '.' if framing else ''}"
-    )
+    prompt = _avatar_plate_prompt(framing, set_text=scene,
+                                  face_first=bool(body), room_last=bool(room))
     return _flux_reference_frame(
         prompt, fal_key, output_path, log=log,
-        actor_photo_path=actor_photo_path,
+        actor_photo_path=primary,
+        extra_photo_paths=[p for p in (body, room) if p],
         label="Avatar reference frame",
         on_failure="; using cropped photo instead",
         billing=billing,
@@ -7479,7 +8080,7 @@ def _avatar_reference_image(
 # Камеры разводит угол, а не крупность, и это правило, а не вкус. Разная
 # крупность у соседних кадров читается не как вторая камера, а как наезд на
 # склейке: тот же человек в той же позе, просто ближе. Дистанция поэтому у всех
-# камер одна и сказана одними и теми же словами (`_AVATAR_CAMERA_DISTANCE`), а
+# камер одна и сказана одними и теми же словами (`_AVATAR_PLATE_TAIL`), а
 # крупность остаётся приёмом внутри кадра (`_talking_push_in`) — редко и по ходу
 # реплики, никогда на монтажном стыке.
 #
@@ -7494,45 +8095,54 @@ def _avatar_reference_image(
 # вышло, читалось наездом.
 _AvatarCamera = namedtuple("_AvatarCamera", "key direction")
 
-# Одна дистанция на все камеры, слово в слово. Доля кадра названа числом:
-# «средний» и «крупный» у редактора гуляют от плиты к плите, а «about a fifth of
-# the frame height» он повторяет.
-_AVATAR_CAMERA_DISTANCE = (
-    "the person framed from the chest up, the head about a fifth of the frame height; keep "
-    "this distance exactly — do not move the camera closer, do not crop tighter"
-)
-
+# Камера называется одной фразой. Прежние постановки росли по предложению за
+# каждый сорванный кадр и доросли до трёхсот тридцати слов — а редактор слышит
+# короткое. Замерено по повороту головы: длинная постановка развела камеры на
+# 0.060, та же камера в восемь слов — на 0.633. Человек проверил это руками
+# 2026-08-05: одно фото и «This is the same photo, but from a different angle,
+# to the right» дали ракурс с первого раза. Всё, что длиннее, — это объяснение
+# модели, зачем ей делать то, что она и так умеет.
 _AVATAR_FRAMINGS = (
-    _AvatarCamera(
-        "front",
-        f"{_AVATAR_CAMERA_DISTANCE}. Camera position: straight in front of the person at eye "
-        "level, the shoulders square to the lens, the person centred with the set behind "
-        "them. The eyes look straight into the lens",
-    ),
-    _AvatarCamera(
-        "side",
-        f"{_AVATAR_CAMERA_DISTANCE}. Camera position: a second camera moved round to the "
-        "person's left, about forty degrees off the straight-on axis and a touch below eye "
-        "level, so the shoulders sit at an angle with one nearer the lens than the other and "
-        "another part of the same room opens up behind them. The person sits off to the "
-        "right of frame. The head is turned toward this camera and the eyes look straight "
-        "into the lens — not away, not down",
-    ),
+    _AvatarCamera("front", "taken straight on at eye level"),
+    _AvatarCamera("side", "taken from a different angle, forty degrees to the right"),
 )
 _AVATAR_HUSH_FRAMING = _AvatarCamera(
-    "hush",
-    f"{_AVATAR_CAMERA_DISTANCE}. Camera position: straight in front, dropped to just below "
-    "eye level so the person looks a little down into it. The person leans slightly toward "
-    "the camera, chin lowered, one hand resting near the mouth, the expression restrained "
-    "and confidential. The eyes look straight into the lens",
-)
+    "hush", "taken from just below eye level, with the person leaning in")
 _AVATAR_CAMERAS = {c.key: c for c in (*_AVATAR_FRAMINGS, _AVATAR_HUSH_FRAMING)}
+
+# Номер локации живёт в ключе камеры, а не рядом с ним: ключ — это и имя файла
+# плиты, и половина её подписи, так что комната, попавшая в ключ, сама разводит
+# кадры по разным файлам и не даёт усыновить чужую плиту из другой комнаты.
+_PLATE_LOCATION_SEP = "_l"
+
+
+def _camera_at_location(camera: _AvatarCamera, index: int) -> _AvatarCamera:
+    """Та же камера, но в другой комнате. Нулевая — без суффикса: имена плит
+    роликов с одним местом остаются прежними, и уже утверждённые кадры не
+    перерисовываются из-за одной опции, которую никто не включал."""
+    if index <= 0:
+        return camera
+    return _AvatarCamera(f"{camera.key}{_PLATE_LOCATION_SEP}{index}", camera.direction)
+
+
+def _camera_location(key: str) -> int:
+    head, sep, tail = (key or "").rpartition(_PLATE_LOCATION_SEP)
+    return int(tail) if head and sep and tail.isdigit() else 0
+
+
+def _camera_base_key(key: str) -> str:
+    return (key or "").rpartition(_PLATE_LOCATION_SEP)[0] or key or ""
 
 
 def _avatar_framing_for_shot(shot: dict, framing_index: int) -> _AvatarCamera:
     if _shot_performance(shot) == "whisper":
-        return _AVATAR_HUSH_FRAMING
-    return _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
+        camera = _AVATAR_HUSH_FRAMING
+    else:
+        camera = _AVATAR_FRAMINGS[framing_index % len(_AVATAR_FRAMINGS)]
+    try:
+        return _camera_at_location(camera, int(shot.get("_set_index") or 0))
+    except (TypeError, ValueError):
+        return camera
 
 
 def _avatar_motion_prompt_for_shot(shot: dict) -> str:
@@ -7630,6 +8240,20 @@ def _avatar_reference_variant(image_path: str, output_path: str, index: int) -> 
 _PLATE_IDENTITY_SUFFIX = ".set.txt"
 
 
+def _reference_fingerprint(path: str) -> str:
+    """Короткая подпись референса — по содержимому, а не по пути.
+
+    Один и тот же портрет приезжает под разными именами: загрузка кладёт его в
+    `actor_uploads/custom_<uuid>.png`, а джоб копирует к себе. По имени такие
+    копии — разные файлы, и плита перерисовывалась бы за деньги на каждой из них.
+    """
+    try:
+        with open(path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()[:12]
+    except OSError:
+        return os.path.basename(path or "")
+
+
 class _AvatarPlates:
     """Постановочные кадры камер — по одному на камеру, общие на весь ролик.
 
@@ -7653,11 +8277,26 @@ class _AvatarPlates:
                  actor_photo: Callable[[], str], fal_key: str,
                  edit_model: str = "", billing: Optional[dict] = None,
                  known_frames: Optional[List[str]] = None,
+                 face_photo: Optional[Callable[[], str]] = None,
+                 set_chosen: bool = False,
+                 sets: Optional[List[str]] = None,
+                 pinned_plates: Optional[dict] = None,
                  log: Callable[[str], None] = print):
         self._output_dir = output_dir
         self._slug = title_slug
-        self._set = pinned_set
+        # Место действия словами берём только когда его выбрал человек: иначе
+        # комнату держит фото ведущего, на котором она уже снята.
+        self._set = pinned_set if set_chosen else ""
+        # Мест может быть несколько — опция «менять локации». Нулевое обязано
+        # совпасть с одиночным: иначе включение опции перерисовало бы и те плиты,
+        # что уже утверждены для первой комнаты.
+        self._sets = [s for s in (sets or []) if s] if set_chosen else []
+        if self._sets:
+            self._set = self._sets[0]
+        # Готовые плиты, загруженные руками: картинка, а не задание её нарисовать.
+        self._pinned_plates = {k: v for k, v in (pinned_plates or {}).items() if v}
         self._actor_photo = actor_photo
+        self._face_photo = face_photo or (lambda: "")
         self._fal_key = fal_key
         self._edit_model = edit_model
         self._billing = billing
@@ -7666,21 +8305,59 @@ class _AvatarPlates:
         # Кадры, которые шоты уже носят, — в том числе из прошлых папок.
         self._known: List[str] = [p for p in (known_frames or []) if p]
         self._forgotten: set = set()
+        # Камера, снятая первой: её плита становится опорой комнаты для всех
+        # остальных. Не «front» жёстко — ролик может целиком уйти в шёпот, и
+        # тогда фронтальная плита рисовалась бы только ради опоры, деньгами за
+        # кадр, которого в ролике нет. Первая камера при этом определяется
+        # порядком говорящих шотов, то есть для одной раскадровки постоянна.
+        self._anchor_key = ""
 
     def path(self, camera: _AvatarCamera) -> str:
         return _framing_plate_path(self._output_dir, self._slug, camera.key)
 
-    def identity(self, camera: _AvatarCamera) -> str:
+    def _set_for(self, camera: _AvatarCamera) -> str:
+        """Комната этой камеры: номер локации зашит в её ключ."""
+        if not self._sets:
+            return self._set
+        return self._sets[_camera_location(camera.key) % len(self._sets)]
+
+    def _pinned_plate(self, camera: _AvatarCamera) -> str:
+        """Кадр, загруженный руками. Шёпот берёт фронтальный: своего слота у него
+        нет, а рисовать его за деньги там, где остальные ракурсы отданы готовыми,
+        значило бы платить за единственный кадр, который человек не выбирал."""
+        base = _camera_base_key(camera.key) or camera.key
+        path = self._pinned_plates.get(base) or (
+            self._pinned_plates.get("front") if base == "hush" else "")
+        return path if (path and _nonempty(path)) else ""
+
+    def identity(self, camera: _AvatarCamera, set_photo: str = "") -> str:
         """Чем эта плита является — по этой строке её узнают в чужой папке.
 
-        Не промпт: постановка камеры важна, а формулировка вокруг неё — нет.
+        Подпись — сам промпт, слово в слово. Раньше здесь лежала выжимка (ключ
+        камеры, постановка, сет, лицо), и правка формулировки картинку меняла, а
+        подпись — нет: 2026-08-04 «сохрани фон» сменилось на «камера видит другой
+        угол», плиты на диске об этом не узнали и усыновились как свои. Пока
+        промпт был на триста слов, выжимка имела смысл — в нём и правда хватало
+        слов, ничего не решающих. В промпте на двенадцать слов лишних нет.
 
-        Но постановка лица сюда входит: она общая для обеих камер и решает, с
-        каким выражением Kling будет говорить всю реплику. Без неё плита,
-        нарисованная под прежнюю формулировку, усыновлялась бы как своя — и
-        улыбка, из-за которой всё затевалось, пережила бы правку промпта.
+        Референс лица — по содержимому файла, а не по имени: сменил портрет, а
+        плита осталась прежней — это ровно тот случай, когда человек видит на
+        экране не того, кого выбрал. Строка появляется только когда портрет есть:
+        без него подпись обязана совпасть слово в слово с той, под которой
+        рисовались уже утверждённые кадры, иначе первый же прогон перерисует их
+        за деньги без всякой причины.
         """
-        return "\n".join([camera.key, camera.direction, self._set, _AVATAR_RESTING_FACE])
+        # Промпт берём в одноимённой форме — без «первое фото это лицо». Ту
+        # оговорку добавляет наличие портрета, а портрет и так входит в подпись
+        # отпечатком файла строкой ниже; считать его дважды значило бы гонять
+        # плиты на перерисовку при смене редактора картинок.
+        parts = [camera.key, _avatar_plate_prompt(camera.direction, set_text=self._set_for(camera))]
+        face = self._face_photo()
+        if face:
+            parts.append(f"face:{_reference_fingerprint(face)}")
+        if set_photo:
+            parts.append(f"set:{_reference_fingerprint(set_photo)}")
+        return "\n".join(parts)
 
     def forget(self, camera: _AvatarCamera) -> None:
         """Убрать плиту, чтобы «перерисовать» действительно перерисовало."""
@@ -7698,14 +8375,63 @@ class _AvatarPlates:
 
     def plate(self, camera: _AvatarCamera) -> str:
         if camera.key not in self._made:
-            self._made[camera.key] = self._adopt(camera) or self._build(camera)
+            self._made[camera.key] = self._take(camera) or self._draw_plate(camera)
+        if not self._anchor_key and self._made.get(camera.key):
+            self._anchor_key = camera.key
         return self._made[camera.key]
 
-    def _adopt(self, camera: _AvatarCamera) -> str:
+    def _take(self, camera: _AvatarCamera) -> str:
+        """Готовый кадр этой камеры: загруженный руками или уже утверждённый."""
+        pinned = self._pinned_plate(camera)
+        if not pinned:
+            return self._adopt(camera, self._set_photo(camera))
+        target = self.path(camera)
+        if os.path.normpath(pinned) != os.path.normpath(target):
+            try:
+                shutil.copyfile(pinned, target)
+            except OSError:
+                return ""
+            # Подпись — отпечаток самого файла: перезалил другую картинку в тот
+            # же слот, и плита обязана обновиться, а не остаться прежней.
+            try:
+                with open(f"{target}{_PLATE_IDENTITY_SUFFIX}", "w", encoding="utf-8") as f:
+                    f.write(f"{camera.key}\nuploaded:{_reference_fingerprint(pinned)}")
+            except OSError:
+                pass
+        self._log(f"  Ракурс «{camera.key}»: беру загруженный кадр, не рисую.")
+        return target
+
+    def _draw_plate(self, camera: _AvatarCamera) -> str:
+        return self._build(camera, self._set_photo(camera))
+
+    def _set_photo(self, camera: _AvatarCamera) -> str:
+        """Опоры больше нет: готовый кадр в референсах убивает вторую камеру.
+
+        Замерено 2026-08-04 по повороту головы (`voice_test/plate_yaw_2026_08_03.py`),
+        разница между камерами относительно фронтальной плиты:
+
+            промпт 332 слова, опора есть   0.035
+            промпт  80 слов,  опора есть   0.003   ← возврат входной картинки
+            промпт 332 слова, опоры нет    0.060
+            промпт  80 слов,  опоры нет    0.633
+
+        С опорой ракурс мёртв при любой формулировке: модели дают готовую
+        фотографию человека и просят сдвинуть камеру — она отдаёт фотографию
+        обратно. Словами это не переспорить, пробовали дважды.
+
+        Держать комнату опора была нужна, пока место сочинялось текстом. Теперь
+        оно приезжает с фото ведущего («the same photo»), и опора стала
+        лишней. Параметр `set_photo_path` при этом жив: в него ляжет плита
+        пустой комнаты, если место всё-таки придётся строить словами. Копировать
+        с неё позу будет не с кого — там нет человека.
+        """
+        return ""
+
+    def _adopt(self, camera: _AvatarCamera, set_photo: str = "") -> str:
         """Готовый кадр этой камеры — из этой папки или из той, где его утвердили."""
         if camera.key in self._forgotten:
             return ""
-        want = self.identity(camera)
+        want = self.identity(camera, set_photo)
         target = self.path(camera)
         for path in [target, *self._known]:
             if not _nonempty(path):
@@ -7719,7 +8445,12 @@ class _AvatarPlates:
             if os.path.normpath(path) == os.path.normpath(target):
                 return target
             shutil.copyfile(path, target)
-            for extra in (_PLATE_IDENTITY_SUFFIX, ".prompt.txt"):
+            # Вместе с картинкой переезжает и ссылка на её загруженную копию:
+            # файл побайтово тот же, значит и залитый файл тот же. Без этого
+            # каждый новый джоб заново отправляет на fal полтора мегабайта уже
+            # лежащей там плиты — и падает, если по дороге оборвётся сеть
+            # (2026-08-04: три попытки подряд, SSL EOF, кадр так и не нарисован).
+            for extra in (_PLATE_IDENTITY_SUFFIX, ".prompt.txt", ".fal_url.txt"):
                 try:
                     shutil.copyfile(f"{path}{extra}", f"{target}{extra}")
                 except OSError:
@@ -7728,21 +8459,27 @@ class _AvatarPlates:
             return target
         return ""
 
-    def _build(self, camera: _AvatarCamera) -> str:
-        made = self._draw(camera)
+    def _build(self, camera: _AvatarCamera, set_photo: str = "") -> str:
+        made = self._draw(camera, set_photo)
         if made and _nonempty(made):
             try:
                 with open(f"{made}{_PLATE_IDENTITY_SUFFIX}", "w", encoding="utf-8") as f:
-                    f.write(self.identity(camera))
+                    f.write(self.identity(camera, set_photo))
             except OSError:
                 pass
         return made
 
-    def _draw(self, camera: _AvatarCamera) -> str:
+    def _draw(self, camera: _AvatarCamera, set_photo: str = "") -> str:
+        if set_photo:
+            self._log(f"  Ракурс «{camera.key}»: ставлю в ту же комнату, что и "
+                      f"«{self._anchor_key}» — её плита идёт референсом.")
         return _avatar_reference_image(
             {}, self._actor_photo(), self._fal_key, self.path(camera), log=self._log,
-            scene_override=self._set, framing=camera.direction,
+            scene_override=self._set_for(camera),
+            framing=camera.direction,
             billing=self._billing, edit_model=self._edit_model,
+            face_photo_path=self._face_photo(),
+            set_photo_path=set_photo,
         )
 
 
@@ -7755,14 +8492,118 @@ def _point_shot_at_frame(shot: dict, frame_path: str, job_dir: str) -> None:
     shot["preview_frame_url"] = url
 
 
+# Слова, по которым оборот в тексте сета опознаётся как разговор о съёмке:
+# сама камера, направление взгляда и замершая поза. Границы слов обязательны —
+# без них `pose` съедает `composed`, а `pan` — `pantry`.
+_SET_CAMERA_WORDS = (
+    r"cameras?", r"lens", r"selfies?", r"webcam", r"tripod", r"handheld",
+    r"shots?", r"close-?ups?", r"framing", r"framed?", r"angles?",
+    r"zoom(?:s|ing)?", r"panning", r"dolly", r"pov", r"vertical", r"9:16",
+    r"gaz(?:e|es|ing)", r"look(?:s|ing)", r"facing", r"eye contact",
+    r"pos(?:e|es|ed|ing)", r"static", r"steady", r"motionless",
+)
+_SET_CAMERA_RE = re.compile(r"\b(?:" + "|".join(_SET_CAMERA_WORDS) + r")\b", re.I)
+
+# Внешность приезжает в сет двумя способами, и лечатся они по-разному.
+#
+# «a beautiful woman» (джоб f14d08b1) — это прилагательное при человеке, и
+# вырезать надо именно его: оборот целиком выбрасывать нельзя, потому что в
+# старых сценариях ровно в этой запятой лежит и комната («same woman from the
+# reference image sitting on a cozy sofa in a modern living room»). Вдобавок
+# «beautiful» бывает и про кухню — тогда клауза обязана уцелеть.
+_SET_LOOKS_PHRASE_RE = re.compile(
+    r"\b(?:a|an|the)\s+"
+    r"(?:beautiful|pretty|gorgeous|attractive|stunning|handsome|lovely|elegant|"
+    r"young|middle-aged|older|slim|slender|curvy|athletic|fit)\s+"
+    r"(?:wom[ae]n|m[ae]n|girls?|guys?|lad(?:y|ies)|persons?|people|"
+    r"females?|males?|models?|presenters?|actors?|actress(?:es)?)\b",
+    re.I,
+)
+# А это слова, которые в описании места не значат ничего, кроме внешности,
+# — такую оговорку выбрасываем целиком.
+_SET_LOOKS_WORDS = (
+    r"blonde", r"brunette", r"redhead", r"freckles?", r"makeup", r"make-up",
+    r"hair", r"hairstyles?", r"haircuts?", r"skin", r"complexions?",
+    r"wearing", r"dressed", r"outfits?", r"years old",
+)
+_SET_LOOKS_RE = re.compile(r"\b(?:" + "|".join(_SET_LOOKS_WORDS) + r")\b", re.I)
+
+
+def _clean_pinned_set(scene: str) -> str:
+    """Оставить в тексте сета место, свет и предметы; убрать съёмку и внешность.
+
+    Закреплённый сет — это первый говорящий кадр раскадровки целиком, и он
+    уезжает во все плиты. Если сценарист написал там «holding a steady selfie
+    pose, looking directly at the camera», эта фраза стоит в промпте рядом со
+    строкой ракурса и побеждает её. Замер 03.08 по тринадцати плитам: сеты со
+    словами про момент («subtle head movement») дали разницу поворота головы
+    между камерами 0.30 и 0.23, сеты со словами про камеру — 0.005 и 0.02, то
+    есть вторая камера выходила тем же анфасом.
+
+    Просьбой это не лечится: в обёртке плиты уже написано «ignore any camera
+    wording», и не помогло — редактор слушает текст, а не оговорку про текст.
+
+    Режем по предложениям, потом по запятым: «sitting on a cozy sofa in a modern
+    living room» остаётся, «looking directly at the camera with a sigh» уходит
+    целиком. Пустой результат отдаём как есть, без отката к оригиналу: если весь
+    сет оказался разговором про съёмку, места в нём и не было — тогда плиты
+    возьмут фон из обёртки и из опорной камеры, и это лучше, чем текст, который
+    заведомо ломает ракурс.
+
+    С появлением `set_prompt` это страховка, а не механизм: место теперь пишет
+    отдельный запрос, у которого других обязанностей нет. Но выделенный запрос
+    тоже иногда пишет лишнее, а старые сценарии приходят вообще без поля.
+    """
+    scene = _SET_LOOKS_PHRASE_RE.sub(" ", scene)
+    kept = []
+    for sentence in re.split(r"(?<=[.;!?])\s+", scene):
+        clauses = [c.strip().strip(".;!?").strip() for c in sentence.split(",")]
+        clauses = [c for c in clauses if c
+                   and not _SET_CAMERA_RE.search(c)
+                   and not _SET_LOOKS_RE.search(c)]
+        if clauses:
+            kept.append(", ".join(clauses))
+    return re.sub(r"\s{2,}", " ", ". ".join(kept)).strip()
+
+
 def _pinned_avatar_set(shots: list) -> str:
-    """Сет первого говорящего кадра — на нём стоят все остальные говорящие."""
+    """Место действия ролика — на нём стоят все говорящие кадры.
+
+    Сначала ищем `set_prompt`: поле, которое пишет отдельный запрос и у которого
+    одна работа. Если его нет (сценарий снят до разделения запросов), работает
+    прежняя схема — промпт первого говорящего кадра, вычищенный от всего, что
+    местом не является.
+    """
+    for shot in shots:
+        pinned = (shot.get("_set_prompt") or "").strip()
+        if pinned:
+            return _clean_pinned_set(pinned)
     for shot in shots:
         if not _is_broll_shot(shot):
             scene = (shot.get("generation_prompt") or shot.get("scene") or "").strip()
             if scene:
-                return scene
+                return _clean_pinned_set(scene)
     return ""
+
+
+def _pinned_avatar_sets(shots: list) -> List[str]:
+    """Все места ролика по порядку — пусто, если оно одно."""
+    for shot in shots:
+        places = [s.strip() for s in (shot.get("_set_prompts") or [])
+                  if isinstance(s, str) and s.strip()]
+        if len(places) > 1:
+            return [_clean_pinned_set(place) for place in places]
+    return []
+
+
+def _pinned_set_is_chosen(shots: list) -> bool:
+    """Место выбрал человек, а не досочинила модель.
+
+    Только в этом случае текст перебивает комнату с фото ведущего: сочинённое
+    вслепую описание её перекрашивает, а заказанное — на то и заказано. Опция
+    «менять локации» — тоже заказ: там человек просит именно выдумку.
+    """
+    return any(shot.get("_set_chosen") for shot in shots)
 
 
 def generate_sliced_avatar_clips(
@@ -7775,12 +8616,14 @@ def generate_sliced_avatar_clips(
     tier: str = "standard",
     actor_description: str = "",
     selected_actor_path: str = "",
+    selected_face_path: str = "",
     broll_tier: str = "standard",
     broll_image_first: bool = True,
     avatar_image_first: bool = True,
     voice_manifest: Optional[dict] = None,
     edit_model: str = "",
     billing: Optional[dict] = None,
+    pinned_plates: Optional[dict] = None,
     log: Callable[[str], None] = print,
 ) -> list:
     """
@@ -7857,9 +8700,16 @@ def generate_sliced_avatar_clips(
                 generate_actor_image(desc, fal_key, fallback_actor_img)
         return fallback_actor_img
 
+    def _shared_face_photo():
+        return selected_face_path if (selected_face_path and os.path.exists(selected_face_path)) else ""
+
     plates = _AvatarPlates(
         output_dir, title_slug, pinned_set, _shared_actor_photo, fal_key,
         edit_model=edit_model, billing=billing, log=log,
+        face_photo=_shared_face_photo,
+        set_chosen=_pinned_set_is_chosen([sl["shot"] for sl in slices]),
+        sets=_pinned_avatar_sets([sl["shot"] for sl in slices]),
+        pinned_plates=pinned_plates or {},
         # Рендер идёт в своей папке, а утверждали кадры в папке предпросмотра.
         # Без этого списка он нарисовал бы плиты заново — и оживил бы не то,
         # что человек посмотрел и принял.
@@ -9079,6 +9929,7 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
     """
     fal_key = config["fal_key"]
     selected_actor_path = config.get("selected_actor_path") or ""
+    selected_face_path = config.get("selected_face_path") or ""
     actor_description = config.get("actor_description") or ""
     only = config.get("frames_only_shot")
     edit_model = _avatar_edit_model(config.get("avatar_edit_model") or "")["id"]
@@ -9097,6 +9948,9 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
                 generate_actor_image(desc, fal_key, path)
             fallback_actor["path"] = path
         return fallback_actor["path"]
+
+    def _face_photo():
+        return selected_face_path if (selected_face_path and os.path.exists(selected_face_path)) else ""
 
     output_root = _job_output_root(output_dir)
 
@@ -9120,6 +9974,10 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
     plates = _AvatarPlates(
         output_dir, title_slug, pinned_set, _actor_photo, fal_key,
         edit_model=edit_model, billing=billing, log=log,
+        face_photo=_face_photo,
+        set_chosen=_pinned_set_is_chosen(shots),
+        sets=_pinned_avatar_sets(shots),
+        pinned_plates=config.get("pinned_plates") or {},
         known_frames=_talking_frames_on_hand(shots, output_root),
     )
     # Постановочные кадры ставим по очереди и до вставок: их на весь ролик один-два,
@@ -9243,8 +10101,6 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
     blocked_by_model = {}
     for item in billing.get("blocked", []):
         blocked_by_model.setdefault(item["model"], item)
-    actor_photo = selected_actor_path or fallback_actor["path"]
-    tried = _models_that_blanked(actor_photo) if actor_photo else set()
     return {
         "video_path": "",
         "video_filename": "",
@@ -9263,7 +10119,7 @@ def _generate_storyboard_frames_only(shots, config, output_dir, title_slug, log=
         "frames_blocked": list(blocked_by_model.values()),
         "avatar_edit_model": edit_model,
         "avatar_edit_models": [
-            {**{k: m[k] for k in ("id", "title", "vendor", "note")}, "blocked": m["id"] in tried}
+            {k: m[k] for k in ("id", "title", "vendor", "note")}
             for m in AVATAR_EDIT_MODELS
         ],
         "duration": 0,
@@ -9682,6 +10538,8 @@ def generate_storyboard_video(
             tier=avatar_tier,
             actor_description=config.get("actor_description") or script.get("actor_description") or "",
             selected_actor_path=config.get("selected_actor_path") or "",
+            selected_face_path=config.get("selected_face_path") or "",
+            pinned_plates=config.get("pinned_plates") or {},
             broll_tier=broll_tier,
             broll_image_first=bool(config.get("broll_image_first", True)),
             avatar_image_first=bool(config.get("avatar_image_first", True)),

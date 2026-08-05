@@ -72,7 +72,47 @@ class SaaSLipSyncTests(unittest.TestCase):
         # Без этого Kling сам придумывает перекладывание ног и рук.
         self.assertIn("hands resting", lowered)
         self.assertIn("legs still", lowered)
-        self.assertIn("only the face moves", lowered)
+        # Камера держится отдельной фразой: неподвижность кадра нужна и после
+        # того, как лицу движение разрешили.
+        self.assertIn("the camera stays where it is", lowered)
+        # Позу называет плита, а не промпт. «Stays seated» поверх плиты, на
+        # которой человек стоит, — противоречие, которое модель не может
+        # разрешить: первый кадр клипа задан плитой.
+        self.assertNotIn("seated", lowered)
+        self.assertIn("holds the pose they are already in", lowered)
+
+    def test_avatar_prompt_asks_for_the_lips_before_anything_else(self):
+        """Губы — первая задача клипа, и просить их надо отдельной фразой.
+
+        У Kling один бюджет движения. Редакция, где губы стояли одним пунктом
+        из пяти рядом с щеками, прищуром и «head turns and nods», вернула дубли
+        с застывшей улыбкой: раскрытие рта на самых громких кадрах оказалось
+        МЕНЬШЕ, чем на самых тихих (−0.003 у обоих дублей ролика 03.08 13:06
+        против 0.000…+0.029 у всех прежних, `voice_test/lip_population_2026_08_03.py`).
+        """
+        for prompt in (saasshorts._AVATAR_MOTION_PROMPT,
+                       saasshorts._AVATAR_WHISPER_MOTION_PROMPT):
+            lowered = prompt.lower()
+            self.assertIn("the lips follow the audio", lowered, prompt)
+            self.assertIn("jaw opens and closes", lowered, prompt)
+            # Щёки и прищур — описание улыбки, а улыбка это форма рта.
+            self.assertNotIn("cheeks", lowered, prompt)
+            self.assertNotIn("eyes narrow", lowered, prompt)
+            self.assertNotIn("turns and nods", lowered, prompt)
+
+    def test_avatar_prompt_lets_the_face_work(self):
+        """Мимику приходится просить поимённо: негативного промпта у Kling нет.
+
+        Лицо, замороженное вместе с руками и ногами, читается как ботокс —
+        измеренное движение лица падало с 4.94 до 2.70 между соседними кадрами.
+        «Не замирай» модель прочтёт как «замри», поэтому брови и лоб названы
+        прямо. Живут они выше рта и его бюджета не занимают.
+        """
+        for prompt in (saasshorts._AVATAR_MOTION_PROMPT,
+                       saasshorts._AVATAR_WHISPER_MOTION_PROMPT):
+            lowered = prompt.lower()
+            self.assertIn("brows", lowered, prompt)
+            self.assertIn("with the meaning", lowered, prompt)
 
     def test_whisper_prompt_is_motion_only_and_uses_a_hush_performance(self):
         prompt = saasshorts._AVATAR_WHISPER_MOTION_PROMPT
@@ -128,12 +168,11 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(payload["image_url"], "https://fal/up.png")
             self.assertIn("kitchen close-up", payload["prompt"])
             self.assertIn("same person", payload["prompt"].lower())
-            self.assertIn("hairstyle", payload["prompt"].lower())
             # Улыбку запрещаем прямо: Kling держит найденное на плите выражение
             # всю реплику, и улыбка с зубами, растянутая на две секунды
-            # говорения, читается как оскал.
-            self.assertIn("the mouth is closed", payload["prompt"].lower())
-            self.assertIn("no teeth are visible", payload["prompt"].lower())
+            # говорения, читается как оскал. Четырёх слов на это хватает —
+            # абзац про «no teeth are visible anywhere» глушил строку камеры.
+            self.assertIn("mouth closed", payload["prompt"].lower())
             self.assertIn("no smile", payload["prompt"].lower())
             self.assertTrue(os.path.exists(f"{out}.prompt.txt"))
 
@@ -1157,22 +1196,28 @@ class SlicedAvatarTests(unittest.TestCase):
                 self.assertTrue(camera.direction.strip(), key)
                 # У камеры нет и не должно быть, с чего её снимать.
                 self.assertEqual(camera._fields, ("key", "direction"))
-                # Дистанция у всех одна и теми же словами: соседние кадры
-                # разводит точка съёмки, а не крупность, иначе склейка читается
-                # наездом (2026-08-02, джоб saas_bd4a6584: 18.0% против 21.4%
-                # высоты лица — на смену плана не хватило, на наезд хватило).
-                self.assertIn(saasshorts._AVATAR_CAMERA_DISTANCE, camera.direction)
-                self.assertIn("Camera position:", camera.direction)
-                self.assertNotIn("close-up", camera.direction)
-        self.assertIn("forty degrees off the straight-on axis", cameras["side"].direction)
-        self.assertIn("chin lowered", cameras["hush"].direction)
+                # Постановка — одна короткая фраза. Длинную редактор не слышит:
+                # 0.060 против 0.633 по повороту головы между камерами.
+                self.assertLessEqual(len(camera.direction.split()), 14, camera.direction)
+                # Крупности в постановке нет вовсе: соседние кадры разводит
+                # точка съёмки, иначе склейка читается наездом (2026-08-02, джоб
+                # saas_bd4a6584: 18.0% против 21.4% высоты лица — на смену плана
+                # не хватило, на наезд хватило). Дистанция общая и лежит в
+                # хвосте, одними и теми же словами для всех камер.
+                for zoom in ("close-up", "close up", "wide", "chest up"):
+                    self.assertNotIn(zoom, camera.direction)
+                self.assertIn("Chest up", saasshorts._AVATAR_PLATE_TAIL)
+        self.assertIn("forty degrees", cameras["side"].direction)
+        self.assertIn("below eye level", cameras["hush"].direction)
 
     def test_framing_line_is_the_last_word_about_the_camera(self):
-        """Строка ракурса — приказ и в конце; сцена камеру не задаёт.
+        """О камере промпт говорит последним, и говорит дистанцией.
 
-        Раньше она стояла в середине и проигрывала двум соседям: закреплённый сет
-        сам заканчивался словами «medium shot», а хвост требовал держать человека
-        «целиком в кадре» — то есть запрещал кроп, которым крупный план и живёт.
+        Текст места пишет человек, и он вправе написать в нём «medium shot» —
+        своя камера в описании комнаты когда-то навязывала план всем кадрам.
+        Спорить с этим абзацем («ignore any camera wording») больше не нужно:
+        дистанция стоит в самом конце, а последнее слово редактор слышит лучше
+        всего.
         """
         with tempfile.TemporaryDirectory() as tmp:
             photo = os.path.join(tmp, "avatar.png")
@@ -1194,16 +1239,12 @@ class SlicedAvatarTests(unittest.TestCase):
                 )
 
             prompt = captured["prompt"]
-            self.assertTrue(
-                prompt.rstrip().endswith("Restage the shot: a tight close-up, shoulders cropped."),
-                prompt,
-            )
-            # Камера сцены обесценена явно, иначе первый кадр раскадровки
-            # навязывает свой план всем остальным.
-            self.assertIn("ignore any appearance or camera wording", prompt)
-            self.assertIn("the staging line below is the only camera instruction", prompt)
-            # Запрета на кроп больше нет — он и убивал крупный план.
-            self.assertNotIn("fully inside the frame", prompt)
+            self.assertTrue(prompt.rstrip().endswith(saasshorts._AVATAR_PLATE_TAIL), prompt)
+            # Ракурс идёт после текста места, дистанция — после ракурса.
+            self.assertLess(prompt.index("medium shot"), prompt.index("shoulders cropped"))
+            self.assertLess(prompt.index("shoulders cropped"), prompt.index("Chest up"))
+            # И весь промпт — одна фраза с хвостом, а не абзац объяснений.
+            self.assertLessEqual(len(prompt.split()), 40, prompt)
 
     def test_talking_clips_get_a_push_in_that_never_moves_the_lip_sync(self):
         """Наезд — приём внутри кадра, и он обязан не трогать время.

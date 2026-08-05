@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -391,7 +392,13 @@ class SaaSTruncatedGeminiAnswerTests(unittest.TestCase):
             responses.append(response)
         client = MagicMock()
         client.models.generate_content.side_effect = responses
-        with patch("google.genai.Client", return_value=client):
+        # Счёт здесь про один запрос — сценарный. Место и картинку пишут
+        # отдельные проходы, их вызовы в «заплатили дважды» не входят.
+        with patch("google.genai.Client", return_value=client), \
+             patch.object(saasshorts, "generate_storyboard_sets",
+                          side_effect=lambda scripts, *a, **kw: scripts), \
+             patch.object(saasshorts, "generate_storyboard_visuals",
+                          side_effect=lambda scripts, *a, **kw: scripts):
             scripts = saasshorts.generate_scripts(
                 analysis={"product_name": "Моя Форма"},
                 gemini_key="key",
@@ -570,6 +577,9 @@ class SaaSFillShotDetailsTests(unittest.TestCase):
             request,
         )
         self.assertIn("For talking shots", request)
+        # Добивочный промпт раздавал ту же готовую фразу про selfie pose.
+        self.assertNotIn("holds a steady selfie pose", request)
+        self.assertIn("the app owns the camera for talking shots", request)
         self.assertIn("B-roll with actor_in_frame=true", request)
         self.assertIn("identify the same actor from the reference image", request)
         self.assertIn(
@@ -859,6 +869,53 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
     def test_missing_file_does_not_crash_and_is_not_blank(self):
         self.assertFalse(saasshorts._looks_blank("/nonexistent/frame.png"))
 
+    def test_legacy_model_only_memo_does_not_block_a_paid_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, [[[10, 20, 30]]])
+            with open(f"{photo}.blank_models.json", "w", encoding="utf-8") as memo:
+                json.dump([saasshorts.DEFAULT_AVATAR_EDIT_MODEL], memo)
+
+            self.assertEqual(saasshorts._models_that_blanked(photo, "new prompt"), set())
+
+    def test_corrupt_memo_fails_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, [[[10, 20, 30]]])
+            with open(f"{photo}.blank_models.json", "w", encoding="utf-8") as memo:
+                memo.write("not json")
+
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt"), set())
+
+    def test_confirmed_moderation_matches_only_same_photo_model_and_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, [[[10, 20, 30], [40, 50, 60]]])
+            model = saasshorts.DEFAULT_AVATAR_EDIT_MODEL
+            flags = {"has_nsfw_concepts": [True]}
+
+            saasshorts._remember_confirmed_moderation(photo, model, "prompt A", flags)
+
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt A"), {model})
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt B"), set())
+            self._write_png(photo, [[[70, 80, 90], [100, 110, 120]]])
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt A"), set())
+
+    def test_only_truthy_explicit_moderation_fields_are_confirmed(self):
+        self.assertEqual(
+            saasshorts._explicit_moderation_flags({"has_nsfw_concepts": [False]}),
+            {},
+        )
+        self.assertEqual(
+            saasshorts._explicit_moderation_flags({"has_nsfw_concepts": [True]}),
+            {"has_nsfw_concepts": [True]},
+        )
+        self.assertEqual(
+            saasshorts._explicit_moderation_flags({"message": "blocked by safety policy"}),
+            {"message": "blocked by safety policy"},
+        )
+        self.assertEqual(saasshorts._explicit_moderation_flags({"error": "timeout"}), {})
+
     def test_oversized_actor_photo_is_shrunk_before_it_goes_to_flux(self):
         """Фото-условие ужимается: на 4802×3584 Kontext возвращал чёрный кадр."""
         import numpy as np
@@ -899,6 +956,85 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
         client.__exit__ = lambda *a: False
         client.get = fake_get
         return client
+
+    def test_blank_without_explicit_moderation_is_not_remembered(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, np.full((8, 8, 3), 100))
+            billing = {}
+            with patch.object(saasshorts, "_fal_run", return_value={"images": [{"url": "u"}]}), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client", return_value=self._fake_httpx_client(
+                     out, iter([np.zeros((8, 8, 3))]))):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None,
+                    actor_photo_path=photo, billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(billing["blocked"][0]["reason"], "blank")
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt"), set())
+
+    def test_confirmed_blank_is_remembered_and_same_prompt_skips_fal(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, np.full((8, 8, 3), 100))
+            first_billing = {}
+            first_run = MagicMock(return_value={
+                "images": [{"url": "u"}], "has_nsfw_concepts": [True],
+            })
+            with patch.object(saasshorts, "_fal_run", first_run), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client", return_value=self._fake_httpx_client(
+                     out, iter([np.zeros((8, 8, 3))]))):
+                saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None,
+                    actor_photo_path=photo, billing=first_billing,
+                )
+
+            second_billing = {}
+            second_run = MagicMock(side_effect=AssertionError("paid retry must not run"))
+            with patch.object(saasshorts, "_fal_run", second_run):
+                saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None,
+                    actor_photo_path=photo, billing=second_billing,
+                )
+
+            first_run.assert_called_once()
+            second_run.assert_not_called()
+            self.assertEqual(second_billing.get("calls", 0), 0)
+            self.assertEqual(second_billing["blocked"][0]["reason"], "known")
+
+    def test_different_prompt_requires_a_new_manual_call(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            self._write_png(photo, np.full((8, 8, 3), 100))
+            model = saasshorts.DEFAULT_AVATAR_EDIT_MODEL
+            saasshorts._remember_confirmed_moderation(
+                photo, model, "prompt A", {"has_nsfw_concepts": [True]},
+            )
+            run = MagicMock(return_value={"images": [{"url": "u"}]})
+            detailed = np.arange(8 * 8 * 3, dtype="uint8").reshape((8, 8, 3))
+            with patch.object(saasshorts, "_fal_run", run), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client", return_value=self._fake_httpx_client(
+                     out, iter([detailed]))):
+                made = saasshorts._flux_reference_frame(
+                    "prompt B", "key", out, log=lambda *_: None,
+                    actor_photo_path=photo, billing={},
+                )
+
+            self.assertEqual(made, out)
+            run.assert_called_once()
 
     def test_one_click_buys_at_most_one_paid_frame(self):
         """Чёрный кадр тарифицируется как обычный — платим за него один раз.
@@ -1111,6 +1247,77 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
             self.assertEqual(billing["blocked"][0]["reason"], "unavailable")
             self.assertFalse(billing["blocked"][0]["charged"])
             self.assertEqual(billing["calls"], 0)
+            # Ошибка эндпоинта не доказывает модерацию и не блокирует модель.
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt"), set())
+
+    def test_a_request_that_never_reached_fal_does_not_blacklist_the_model(self):
+        """Оборванная сеть — не вердикт модерации, и вычёркивать модель нельзя.
+
+        Список зарубленных редакторов вечен: попав в него, модель больше не
+        предлагается на этом фото. 2026-08-05 резолвер в контейнере перестал
+        разрешать `queue.fal.run`, и в список ушли два редактора из четырёх, ни
+        разу не увидев фотографию. Ещё два таких обрыва — и интерфейс посоветовал
+        бы менять фото ведущего, с которым всё в порядке.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(11)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            billing = {}
+
+            with patch.object(saasshorts, "_fal_run", side_effect=saasshorts.FalUnreachable(
+                    "[Errno -5] No address associated with hostname")), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client",
+                              return_value=self._fake_httpx_client(out, iter([]))):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(billing["blocked"][0]["reason"], "unreachable")
+            self.assertFalse(billing["blocked"][0]["charged"])
+            self.assertEqual(billing["calls"], 0)
+            # Главное: модель осталась доступной.
+            self.assertEqual(saasshorts._models_that_blanked(photo, "prompt"), set())
+
+    def test_a_failure_after_the_picture_was_drawn_still_counts_the_money(self):
+        """Картинка нарисована и оплачена — не скачалась уже наша беда, не fal.
+
+        Раньше любой сбой внутри одного `except` вычитал вызов из сметы и говорил
+        «денег не списано». Между «не дошли до fal» и «не забрали готовое» лежит
+        целая генерация, и во втором случае это неправда.
+        """
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "plate.png")
+            photo = os.path.join(tmp, "actor.png")
+            rng = np.random.default_rng(12)
+            self._write_png(photo, rng.integers(0, 256, size=(128, 72, 3)))
+            billing = {}
+
+            broken = MagicMock()
+            broken.__enter__ = lambda self_: self_
+            broken.__exit__ = lambda *a: False
+            broken.get = MagicMock(side_effect=RuntimeError("CDN unreachable"))
+
+            with patch.object(saasshorts, "_fal_run",
+                              return_value={"images": [{"url": "u"}]}), \
+                 patch.object(saasshorts, "_fal_upload_file", return_value="http://photo"), \
+                 patch.object(saasshorts.httpx, "Client", return_value=broken):
+                made = saasshorts._flux_reference_frame(
+                    "prompt", "key", out, log=lambda *_: None, actor_photo_path=photo,
+                    billing=billing,
+                )
+
+            self.assertEqual(made, "")
+            self.assertEqual(billing["calls"], 1)
+            self.assertTrue(billing["blocked"][0]["charged"])
 
     def test_editor_catalogue_ends_on_a_model_without_a_moderator(self):
         """Последним стоит редактор с открытыми весами — его никто не зарубит.
@@ -1182,6 +1389,731 @@ class SaaSBlankFrameGuardTests(unittest.TestCase):
             saasshorts._refuse_unusable_start_frame("/nonexistent.png")  # нечитаемое — не мешаем
 
 
+class SaaSFaceReferenceTests(unittest.TestCase):
+    """Отдельный портрет как источник лица для постановочных кадров.
+
+    Общий план ведущего личность не несёт: лицо на нём занимает проценты кадра,
+    и редактор дорисовывает черты сам — каждый прогон немного по-своему. Портрет
+    крупно даёт то, чего в общем плане просто нет.
+    """
+
+    def _write_png(self, path, arr):
+        from PIL import Image
+        import numpy as np
+
+        Image.fromarray(np.asarray(arr, dtype="uint8"), "RGB").save(path)
+
+    def _photos(self, root):
+        import numpy as np
+
+        rng = np.random.default_rng(21)
+        body = os.path.join(root, "actor.png")
+        face = os.path.join(root, "face.png")
+        self._write_png(body, rng.integers(0, 256, size=(128, 72, 3)))
+        self._write_png(face, rng.integers(0, 256, size=(128, 72, 3)))
+        return body, face
+
+    def _draw(self, root, out, edit_model, **kw):
+        """Нарисовать плиту, вернув аргументы, ушедшие в fal."""
+        import numpy as np
+
+        seen = {}
+
+        def fake_run(model, args, key, **_):
+            seen["model"], seen["args"] = model, args
+            return {"images": [{"url": "u"}]}
+
+        def fake_upload(path, key):
+            return f"http://fal/{os.path.basename(path)}"
+
+        def fake_get(url, *a, **kw_):
+            self._write_png(out, np.random.default_rng(3).integers(0, 256, size=(128, 72, 3)))
+            with open(out, "rb") as f:
+                return MagicMock(content=f.read(), raise_for_status=lambda: None)
+
+        client = MagicMock()
+        client.__enter__ = lambda self_: self_
+        client.__exit__ = lambda *a: False
+        client.get = fake_get
+
+        with patch.object(saasshorts, "_fal_run", side_effect=fake_run), \
+             patch.object(saasshorts, "_fal_upload_file", side_effect=fake_upload), \
+             patch.object(saasshorts.httpx, "Client", return_value=client):
+            made = saasshorts._avatar_reference_image(
+                {}, kw.pop("body"), "key", out, log=lambda *_: None,
+                edit_model=edit_model, **kw,
+            )
+        return made, seen
+
+    def test_single_image_editor_gets_the_portrait_and_is_told_so(self):
+        """У Kontext вход один — туда уходит лицо, а не общий план.
+
+        Промпт при этом не должен обещать вторую картинку: описывать модели
+        картинку, которой она не получила, значит просить её выдумать.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            out = os.path.join(tmp, "plate.png")
+            made, seen = self._draw(
+                tmp, out, saasshorts.AVATAR_REFERENCE_MODEL,
+                body=body, face_photo_path=face, framing="Camera straight ahead",
+            )
+
+            self.assertEqual(made, out)
+            self.assertEqual(seen["args"]["image_url"], "http://fal/face.png")
+            self.assertNotIn("image_urls", seen["args"])
+            self.assertNotIn("second photo", seen["args"]["prompt"])
+
+    def test_multi_image_editor_gets_the_portrait_first_and_the_body_second(self):
+        """Там, где поле принимает список, едут оба: лицо и фигура с одеждой."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            out = os.path.join(tmp, "plate.png")
+            made, seen = self._draw(
+                tmp, out, "fal-ai/nano-banana/edit",
+                body=body, face_photo_path=face, framing="Camera straight ahead",
+            )
+
+            self.assertEqual(made, out)
+            self.assertEqual(seen["args"]["image_urls"],
+                             ["http://fal/face.png", "http://fal/actor.png"])
+            self.assertIn("The first photo is this person's face", seen["args"]["prompt"])
+            self.assertIn("The second photo again", seen["args"]["prompt"])
+
+    def test_without_a_portrait_the_prompt_is_one_sentence_and_a_tail(self):
+        """Без портрета промпт — ровно одна фраза про камеру и хвост требований.
+
+        Здесь раньше стоял дословный кусок трёхсотсловного промпта — сторож
+        того, чтобы правка ради портрета не перерисовала чужие плиты. Сторожить
+        теперь нечего: длинный промпт и был дефектом. Человек проверил руками
+        (2026-08-05), что одной фразы «the same photo, but from a different
+        angle» хватает на ракурс, а замер до того дал 0.633 против 0.060.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = self._photos(tmp)
+            out = os.path.join(tmp, "plate.png")
+            _, seen = self._draw(
+                tmp, out, saasshorts.AVATAR_REFERENCE_MODEL,
+                body=body, framing="Camera straight ahead",
+            )
+
+            self.assertEqual(
+                seen["args"]["prompt"],
+                "The same photo, Camera straight ahead. "
+                "Chest up, mouth closed, no smile, vertical 9:16.",
+            )
+            self.assertEqual(seen["args"]["image_url"], "http://fal/actor.png")
+
+    def test_the_set_photo_rides_last_and_is_named_as_the_set(self):
+        """Комната уезжает картинкой, а не только словами «the same room».
+
+        Промпт второй камеры просит «another part of the same room», но той
+        комнаты модель не видела: плиты рисовались каждая от фото ведущего.
+        Замер 03.08 (джоб saas_c706dab8): при одном тексте сета `front` вышел
+        кухней, `side` — гостиной, общих предметов ноль.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            room = os.path.join(tmp, "room.png")
+            self._write_png(room, [[[3, 5, 7]] * 72] * 128)
+            out = os.path.join(tmp, "plate.png")
+            _, seen = self._draw(
+                tmp, out, "fal-ai/nano-banana/edit",
+                body=body, face_photo_path=face, set_photo_path=room,
+                framing="Camera round to the left",
+            )
+
+            self.assertEqual(seen["args"]["image_urls"],
+                             ["http://fal/face.png", "http://fal/actor.png",
+                              "http://fal/room.png"])
+            self.assertIn("The last photo is the room", seen["args"]["prompt"])
+
+    def test_a_single_image_editor_is_not_promised_a_room_it_never_gets(self):
+        """У Kontext вход один, и он занят лицом — про комнату молчим."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            room = os.path.join(tmp, "room.png")
+            self._write_png(room, [[[3, 5, 7]] * 72] * 128)
+            out = os.path.join(tmp, "plate.png")
+            _, seen = self._draw(
+                tmp, out, saasshorts.AVATAR_REFERENCE_MODEL,
+                body=body, face_photo_path=face, set_photo_path=room,
+                framing="Camera round to the left",
+            )
+
+            self.assertEqual(seen["args"]["image_url"], "http://fal/face.png")
+            self.assertNotIn("image_urls", seen["args"])
+            self.assertNotIn("the room", seen["args"]["prompt"])
+
+    def test_no_camera_is_staged_on_another_cameras_finished_plate(self):
+        """Готовый кадр в референсах убивает вторую камеру — не отправляем его.
+
+        Замер 2026-08-04 по повороту головы, разница между камерами: с опорой
+        0.035 при длинном промпте и 0.003 при коротком (то есть возврат входной
+        картинки), без опоры — 0.060 и 0.633. Модели дают фотографию человека и
+        просят сдвинуть камеру; она отдаёт фотографию обратно, и словами это не
+        переспорить. Комнату теперь держит фото ведущего.
+
+        Подпись плиты при этом всё ещё различает кадр, снятый с опорой: место
+        под неё оставлено для плиты пустой комнаты, с которой некого копировать.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = self._photos(tmp)
+            seen = []
+
+            def fake_draw(shot, actor, key, out, **kw):
+                seen.append((os.path.basename(out), kw.get("set_photo_path", "")))
+                self._write_png(out, [[[len(seen), 9, 11]] * 72] * 128)
+                return out
+
+            plates = saasshorts._AvatarPlates(
+                tmp, "job", "kitchen", lambda: body, "key",
+                edit_model="fal-ai/nano-banana/edit", log=lambda *_: None,
+            )
+            with patch.object(saasshorts, "_avatar_reference_image", side_effect=fake_draw):
+                first = plates.plate(saasshorts._AVATAR_FRAMINGS[0])
+                second = plates.plate(saasshorts._AVATAR_FRAMINGS[1])
+
+            # Ни одна камера не получает чужой готовый кадр в референсы.
+            self.assertEqual([set_photo for _, set_photo in seen], ["", ""])
+            self.assertNotEqual(first, second)
+            side = saasshorts._AVATAR_FRAMINGS[1]
+            self.assertNotEqual(plates.identity(side), plates.identity(side, first))
+
+    def test_a_place_nobody_asked_for_does_not_repaint_the_room_on_the_photo(self):
+        """Сочинённое ИИ место в плиты не уезжает — комнату держит фото.
+
+        2026-08-04, джоб 244d4ef0: на фото ведущего светлая дневная кухня, а
+        подобранный сет просил «soft evening ambient lighting, warm glow» — и
+        кадр вышел в чужой вечерней кухне с тёмными фасадами. Та модель фото
+        не видит, поэтому её описание не вправе перебивать снятое.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = self._photos(tmp)
+            camera = saasshorts._AVATAR_FRAMINGS[0]
+            seen = {}
+
+            def fake_draw(shot, actor, key, out, **kw):
+                seen.update(kw)
+                self._write_png(out, [[[1, 2, 3]] * 72] * 128)
+                return out
+
+            for chosen, expected_scene in ((False, ""), (True, "evening kitchen")):
+                plates = saasshorts._AvatarPlates(
+                    os.path.join(tmp, str(chosen)), "job", "evening kitchen", lambda: body,
+                    "key", set_chosen=chosen, log=lambda *_: None,
+                )
+                os.makedirs(os.path.join(tmp, str(chosen)), exist_ok=True)
+                with patch.object(saasshorts, "_avatar_reference_image", side_effect=fake_draw):
+                    plates.plate(camera)
+                self.assertEqual(seen["scene_override"], expected_scene)
+                # И в промпте: без выбора места — «то же фото», с выбором —
+                # названная комната. Проверяем текстом, потому что именно текст
+                # и уезжает в редактор.
+                prompt = saasshorts._avatar_plate_prompt(camera.direction,
+                                                         set_text=seen["scene_override"])
+                self.assertEqual("evening kitchen" in prompt, chosen)
+                self.assertEqual(prompt.startswith("The same photo,"), not chosen)
+
+    def test_the_broll_rhythm_is_an_option_and_stays_off_by_default(self):
+        """Чередование с перебивками просят явно — оно стоит клип за вставку."""
+        analysis = {"product_name": "X", "description": "d", "key_features": ["f"]}
+        answer = json.dumps([{
+            "title": "T", "format": "storyboard_v3",
+            "shots": [{"shot_number": 1, "speech": "привет", "visual_type": "talking"}],
+        }])
+
+        def prompt_for(flag):
+            with patch.object(saasshorts, "_generate_gemini_content",
+                              return_value=MagicMock(text=answer)) as gen, \
+                 patch.object(saasshorts, "generate_storyboard_sets",
+                              side_effect=lambda s, *a, **k: s), \
+                 patch.object(saasshorts, "generate_storyboard_visuals",
+                              side_effect=lambda s, *a, **k: s):
+                saasshorts.generate_scripts(
+                    analysis, "key", num_scripts=1, script_format="storyboard_v3",
+                    broll_between_talking=flag,
+                )
+            return gen.call_args_list[0].kwargs["contents"][0]
+
+        default, alternating = prompt_for(False), prompt_for(True)
+        self.assertIn("B-roll is therefore the exception, not the rhythm", default)
+        self.assertNotIn("Two talking shots in a row are not allowed", default)
+        self.assertIn("Two talking shots in a row are not allowed", alternating)
+        self.assertNotIn("B-roll is therefore the exception", alternating)
+        # Дорогая правда про перебивку остаётся в обоих: она стоит целый клип.
+        for prompt in (default, alternating):
+            self.assertIn("most expensive shot there is", prompt)
+
+    def test_the_shots_carry_who_chose_the_place(self):
+        """Флаг «место выбрал человек» доезжает до плит вместе с кадрами."""
+        script = {
+            "format": "storyboard_v3",
+            "set_prompt": "a quiet office",
+            "shots": [{"shot_number": 1, "speech": "привет", "visual_type": "talking"}],
+        }
+        by_ai = saasshorts.normalize_storyboard_shots({**script, "set_source": "ai"})
+        by_user = saasshorts.normalize_storyboard_shots({**script, "set_source": "user"})
+
+        self.assertFalse(saasshorts._pinned_set_is_chosen(by_ai))
+        self.assertTrue(saasshorts._pinned_set_is_chosen(by_user))
+        # Текст места едет в обоих случаях: он нужен интерфейсу и подписи плиты.
+        self.assertEqual(saasshorts._pinned_avatar_set(by_user), "a quiet office")
+
+    def test_locations_change_every_third_talking_shot_and_only_on_request(self):
+        """Опция «менять локации»: место на каждые три говорящих кадра, не чаще.
+
+        Кадр на каждый шот — это плата за каждый шот. Внутри локации соседние
+        кадры разводит вторая камера, поэтому смена комнаты нужна реже, чем
+        смена ракурса, а по кругу локации возвращаются и берут готовые плиты
+        даром.
+        """
+        shots = [{"shot_number": i, "speech": f"строка {i}", "visual_type": "talking"}
+                 for i in range(1, 8)]
+        base = {"format": "storyboard_v3", "set_prompt": "кухня", "set_source": "ai",
+                "set_prompts": ["кухня", "балкон"], "shots": shots}
+
+        off = saasshorts.normalize_storyboard_shots({**base, "set_changes": False})
+        on = saasshorts.normalize_storyboard_shots({**base, "set_changes": True})
+
+        # Без опции текста мест нет вовсе: комнату держит фото ведущего.
+        self.assertFalse(saasshorts._pinned_avatar_sets(off))
+        self.assertFalse(saasshorts._pinned_set_is_chosen(off))
+        self.assertEqual([shot.get("_set_index") for shot in on],
+                         [0, 0, 0, 1, 1, 1, 0])
+        # Сочинённое моделью место доезжает до плит только по этой просьбе.
+        self.assertTrue(saasshorts._pinned_set_is_chosen(on))
+        self.assertEqual(saasshorts._pinned_avatar_sets(on), ["кухня", "балкон"])
+
+    def test_the_set_writer_is_asked_for_several_places_only_on_request(self):
+        """Мест просят столько, сколько заказано, и первое остаётся совместимым."""
+        script = {"title": "T", "shots": [{"speech": "привет"}]}
+        answers = {
+            1: [{"script_index": 0, "set_scene": "кухня", "set_prompt": "a kitchen"}],
+            saasshorts._MAX_LOCATIONS: [{"script_index": 0, "sets": [
+                {"set_scene": "кухня", "set_prompt": "a kitchen"},
+                {"set_scene": "балкон", "set_prompt": "a balcony"},
+                {"set_scene": "прихожая", "set_prompt": "a hallway"},
+            ]}],
+        }
+
+        def run(locations):
+            with patch.object(saasshorts, "_gemini_json_array",
+                              return_value=answers[locations]) as ask:
+                out = saasshorts.generate_storyboard_sets(
+                    [dict(script)], "key", locations=locations)
+            return out[0], ask.call_args.args[0]
+
+        one, one_prompt = run(1)
+        many, many_prompt = run(saasshorts._MAX_LOCATIONS)
+
+        self.assertIn("pick ONE place the whole reel is shot in", one_prompt)
+        self.assertNotIn("set_prompts", one)
+        self.assertFalse(one.get("set_changes"))
+        self.assertIn("places the reel moves between", many_prompt)
+        self.assertEqual(many["set_prompts"], ["a kitchen", "a balcony", "a hallway"])
+        # Первое место дублируется в старое поле: всё, что читает одно место,
+        # продолжает работать и видит ту же комнату, что и первая плита.
+        self.assertEqual(many["set_prompt"], "a kitchen")
+        self.assertTrue(many["set_changes"])
+
+    def test_a_second_location_gets_its_own_plates_and_the_first_keeps_its_names(self):
+        """Комната зашита в ключ камеры — и в имя файла плиты.
+
+        Иначе вторая локация усыновила бы кадр первой: камера-то та же. А
+        нулевая локация обязана остаться без суффикса, иначе включение опции
+        перерисовало бы за деньги уже утверждённые кадры одноместных роликов.
+        """
+        camera = saasshorts._AVATAR_FRAMINGS[1]
+        first = saasshorts._camera_at_location(camera, 0)
+        second = saasshorts._camera_at_location(camera, 1)
+
+        self.assertEqual(first.key, "side")
+        self.assertEqual(second.key, "side_l1")
+        self.assertEqual(saasshorts._camera_location(second.key), 1)
+        self.assertEqual(saasshorts._camera_base_key(second.key), "side")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = self._photos(tmp)
+            plates = saasshorts._AvatarPlates(
+                tmp, "job", "кухня", lambda: body, "key", set_chosen=True,
+                sets=["кухня", "балкон"], log=lambda *_: None,
+            )
+            self.assertNotEqual(plates.path(first), plates.path(second))
+            self.assertNotEqual(plates.identity(first), plates.identity(second))
+            self.assertIn("кухня", plates.identity(first))
+            self.assertIn("балкон", plates.identity(second))
+
+    def test_an_uploaded_plate_is_copied_not_drawn(self):
+        """Принесённый руками ракурс не рисуется: ни одного платного вызова.
+
+        Шёпот своего слота не имеет и берёт фронтальную плиту — платить за
+        единственный кадр, который человек не выбирал, было бы странно.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, mine = self._photos(tmp)
+            drawn = []
+
+            def fake_draw(*a, **kw):
+                drawn.append(kw.get("framing"))
+                return ""
+
+            plates = saasshorts._AvatarPlates(
+                tmp, "job", "", lambda: body, "key", log=lambda *_: None,
+                pinned_plates={"front": mine},
+            )
+            front = saasshorts._AVATAR_FRAMINGS[0]
+            side = saasshorts._AVATAR_FRAMINGS[1]
+            with patch.object(saasshorts, "_avatar_reference_image", side_effect=fake_draw):
+                got = plates.plate(front)
+                hush = plates.plate(saasshorts._AVATAR_HUSH_FRAMING)
+                plates.plate(side)
+
+            self.assertEqual(got, plates.path(front))
+            self.assertEqual(hush, plates.path(saasshorts._AVATAR_HUSH_FRAMING))
+            with open(got, "rb") as f, open(mine, "rb") as src:
+                self.assertEqual(f.read(), src.read())
+            # Рисовали ровно то, чего не принесли.
+            self.assertEqual(drawn, [side.direction])
+
+    def test_an_adopted_plate_brings_its_upload_link_along(self):
+        """Картинка переехала из чужой папки — ссылка на залитую копию с ней.
+
+        Файл побайтово тот же, значит и лежащая на fal копия та же. Без этого
+        каждый новый джоб грузил полтора мегабайта заново, и обрыв связи стоил
+        кадра (2026-08-04: три попытки, SSL EOF, плита так и не нарисована).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = self._photos(tmp)
+            camera = saasshorts._AVATAR_FRAMINGS[0]
+            approved_dir = os.path.join(tmp, "approved")
+            here = os.path.join(tmp, "now")
+            os.makedirs(approved_dir)
+            os.makedirs(here)
+
+            plates = saasshorts._AvatarPlates(
+                here, "job", "kitchen", lambda: body, "key", log=lambda *_: None,
+                known_frames=[saasshorts._framing_plate_path(approved_dir, "job", camera.key)],
+            )
+            approved = saasshorts._framing_plate_path(approved_dir, "job", camera.key)
+            self._write_png(approved, [[[13, 17, 19]] * 72] * 128)
+            for suffix, text in ((saasshorts._PLATE_IDENTITY_SUFFIX, plates.identity(camera)),
+                                 (".fal_url.txt", "https://fal.media/already-uploaded.png")):
+                with open(f"{approved}{suffix}", "w", encoding="utf-8") as f:
+                    f.write(text)
+
+            with patch.object(saasshorts, "_avatar_reference_image",
+                              side_effect=AssertionError("плита готова — рисовать нечего")):
+                got = plates.plate(camera)
+
+            self.assertEqual(os.path.dirname(got), here)
+            with open(f"{got}.fal_url.txt", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "https://fal.media/already-uploaded.png")
+
+    def test_swapping_the_portrait_invalidates_the_staged_plate(self):
+        """Сменил лицо — плита обязана перерисоваться, а не приехать из кэша.
+
+        Плита узнаётся по `.set.txt`, и без подписи портрета «поменял портрет»
+        означало бы «увидел на экране прежнего человека».
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            other = os.path.join(tmp, "face2.png")
+            self._write_png(other, [[[7, 9, 11]] * 72] * 128)
+            camera = saasshorts._AVATAR_FRAMINGS[0]
+
+            def plates(face_path):
+                return saasshorts._AvatarPlates(
+                    tmp, "job", "kitchen", lambda: body, "key",
+                    face_photo=lambda: face_path, set_chosen=True, log=lambda *_: None,
+                )
+
+            none = plates("").identity(camera)
+            first = plates(face).identity(camera)
+            second = plates(other).identity(camera)
+
+            self.assertNotEqual(first, second)
+            self.assertNotEqual(first, none)
+            # Подпись — сам промпт: правка формулировки обязана дойти до плит,
+            # иначе кадр, снятый по старым словам, усыновится как свой
+            # (2026-08-04: «сохрани фон» сменилось на «другой угол», а плиты на
+            # диске об этом не узнали).
+            self.assertEqual(none, "\n".join([
+                camera.key,
+                saasshorts._avatar_plate_prompt(camera.direction, set_text="kitchen"),
+            ]))
+
+    def test_the_same_portrait_under_two_names_is_the_same_portrait(self):
+        """Копия файла в папке джоба — тот же референс, а не повод платить снова."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body, face = self._photos(tmp)
+            copy = os.path.join(tmp, "selected_face.png")
+            shutil.copyfile(face, copy)
+            self.assertEqual(saasshorts._reference_fingerprint(face),
+                             saasshorts._reference_fingerprint(copy))
+
+
+class SaaSPinnedSetTests(unittest.TestCase):
+    """Закреплённый сет не должен диктовать плитам съёмку.
+
+    Сет — это первый говорящий кадр целиком, он уезжает во все плиты и стоит в
+    промпте рядом со строкой ракурса. Замер 03.08: сеты со словами про камеру
+    давали разницу поворота головы между камерами 0.005-0.02 (то есть обе
+    камеры выходили одним анфасом) против 0.23-0.30 у сетов без них.
+    """
+
+    def test_the_room_and_the_light_stay_the_camera_goes(self):
+        shots = [{"visual_type": "talking", "generation_prompt": (
+            "vertical 9:16 realistic phone video, same woman from the reference image "
+            "sitting on a cozy sofa in a modern living room, holding a steady selfie pose, "
+            "looking directly at the camera, warm morning light through the window"
+        )}]
+        got = saasshorts._pinned_avatar_set(shots)
+        self.assertEqual(
+            got,
+            "same woman from the reference image sitting on a cozy sofa in a modern "
+            "living room, warm morning light through the window",
+        )
+
+    def test_a_word_that_merely_contains_a_camera_word_survives(self):
+        """Границы слов: `pose` не должен съедать `composed`, `frame` — `framework`."""
+        shots = [{"visual_type": "talking", "generation_prompt": (
+            "a composed woman by a framework of shelves in a sunlit pantry"
+        )}]
+        self.assertEqual(
+            saasshorts._pinned_avatar_set(shots),
+            "a composed woman by a framework of shelves in a sunlit pantry",
+        )
+
+    def test_a_set_that_is_only_camera_talk_comes_out_empty(self):
+        """Отката к оригиналу нет: места в таком тексте и не было.
+
+        Пустой сет плиты переживут — фон возьмут из обёртки и из опорной
+        камеры. Текст, который заведомо ломает ракурс, они не переживут.
+        """
+        shots = [{"visual_type": "talking", "generation_prompt": (
+            "medium shot, static camera, the woman holds a steady selfie pose "
+            "looking directly into the lens"
+        )}]
+        self.assertEqual(saasshorts._pinned_avatar_set(shots), "")
+
+    def test_the_set_field_wins_over_the_first_talking_shot(self):
+        """Есть `set_prompt` — читаем его, а не гадаем по первой реплике."""
+        shots = [{"visual_type": "talking",
+                  "_set_prompt": "a sunlit kitchen with a marble counter",
+                  "generation_prompt": "she leans in with a small nod"}]
+        self.assertEqual(saasshorts._pinned_avatar_set(shots),
+                         "a sunlit kitchen with a marble counter")
+
+    def test_a_script_written_before_the_split_still_finds_its_set(self):
+        shots = [{"visual_type": "talking",
+                  "generation_prompt": "same actor in a bright kitchen, warm morning light"}]
+        self.assertEqual(saasshorts._pinned_avatar_set(shots),
+                         "same actor in a bright kitchen, warm morning light")
+
+    def test_the_looks_of_the_actor_are_cut_out_of_the_place(self):
+        """«a beautiful woman» нарисовало своё лицо вместо выбранного (джоб f14d08b1).
+
+        Вырезается прилагательное при человеке, а не вся оговорка: в старых
+        сценариях ровно в ней же лежит и комната.
+        """
+        shots = [{"visual_type": "talking", "generation_prompt": (
+            "realistic social video, a beautiful woman, the same actor from the reference "
+            "image sitting on a sofa in a bright modern kitchen, blonde hair, soft light"
+        )}]
+        self.assertEqual(
+            saasshorts._pinned_avatar_set(shots),
+            "realistic social video, the same actor from the reference image sitting on "
+            "a sofa in a bright modern kitchen, soft light",
+        )
+
+    def test_a_beautiful_kitchen_is_not_an_actor(self):
+        """Прилагательное про место не должно уносить с собой место."""
+        shots = [{"visual_type": "talking",
+                  "generation_prompt": "a beautiful bright kitchen, warm morning light"}]
+        self.assertEqual(saasshorts._pinned_avatar_set(shots),
+                         "a beautiful bright kitchen, warm morning light")
+
+    def test_the_set_travels_with_the_shots_not_with_the_script(self):
+        """До плит доезжают одни кадры — сет обязан ехать на них."""
+        shots = saasshorts.normalize_storyboard_shots({
+            "set_prompt": "a quiet home office with a wooden desk",
+            "shots": [{"shot_number": 1, "speech": "Привет.", "visual_type": "talking"}],
+        })
+        self.assertEqual(shots[0]["_set_prompt"], "a quiet home office with a wooden desk")
+
+    def test_the_moment_is_not_mistaken_for_the_camera(self):
+        """Движение головы — единственное, что до картинки доходит; его не трогаем."""
+        shots = [
+            {"visual_type": "broll", "generation_prompt": "close up on an hourglass"},
+            {"visual_type": "talking", "generation_prompt": (
+                "same woman in a bright kitchen, a subtle head tilt and a small nod, "
+                "one hand settling near her chest"
+            )},
+        ]
+        self.assertEqual(
+            saasshorts._pinned_avatar_set(shots),
+            "same woman in a bright kitchen, a subtle head tilt and a small nod, "
+            "one hand settling near her chest",
+        )
+
+
+class SaaSSplitStoryboardPassesTests(unittest.TestCase):
+    """Место и картинка — отдельные запросы, каждый со своими правилами.
+
+    Пока всё писал один запрос, модель тянула в говорящий кадр камеру и
+    внешность: правила про то и другое лежали рядом с противоположными.
+    """
+
+    def _answer(self, payload):
+        return MagicMock(text=json.dumps(payload, ensure_ascii=False))
+
+    def test_the_set_pass_writes_a_place_for_the_whole_reel(self):
+        scripts = [{"title": "Т", "language": "ru",
+                    "shots": [{"shot_number": 1, "speech": "Привет."}]}]
+        reply = [{"script_index": 0,
+                  "set_scene": "Светлая кухня, мрамор, утренний свет из окна",
+                  "set_prompt": "a bright kitchen with a marble counter, morning window light"}]
+        with patch("google.genai.Client", MagicMock()), \
+             patch("saasshorts._generate_gemini_content", return_value=self._answer(reply)) as ask:
+            saasshorts.generate_storyboard_sets(scripts, "key", language="ru")
+
+        request = ask.call_args.kwargs["contents"][0]
+        self.assertIn("NO people", request)
+        self.assertIn("NO camera", request)
+        self.assertIn("NO appearance", request)
+        self.assertEqual(scripts[0]["set_prompt"],
+                         "a bright kitchen with a marble counter, morning window light")
+        self.assertEqual(scripts[0]["set_scene"],
+                         "Светлая кухня, мрамор, утренний свет из окна")
+
+    def test_a_failed_set_pass_leaves_the_script_alone(self):
+        """Проход не блокирующий: сорвался — сценарий остаётся прежним."""
+        scripts = [{"title": "Т", "shots": [{"shot_number": 1, "speech": "Привет."}]}]
+        with patch("google.genai.Client", MagicMock()), \
+             patch("saasshorts._generate_gemini_content", side_effect=RuntimeError("503")):
+            saasshorts.generate_storyboard_sets(scripts, "key")
+
+        self.assertNotIn("set_prompt", scripts[0])
+
+    def test_the_visuals_pass_gives_each_shot_its_picture(self):
+        scripts = [{
+            "language": "ru",
+            "set_prompt": "a bright kitchen with a marble counter",
+            "shots": [
+                {"shot_number": 1, "speech": "Привет.", "visual_type": "talking"},
+                {"shot_number": 2, "speech": "Песок сыплется.", "visual_type": "broll"},
+            ],
+        }]
+        reply = [
+            {"script_index": 0, "shot_number": 1, "scene": "Слегка кивает",
+             "generation_prompt": "the same actor from the reference image gives a small nod",
+             "camera": "крупный план"},
+            {"script_index": 0, "shot_number": 2, "scene": "Песочные часы",
+             "generation_prompt": "close up on an hourglass, slow push in",
+             "camera": "макро, медленный наезд"},
+        ]
+        with patch("google.genai.Client", MagicMock()), \
+             patch("saasshorts._generate_gemini_content", return_value=self._answer(reply)) as ask:
+            saasshorts.generate_storyboard_visuals(scripts, "key", language="ru")
+
+        request = ask.call_args.kwargs["contents"][0]
+        self.assertIn("TALKING SHOTS", request)
+        self.assertIn("B-ROLL SHOTS", request)
+        self.assertIn("NO camera wording at all", request)
+        self.assertIn("Here the camera IS yours", request)
+        # Художник обязан видеть уже выбранное место, иначе опишет своё.
+        self.assertIn("a bright kitchen with a marble counter", request)
+
+        talking, broll = scripts[0]["shots"]
+        self.assertEqual(talking["scene"], "Слегка кивает")
+        self.assertEqual(talking["generation_prompt"],
+                         "the same actor from the reference image gives a small nod")
+        # Камера у говорящего кадра — не поле модели: её ставит сборка.
+        self.assertNotIn("camera", talking)
+        self.assertEqual(broll["camera"], "макро, медленный наезд")
+
+    def test_a_hand_written_prompt_is_not_overwritten(self):
+        scripts = [{"shots": [
+            {"shot_number": 1, "speech": "Привет.", "visual_type": "talking",
+             "prompt_manual": True, "generation_prompt": "мой промпт"},
+            {"shot_number": 2, "speech": "И ещё.", "visual_type": "talking"},
+        ]}]
+        reply = [{"script_index": 0, "shot_number": 1, "scene": "не моё",
+                  "generation_prompt": "not mine"}]
+        with patch("google.genai.Client", MagicMock()), \
+             patch("saasshorts._generate_gemini_content", return_value=self._answer(reply)) as ask:
+            saasshorts.generate_storyboard_visuals(scripts, "key")
+
+        self.assertNotIn("мой промпт", ask.call_args.kwargs["contents"][0])
+        self.assertEqual(scripts[0]["shots"][0]["generation_prompt"], "мой промпт")
+
+    def test_three_passes_run_in_order_and_the_set_reaches_the_shots(self):
+        """Сквозная проверка: текст → место → картинка, и всё это доезжает до плит.
+
+        Порядок здесь важнее содержания. Проходы обязаны отработать ДО
+        нормализации кадров: она собирает `generation_prompt` и штампует сет на
+        каждый кадр, и если её пустить первой, до плит доедут пустышки.
+        """
+        script = {
+            "title": "Восемьдесят на двадцать",
+            "hook_type": "result_first",
+            "shots": [
+                {"shot_number": 1, "role": "hook", "speech": "Хочешь худеть?",
+                 "visual_type": "talking", "actor_in_frame": False, "transition": "cut",
+                 "emotion": "excited", "overlay_text": "80/20"},
+                {"shot_number": 2, "role": "cta", "speech": "Начни сегодня.",
+                 "visual_type": "talking", "actor_in_frame": False, "transition": "cut",
+                 "emotion": "warm", "overlay_text": "старт"},
+            ],
+        }
+
+        def answer(client, contents, **kwargs):
+            asked = contents[0]
+            if "WHAT A SET IS" in asked:
+                return MagicMock(text=json.dumps([{
+                    "script_index": 0,
+                    "set_scene": "Светлая кухня, мрамор",
+                    "set_prompt": "a bright kitchen with a marble counter, morning light",
+                }], ensure_ascii=False))
+            if "TALKING SHOTS" in asked:
+                return MagicMock(text=json.dumps([
+                    {"script_index": 0, "shot_number": 1, "scene": "Слегка кивает",
+                     "generation_prompt": "the same actor gives a small nod"},
+                    {"script_index": 0, "shot_number": 2, "scene": "Разводит руками",
+                     "generation_prompt": "the same actor opens her hands"},
+                ], ensure_ascii=False))
+            return MagicMock(text=json.dumps([script], ensure_ascii=False))
+
+        with patch("google.genai.Client", MagicMock()), \
+             patch("saasshorts._generate_gemini_content", side_effect=answer), \
+             patch("saasshorts.refine_storyboard_broll_alignment",
+                   side_effect=lambda scripts, *a, **kw: scripts):
+            scripts = saasshorts.generate_scripts(
+                analysis={"product_name": "Моя Форма"},
+                gemini_key="key",
+                num_scripts=1,
+                script_format="storyboard_v3",
+                language="ru",
+            )
+
+        made = scripts[0]
+        self.assertEqual(made["set_scene"], "Светлая кухня, мрамор")
+        self.assertEqual([shot["scene"] for shot in made["shots"]],
+                         ["Слегка кивает", "Разводит руками"])
+        self.assertIn("small nod", made["shots"][0]["generation_prompt"])
+        # Сет доехал до кадров — только их получает слайсер и рендер.
+        self.assertEqual(saasshorts._pinned_avatar_set(made["shots"]),
+                         "a bright kitchen with a marble counter, morning light")
+
+    def test_without_a_key_neither_pass_asks_anything(self):
+        scripts = [{"shots": [{"shot_number": 1, "speech": "Привет."}]}]
+        with patch("saasshorts._generate_gemini_content") as ask:
+            saasshorts.generate_storyboard_sets(scripts, "")
+            saasshorts.generate_storyboard_visuals(scripts, "")
+        ask.assert_not_called()
+
+
 class SaaSStoryboardTests(unittest.TestCase):
     def test_target_duration_normalizes_supported_presets_and_falls_back_to_twenty(self):
         for value in (15, 20, 30, 45):
@@ -1225,7 +2157,9 @@ class SaaSStoryboardTests(unittest.TestCase):
                 target_duration_seconds=30,
             )
 
-        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        # Первый вызов — сценарный. Место и картинку пишут отдельные запросы
+        # после него, и их промпты про хронометраж ничего не знают.
+        prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("28-32 seconds", prompt)
         # Бюджет слов — это остаток от 30 секунд после оплаты тегов и пауз, а не
         # отдельное подобранное число: см. `_duration_preset`.
@@ -1246,22 +2180,22 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertIn("Never place two B-roll shots next to each other", prompt)
         self.assertIn("The first shot and the last shot MUST be talking", prompt)
         self.assertIn("Vary B-roll subject types", prompt)
+        # Сценарист пишет текст, а не картинку. Пока схема ответа просила у него
+        # «scene, action, camera», он послушно писал «static camera, holding a
+        # steady selfie pose» — и эта фраза, приехав в сет, ставила обе камеры
+        # анфасом. Полей про картинку в его ответе больше нет вовсе.
+        self.assertIn("You write the TEXT of this reel, not its pictures", prompt)
         self.assertIn(
-            '"actor_action": "what the visible subject does; for talking shots, what the actor does',
+            "Each shot MUST include role, visual_type, actor_in_frame, overlay_text, speech",
             prompt,
         )
-        self.assertIn(
-            "Every talking generation_prompt MUST identify the same actor from the reference image",
-            prompt,
-        )
-        self.assertIn(
-            "For a B-roll shot with actor_in_frame=true, generation_prompt MUST identify the same actor from the reference image",
-            prompt,
-        )
-        self.assertIn(
-            "For a B-roll shot with actor_in_frame=false, generation_prompt MUST NOT mention the actor or reference image",
-            prompt,
-        )
+        self.assertNotIn('"scene":', prompt)
+        self.assertNotIn('"camera":', prompt)
+        self.assertNotIn('"generation_prompt":', prompt)
+        self.assertNotIn('"actor_action":', prompt)
+        self.assertNotIn("holds a steady selfie pose", prompt)
+        self.assertNotIn("scene, action, camera, lighting", prompt)
+        self.assertNotIn("fully describe the scene, action and camera on its own", prompt)
         self.assertNotIn('Make 1-2 middle shots "broll"', prompt)
         self.assertNotIn(
             "generation_prompt MUST be in English and MUST say: vertical 9:16, realistic phone video, same actor",
@@ -1288,7 +2222,9 @@ class SaaSStoryboardTests(unittest.TestCase):
                 script_format="storyboard_v3",
             )
 
-        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        # Первый вызов — сценарный. Место и картинку пишут отдельные запросы
+        # после него, и их промпты про хронометраж ничего не знают.
+        prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("reference image is the only source", prompt)
         self.assertIn("pose, position, gaze, expression, emotion", prompt)
         self.assertNotIn('"actor_description": "English physical description only"', prompt)
@@ -1313,7 +2249,9 @@ class SaaSStoryboardTests(unittest.TestCase):
                 target_duration_seconds=20,
             )
 
-        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        # Первый вызов — сценарный. Место и картинку пишут отдельные запросы
+        # после него, и их промпты про хронометраж ничего не знают.
+        prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("7-8 visual beats", prompt)
         # Нижняя граница бита поднята до пола клипа: короче модель не снимает,
         # а платит заказчик за полный клип.
@@ -1411,7 +2349,9 @@ class SaaSStoryboardTests(unittest.TestCase):
                 target_duration_seconds=45,
             )
 
-        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        # Первый вызов — сценарный. Место и картинку пишут отдельные запросы
+        # после него, и их промпты про хронометраж ничего не знают.
+        prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("43-47 seconds", prompt)
         self.assertIn("78-82 spoken words", prompt)
         self.assertIn("five segments", prompt.casefold())
@@ -1492,7 +2432,9 @@ class SaaSStoryboardTests(unittest.TestCase):
                 script_format="ugc",
             )
 
-        prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+        # Первый вызов — сценарный. Место и картинку пишут отдельные запросы
+        # после него, и их промпты про хронометраж ничего не знают.
+        prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("reference image is the only source", prompt)
         self.assertNotIn('"actor_description": "Specific person description', prompt)
         self.assertNotIn("Vary actor look", prompt)
@@ -2438,7 +3380,9 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             self.assertEqual(set(used), staged)
             for a, b in zip(used, used[1:]):
                 self.assertNotEqual(a, b)
-            self.assertEqual({scene for _, _, scene in draws}, {"p1"})
+            # Место словами сюда не уезжает: его никто не выбирал, а на фото
+            # ведущего комната уже снята. Важно, что оно одно на все камеры.
+            self.assertEqual({scene for _, _, scene in draws}, {""})
 
     def test_each_camera_is_staged_from_the_actor_photo_never_cropped_from_another(self):
         """Две камеры — две постановки, как на подкасте. Кропа между кадрами нет.
@@ -2474,10 +3418,10 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             self.assertEqual([path for path, _, _ in draws], [front, side])
             framings = dict((p, f) for p, f, _ in draws)
             # Вторая камера — другая точка съёмки, а не другая крупность:
-            # дистанция у обеих названа одними и теми же словами.
-            self.assertIn("forty degrees off the straight-on axis", framings[side])
+            # крупности в постановке нет вовсе, дистанция общая и в хвосте.
+            self.assertIn("forty degrees", framings[side])
             for path in (front, side):
-                self.assertIn(saasshorts._AVATAR_CAMERA_DISTANCE, framings[path])
+                self.assertNotIn("close", framings[path])
             # И ни одна не срезана с другой.
             self.assertEqual(crops, [])
 

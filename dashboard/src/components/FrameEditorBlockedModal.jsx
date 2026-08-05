@@ -8,11 +8,18 @@ const REASON_TEXT = {
   moderation:
     'Это модерация на стороне вендора: она смотрит и на входное фото, и на результат. '
     + 'Кадр вернулся пустым, но fal тарифицирует его как обычную картинку.',
+  blank:
+    'Модель вернула пустой кадр без подтверждённого флага модерации. '
+    + 'Результат оплачен, но не запомнен; повтор возможен только вручную.',
   known:
-    'Эта модель уже отказывала на этом фото. Модерация срабатывает одинаково, '
-    + 'поэтому повторный запрос не отправлялся — денег не списано.',
+    'Эта модель уже отказывала на этом фото с тем же описанием кадра. '
+    + 'Поэтому повторный запрос не отправлялся — денег не списано.',
   unavailable:
-    'Эндпоинт модели не ответил. За несостоявшуюся генерацию fal денег не берёт.',
+    'Эндпоинт модели ответил ошибкой — похоже, её сняли или переехала. '
+    + 'За несостоявшуюся генерацию fal денег не берёт.',
+  unreachable:
+    'Запрос не дошёл до fal — оборвалась сеть или не разрешилось имя. Модель '
+    + 'фотографию не видела и ничего не отклоняла, денег не списано.',
 };
 
 /**
@@ -33,9 +40,15 @@ export default function FrameEditorBlockedModal({
   if (!block) return null;
 
   const flags = block.flags && Object.keys(block.flags).length ? block.flags : null;
-  // Каталог из ответа бэкенда, иначе — то, что он приложил к самому отказу.
-  const options = (models.length ? models : (block.alternatives || []))
-    .filter((m) => m.id !== block.model);
+  // Отказ содержит варианты именно для этого фото и описания кадра. Общий
+  // каталог нужен только для ответа старого бэкенда, где alternatives ещё нет.
+  const sourceModels = Array.isArray(block.alternatives)
+    ? block.alternatives
+    : models;
+  const options = sourceModels.filter((m) => m.id !== block.model);
+  // Сеть не чинится сменой модели. Предлагать здесь перебор — это звать
+  // потратить $0.05 на попытку, которая упрётся ровно в то же место.
+  const unreachable = block.reason === 'unreachable';
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
@@ -77,7 +90,15 @@ export default function FrameEditorBlockedModal({
             : 'За эту попытку деньги не списаны.'}
         </p>
 
-        {options.length > 0 ? (
+        {unreachable ? (
+          <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3 flex gap-2.5">
+            <ImageOff size={16} className="text-zinc-400 shrink-0 mt-0.5" />
+            <p className="text-[12px] text-zinc-300">
+              Другая модель не поможет — она живёт по тому же адресу. Проверь сеть
+              и нажми «Перегенерить» ещё раз той же моделью.
+            </p>
+          </div>
+        ) : options.length > 0 ? (
           <div className="mt-5">
             <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2">
               Попробовать другой моделью

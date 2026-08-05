@@ -16,6 +16,7 @@ import {
   Pencil,
 } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { galleryVideoModeBadge } from './videoModeBadge';
 
 const LIPSYNC_MODEL_OPTIONS = [
   {
@@ -764,7 +765,7 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
     }
   };
 
-  const mode = video.video_mode;
+  const modeBadge = galleryVideoModeBadge(video.video_mode);
 
   return (
     <button
@@ -792,12 +793,8 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
           </div>
         )}
         <div className="absolute top-1.5 right-1.5">
-          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full ${
-            mode === 'lowcost' ? 'bg-green-500 text-black' :
-            mode === 'premium' ? 'bg-violet-500 text-white' :
-            'bg-blue-500 text-white'
-          }`}>
-            {mode === 'lowcost' ? 'LOW COST' : mode === 'premium' ? 'PREMIUM' : 'STANDARD'}
+          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full ${modeBadge.className}`}>
+            {modeBadge.label}
           </span>
         </div>
         {lipSyncJob?.status === 'processing' && (

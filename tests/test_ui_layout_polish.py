@@ -339,7 +339,42 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("storyboard_generation_mode", tab)
         self.assertNotIn("STORYBOARD_PACING_OPTIONS", tab)
         self.assertNotIn("storyboard_pacing: storyboardPacing", tab)
-        self.assertIn("talkingShots * FLUX_FRAME_COST", tab)
+        # Плиты рисуются по числу камер, а не по числу говорящих кадров, а
+        # перебивка стоит не меньше пола Kling — смета должна знать и то, и другое.
+        self.assertIn("Math.min(talkingShots, TALKING_PLATE_COUNT) * FLUX_FRAME_COST", tab)
+        self.assertIn("BROLL_MIN_CLIP_SECONDS", tab)
+
+    def test_a_shot_too_short_for_its_clip_says_so_before_the_money_is_spent(self):
+        """Реплика короче пола модели — единственный перерасход, невидимый глазом.
+
+        Кадр на полторы секунды выглядит в редакторе ровно как кадр на три:
+        поля «длительность» нет, длину задаёт озвучка. А снимут и посчитают
+        минимум модели. Узнавать об этом по отчёту после оплаты — поздно.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("shotIsShorterThanItsClip", tab)
+        self.assertIn("shotClipFloorSeconds", tab)
+        self.assertIn("платим за полный", tab)
+        # Предупреждение и смета обязаны мерить кадр одинаково: разойдись они, и
+        # редактор будет спорить сам с собой на той же раскадровке.
+        self.assertIn("const share = shotPlannedSeconds(script, shot, totalSeconds);", tab)
+
+    def test_generation_steps_ask_about_the_storyboard_before_the_lipsync(self):
+        """Иначе галочки не загорались бы весь прогон.
+
+        Раскадровка пишет построчно «создаю новое lip-sync видео Kling Avatar»,
+        так что `isLipSyncJob` истинно и у неё. Подписи этапов берутся от
+        раскадровки, и состояние обязано спрашивать в том же порядке — иначе оно
+        ищет маркеры `[lipsync N/3]`, которых раскадровочная задача не печатает.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        for binding in ("const labels = isStoryboardJob",
+                        "const stepDone = isStoryboardJob",
+                        "const stepActive = isStoryboardJob"):
+            self.assertIn(binding, tab)
+            self.assertNotIn(binding.replace("isStoryboardJob", "isLipSyncJob"), tab)
 
     def test_ai_shorts_exposes_and_persists_target_duration_presets(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -418,11 +453,17 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_deleted_shots_come_back_where_they_were(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        # Раскадровку разбирают, чтобы отрендерить один кадр на пробу. Возврат в
-        # конец списка собирал её в другом порядке — позиция запоминается вместе
-        # с кадром, а «вернуть все» отменяет удаления с конца, то есть точно.
-        self.assertIn("_archived_at: shotIndex", tab)
+        # Раскадровку разбирают, чтобы отрендерить один кадр на пробу. Место
+        # кадра держит ключ порядка, а не индекс на момент удаления: индекс верен
+        # только при строго обратном возврате, а кнопка «Вернуть» стоит у каждого
+        # кадра — и возврат сверху вниз переворачивал блок (03.08, saas_c079a7dc).
+        self.assertIn("const withShotOrder", tab)
         self.assertIn("const archivedShotSlot", tab)
+        self.assertNotIn("_archived_at: shotIndex", tab)
+        slot = tab[tab.index("const archivedShotSlot"):tab.index("const restoredShot")]
+        self.assertIn("s._ord > shot._ord", slot)
+        # Старые архивы ключа не носят — для них остаётся прежний путь.
+        self.assertIn("shot._archived_at", slot)
         self.assertIn("restoreAllArchivedShots", tab)
         self.assertIn("Вернуть все", tab)
         restore_all = tab[tab.index("const restoreAllArchivedShots"):tab.index("const dropArchivedShot")]
@@ -615,6 +656,26 @@ class UILayoutPolishTests(unittest.TestCase):
         add = tab[tab.index("const addShotWithSpeech"):]
         self.assertIn("fillShotDetails", add[:add.index("\n  };")])
 
+    def test_the_reel_set_is_its_own_field_above_the_shots(self):
+        """Место действия — свойство сценария, а не текст, спрятанный в кадре 1.
+
+        Пока оно жило внутри кадра, туда писали и камеру, и позу, и внешность —
+        и всё это уезжало в плиты вместе с комнатой.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("/api/saasshorts/storyboard-set", tab)
+        self.assertIn("pickReelSet", tab)
+        self.assertIn("Место действия ролика", tab)
+        self.assertIn("Подобрать ИИ", tab)
+        self.assertIn("set_prompt", tab)
+        # Карточка стоит до списка кадров.
+        self.assertLess(tab.index("Место действия ролика"), tab.index("Добавить кадр"))
+        # У сценариев со своим полем кадр 1 перестаёт быть «тем самым», у старых
+        # остаётся: подпись обязана говорить правду про обе схемы.
+        self.assertIn("shotIndex === setDefiningShotIndex && !hasOwnSet", tab)
+        self.assertIn("Место — из поля «Место действия ролика» выше", tab)
+
     def test_storyboard_duration_estimate_tracks_voiceover_not_a_flat_floor(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
@@ -672,6 +733,79 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("Управлять проектами", tab)
         self.assertIn("Аватар проекта", tab)
         self.assertIn("Сохранённые аватары", tab)
+
+    def test_wizard_steps_can_be_walked_forward_again_after_going_back(self):
+        """Уйдя назад в настройку, к своему готовому ролику можно вернуться.
+
+        Раньше «назад» существовало кнопками в подвалах, а «вперёд» — нет: логи и
+        результат оплаченного рендера лежали в снапшоте, но открыть их было нечем.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("const stepReady = [", tab)
+        self.assertIn("const previousReadyStep =", tab)
+        self.assertIn("const nextReadyStep =", tab)
+        self.assertIn("setStep(nextReadyStep)", tab)
+        self.assertIn("setStep(previousReadyStep)", tab)
+        self.assertIn('aria-label="Вперёд"', tab)
+        self.assertIn('aria-label="Назад"', tab)
+        # Шаг без данных отрисуется пустым, поэтому переход в него закрыт.
+        self.assertIn("disabled={!stepReady[i] || i === step}", tab)
+        self.assertIn("пока нечего показать", tab)
+
+    def test_storyboard_flags_a_duration_that_missed_the_target(self):
+        """«Выбрал 15 секунд — сгенерилось на 24» должно быть видно до рендера.
+
+        Допуск и оценка те же, что на бэкенде, и пересчитываются на каждой правке
+        кадров: длину ролика задаёт озвучка, поэтому лишний текст — это лишние
+        секунды и лишние оплаченные кадры.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        self.assertIn("const durationGap =", tab)
+        self.assertIn("Math.abs(storyboardSeconds - targetDurationSeconds) > 2", tab)
+        self.assertIn("{durationGap !== 0 && (", tab)
+        self.assertIn("длиннее", tab)
+        self.assertIn("короче", tab)
+
+    def test_storyboard_says_who_owns_the_place_and_the_camera(self):
+        """Раскадровка перестаёт обещать то, чего снимающий код не делает.
+
+        Говорящие кадры снимаются в одном месте (его задаёт первый из них), а
+        ракурсы чередует сборка. Пока это было невидимо, поле «Что в кадре»
+        заполнялось текстом вида «та же комната, ракурс чуть сменился» — и не
+        менялось ничего, кроме ожиданий.
+        """
+        tab = SAAS_SHORTS.read_text(encoding="utf-8")
+
+        # Очередь камер — та же, что на бэкенде: шёпот всегда доверительный крупный.
+        self.assertIn("const talkingCameras = (() => {", tab)
+        self.assertIn("isWhisperShot(shot)", tab)
+        self.assertIn("order % 2 === 0 ? 'front' : 'side'", tab)
+        self.assertIn("Камера: {CAMERA_LABELS[talkingCameras[shotIndex]]}", tab)
+        # Место действия принадлежит одному кадру, а не каждому.
+        self.assertIn("const setDefiningShotIndex =", tab)
+        self.assertIn("место действия всего ролика", tab)
+        self.assertIn("Поза, взгляд, что делают руки", tab)
+        self.assertIn("новую комнату или", tab)
+
+    def test_talking_shots_are_told_to_describe_the_moment_not_the_room(self):
+        """То же правило — в промптах моделей, иначе они пишут про камеру.
+
+        Модель сочиняла «ракурс чуть сменился» и новую комнату на каждый кадр,
+        хотя до картинки доходит одно место действия на весь ролик. Теперь это
+        правило живёт там, где кадр рисуется: в проходе по картинкам и в
+        дозаполнении полей по реплике.
+        """
+        pipeline = PIPELINE.read_text(encoding="utf-8")
+
+        self.assertIn("ALL talking shots happen in ONE place", pipeline)
+        self.assertIn("The place is already chosen and is NOT yours", pipeline)
+        self.assertIn("`scene` is the MOMENT", pipeline)
+        self.assertIn("the app stages the talking shots itself and rotates its own cameras",
+                      pipeline)
+        # И в дозаполнении полей по реплике — оно ходит тем же путём.
+        self.assertIn("ALL talking shots happen in ONE place, the one the first talking shot above is", pipeline)
 
 
 if __name__ == "__main__":

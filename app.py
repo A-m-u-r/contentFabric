@@ -1459,6 +1459,12 @@ def _infer_local_gallery_meta(job_dir: str) -> Optional[dict]:
         "style": script.get("style", "ugc"),
         "language": script.get("language", "ru"),
         "duration": job_result.get("duration", 0) if isinstance(job_result, dict) else 0,
+        # Что просили и что оценили — рядом с фактической длиной. Без этих двух
+        # полей расхождение «выбрал 15 с, вышло 24» постфактум не проверить:
+        # цель жила только в форме, а оценка только в оперативной памяти джоба.
+        "target_duration_seconds": script.get("target_duration_seconds", 0),
+        "estimated_duration_seconds": script.get("duration_seconds", 0),
+        "duration_target_status": script.get("duration_target_status", ""),
         "video_mode": "lowcost" if "hailuo" in " ".join(os.listdir(job_dir)).lower() else "standard",
         "product_name": script.get("_product_name", ""),
         "product_url": script.get("_product_url", ""),
@@ -3163,6 +3169,7 @@ from saasshorts import (
     generate_scripts,
     generate_content_plan,
     fill_storyboard_shot_details,
+    generate_storyboard_sets,
     build_custom_script,
     GeminiTemporaryError,
     generate_full_video,
@@ -3223,6 +3230,12 @@ class SaaSAnalyzeRequest(BaseModel):
     style: str = "ugc"
     language: str = "en"
     actor_gender: str = "female"
+    # Не ставить два говорящих кадра подряд. Выключено по умолчанию: перебивка
+    # это отдельный платный клип от трёх секунд, и чередование поднимает смету.
+    broll_between_talking: bool = False
+    # Менять место по ходу ролика. Тоже выключено и тоже из-за денег: каждая
+    # новая комната — своя плита на каждую снимающую в ней камеру.
+    changing_locations: bool = False
     use_platform_keys: bool = False
 
     @field_validator("target_duration_seconds", mode="before")
@@ -3302,6 +3315,8 @@ async def saasshorts_analyze(
                     script_format=req.script_format,
                     text_model=req.text_model,
                     target_duration_seconds=req.target_duration_seconds,
+                    broll_between_talking=req.broll_between_talking,
+                    changing_locations=req.changing_locations,
                 )
             else:
                 # Manual description: build analysis from description
@@ -3327,6 +3342,8 @@ async def saasshorts_analyze(
                     script_format=req.script_format,
                     text_model=req.text_model,
                     target_duration_seconds=req.target_duration_seconds,
+                    broll_between_talking=req.broll_between_talking,
+                    changing_locations=req.changing_locations,
                 )
             return {
                 "analysis": analysis,
@@ -3396,6 +3413,55 @@ async def saasshorts_content_plan(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class SaaSStoryboardSetRequest(BaseModel):
+    script: Dict[str, Any]
+    language: str = "ru"
+    text_model: str = "fast"
+    use_platform_keys: bool = False
+
+
+@app.post("/api/saasshorts/storyboard-set")
+async def saasshorts_storyboard_set(
+    req: SaaSStoryboardSetRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Подобрать место действия ролика: `set_scene` для интерфейса, `set_prompt` в плиты.
+
+    Текстовый вызов Gemini, fal.ai не трогается — переподбирать место можно
+    сколько угодно, пока кадры не отрисованы.
+    """
+    user = get_user_from_authorization(authorization)
+    try:
+        gemini_key = resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
+    except SubscriptionRequiredError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except PlatformKeyUnavailableError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
+
+    try:
+        loop = asyncio.get_event_loop()
+        scripts = await loop.run_in_executor(
+            None,
+            lambda: generate_storyboard_sets(
+                [dict(req.script)], gemini_key,
+                text_model=req.text_model, language=req.language,
+            ),
+        )
+        script = scripts[0] if scripts else {}
+        if not (script.get("set_prompt") or "").strip():
+            raise HTTPException(status_code=502, detail="Не удалось подобрать место действия")
+        return {"set_scene": script.get("set_scene") or "", "set_prompt": script["set_prompt"]}
+    except HTTPException:
+        raise
+    except GeminiTemporaryError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class SaaSShotFillRequest(BaseModel):
     script: Dict[str, Any]
     shots: List[Dict[str, Any]]
@@ -3457,6 +3523,10 @@ class SaaSActorRequest(BaseModel):
 
 ACTOR_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 STORYBOARD_FRAME_EXTENSIONS = ACTOR_IMAGE_EXTENSIONS
+# Ракурсы, которые можно принести своей картинкой. Шёпотного слота нет: он
+# берёт фронтальную плиту, чтобы человек не готовил кадр для случая, которого
+# в ролике может и не быть.
+PLATE_CAMERA_KEYS = ("front", "side")
 
 
 def _output_file_url(file_path: str) -> str:
@@ -3887,9 +3957,15 @@ async def saasshorts_actor_upload(
 async def saasshorts_storyboard_frame_upload(
     file: UploadFile = File(...),
     shot_number: int = Form(0),
+    camera: str = Form(""),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
-    """Upload a storyboard reference frame for Kling V3 image-to-video shots."""
+    """Upload a storyboard reference frame for Kling V3 image-to-video shots.
+
+    `camera` («front» или «side») загружает не кадр одного шота, а плиту: снимок
+    ракурса, на котором стоят все говорящие кадры этой камеры. Такая плита не
+    рисуется вовсе — ни одного платного вызова на постановку.
+    """
     user = get_user_from_authorization(authorization)
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -3909,7 +3985,11 @@ async def saasshorts_storyboard_frame_upload(
         upload_id = uuid.uuid4().hex[:8]
         upload_dir = os.path.join(OUTPUT_DIR, "storyboard_frames")
         os.makedirs(upload_dir, exist_ok=True)
-        filename = f"shot_{max(0, int(shot_number or 0)):02d}_{upload_id}{ext}"
+        plate_camera = (camera or "").strip().lower()
+        if plate_camera and plate_camera not in PLATE_CAMERA_KEYS:
+            raise HTTPException(status_code=400, detail="Unknown camera")
+        filename = (f"plate_{plate_camera}_{upload_id}{ext}" if plate_camera
+                    else f"shot_{max(0, int(shot_number or 0)):02d}_{upload_id}{ext}")
         file_path = os.path.join(upload_dir, filename)
 
         with open(file_path, "wb") as f:
@@ -3922,6 +4002,7 @@ async def saasshorts_storyboard_frame_upload(
             "image_path": file_path,
             "key": os.path.relpath(file_path, OUTPUT_DIR).replace(os.sep, "/"),
             "shot_number": shot_number,
+            "camera": plate_camera,
             "created_at": _utc_now(),
             "storage": "local",
             "owner_user_id": user.get("id") if user else "",
@@ -4371,6 +4452,13 @@ class SaaSGenerateRequest(BaseModel):
     language: Optional[str] = None
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
+    # Отдельный портрет того же человека: с общего плана личность не снимается —
+    # лицо там в проценты кадра, и редактор дорисовывает черты сам.
+    selected_face_url: Optional[str] = None
+    # Готовые плиты ракурсов, принесённые руками: {"front": url, "side": url}.
+    # Что лежит здесь — не рисуется, а копируется: ноль платных вызовов на
+    # постановку и полный контроль над лицом и комнатой.
+    plate_urls: Dict[str, str] = {}
     retry_job_id: Optional[str] = None
     video_mode: str = "standard"  # "lowcost", "standard", or "premium"
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
@@ -4670,27 +4758,37 @@ async def saasshorts_generate(
         )
 
     # If user selected a pre-generated actor, resolve it to a local path
-    selected_actor_path = None
-    if req.selected_actor_url:
-        if req.selected_actor_url.startswith("http"):
+    def _resolve_reference_photo(url: Optional[str], local_name: str) -> Optional[str]:
+        if not url:
+            return None
+        if url.startswith("http"):
             # Download from S3 — but only from our own bucket host (SSRF guard).
-            if _allowed_remote_actor_url(req.selected_actor_url):
-                import httpx
-                try:
-                    actor_local = os.path.join(job_output_dir, "selected_actor.png")
-                    with httpx.Client(timeout=30.0) as client:
-                        resp = client.get(req.selected_actor_url)
-                        if resp.status_code == 200:
-                            with open(actor_local, "wb") as f:
-                                f.write(resp.content)
-                            selected_actor_path = actor_local
-                except Exception:
-                    pass
-        else:
-            # Local reference — must stay inside OUTPUT_DIR (path-traversal guard).
-            src = _safe_output_subpath(req.selected_actor_url)
-            if src and os.path.exists(src):
-                selected_actor_path = src
+            if not _allowed_remote_actor_url(url):
+                return None
+            import httpx
+            try:
+                local = os.path.join(job_output_dir, local_name)
+                with httpx.Client(timeout=30.0) as client:
+                    resp = client.get(url)
+                    if resp.status_code == 200:
+                        with open(local, "wb") as f:
+                            f.write(resp.content)
+                        return local
+            except Exception:
+                return None
+            return None
+        # Local reference — must stay inside OUTPUT_DIR (path-traversal guard).
+        src = _safe_output_subpath(url)
+        return src if (src and os.path.exists(src)) else None
+
+    selected_actor_path = _resolve_reference_photo(req.selected_actor_url, "selected_actor.png")
+    selected_face_path = _resolve_reference_photo(req.selected_face_url, "selected_face.png")
+    pinned_plates = {}
+    for _camera in PLATE_CAMERA_KEYS:
+        _plate = _resolve_reference_photo((req.plate_urls or {}).get(_camera),
+                                          f"uploaded_plate_{_camera}.png")
+        if _plate:
+            pinned_plates[_camera] = _plate
 
     _bound = resolve_avatar_bound_voice(req.selected_actor_url)
     eleven_voice_audit = resolve_voice_audit(
@@ -4761,6 +4859,8 @@ async def saasshorts_generate(
         "language": resolved_language,
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
+        "selected_face_path": selected_face_path,
+        "pinned_plates": pinned_plates,
         "video_mode": req.video_mode,
         "broll_mode": req.broll_mode or "mockup",
         "punch_in_cuts": req.punch_in_cuts,

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import FrameEditorBlockedModal from './FrameEditorBlockedModal';
+import ImageLightbox from './ImageLightbox';
 import {
   loadBusinessProfiles,
   saveBusinessProfiles,
@@ -332,6 +333,42 @@ function estimateStoryboardSeconds(script, fallbackText) {
 const AVATAR_RATE = { standard: 0.0562, pro: 0.115 };
 const STORYBOARD_RATE = { storyboard_v3_standard: 0.084, storyboard_v3_pro: 0.112, storyboard_veo31_quality: 0.20 };
 const FLUX_FRAME_COST = 0.05; // Flux-кадр под каждый b-roll (image-first)
+// Зеркало `_KLING_MIN_CLIP_SECONDS`: клипов короче у Kling не бывает, и платят
+// за три секунды даже под полусекундную реплику.
+const BROLL_MIN_CLIP_SECONDS = 3;
+// Зеркало `_billed_avatar_seconds`. Замерено по 24 клипам на диске: Kling Avatar
+// не отдаёт клип короче 64 кадров при 30 fps, а выше пола округляет длину вверх
+// до блока в 8 кадров. Платят за отданное, а не за длину реплики.
+const TALKING_MIN_CLIP_SECONDS = 64 / 30;
+const TALKING_CLIP_BLOCK_SECONDS = 8 / 30;
+const billedTalkingSeconds = (seconds) => Math.max(
+  TALKING_MIN_CLIP_SECONDS,
+  Math.ceil(Math.max(0, seconds) / TALKING_CLIP_BLOCK_SECONDS) * TALKING_CLIP_BLOCK_SECONDS,
+);
+// Говорящие кадры делят несколько плит одного сета (средний/крупный), а не
+// носят по кадру каждый: плита рисуется раз на ролик и переиспользуется.
+const TALKING_PLATE_COUNT = 2;
+
+const shotWordCount = (shot) => (shot?.speech || '').trim().split(/\s+/).filter(Boolean).length;
+
+const isBrollShot = (shot) => (shot?.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
+
+// Пол клипа у модели, которой снимут этот кадр. Короче она не отдаёт — и короче
+// не считает: реплика на секунду приедет клипом на два и оплатится как два.
+const shotClipFloorSeconds = (shot) => (
+  isBrollShot(shot) ? BROLL_MIN_CLIP_SECONDS : TALKING_MIN_CLIP_SECONDS
+);
+
+// Сколько секунд ролика достанется кадру. Поля «длительность» больше нет и не
+// будет: бэкенд нарезает готовую озвучку по словам, так что доля кадра — это
+// доля его слов. Та же формула, что в `splitStoryboardSeconds`, иначе смета и
+// предупреждение под кадром разошлись бы между собой.
+function shotPlannedSeconds(script, shot, totalSeconds) {
+  const words = shotWordCount(shot);
+  if (words <= 0) return 0;
+  const totalWords = (script?.shots || []).reduce((sum, item) => sum + shotWordCount(item), 0);
+  return totalWords > 0 ? (words / totalWords) * totalSeconds : 0;
+}
 const TYPICAL_VIDEO_SECONDS = 35; // до генерации сценария длительность неизвестна
 
 // Textarea that grows to fit its content instead of clipping to a fixed number
@@ -403,23 +440,25 @@ function splitStoryboardSeconds(script, totalSeconds) {
   // время по словам речи (а не по длительностям кадров) и пропускает кадры без
   // речи — поэтому долю b-roll считаем по словам, и только у кадров с речью.
   if (Array.isArray(script?.shots) && script.shots.length > 0) {
-    const wordsOf = (shot) => (shot.speech || '').trim().split(/\s+/).filter(Boolean).length;
-    const totalWords = script.shots.reduce((sum, shot) => sum + wordsOf(shot), 0);
-    let brollWords = 0;
     let brollShots = 0;
     let talkingShots = 0;
+    // Кадр тарифицируется по снятому клипу, а клип не короче пола своей модели:
+    // под полсекунды речи Kling V3 снимет три секунды и три возьмёт в счёт.
+    // Поэтому у каждого кадра своя цена, а не доля от общей длительности.
+    let talkingBilled = 0;
+    let brollBilled = 0;
     for (const shot of script.shots) {
-      const words = wordsOf(shot);
-      if (words <= 0) continue; // кадры без речи не генерируются
-      if ((shot.visual_type || '').toLowerCase() === 'broll') {
-        brollWords += words;
+      if (shotWordCount(shot) <= 0) continue; // кадры без речи не генерируются
+      const share = shotPlannedSeconds(script, shot, totalSeconds);
+      if (isBrollShot(shot)) {
         brollShots += 1;
+        brollBilled += Math.max(BROLL_MIN_CLIP_SECONDS, Math.ceil(share));
       } else {
         talkingShots += 1;
+        talkingBilled += billedTalkingSeconds(share);
       }
     }
-    const broll = totalWords > 0 ? (brollWords / totalWords) * totalSeconds : 0;
-    return { talking: Math.max(0, totalSeconds - broll), broll, brollShots, talkingShots };
+    return { talking: talkingBilled, broll: brollBilled, brollShots, talkingShots };
   }
   // Сценария ещё нет: типичная раскадровка ~70% речи в кадре и 2 b-roll вставки.
   return { talking: totalSeconds * 0.7, broll: totalSeconds * 0.3, brollShots: 2, talkingShots: 3 };
@@ -453,9 +492,10 @@ function estimateSaasVideoCost({ text, videoMode, ttsProvider, brollMode, hasSel
       ? STORYBOARD_RATE[videoMode]
       : STORYBOARD_RATE.storyboard_v3_standard;
     const { talking, broll, brollShots, talkingShots } = splitStoryboardSeconds(script, storyboardSeconds);
-    // Каждый говорящий кадр стартует со свежего Flux-кадра (аватар + сцена),
-    // как b-roll — иначе Kling клонирует человека по краям из одного фото.
-    videoCost = talking * AVATAR_RATE[avatarTier] + talkingShots * FLUX_FRAME_COST;
+    // Говорящие кадры стартуют с плит одного сета: их столько же, сколько камер,
+    // а не сколько кадров, и второй раз они не рисуются.
+    videoCost = talking * AVATAR_RATE[avatarTier]
+      + Math.min(talkingShots, TALKING_PLATE_COUNT) * FLUX_FRAME_COST;
     brollCost = broll * brollRate + brollShots * FLUX_FRAME_COST;
   } else if (storyboardMode) {
     videoCost = storyboardSeconds * (STORYBOARD_RATE[videoMode] || STORYBOARD_RATE.storyboard_v3_standard);
@@ -679,6 +719,14 @@ export default function SaaShortsTab({
   ));
   const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || 'ai'); // "ai" or "custom"
   const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || 'ugc');
+  // Не ставить два говорящих кадра подряд. По умолчанию выключено: каждая
+  // перебивка — отдельный платный клип, который тарифицируется от трёх секунд.
+  const [changingLocations, setChangingLocations] = useState(
+    () => Boolean(initialCache?.changingLocations),
+  );
+  const [brollBetweenTalking, setBrollBetweenTalking] = useState(
+    () => Boolean(initialCache?.brollBetweenTalking),
+  );
   const [targetDurationSeconds, setTargetDurationSeconds] = useState(
     () => initialCache?.targetDurationSeconds || 20,
   );
@@ -733,6 +781,7 @@ export default function SaaShortsTab({
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   // Кадры, которые сейчас дозаполняет ИИ (сцена/камера/действие), и ошибка этого запроса.
   const [fillingShots, setFillingShots] = useState([]);
+  const [pickingSet, setPickingSet] = useState(false);
   const [fillError, setFillError] = useState('');
   // Номера кадров, которые пользователь просит переснять, хотя текст не менялся:
   // без этого их отдал бы кэш прошлого рендера.
@@ -762,6 +811,21 @@ export default function SaaShortsTab({
     return url ? { localPreview: getApiUrl(url), serverUrl: url } : null;
   });
   const [actorUploadStatus, setActorUploadStatus] = useState('');
+  // Портрет крупно — отдельно от аватара. С общего плана лицо не снимается:
+  // оно занимает проценты кадра, и генератор дорисовывает черты сам, каждый раз
+  // по-своему. Портрет несёт поры, веснушки и цвет губ — то, по чему человека и
+  // узнают.
+  const [selectedFace, setSelectedFace] = useState(() => initialVideoPrefs.selectedFace || null);
+  const [faceUploadStatus, setFaceUploadStatus] = useState('');
+  const [uploadingFace, setUploadingFace] = useState(false);
+  // Готовые плиты ракурсов: {front, side}. Что лежит здесь — копируется в ролик
+  // как есть, без единого платного вызова на постановку камеры.
+  const [plateUrls, setPlateUrls] = useState(() => initialVideoPrefs.plateUrls || {});
+  const [uploadingPlate, setUploadingPlate] = useState('');
+  const [plateUploadStatus, setPlateUploadStatus] = useState('');
+  // Кадр, открытый на весь экран: {src, alt, caption}. Кадры живут миниатюрами,
+  // а утверждают их именно по деталям лица — по 104 пикселям это не решается.
+  const [lightbox, setLightbox] = useState(null);
   const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
   const [productDescription, setProductDescription] = useState('');
 
@@ -827,6 +891,8 @@ export default function SaaShortsTab({
     setScriptMode(snapshot.scriptMode || 'ai');
     setScriptFormat(snapshot.scriptFormat || 'ugc');
     setTargetDurationSeconds(snapshot.targetDurationSeconds || 20);
+    setBrollBetweenTalking(Boolean(snapshot.brollBetweenTalking));
+    setChangingLocations(Boolean(snapshot.changingLocations));
     setTextModel(snapshot.textModel || 'fast');
     setCustomScript(snapshot.customScript || '');
     setAnalysis(snapshot.analysis || null);
@@ -851,6 +917,8 @@ export default function SaaShortsTab({
     scriptMode,
     scriptFormat,
     targetDurationSeconds,
+    brollBetweenTalking,
+    changingLocations,
     textModel,
     customScript: scriptMode === 'custom' ? customScript.trim() : '',
     analysis,
@@ -1016,6 +1084,8 @@ export default function SaaShortsTab({
     scriptMode,
     scriptFormat,
     targetDurationSeconds,
+    brollBetweenTalking,
+    changingLocations,
     textModel,
     customScript,
     analysis,
@@ -1274,12 +1344,14 @@ export default function SaaShortsTab({
       voiceKey: `${language}-${actorGender}`,
       ttsProvider,
       selectedActor: selectedActor || '',
+      selectedFace: selectedFace || '',
+      plateUrls,
       uploadedActorUrl: uploadedActorPreview?.serverUrl || '',
       backgroundMusic,
       clipVisionQc,
       brollImageFirst,
     });
-  }, [activeWorkspaceKey, selectedVoice, selectedVoiceName, voiceSelectionSource, ttsProvider, selectedActor, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
+  }, [activeWorkspaceKey, selectedVoice, selectedVoiceName, voiceSelectionSource, ttsProvider, selectedActor, selectedFace, plateUrls, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
 
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
@@ -1399,6 +1471,8 @@ export default function SaaShortsTab({
           style,
           language,
           actor_gender: actorGender,
+          broll_between_talking: brollBetweenTalking,
+          changing_locations: changingLocations,
           use_platform_keys: usePlatformKeys,
         }),
       });
@@ -1521,8 +1595,55 @@ export default function SaaShortsTab({
     });
   };
 
+  // Место действия — свойство сценария, а не кадра: одна комната на все
+  // говорящие кадры (`_pinned_avatar_set` на бэкенде). Раньше оно жило внутри
+  // кадра 1 и потому собирало на себя всё, что туда написали, — камеру, позу,
+  // внешность, — и всё это уезжало в плиты.
+  const updateSelectedScript = (patch) => {
+    const nextScripts = scripts.map((script, idx) => (
+      idx === selectedScript ? { ...script, ...patch } : script
+    ));
+    setScripts(nextScripts);
+    persistScripts(nextScripts);
+  };
+
   // Keep shot_number in sync with position after add / delete / reorder.
   const renumberShots = (shots) => shots.map((shot, idx) => ({ ...shot, shot_number: idx + 1 }));
+
+  // Ключ порядка `_ord`. Нужен архиву: удалённый кадр обязан вернуться туда,
+  // где стоял, при любом порядке нажатий «Вернуть». Номер для этого не годится
+  // (перенумеровывается), индекс на момент удаления — тоже: он верен только
+  // пока возвращают строго в обратном порядке. Кнопка «Вернуть» стоит у каждого
+  // кадра, и естественный порядок — сверху вниз — ровно обратный правильному:
+  // три кадра, удалённые с одной позиции, возвращались перевёрнутым блоком.
+  // Так 03.08 раскадровка собралась в другом порядке (джоб saas_c079a7dc).
+  //
+  // Ключ описывает ПОЗИЦИЮ, а не кадр: набор ключей в живом списке при
+  // перестановке не меняется, кадры едут между ними. Поэтому после любой правки
+  // ключи просто раздаются заново сверху вниз — и «вернуть на своё место»
+  // остаётся осмысленным даже после ручного переупорядочивания.
+  const withShotOrder = (shots) => {
+    const pool = shots.map((s) => s._ord).filter((v) => typeof v === 'number').sort((a, b) => a - b);
+    let taken = 0;
+    let prev = null;
+    return shots.map((shot, i) => {
+      if (typeof shot._ord === 'number') {
+        const ord = pool[taken];
+        taken += 1;
+        prev = ord;
+        return ord === shot._ord ? shot : { ...shot, _ord: ord };
+      }
+      // Кадр без ключа — новый (или пришёл из раскадровки, сделанной до этого
+      // правила). Ставим его между соседями: дробный ключ не сдвигает чужие и
+      // не сталкивается с ключом, уехавшим в архив.
+      const next = pool[taken];
+      let ord;
+      if (next === undefined) ord = prev === null ? i : prev + 1;
+      else ord = prev === null ? next - 1 : (prev + next) / 2;
+      prev = ord;
+      return { ...shot, _ord: ord };
+    });
+  };
 
   const makeBlankShot = (shots) => {
     const last = shots[shots.length - 1];
@@ -1552,9 +1673,12 @@ export default function SaaShortsTab({
     const prevArchived = (current.shots_archived || []).map((shot) => ({ ...shot }));
     const nextScripts = scripts.map((script, idx) => {
       if (idx !== selectedScript) return script;
-      const shots = resequenceShotTimeline(renumberShots(mutator([...(script.shots || [])])));
+      // Ключи порядка проставляем ДО правки: архиву нужен ключ того кадра,
+      // который сейчас удаляют, а он берётся из этого же списка.
+      const before = withShotOrder(script.shots || []);
+      const shots = resequenceShotTimeline(renumberShots(withShotOrder(mutator([...before]))));
       const archived = archiveMutator
-        ? archiveMutator([...(script.shots_archived || [])])
+        ? archiveMutator([...(script.shots_archived || [])], before)
         : (script.shots_archived || []);
       return { ...script, format: 'storyboard_v3', shots, shots_archived: archived };
     });
@@ -1603,12 +1727,13 @@ export default function SaaShortsTab({
   const removeSelectedScriptShot = (shotIndex) => {
     const shots = scripts[selectedScript]?.shots || [];
     if (shots.length <= 1) return; // keep at least one shot
-    // Позиция запоминается вместе с кадром: без неё возврат клал кадр в конец,
-    // и раскадровка, разобранная на время теста, собиралась в другом порядке.
-    const removed = { ...shots[shotIndex], _archived_at: shotIndex };
+    // Кадр уносит в архив свой ключ порядка — по нему и вернётся на место.
+    // `_archived_at` (индекс на момент удаления) больше не пишем: он врал при
+    // любом возврате, кроме строго обратного, и читается теперь только у
+    // архивов, снятых до появления ключа.
     mutateSelectedScriptShots(
       (next) => { next.splice(shotIndex, 1); return next; },
-      (archived) => [...archived, removed],
+      (archived, before) => [...archived, { ...before[shotIndex] }],
     );
   };
 
@@ -1674,6 +1799,56 @@ export default function SaaShortsTab({
     }
   };
 
+  // Подобрать место действия — отдельный текстовый запрос, fal.ai не трогается.
+  // Переподбирать можно сколько угодно, пока кадры не отрисованы: плиты рисуются
+  // по `set_prompt`, и смена места до съёмки не стоит ничего.
+  const pickReelSet = async () => {
+    const script = scripts[selectedScript];
+    if (!script) return;
+    setPickingSet(true);
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/storyboard-set'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders(),
+          ...(geminiApiKey && !isManagedKey(geminiApiKey) ? { 'X-Gemini-Key': geminiApiKey } : {}),
+        },
+        body: JSON.stringify({
+          script: {
+            title: script.title,
+            _video_topic: topic,
+            shots: (script.shots || []).map((shot) => ({
+              shot_number: shot.shot_number,
+              speech: shot.speech,
+            })),
+          },
+          language,
+          text_model: textModel,
+          use_platform_keys: usePlatformKeys,
+        }),
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось подобрать место';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { /* оставим дефолт */ }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      // Подобранное, а не выбранное: комнату по-прежнему держит фото ведущего,
+      // пока человек не впишет своё место руками.
+      updateSelectedScript({
+        set_scene: data.set_scene || '',
+        set_prompt: data.set_prompt || '',
+        set_source: 'ai',
+      });
+    } catch (e) {
+      setFillError(e.message || 'Не удалось подобрать место');
+      setTimeout(() => setFillError(''), 6000);
+    } finally {
+      setPickingSet(false);
+    }
+  };
+
   const addShotWithSpeech = async (speech) => {
     const shotNumber = (scripts[selectedScript]?.shots || []).length + 1;
     const nextScripts = mutateSelectedScriptShots(
@@ -1686,7 +1861,15 @@ export default function SaaShortsTab({
   // удалении, поэтому возврат с конца архива это точная отмена удалений: порядок
   // кадров совпадает с исходным, даже если удаляли вразнобой. Старые записи без
   // индекса уходят в конец, как раньше.
+  // Куда вернуть кадр: перед первым живым кадром, чей ключ порядка больше. Это
+  // не зависит от того, сколько кадров вернули до него и в каком порядке.
   const archivedShotSlot = (shot, shots) => {
+    if (typeof shot?._ord === 'number') {
+      const at = shots.findIndex((s) => typeof s._ord === 'number' && s._ord > shot._ord);
+      return at === -1 ? shots.length : at;
+    }
+    // Архив, снятый до появления ключа: остаётся старый индекс. Он верен только
+    // при «Вернуть все» (там возврат идёт с конца), но лучше, чем ничего.
     const at = Number.isInteger(shot?._archived_at) ? shot._archived_at : shots.length;
     return Math.max(0, Math.min(at, shots.length));
   };
@@ -1710,9 +1893,9 @@ export default function SaaShortsTab({
     );
   };
 
-  // Собрать раскадровку обратно одним нажатием. Возвращаем с конца архива:
-  // каждое восстановление отменяет своё удаление, поэтому кадры встают ровно
-  // туда, где стояли, — что и нужно после теста «отрендерить один кадр».
+  // Собрать раскадровку обратно одним нажатием. Идём с конца архива: кадрам с
+  // ключом порядка направление безразлично, а вот у архивов, снятых до него,
+  // сохранённый индекс верен только при возврате в обратном порядке.
   const restoreAllArchivedShots = () => {
     const archived = scripts[selectedScript]?.shots_archived || [];
     if (!archived.length) return;
@@ -1748,7 +1931,9 @@ export default function SaaShortsTab({
       const original = shots[shotIndex];
       if (!original) return shots;
       // Deep-ish copy; the generated-frame status is per-run, so drop it.
-      const { frame_status, ...rest } = original;
+      // Ключ порядка тоже: копия — отдельный кадр, ей нужен свой, иначе архив
+      // не отличит её от оригинала.
+      const { frame_status, _ord, ...rest } = original;
       shots.splice(shotIndex + 1, 0, { ...rest });
       return shots;
     });
@@ -1854,6 +2039,8 @@ export default function SaaShortsTab({
           language,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
+          selected_face_url: selectedFace || undefined,
+          plate_urls: plateUrls,
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
@@ -1976,6 +2163,8 @@ export default function SaaShortsTab({
           language,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
+          selected_face_url: selectedFace || undefined,
+          plate_urls: plateUrls,
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
@@ -2080,6 +2269,8 @@ export default function SaaShortsTab({
           language,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
+          selected_face_url: selectedFace || undefined,
+          plate_urls: plateUrls,
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
@@ -2166,6 +2357,8 @@ export default function SaaShortsTab({
           language,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
+          selected_face_url: selectedFace || undefined,
+          plate_urls: plateUrls,
           retry_job_id: jobId,
           video_mode: videoMode,
           broll_mode: storyboardSelected ? 'off' : brollMode,
@@ -2360,6 +2553,74 @@ export default function SaaShortsTab({
     }
   };
 
+  // Портрет едет тем же маршрутом, что и аватар: одна ручка загрузки, одно
+  // хранилище. Разное у них только назначение — этот кадр уходит источником
+  // лица в постановочные кадры говорящих шотов.
+  const handleFaceUpload = async (file) => {
+    if (!file) return;
+    setUploadingFace(true);
+    setFaceUploadStatus('Загружаю портрет...');
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/actor-upload'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось загрузить портрет';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      if (data.url) {
+        setSelectedFace(data.url);
+        setFaceUploadStatus('Портрет выбран источником лица.');
+      }
+    } catch (err) {
+      console.error('Face upload failed:', err);
+      setFaceUploadStatus(err.message || 'Не удалось загрузить портрет');
+    } finally {
+      setUploadingFace(false);
+    }
+  };
+
+  // Плита ракурса, принесённая руками. Ходит в тот же эндпоинт, что и кадры
+  // шотов, но с именем камеры: тогда картинка становится общей для всех
+  // говорящих кадров этого ракурса и не рисуется вовсе.
+  const handlePlateUpload = async (camera, file) => {
+    if (!file) return;
+    setUploadingPlate(camera);
+    setPlateUploadStatus('Загружаю ракурс...');
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('camera', camera);
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/storyboard-frame-upload'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: formData,
+      });
+      if (!res.ok) {
+        let msg = 'Не удалось загрузить ракурс';
+        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      const url = data.image_url || data.url;
+      if (url) {
+        setPlateUrls((prev) => ({ ...prev, [camera]: url }));
+        setPlateUploadStatus('Ракурс загружен — рисоваться он не будет.');
+      }
+    } catch (err) {
+      console.error('Plate upload failed:', err);
+      setPlateUploadStatus(err.message || 'Не удалось загрузить ракурс');
+    } finally {
+      setUploadingPlate('');
+    }
+  };
+
   const handleCopy = (text, label) => {
     navigator.clipboard.writeText(text);
     setCopied(label);
@@ -2470,6 +2731,48 @@ export default function SaaShortsTab({
   const AVATAR_FRAMING_COUNT = 2;
   const isBrollShot = (shot) => (shot?.visual_type || '')
     .toLowerCase().replace(/[-_]/g, '').includes('broll');
+
+  // Какой ракурс достанется говорящему кадру. Та же очередь, что на бэкенде
+  // (`_avatar_framing_for_shot`): шёпот всегда доверительный, остальные по кругу.
+  // Показываем это в карточке, потому что раньше про ракурс писала сценарная
+  // модель — в текст, который снимающий код не читает. Камеры отличаются точкой
+  // съёмки, а не крупностью: дистанция у всех одна, иначе склейка читается
+  // наездом, а не сменой камеры.
+  const CAMERA_LABELS = {
+    front: 'прямо в камеру',
+    side: 'вполоборота, сбоку',
+    hush: 'доверительный, снизу',
+  };
+  const isWhisperShot = (shot) => /\[(whispers?|whispering)\]/i.test(shot?.speech || '');
+  const talkingCameras = (() => {
+    const byIndex = {};
+    let order = 0;
+    (currentScript?.shots || []).forEach((shot, index) => {
+      if (isBrollShot(shot)) return;
+      byIndex[index] = isWhisperShot(shot)
+        ? 'hush'
+        : (order % 2 === 0 ? 'front' : 'side');
+      order += 1;
+    });
+    return byIndex;
+  })();
+  // Кадр, который задаёт место действия всем говорящим: его описание бэкенд
+  // закрепляет за ролик целиком (`_pinned_avatar_set`), у остальных читает
+  // только действие.
+  const setDefiningShotIndex = (currentScript?.shots || [])
+    .findIndex((shot) => !isBrollShot(shot));
+  // У сценариев, снятых после разделения запросов, место лежит в своём поле, и
+  // кадр 1 перестаёт быть «тем самым». У старых поля нет — там работает прежняя
+  // схема, и подписи обязаны говорить правду про обе.
+  const hasOwnSet = Boolean((currentScript?.set_prompt || '').trim());
+  // Место, вписанное руками, перебивает комнату с фото ведущего; подобранное
+  // ИИ — нет: та модель фото не видела и описывает комнату наугад.
+  const setChosenByUser = hasOwnSet && currentScript?.set_source === 'user';
+  // Мест может быть несколько — опция «менять локации». Первое всегда лежит и в
+  // `set_scene`, поэтому редактируемое поле остаётся одним и тем же.
+  const reelLocations = Array.isArray(currentScript?.set_scenes)
+    ? currentScript.set_scenes.filter((place) => (place || '').trim())
+    : [];
   const billableFrameCount = (() => {
     const missing = (currentScript?.shots || []).filter((shot) => !shotHasFrame(shot));
     const talking = missing.filter((shot) => !isBrollShot(shot)).length;
@@ -2603,6 +2906,34 @@ export default function SaaShortsTab({
       || selectedVoice
       || 'по умолчанию');
 
+  // Насколько сценарий разошёлся с выбранным хронометражом. Допуск тот же, что
+  // на бэкенде (`_TARGET_DURATION_TOLERANCE`). Считаем по той же оценке, что
+  // показана рядом, и на каждой правке кадров: выбрать 15 секунд и получить 24
+  // молча — это то, о чём человек узнавал уже по готовому ролику.
+  const storyboardSeconds = scripts[selectedScript]
+    ? estimateStoryboardSeconds(scripts[selectedScript], '')
+    : 0;
+  const durationGap = storyboardSeconds && targetDurationSeconds
+    && Math.abs(storyboardSeconds - targetDurationSeconds) > 2
+    ? storyboardSeconds - targetDurationSeconds
+    : 0;
+
+  // Шаг открывается только когда его есть чем отрисовать — те же условия, что
+  // у блоков ниже, иначе переход даёт пустой экран. Отсюда же берётся «вперёд»:
+  // уйдя с готового ролика назад в настройку, вернуться к нему было нельзя,
+  // хотя и логи, и результат лежат в снапшоте.
+  const stepReady = [
+    true,
+    Boolean(analysis),
+    Boolean(scripts[selectedScript]),
+    Boolean(jobId),
+    Boolean(genResult),
+  ];
+  // Ближайший доступный шаг, а не step±1: пропущенный шаг (сценарий импортирован
+  // без анализа, ролик открыт из галереи без логов) не должен упирать стрелку.
+  const previousReadyStep = [...stepReady.keys()].filter((i) => i < step && stepReady[i]).pop();
+  const nextReadyStep = [...stepReady.keys()].find((i) => i > step && stepReady[i]);
+
   // ─── Render Steps ─────────────────────────────────────────────────
 
   return (
@@ -2630,27 +2961,55 @@ export default function SaaShortsTab({
           )}
         </div>
 
-        {/* Progress Steps */}
+        {/* Progress Steps — сама полоска и есть навигация: шаг с данными
+            открывается кликом, стрелки ходят по доступным шагам в обе стороны. */}
         <div className="flex items-center gap-2 mb-8">
+          <button
+            type="button"
+            onClick={() => setStep(previousReadyStep)}
+            disabled={previousReadyStep === undefined}
+            title="Назад"
+            aria-label="Назад"
+            className="shrink-0 w-7 h-7 rounded-full bg-white/5 text-zinc-400 flex items-center justify-center transition-colors enabled:hover:bg-white/10 enabled:hover:text-white disabled:opacity-25"
+          >
+            <ChevronLeft size={14} />
+          </button>
           {['Setup', 'Analysis', 'Configure', 'Generate', 'Result'].map((label, i) => (
             <React.Fragment key={i}>
               {i > 0 && <div className={`flex-1 h-px ${i <= step ? 'bg-violet-500' : 'bg-white/10'}`} />}
-              <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
-                i === step ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' :
-                i < step ? 'bg-violet-500/10 text-violet-400' :
-                'bg-white/5 text-zinc-600'
-              }`}>
+              <button
+                type="button"
+                onClick={() => setStep(i)}
+                disabled={!stepReady[i] || i === step}
+                title={stepReady[i] ? label : `${label} — пока нечего показать`}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
+                  i === step ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' :
+                  stepReady[i] ? 'bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 hover:text-violet-300' :
+                  'bg-white/5 text-zinc-600 cursor-not-allowed'
+                }`}
+              >
                 <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
                   i < step ? 'bg-violet-500 text-white' :
                   i === step ? 'bg-violet-500/30 text-violet-300' :
+                  stepReady[i] ? 'bg-violet-500/20 text-violet-300' :
                   'bg-white/10 text-zinc-600'
                 }`}>
                   {i < step ? <Check size={10} /> : i + 1}
                 </span>
                 <span className="hidden sm:inline">{label}</span>
-              </div>
+              </button>
             </React.Fragment>
           ))}
+          <button
+            type="button"
+            onClick={() => setStep(nextReadyStep)}
+            disabled={nextReadyStep === undefined}
+            title="Вперёд"
+            aria-label="Вперёд"
+            className="shrink-0 w-7 h-7 rounded-full bg-white/5 text-zinc-400 flex items-center justify-center transition-colors enabled:hover:bg-white/10 enabled:hover:text-white disabled:opacity-25"
+          >
+            <ChevronRight size={14} />
+          </button>
         </div>
 
         {/* ── Step 0: URL Input ────────────────────────────────── */}
@@ -2884,7 +3243,18 @@ export default function SaaShortsTab({
                   <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-black/20 p-2.5">
                     <div className="h-12 w-9 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
                       {selectedActorPreviewUrl ? (
-                        <img src={selectedActorPreviewUrl} alt="Выбранный аватар" className="h-full w-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => setLightbox({
+                            src: selectedActorPreviewUrl,
+                            alt: 'Выбранный аватар',
+                            caption: 'Аватар — источник причёски, фигуры и одежды',
+                          })}
+                          title="Открыть аватар на весь экран"
+                          className="h-full w-full cursor-zoom-in"
+                        >
+                          <img src={selectedActorPreviewUrl} alt="Выбранный аватар" className="h-full w-full object-cover" />
+                        </button>
                       ) : (
                         <div className="flex h-full w-full items-center justify-center text-zinc-700">
                           <User size={14} />
@@ -3036,6 +3406,160 @@ export default function SaaShortsTab({
                     {actorUploadStatus && (
                       <p className={`text-[10px] ${/не удалось|fail/i.test(actorUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
                         {actorUploadStatus}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Портрет крупно — отдельно от аватара. На общем плане лицо
+                      занимает проценты кадра, и генератор дорисовывает черты
+                      сам: отсюда «человек меняется» между дублями. */}
+                  <div className="mt-4 space-y-2 rounded-xl border border-white/10 bg-black/20 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-xs font-semibold text-zinc-300">Портрет крупно (источник лица)</p>
+                      {selectedFace && (
+                        <button
+                          type="button"
+                          onClick={() => { setSelectedFace(null); setFaceUploadStatus(''); }}
+                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                        >
+                          Убрать
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-zinc-500">
+                      Необязательно. Лицо берётся отсюда, а причёска, фигура и одежда — с аватара выше.
+                      Нужен один человек, вертикальный кадр по грудь, лицо крупно и в резкости.
+                    </p>
+                    <div className="flex items-center gap-3">
+                      <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                        {selectedFace ? (
+                          <button
+                            type="button"
+                            onClick={() => setLightbox({
+                              src: getApiUrl(selectedFace),
+                              alt: 'Портрет ведущего',
+                              caption: 'Портрет — источник лица',
+                            })}
+                            title="Открыть портрет на весь экран"
+                            className="h-full w-full cursor-zoom-in"
+                          >
+                            <img src={getApiUrl(selectedFace)} alt="Портрет ведущего" className="h-full w-full object-cover" />
+                          </button>
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                            <User size={14} />
+                          </div>
+                        )}
+                      </div>
+                      <label className="cursor-pointer rounded-lg border border-dashed border-white/15 px-3 py-2 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200">
+                        {uploadingFace ? (
+                          <span className="flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Загружаю...</span>
+                        ) : (
+                          <span className="flex items-center gap-1"><Upload size={12} /> {selectedFace ? 'Заменить портрет' : 'Загрузить портрет'}</span>
+                        )}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            await handleFaceUpload(file);
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                    </div>
+                    {faceUploadStatus && (
+                      <p className={`text-[10px] ${/не удалось|fail/i.test(faceUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                        {faceUploadStatus}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Свои ракурсы. Всё, что загружено сюда, не рисуется: ни
+                      одного платного вызова на постановку, и лицо ровно то,
+                      которое человек выбрал, — генератор его не пересочиняет. */}
+                  <div className="mt-4 space-y-2 rounded-xl border border-white/10 bg-black/20 p-3">
+                    <p className="text-xs font-semibold text-zinc-300">Свои ракурсы ведущего</p>
+                    <p className="text-[11px] leading-relaxed text-zinc-500">
+                      Необязательно. Загруженный ракурс становится общим для всех говорящих
+                      кадров этой камеры и не генерируется — это ноль платных кадров на
+                      постановку. Шёпотные кадры берут фронтальный.
+                    </p>
+                    <div className="grid grid-cols-2 gap-3">
+                      {[
+                        { key: 'front', label: 'Фронт' },
+                        { key: 'side', label: 'Вполоборота' },
+                      ].map((slot) => (
+                        <div key={slot.key} className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-medium text-zinc-400">{slot.label}</span>
+                            {plateUrls[slot.key] && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setPlateUrls((prev) => {
+                                    const next = { ...prev };
+                                    delete next[slot.key];
+                                    return next;
+                                  });
+                                  setPlateUploadStatus('');
+                                }}
+                                className="text-[10px] text-zinc-500 hover:text-zinc-200"
+                              >
+                                Убрать
+                              </button>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="h-16 w-9 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                              {plateUrls[slot.key] ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setLightbox({
+                                    src: getApiUrl(plateUrls[slot.key]),
+                                    alt: `Ракурс «${slot.label}»`,
+                                    caption: `Ракурс «${slot.label}» — загружен вручную`,
+                                  })}
+                                  title="Открыть на весь экран"
+                                  className="h-full w-full cursor-zoom-in"
+                                >
+                                  <img
+                                    src={getApiUrl(plateUrls[slot.key])}
+                                    alt={`Ракурс «${slot.label}»`}
+                                    className="h-full w-full object-cover"
+                                  />
+                                </button>
+                              ) : (
+                                <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                                  <User size={14} />
+                                </div>
+                              )}
+                            </div>
+                            <label className="cursor-pointer rounded-lg border border-dashed border-white/15 px-2 py-1.5 text-[10px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200">
+                              {uploadingPlate === slot.key ? (
+                                <span className="flex items-center gap-1"><Loader2 size={11} className="animate-spin" /> Загружаю...</span>
+                              ) : (
+                                <span className="flex items-center gap-1"><Upload size={11} /> {plateUrls[slot.key] ? 'Заменить' : 'Загрузить'}</span>
+                              )}
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={async (e) => {
+                                  const file = e.target.files?.[0];
+                                  await handlePlateUpload(slot.key, file);
+                                  e.target.value = '';
+                                }}
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    {plateUploadStatus && (
+                      <p className={`text-[10px] ${/не удалось|fail/i.test(plateUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                        {plateUploadStatus}
                       </p>
                     )}
                   </div>
@@ -3380,6 +3904,61 @@ export default function SaaShortsTab({
                   })}
                 </div>
               </div>
+
+              {/* Ритм перебивок. Умолчание — редкая перебивка: она стоит целый
+                  клип и тарифицируется от трёх секунд, поэтому чередование
+                  заметно поднимает смету. Опция для тех, кому важнее монтаж. */}
+              {scriptFormat === 'storyboard_v3' && (
+                <div data-section="broll-rhythm-section">
+                  <label className="flex cursor-pointer items-start gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={brollBetweenTalking}
+                      onChange={(event) => setBrollBetweenTalking(event.target.checked)}
+                      disabled={scriptMode === 'custom'}
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-zinc-300">
+                        Перебивка между кадрами с ведущим
+                      </span>
+                      <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">
+                        Два говорящих кадра подряд не ставятся — между ними всегда вставка.
+                        Ролик монтажнее, но дороже: перебивка это отдельный клип, и короче трёх
+                        секунд он не тарифицируется.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              {/* Смена локаций. Умолчание — одно место на ролик: так он читается
+                  как одна съёмка и стоит две плиты. Каждая новая комната — своя
+                  плита на каждую снимающую в ней камеру, поэтому опция. */}
+              {scriptFormat === 'storyboard_v3' && (
+                <div data-section="changing-locations-section">
+                  <label className="flex cursor-pointer items-start gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={changingLocations}
+                      onChange={(event) => setChangingLocations(event.target.checked)}
+                      disabled={scriptMode === 'custom'}
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-zinc-300">
+                        Менять локации по ходу ролика
+                      </span>
+                      <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">
+                        ИИ подбирает до трёх мест и меняет их каждые три говорящих кадра —
+                        другой угол той же квартиры или другое место, как ляжет по тексту.
+                        Дороже: каждая комната это свои постановочные кадры. Комнату с фото
+                        ведущего при этом заменяет выдуманная.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
 
               <div>
                 <div className="flex items-center justify-between gap-3 mb-2">
@@ -3747,6 +4326,19 @@ export default function SaaShortsTab({
                         Ролик собирается по кадрам. Для каждого укажи, что в кадре и что человек говорит.
                         Кадры можно добавлять, дублировать, удалять и перетаскивать за уголок <GripVertical size={11} className="inline align-[-1px] text-zinc-500" />, чтобы поменять порядок.
                       </p>
+                      {/* Одно место на все говорящие кадры и своя очередь камер —
+                          иначе непонятно, почему описание «другой ракурс» ничего
+                          не меняет, а фон вдруг остаётся прежним. */}
+                      {setDefiningShotIndex >= 0 && (
+                        <p className="text-[11px] text-zinc-500 mt-1 max-w-xl">
+                          {reelLocations.length > 1
+                            ? `Место меняется по ходу ролика: ${reelLocations.length} локации, каждые три говорящих кадра.`
+                            : <>Все говорящие кадры сняты в одном месте — {hasOwnSet
+                              ? 'оно в поле «Место действия ролика» ниже'
+                              : `его задаёт кадр ${setDefiningShotIndex + 1}`}.</>}
+                          {' '}Между ними чередуются камеры, поэтому ракурс в описании кадра указывать не нужно.
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
                       {shotHistory.some((entry) => entry.scriptIndex === selectedScript) && (
@@ -3766,8 +4358,17 @@ export default function SaaShortsTab({
                         className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400"
                         title="≈ длина озвучки. По ней собирается ролик — видео не длиннее речи, лишние кадры не оплачиваются."
                       >
-                        ~{estimateStoryboardSeconds(scripts[selectedScript], '')} сек
+                        ~{storyboardSeconds} сек
                       </span>
+                      {durationGap !== 0 && (
+                        <span
+                          className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200"
+                          title={`Хронометраж выбран на первом шаге: ~${targetDurationSeconds} сек. Длину ролика задаёт озвучка, так что лишний текст — это лишние секунды и лишние оплаченные кадры. Уберите или сократите реплики, либо смените цель.`}
+                        >
+                          {durationGap > 0 ? 'длиннее' : 'короче'} цели
+                          на {Math.abs(durationGap)} сек
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -3831,6 +4432,65 @@ export default function SaaShortsTab({
                   {fillError && (
                     <p className="text-[11px] text-red-300">{fillError}</p>
                   )}
+
+                  {/* Место действия — одно на весь ролик и своё поле. Пока оно
+                      жило внутри кадра 1, в плиты вместе с комнатой уезжало всё,
+                      что там оказалось: «static camera» — и обе камеры выходили
+                      одним анфасом, «a beautiful woman» — и редактор рисовал своё
+                      лицо вместо выбранного. */}
+                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[12px] font-semibold text-zinc-200">
+                        Место действия ролика
+                      </span>
+                      <button
+                        type="button"
+                        onClick={pickReelSet}
+                        disabled={pickingSet}
+                        className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200 disabled:opacity-50"
+                        title="Подобрать место по тексту ролика (Gemini, бесплатно)"
+                      >
+                        {pickingSet
+                          ? (<><Loader2 size={11} className="animate-spin" /> Подбираю…</>)
+                          : (<><Sparkles size={11} /> Подобрать ИИ</>)}
+                      </button>
+                    </div>
+                    <textarea
+                      className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+                      value={currentScript?.set_scene || ''}
+                      onChange={(event) => updateSelectedScript({
+                        set_scene: event.target.value,
+                        set_prompt: event.target.value,
+                        set_source: 'user',
+                      })}
+                      placeholder="Комната, свет, поверхности, что на них стоит — здесь снят весь ролик"
+                    />
+                    {/* Что сейчас в силе — видно, а не угадывается. Описание,
+                        подобранное ИИ, фото ведущего не видело: там уже снята
+                        своя комната, и текст её перекрашивал (светлая дневная
+                        кухня уезжала в вечернюю). Поэтому текст вступает в дело
+                        только когда место вписал человек. */}
+                    {reelLocations.length > 1 && (
+                      <ul className="space-y-0.5 text-[10px] leading-snug text-zinc-500">
+                        {reelLocations.map((place, index) => (
+                          <li key={`${index}-${place.slice(0, 12)}`}>
+                            <span className="text-zinc-400">Локация {index + 1}:</span> {place}
+                            {index === 0 ? ' (её и правит поле выше)' : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    <p className="text-[10px] leading-snug text-zinc-500">
+                      {reelLocations.length > 1
+                        ? 'Локации меняются по ходу ролика — каждая снимается своими постановочными кадрами.'
+                        : setChosenByUser
+                          ? 'Снимаем в этом месте — текст перебивает комнату с фото ведущего.'
+                          : 'Сейчас комната берётся с фото ведущего — та же, что за спиной на портрете. Впиши своё место, если нужна другая.'}
+                      {' '}Только место: людей, ракурс и внешность сюда писать не нужно — человека
+                      ставит приложение, камеры чередует само. Пока кадры не отрисованы,
+                      переподбор ничего не стоит.
+                    </p>
+                  </div>
 
                   {/* Озвучка идёт первой: её длина — это длина ролика, её паузы —
                       границы кадров, а длинная реплика режется на несколько
@@ -3982,7 +4642,14 @@ export default function SaaShortsTab({
                       const shotNumber = shot.shot_number ?? (shotIndex + 1);
                       const markedForReshoot = reshootShots.includes(shotNumber);
                       const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
-                      const isBroll = (shot.visual_type || '').toLowerCase().replace(/[-_]/g, '').includes('broll');
+                      const isBroll = isBrollShot(shot);
+                      // Сколько экрана достанется кадру и сколько мы за него
+                      // заплатим. Расходятся они у коротких реплик: клип короче
+                      // пола модель не отдаёт, а счёт выставляет по отданному.
+                      const plannedSeconds = shotPlannedSeconds(scripts[selectedScript], shot, storyboardSeconds);
+                      const clipFloorSeconds = shotClipFloorSeconds(shot);
+                      const shotIsShorterThanItsClip = plannedSeconds > 0
+                        && plannedSeconds < clipFloorSeconds - 0.05;
 
                       return (
                         <div
@@ -4091,7 +4758,24 @@ export default function SaaShortsTab({
                             <div className="flex gap-2 sm:block">
                               <div className="aspect-[9/16] w-[104px] shrink-0 overflow-hidden rounded-lg border border-white/10 bg-zinc-950 sm:mb-2 sm:w-full">
                                 {previewUrl ? (
-                                  <img src={previewUrl} alt={`Кадр ${shotIndex + 1}`} className="h-full w-full object-cover" />
+                                  // Кнопка, а не картинка с onClick: кадр открывается
+                                  // и с клавиатуры, и читалка называет его вслух.
+                                  <button
+                                    type="button"
+                                    onClick={() => setLightbox({
+                                      src: previewUrl,
+                                      alt: `Кадр ${shotIndex + 1}`,
+                                      caption: `Кадр ${shotIndex + 1} — нажми на фон или Esc, чтобы закрыть`,
+                                    })}
+                                    title="Открыть кадр на весь экран"
+                                    className="group h-full w-full cursor-zoom-in"
+                                  >
+                                    <img
+                                      src={previewUrl}
+                                      alt={`Кадр ${shotIndex + 1}`}
+                                      className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.03]"
+                                    />
+                                  </button>
                                 ) : (
                                   <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-[10px] text-zinc-600">
                                     <Upload size={18} />
@@ -4184,10 +4868,28 @@ export default function SaaShortsTab({
                                     Перебивка
                                   </button>
                                 </div>
+                                {/* Ракурс — решение сборки, а не текста: она
+                                    чередует камеры одного сета. Раньше это было
+                                    невидимо, и человек просил крупный план в
+                                    описании, где его никто не читает. */}
+                                {!isBroll && talkingCameras[shotIndex] && (
+                                  <span
+                                    className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400"
+                                    title="Ракурс чередуется автоматически между говорящими кадрами, чтобы соседние склейки не читались как сбой. В описании кадра его задать нельзя."
+                                  >
+                                    Камера: {CAMERA_LABELS[talkingCameras[shotIndex]]}
+                                  </span>
+                                )}
                               </div>
                               <label className="space-y-1.5 text-xs text-zinc-400 block">
                                 <div className="flex items-center justify-between gap-2">
-                                  <span>Что в кадре</span>
+                                  <span>
+                                    {isBroll
+                                      ? 'Что в кадре'
+                                      : (shotIndex === setDefiningShotIndex && !hasOwnSet
+                                        ? 'Что в кадре — место действия всего ролика'
+                                        : 'Что делает')}
+                                  </span>
                                   {/* Пустая сцена = случайная картинка: промпт для
                                       видео-модели строится именно отсюда. */}
                                   <button
@@ -4206,8 +4908,28 @@ export default function SaaShortsTab({
                                   className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
                                   value={shot.scene || ''}
                                   onChange={(event) => handleSelectedScriptShot(shotIndex, 'scene', event.target.value)}
-                                  placeholder="Опиши, что видно в кадре"
+                                  placeholder={isBroll
+                                    ? 'Опиши, что видно в кадре'
+                                    : (shotIndex === setDefiningShotIndex && !hasOwnSet
+                                      ? 'Комната, свет, что в руках — это место остаётся до конца ролика'
+                                      : 'Поза, взгляд, что делают руки')}
                                 />
+                                {/* Место и камеру у говорящих кадров задаём не
+                                    словами: комната одна на весь ролик, ракурсы
+                                    чередует сборка. Без этой строчки поле снова
+                                    заполняли текстом вида «ракурс чуть сменился»,
+                                    которого в картинке никогда не будет. */}
+                                {!isBroll && (hasOwnSet || shotIndex !== setDefiningShotIndex) && (
+                                  <p className="text-[10px] leading-snug text-zinc-500">
+                                    {setChosenByUser
+                                      ? 'Место — из поля «Место действия ролика» выше'
+                                      : (hasOwnSet
+                                        ? 'Место — с фото ведущего, одно на весь ролик'
+                                        : `Место то же, что в кадре ${setDefiningShotIndex + 1}`)}
+                                    {' '}— новую комнату или ракурс отсюда не заказать.
+                                    Пиши, что меняется в самом человеке.
+                                  </p>
+                                )}
                               </label>
                               <label className="space-y-1.5 text-xs text-zinc-400 block">
                                 <span>{isBroll ? 'Текст за кадром (озвучка)' : 'Что говорит'}</span>
@@ -4217,6 +4939,19 @@ export default function SaaShortsTab({
                                   onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
                                   placeholder={isBroll ? 'Что звучит голосом, пока показываем вставку (можно оставить пустым)' : 'Реплика для этого кадра'}
                                 />
+                                {/* Реплика короче пола клипа — единственное место,
+                                    где счёт растёт молча: на экране кадр мелькнёт,
+                                    а модель снимет и посчитает свой минимум. Видно
+                                    это должно быть здесь, до оплаты, а не в отчёте
+                                    после. Сборка потом дотянет кадр соседней
+                                    тишиной, но занимать её не всегда есть у кого. */}
+                                {shotIsShorterThanItsClip && (
+                                  <p className="text-[10px] leading-snug text-amber-400/80">
+                                    Коротко: {plannedSeconds.toFixed(1)} с речи при клипе от{' '}
+                                    {clipFloorSeconds.toFixed(1)} с — платим за полный.
+                                    Добавь слов или слей с соседним кадром.
+                                  </p>
+                                )}
                               </label>
                               {/* Записанная реплика: послушать именно её, увидеть
                                   её длину (её задаёт голос, а не поле «секунды»)
@@ -5004,34 +5739,42 @@ export default function SaaShortsTab({
                       if (i === 2) return logStr.includes('[4/6]') && !logStr.includes('[5/6]') && !logStr.includes('[6/6]');
                       return (logStr.includes('[5/6]') || logStr.includes('[6/6]')) && genStatus !== 'completed';
                     };
-                    const stepDone = isLipSyncJob
-                      ? (
-                        i === 0 ? logStr.includes('[lipsync 1/3]') || logStr.includes('[lipsync 2/3]') :
-                        i === 1 ? logStr.includes('[lipsync 2/3]') || logStr.includes('[lipsync 3/3]') :
-                        i === 2 ? logStr.includes('[lipsync 3/3]') || genStatus === 'completed' :
-                        genStatus === 'completed'
-                      )
-                      : isStoryboardJob
+                    // Тот же порядок, что у `labels` выше, и это не вкусовщина.
+                    // Раскадровка пишет построчно «создаю новое lip-sync видео
+                    // Kling Avatar», от этого `isLipSyncJob` истинно и у неё —
+                    // и когда состояние спрашивали про липсинк раньше, чем про
+                    // раскадровку, оно искало маркеры `[lipsync N/3]`, которых
+                    // раскадровочная задача не печатает никогда. Подписи брались
+                    // от раскадровки, галочки от липсинка, и кружки не
+                    // заполнялись до самого конца.
+                    const stepDone = isStoryboardJob
                       ? (
                         i === 0 ? logStr.includes('[2/5]') || logStr.includes('[3/5]') :
                         i === 1 ? logStr.includes('[3/5]') || logStr.includes('[4/5]') || genStatus === 'completed' :
                         i === 2 ? logStr.includes('[4/5]') || genStatus === 'completed' :
                         genStatus === 'completed'
                       )
-                      : normalStepDone();
-                    const stepActive = isLipSyncJob
+                      : isLipSyncJob
                       ? (
-                        i === 0 ? logStr.includes('post-process started') && !stepDone :
-                        i === 1 ? logStr.includes('[lipsync 1/3]') && !logStr.includes('[lipsync 2/3]') :
-                        i === 2 ? logStr.includes('[lipsync 2/3]') && !logStr.includes('[lipsync 3/3]') :
-                        logStr.includes('[lipsync 3/3]') && genStatus !== 'completed'
+                        i === 0 ? logStr.includes('[lipsync 1/3]') || logStr.includes('[lipsync 2/3]') :
+                        i === 1 ? logStr.includes('[lipsync 2/3]') || logStr.includes('[lipsync 3/3]') :
+                        i === 2 ? logStr.includes('[lipsync 3/3]') || genStatus === 'completed' :
+                        genStatus === 'completed'
                       )
-                      : isStoryboardJob
+                      : normalStepDone();
+                    const stepActive = isStoryboardJob
                       ? (
                         i === 0 ? logStr.includes('[1/5]') && !stepDone :
                         i === 1 ? logStr.includes('[2/5]') && !stepDone :
                         i === 2 ? logStr.includes('[3/5]') && !stepDone :
                         logStr.includes('[4/5]') && genStatus !== 'completed'
+                      )
+                      : isLipSyncJob
+                      ? (
+                        i === 0 ? logStr.includes('post-process started') && !stepDone :
+                        i === 1 ? logStr.includes('[lipsync 1/3]') && !logStr.includes('[lipsync 2/3]') :
+                        i === 2 ? logStr.includes('[lipsync 2/3]') && !logStr.includes('[lipsync 3/3]') :
+                        logStr.includes('[lipsync 3/3]') && genStatus !== 'completed'
                       )
                       : normalStepActive();
 
@@ -5441,6 +6184,15 @@ export default function SaaShortsTab({
           setFrameBlock(null);
           handleGenerateFrames(retryShot, modelId);
         }}
+      />
+
+      {/* Кадр во весь экран. Живёт на уровне вкладки, а не внутри карточки шота:
+          из карточки он был бы прижат её overflow и вылезал бы поверх соседей. */}
+      <ImageLightbox
+        src={lightbox?.src || ''}
+        alt={lightbox?.alt || ''}
+        caption={lightbox?.caption || ''}
+        onClose={() => setLightbox(null)}
       />
     </div>
   );
