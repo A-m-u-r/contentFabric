@@ -63,6 +63,16 @@ GEMINI_FALLBACK_MODELS = [
 ]
 GEMINI_PRO_MODEL = os.environ.get("GEMINI_PRO_MODEL", "gemini-3.1-pro-preview")
 GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "2"))
+FAL_TEXT_ENDPOINT = os.environ.get("FAL_TEXT_ENDPOINT", "openrouter/router")
+FAL_GEMINI_PRO_MODEL = os.environ.get(
+    "FAL_GEMINI_PRO_MODEL", "google/gemini-3.1-pro-preview"
+)
+FAL_GEMINI_FLASH_MODEL = os.environ.get(
+    "FAL_GEMINI_FLASH_MODEL", "google/gemini-3-flash-preview"
+)
+FAL_GEMINI_FAST_FALLBACK_MODEL = os.environ.get(
+    "FAL_GEMINI_FAST_FALLBACK_MODEL", "google/gemini-2.5-flash"
+)
 
 GEMINI_FAST_TEXT_MODEL_KEYS = {"fast", "flash", "default"}
 GEMINI_PRO_TEXT_MODEL_KEYS = {"pro", "quality", "power"}
@@ -70,6 +80,17 @@ GEMINI_PRO_TEXT_MODEL_KEYS = {"pro", "quality", "power"}
 
 class GeminiTemporaryError(Exception):
     """Raised when Gemini is temporarily unavailable after retry/fallback attempts."""
+
+
+class FalTextResponse:
+    """Small compatibility adapter for fal.ai text output."""
+
+    def __init__(self, text: str, *, usage: Optional[dict] = None, request_meta: Optional[dict] = None):
+        self.text = text
+        self.usage = usage or {}
+        self.request_meta = request_meta or {}
+        self.paid_provider = True
+        self.candidates = []
 
 
 def resolve_gemini_text_model(text_model: Optional[str] = None) -> str:
@@ -82,6 +103,18 @@ def resolve_gemini_text_model(text_model: Optional[str] = None) -> str:
     if key.startswith("gemini-"):
         return key
     return GEMINI_MODEL
+
+
+def fal_gemini_text_model_chain(text_model: Optional[str] = None) -> list:
+    """Map SaaS Shorts text presets to paid Google models served through fal.ai."""
+    key = (text_model or "fast").strip().lower()
+    if key in GEMINI_PRO_TEXT_MODEL_KEYS:
+        models = [FAL_GEMINI_PRO_MODEL, FAL_GEMINI_FLASH_MODEL]
+    elif key.startswith("gemini-"):
+        models = [f"google/{key}", FAL_GEMINI_FLASH_MODEL]
+    else:
+        models = [FAL_GEMINI_FLASH_MODEL, FAL_GEMINI_FAST_FALLBACK_MODEL]
+    return list(dict.fromkeys(models))
 
 
 def gemini_text_model_chain(text_model: Optional[str] = None) -> list:
@@ -189,6 +222,102 @@ def _generate_gemini_content(
     raise GeminiTemporaryError(
         f"Gemini models are temporarily unavailable after retries: {last_error}"
     )
+
+
+def _is_retryable_fal_text_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "503",
+            "unavailable",
+            "high demand",
+            "connection",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _fal_text_input(prompt: str, *, config=None, enable_web_search: bool = False) -> dict:
+    input_data = {"prompt": prompt}
+    max_output_tokens = getattr(config, "max_output_tokens", None)
+    if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+        input_data["max_tokens"] = max_output_tokens
+    temperature = getattr(config, "temperature", None)
+    if isinstance(temperature, (int, float)):
+        input_data["temperature"] = temperature
+    if enable_web_search:
+        input_data["enable_web_search"] = True
+    return input_data
+
+
+def _generate_analysis_content(
+    client,
+    *,
+    contents,
+    config=None,
+    text_model: Optional[str] = None,
+    direct_model_chain: Optional[list] = None,
+    fal_key: Optional[str] = None,
+    fal_fallback_enabled: bool = False,
+    fal_enable_web_search: bool = False,
+):
+    """Generate analysis text while leaving non-analysis Gemini routing unchanged."""
+    model_chain = direct_model_chain
+    if fal_fallback_enabled and model_chain is None:
+        model_chain = [resolve_gemini_text_model(text_model)]
+    last_error = None
+    try:
+        return _generate_gemini_content(
+            client,
+            contents=contents,
+            config=config,
+            text_model=text_model,
+            model_chain=model_chain,
+        )
+    except GeminiTemporaryError as direct_error:
+        last_error = direct_error
+        if not fal_fallback_enabled:
+            raise
+        if not fal_key:
+            raise GeminiTemporaryError(
+                "Google quota is exhausted or temporarily unavailable, "
+                "and the fal.ai fallback key is missing"
+            ) from direct_error
+
+    prompt_parts = contents if isinstance(contents, (list, tuple)) else [contents]
+    prompt = "\n".join(str(part) for part in prompt_parts if part is not None)
+    fal_input = _fal_text_input(
+        prompt,
+        config=config,
+        enable_web_search=fal_enable_web_search,
+    )
+    for fal_model in fal_gemini_text_model_chain(text_model):
+        try:
+            payload = _fal_run(
+                FAL_TEXT_ENDPOINT,
+                {**fal_input, "model": fal_model},
+                fal_key,
+            )
+            payload_error = str(payload.get("error") or "").strip()
+            if payload_error:
+                raise RuntimeError(payload_error)
+            output = payload.get("output")
+            if not isinstance(output, str) or not output.strip():
+                raise RuntimeError("fal.ai returned no text output")
+            return FalTextResponse(
+                output,
+                usage=payload.get("usage"),
+                request_meta=payload.get("_fal_request"),
+            )
+        except Exception as error:
+            last_error = error
+            if not _is_retryable_fal_text_error(error):
+                break
+
+    raise GeminiTemporaryError(f"Gemini via fal.ai is unavailable: {last_error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
