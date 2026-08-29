@@ -17,6 +17,7 @@ import re
 import glob
 import json
 import math
+import array
 import time
 import difflib
 import hashlib
@@ -2608,6 +2609,99 @@ class FalUnreachable(Exception):
     """
 
 
+class FalResultPending(Exception):
+    """Задание в очереди fal существует и уже оплачено, а результат не забрали.
+
+    Отдельный тип, потому что лечится это не повтором генерации, а повторным
+    походом за готовым файлом. 2026-08-05 так пропали три клипа Kling: fal
+    досчитал их за 112–136 секунд, скачивание результата упало на DNS, и вместе
+    с исключением потерялся `request_id` — единственная ниточка к оплаченному
+    видео. Поэтому тот, кто ловит, обязан положить `record()` рядом с кадром:
+    следующий прогон сначала спросит fal об этом задании и только потом закажет
+    новое.
+    """
+
+    def __init__(self, message: str, model_id: str = "", request_id: str = "",
+                 status_url: str = "", response_url: str = ""):
+        super().__init__(message)
+        self.model_id = model_id
+        self.request_id = request_id
+        self.status_url = status_url
+        self.response_url = response_url
+
+    def record(self) -> dict:
+        return {
+            "model_id": self.model_id,
+            "request_id": self.request_id,
+            "status_url": self.status_url,
+            "response_url": self.response_url,
+        }
+
+
+def _fal_request_meta(result: Any, request: dict) -> dict:
+    """Результат fal вместе с адресом задания, которое его выдало."""
+    payload = dict(result) if isinstance(result, dict) else {"result": result}
+    payload["_fal_request"] = dict(request)
+    return payload
+
+
+def _fal_collect_pending(pending: dict, fal_key: str) -> Optional[dict]:
+    """Забрать результат уже оплаченного задания, ничего не заказывая.
+
+    Возвращает результат, если fal его отдал, и None во всех остальных случаях —
+    задания больше нет, оно ещё считается, сеть снова легла. Исключение не
+    поднимает намеренно: это попытка сэкономить перед обычной генерацией, и её
+    провал не должен ронять кадр, который иначе снялся бы заново.
+    """
+    response_url = (pending or {}).get("response_url") or ""
+    request_id = (pending or {}).get("request_id") or ""
+    if not response_url:
+        return None
+    headers = {"Authorization": f"Key {fal_key}"}
+    print(f"[fal.ai] Задание {request_id} уже оплачено — иду за результатом до того, как заказывать новое...")
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.get(response_url, headers=headers)
+        except httpx.RequestError as e:
+            if attempt == 2:
+                print(f"[fal.ai] До результата {request_id} не достучался ({e}) — заказываю заново.")
+                return None
+            time.sleep(5)
+            continue
+        if resp.status_code == 200:
+            print(f"[fal.ai] ✅ Результат {request_id} забран без новой оплаты.")
+            try:
+                return _fal_request_meta(resp.json(), pending)
+            except json.JSONDecodeError as e:
+                print(f"[fal.ai] Результат {request_id} не читается как JSON ({e}) — заказываю заново.")
+                return None
+        # 404 — fal результат уже не хранит, 202 — задание ещё в работе.
+        print(f"[fal.ai] Задание {request_id}: fal ответил {resp.status_code} — заказываю заново.")
+        return None
+    return None
+
+
+def _pending_fal_request(meta_path: str, payload: dict) -> dict:
+    """Оплаченное задание, оставшееся от прошлого прогона этого же кадра.
+
+    Отдаём его только когда payload совпадает дословно: иначе в очереди лежит
+    клип по другой картинке или другой реплике, и «сэкономленный» файл встал бы
+    не в свой кадр. Ссылки на заливки fal кэшируются рядом с файлами, поэтому у
+    неизменившегося кадра payload на повторе тот же самый — а изменившемуся
+    `_ensure_slice_audio` эту мету всё равно сносит вместе с клипом.
+    """
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    pending = meta.get("pending_fal_request") or {}
+    if not pending.get("response_url") or meta.get("payload") != payload:
+        return {}
+    return pending
+
+
 def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) -> dict:
     """
     Submit a job to fal.ai queue, poll for completion, return result.
@@ -2615,14 +2709,12 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
     """
 
     def _with_request_meta(result: Any, request_id: Optional[str], status_url: str = "", response_url: str = "") -> dict:
-        payload = dict(result) if isinstance(result, dict) else {"result": result}
-        payload["_fal_request"] = {
+        return _fal_request_meta(result, {
             "model_id": model_id,
             "request_id": request_id,
             "status_url": status_url,
             "response_url": response_url,
-        }
-        return payload
+        })
 
     headers = {
         "Authorization": f"Key {fal_key}",
@@ -2698,7 +2790,11 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
                         return _with_request_meta(result_resp.json(), request_id, status_url, response_url)
                 except httpx.RequestError as e:
                     if attempt == 2:
-                        raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
+                        # Модель отработала, счёт выставлен — теряется только файл.
+                        raise FalResultPending(
+                            f"fal.ai result fetch failed for {model_id} at {response_url}: {e}",
+                            model_id, request_id, status_url, response_url,
+                        ) from e
                     print(f"[fal.ai] Result fetch failed ({e}), retrying in 5s...")
                     time.sleep(5)
                 except httpx.HTTPStatusError as e:
@@ -2728,15 +2824,21 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
                     result_resp.raise_for_status()
                     return _with_request_meta(result_resp.json(), request_id, status_url, response_url)
             except httpx.RequestError as e:
-                raise Exception(f"fal.ai result fetch failed for {model_id} at {response_url}: {e}") from e
+                raise FalResultPending(
+                    f"fal.ai result fetch failed for {model_id} at {response_url}: {e}",
+                    model_id, request_id, status_url, response_url,
+                ) from e
             except httpx.HTTPStatusError as e:
                 raise Exception(f"fal.ai result fetch error ({e.response.status_code}) for {model_id}: {e.response.text[:300]}") from e
     except Exception as e:
         print(f"[fal.ai] Final fetch after timeout failed: {e}")
 
-    raise Exception(
+    # Задание в очереди осталось и, скорее всего, досчитается: заказывать его
+    # заново — это второй счёт за ту же секунду видео.
+    raise FalResultPending(
         f"fal.ai job timed out after {timeout}s for {model_id} "
-        f"(request_id={request_id}, status_url={status_url})"
+        f"(request_id={request_id}, status_url={status_url})",
+        model_id, request_id, status_url, response_url,
     )
 
 
@@ -4021,6 +4123,23 @@ _STORYBOARD_NEGATIVE_PROMPT = (
     "signage, user interface"
 )
 
+# Вставка играет под мастер-озвучку и своего звука не имеет, поэтому говорящий
+# рот на ней — брак. Требование это стояло в положительном промпте: «anyone in
+# frame keeps their mouth closed and still, plain surfaces with nothing written
+# on them, any device screens turned away from camera or out of focus, voiceover
+# plays over the scene». Ровно то, о чём предупреждает комментарий выше:
+# отрицание модель не читает, а существительные читает — и на кадр «руки
+# переворачивают песочные часы» приходил человек, который что-то говорит.
+# Худшая строка там последняя: «voiceover plays over the scene» прямым текстом
+# сообщает, что в сцене звучит речь. Надписи и экраны из того же списка уже
+# перечислены в `_STORYBOARD_NEGATIVE_PROMPT` — в положительном промпте они
+# только приводили в кадр то, что запрещали.
+_BROLL_NEGATIVE_PROMPT = (
+    _STORYBOARD_NEGATIVE_PROMPT
+    + ", talking, speaking, open mouth, moving lips, lip sync, mouthing words, "
+      "dialogue, singing, addressing the camera"
+)
+
 
 def build_kling_v3_storyboard_request(
     shots: list,
@@ -4047,6 +4166,14 @@ def build_kling_v3_storyboard_request(
     tier_config = STORYBOARD_VIDEO_TIERS[tier]
     model_id = tier_config[model_key]
 
+    # Кадр может попросить себе более строгий запрет, чем общий (см.
+    # `_broll_slice_shot`). Поле одно на запрос, поэтому берём первое заявленное.
+    negative_prompt = next(
+        (shot["_negative_prompt"] for shot in normalized
+         if (shot.get("_negative_prompt") or "").strip()),
+        _STORYBOARD_NEGATIVE_PROMPT,
+    )
+
     if tier_config.get("family") == "veo31":
         if generation_mode == "multi_shot" and len(normalized) > 1:
             raise ValueError("Veo 3.1 storyboard mode supports one prompt per fal.ai request")
@@ -4055,7 +4182,7 @@ def build_kling_v3_storyboard_request(
             "prompt": shot.get("generation_prompt") or shot.get("scene") or shot.get("speech") or "vertical social video shot",
             "aspect_ratio": aspect_ratio,
             "duration": _veo31_duration(_shot_duration(shot)),
-            "negative_prompt": _STORYBOARD_NEGATIVE_PROMPT,
+            "negative_prompt": negative_prompt,
             "resolution": tier_config.get("resolution", "1080p"),
             "generate_audio": False,
             "auto_fix": False,
@@ -4068,7 +4195,7 @@ def build_kling_v3_storyboard_request(
     payload = {
         "duration": str(min(15, sum(_shot_duration(shot) for shot in normalized))),
         "generate_audio": False,
-        "negative_prompt": _STORYBOARD_NEGATIVE_PROMPT,
+        "negative_prompt": negative_prompt,
     }
     if use_image_to_video:
         payload["start_image_url"] = start_image_url
@@ -4299,8 +4426,14 @@ def generate_talking_head(
             "reference_fingerprint": reference_fingerprint,
         }
 
+        # Прошлый прогон мог оставить оплаченное задание, результат которого не
+        # забрали. Спрашиваем fal о нём до того, как заказывать новое.
+        pending = _pending_fal_request(attempt_meta_path, payload)
+
         try:
-            result = _fal_run(model_id, payload, fal_key, timeout=1200)
+            result = _fal_collect_pending(pending, fal_key) if pending else None
+            if result is None:
+                result = _fal_run(model_id, payload, fal_key, timeout=1200)
             video = result.get("video")
             video_url = video.get("url") if isinstance(video, dict) else video
             if not video_url:
@@ -4335,13 +4468,21 @@ def generate_talking_head(
         except Exception as e:
             attempt_record["error"] = str(e)
             attempts.append(attempt_record)
-            _write_json_file(attempt_meta_path, {
+            record = {
                 "attempt": attempt_name,
                 "tier": tier,
                 "model_id": model_id,
                 "payload": payload,
                 "error": str(e),
-            })
+            }
+            # Единственная ошибка, после которой оплаченный результат остаётся у
+            # fal. Адрес задания обязан пережить падение, иначе повтор заплатит
+            # второй раз за уже снятое видео.
+            if isinstance(e, FalResultPending):
+                record["pending_fal_request"] = e.record()
+                print(f"[fal.ai] Задание {e.request_id} записано рядом с кадром — "
+                      "повтор заберёт результат, а не закажет новый.")
+            _write_json_file(attempt_meta_path, record)
 
     if not selected_attempt:
         selected_attempt = select_best_talking_head_attempt(attempts)
@@ -6124,7 +6265,24 @@ def generate_storyboard_shot_clip(
         aspect_ratio=aspect_ratio,
         start_image_url=start_image_url,
     )
-    result = _fal_run(model_id, payload, fal_key, timeout=1800)
+    meta_path = f"{output_path}.meta.json"
+    # Вставка — самый дорогой клип в ролике: её тарифицируют от трёх секунд.
+    # Поэтому сначала спрашиваем fal об уже оплаченном задании прошлого прогона.
+    pending = _pending_fal_request(meta_path, payload)
+    try:
+        result = _fal_collect_pending(pending, fal_key) if pending else None
+        if result is None:
+            result = _fal_run(model_id, payload, fal_key, timeout=1800)
+    except FalResultPending as e:
+        _write_json_file(meta_path, {
+            "shot": shot,
+            "tier": tier,
+            "model_id": model_id,
+            "payload": payload,
+            "error": str(e),
+            "pending_fal_request": e.record(),
+        })
+        raise
     video_url = _video_url_from_fal_result(result)
     with httpx.Client(timeout=300.0) as client:
         vid_resp = client.get(video_url)
@@ -6132,7 +6290,7 @@ def generate_storyboard_shot_clip(
         with open(output_path, "wb") as f:
             f.write(vid_resp.content)
 
-    _write_json_file(f"{output_path}.meta.json", {
+    _write_json_file(meta_path, {
         "shot": shot,
         "tier": tier,
         "model_id": model_id,
@@ -6414,7 +6572,17 @@ def _final_audio_filter_parts(
         mix_src = "[mix]"
     else:
         mix_src = voice_src
-    parts.append(f"{mix_src}{_loudnorm_filter(measured, print_json)},aresample=48000[aout]")
+    # Хвост про запас. Кодек пишет звук кадрами по 1024 отсчёта, а лимитер
+    # loudnorm держит своё окно, и дорожка выходит из графа чуть короче, чем
+    # вошла: замер на ролике — 16.067 с на входе, 16.000 на выходе. `-shortest`
+    # равняет по короткому, так что эти 0.067 с срезались с последнего слова.
+    # Все, кто берёт этот граф, кодируют с `-shortest`, поэтому лишнее уйдёт
+    # само — обрезать будут звук по картинке, а не наоборот. На замер громкости
+    # тишина не влияет: гейт loudnorm такие блоки не считает.
+    parts.append(
+        f"{mix_src}{_loudnorm_filter(measured, print_json)},"
+        "aresample=48000,apad=pad_dur=0.25[aout]"
+    )
     return parts
 
 
@@ -6592,23 +6760,84 @@ def _take_level_match_db(clip: dict, master_path: str, master_start: float,
     return max(-6.0, min(6.0, ours - theirs))
 
 
+# Сколько тишины оставляем дублю после последнего слова. Ноль резал бы по
+# последнему звуку, и склейка читалась бы как оборванная реплика; четверть
+# секунды — это вдох, а не пауза.
+_MAX_WORDLESS_TAIL_SECONDS = 0.25
+# Ниже этого кадр не ужимается, что бы ни намерил детектор. Промах измерения
+# стоил бы кадра целиком, а лишняя секунда — только секунды.
+_MIN_PLAYED_SLICE_SECONDS = 0.4
+# Насколько дубль может недотягивать до кадра, чтобы кадр всё равно считался
+# озвученным. Длительность потока приходит от ffprobe с округлением, и без
+# допуска клип в ровные 64 кадра иногда меряется как 63.999 и терял бы кадр на
+# пустом месте. Две миллисекунды дописанной тишины не слышно; слышно
+# семнадцать — то есть полкадра, поэтому допуск не растёт до половины.
+_AUDIO_FRAME_ROUNDING_SECONDS = 0.002
+# Порог тишины отсчитывается от самого дубля, а не назначен абсолютным: реплики
+# приезжают с разным уровнем, а шёпот тише обычной речи на пару десятков дБ и по
+# фиксированному порогу пропал бы вместе с последними словами.
+_SPEECH_END_FLOOR_DB = -50.0
+_SPEECH_END_BELOW_PEAK_DB = 28.0
+
+
+def _speech_end(path: str, window: float = 0.05) -> Optional[float]:
+    """Когда в дорожке отзвучало последнее слово. None — если не измерить.
+
+    Считаем по самой дорожке: порог берём от её собственного пика, иначе шёпот
+    (кадр 5 ролика saas_a6bea5f1 — «копит упрямый жир» на -23 dB против -6 у
+    обычной реплики) был бы отброшен как тишина вместе с концом фразы.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-vn",
+             "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+            capture_output=True, timeout=180,
+        )
+    except Exception:
+        return None
+    samples = array.array("h")
+    try:
+        samples.frombytes(proc.stdout[:len(proc.stdout) // 2 * 2])
+    except (ValueError, TypeError):
+        return None
+    step = max(1, int(16000 * window))
+    levels = []
+    for start in range(0, max(0, len(samples) - step + 1), step):
+        chunk = samples[start:start + step]
+        power = sum(float(value) * value for value in chunk) / len(chunk)
+        levels.append(10 * math.log10(power / (32768.0 ** 2)) if power > 0 else -120.0)
+    if not levels:
+        return None
+    threshold = max(_SPEECH_END_FLOOR_DB, max(levels) - _SPEECH_END_BELOW_PEAK_DB)
+    for index in range(len(levels) - 1, -1, -1):
+        if levels[index] >= threshold:
+            return (index + 1) * step / 16000.0
+    return None
+
+
 def _reel_layout(clips: list, master_path: str = "") -> list:
     """Where every clip sits in the edit, and where its words sit in the master.
 
-    One timeline, snapped to the frame grid: shot boundaries are rounded to a
-    whole frame once, off the running master time, so a segment is always a
-    whole number of frames and nothing accumulates. Reel time and master time
-    stay the same time, which is what lets a take's own audio and the master
-    take turns without a gap or a repeat at the seam.
+    Two clocks, not one. Master time is where a shot's words sit in the
+    voiceover and never moves — b-roll reads its sound from there. Reel time is
+    how long the shot actually plays, and it is shorter whenever the take ends
+    on silence: `_MAX_WORDLESS_TAIL_SECONDS` is all the wordless tail a shot is
+    allowed to keep. Пауза, за которую заплатили, но в которой никто не говорит,
+    — это и лишние секунды хронометража, и та самая тишина, которую Kling
+    заполняет отсебятиной (кадр 5 ролика saas_a6bea5f1: 0.8 с без слов, и модель
+    улыбнулась под текст про упрямый жир).
+
+    Both clocks are snapped to the frame grid, so a segment is always a whole
+    number of frames and nothing accumulates.
 
     A self-voiced take gives up exactly the picture the model drew around its
     words: the head of silence its driving mp3 carried (`speech_offset`) and
     everything past the last word. Both ends are cut from picture and sound
-    together, so the model's own lip sync is untouched — but the sentence runs
-    on without the hole that padding used to punch into it.
+    together, so the model's own lip sync is untouched.
     """
     layout = []
     master_cursor = 0.0
+    master_frames_done = 0
     frame_cursor = 0
     for index, clip in enumerate(clips):
         actual = _get_media_duration(clip["path"])
@@ -6620,20 +6849,57 @@ def _reel_layout(clips: list, master_path: str = "") -> list:
             offset = 0.0
         master_start = master_cursor
         master_cursor += window
-        reel_start = frame_cursor / _REEL_FPS
-        frame_cursor = int(round(master_cursor * _REEL_FPS))
-        duration = frame_cursor / _REEL_FPS - reel_start
+        # Кадры мастера считаются от абсолютного времени, как раньше: перебивка
+        # читает звук именно оттуда, и её слот обязан лечь на озвучку встык.
+        master_frames = int(round(master_cursor * _REEL_FPS)) - master_frames_done
+        master_frames_done += master_frames
         own_audio = 0.0
         gain_db = 0.0
         head = 0.0
+        played = window
         if self_voiced:
             own_audio = _get_media_stream_duration(clip["path"], "audio")
-            head = max(0.0, min(reel_start - master_start + offset,
-                                max(0.0, actual - duration)))
+            # Голова остаётся точной: по ней режется и звук дубля (`atrim`), а
+            # там задержка mp3-кодека в 25 мс — это выравнивание по мастеру, и
+            # округлять её до кадра нельзя. Картинку кадрует сам `trim`, а на
+            # нужное число кадров сегмент ставит замыкающий `end_frame`.
+            head = max(0.0, min(offset, max(0.0, actual - window)))
+            # Хвост без слов режется у дубля, а не у мастера: свой звук дубль
+            # несёт сам, поэтому картинка и голос уходят одним резом и липсинк
+            # не трогается. Мастер об этом не знает — по нему по-прежнему
+            # отсчитываются перебивки.
+            spoken = _speech_end(clip["path"])
+            if spoken is not None:
+                played = min(window, max(
+                    _MIN_PLAYED_SLICE_SECONDS,
+                    spoken - head + _MAX_WORDLESS_TAIL_SECONDS,
+                ))
             if master_path:
                 gain_db = _take_level_match_db(
                     clip, master_path, master_start, window, offset,
                 )
+        # Не тронули хвост — кадры берём у мастера как есть. Считать их заново
+        # через `round(played * 30)` нельзя: слот 1.34 с это 40.2 кадра, а
+        # мастер-сетка отдаёт ему 41, и сегмент терял бы кадр на ровном месте.
+        frames = master_frames
+        if played < window:
+            frames = max(1, min(master_frames, int(round(played * _REEL_FPS))))
+        if self_voiced and own_audio:
+            # Дальше собственного звука сегмент не играет. Слот бывает длиннее
+            # дубля — модель округляет длину по своей сетке и отдаёт короче, чем
+            # мы послали, — и тогда `apad` дописывал недостающее цифровой
+            # тишиной. Приклеенная к живой волне, она слышна щелчком: на кадре 6
+            # ролика saas_a6bea5f1 дубль обрывался на -23 dB, а `afade` стоял в
+            # конце слота, то есть уже внутри дописанного, и не срабатывал.
+            own_frames = int(
+                (own_audio - head + _AUDIO_FRAME_ROUNDING_SECONDS) * _REEL_FPS
+            )
+            frames = max(1, min(frames, max(
+                own_frames, int(_MIN_PLAYED_SLICE_SECONDS * _REEL_FPS),
+            )))
+        reel_start = frame_cursor / _REEL_FPS
+        frame_cursor += frames
+        duration = frames / _REEL_FPS
         layout.append({
             "index": index,
             "clip": clip,
@@ -6646,6 +6912,12 @@ def _reel_layout(clips: list, master_path: str = "") -> list:
             "head": head,
             "master_start": master_start,
             "master_end": master_cursor,
+            # То же место в мастере, но по кадровой сетке. Пока часы совпадали,
+            # это был `reel_start`, и перебивки читали звук по нему. Теперь ролик
+            # короче озвучки, а слова перебивки остались там же, где лежали, —
+            # читать их надо отсюда. Соседние сегменты стыкуются встык, потому
+            # что границы берутся из одного и того же целочисленного счётчика.
+            "master_grid_start": (master_frames_done - master_frames) / _REEL_FPS,
             "reel_start": reel_start,
         })
     return layout
@@ -6735,9 +7007,15 @@ def _stitched_voice_filter_parts(layout: list, master_input: str,
                 f"afade=t=out:st={max(0.0, duration - fade):.3f}:d={fade},"
             )
         else:
+            # Место в мастере, а не в ролике: у ролика теперь свои часы —
+            # говорящий кадр, обрезанный по последнему слову, играет короче
+            # своего места в озвучке. Слова перебивки лежат в мастере там, где
+            # лежали, и читать их надо оттуда, иначе с каждым обрезанным кадром
+            # вставка забирала бы кусок чужой фразы.
+            start = segment["master_grid_start"]
             source = (
-                f"[m{index}]atrim=start={segment['reel_start']:.3f}:"
-                f"end={segment['reel_start'] + duration:.3f},asetpts=PTS-STARTPTS,"
+                f"[m{index}]atrim=start={start:.3f}:"
+                f"end={start + duration:.3f},asetpts=PTS-STARTPTS,"
             )
         parts.append(
             f"{source}apad,atrim=end={duration:.3f},"
@@ -6753,6 +7031,75 @@ def _stitched_voice_filter_parts(layout: list, master_input: str,
             sum(segment["duration"] for segment in layout), room_tone_db,
         ))
     return parts
+
+
+def _master_to_reel_seconds(layout: list, moment: float) -> float:
+    """Момент озвучки — в момент готового ролика.
+
+    Субтитры расставлены по мастер-дорожке, а ролик короче неё на все вырезанные
+    паузы. Без этого пересчёта подпись уезжала бы вперёд текста ровно на сумму
+    вырезанного.
+    """
+    for segment in layout:
+        if moment < segment["master_end"]:
+            inside = min(max(0.0, moment - segment["master_start"]), segment["duration"])
+            return segment["reel_start"] + inside
+    last = layout[-1]
+    return last["reel_start"] + last["duration"]
+
+
+_ASS_DIALOGUE_RE = re.compile(
+    r"^(Dialogue:[^,]*,)(\d+:\d\d:\d\d\.\d\d),(\d+:\d\d:\d\d\.\d\d),(.*)$")
+
+
+def _ass_seconds(stamp: str) -> float:
+    hours, minutes, seconds = stamp.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _ass_stamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{int(round((seconds % 1) * 100)):02d}"
+
+
+def _reel_timed_subtitles(srt_path: str, layout: list) -> str:
+    """Копия субтитров, переставленная с часов озвучки на часы ролика.
+
+    Пока ролик шёл ровно столько же, сколько озвучка, пересчитывать было нечего.
+    Теперь говорящий кадр играет до последнего слова, а не до конца своего места
+    в мастере, и разница копится от кадра к кадру. Подписи, целиком попавшие в
+    вырезанное, выбрасываются — им больше не над чем стоять.
+    """
+    if not srt_path.endswith(".ass") or not layout:
+        return srt_path
+    if all(abs(s["duration"] - s["window"]) < 0.5 / _REEL_FPS for s in layout):
+        return srt_path
+    try:
+        with open(srt_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return srt_path
+    out = []
+    for line in lines:
+        match = _ASS_DIALOGUE_RE.match(line)
+        if not match:
+            out.append(line)
+            continue
+        head, start, end, tail = match.groups()
+        new_start = _master_to_reel_seconds(layout, _ass_seconds(start))
+        new_end = _master_to_reel_seconds(layout, _ass_seconds(end))
+        if new_end - new_start < 0.02:
+            continue
+        out.append(f"{head}{_ass_stamp(new_start)},{_ass_stamp(new_end)},{tail}")
+    reel_path = f"{os.path.splitext(srt_path)[0]}.reel.ass"
+    try:
+        with open(reel_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+    except OSError:
+        return srt_path
+    return reel_path
 
 
 def composite_storyboard_video(
@@ -6777,7 +7124,7 @@ def composite_storyboard_video(
 
     layout = _reel_layout(clips, audio_path)
     stitched_voice = any(segment["self_voiced"] for segment in layout)
-    sub_filter = _subtitle_filter(srt_path)
+    sub_filter = _subtitle_filter(_reel_timed_subtitles(srt_path, layout))
     inputs = []
     for clip in clips:
         inputs.extend(["-i", clip["path"]])
@@ -6814,6 +7161,11 @@ def composite_storyboard_video(
             whisper_start = 0.0
         if not (whisper and 0.05 < whisper_start < duration - 0.05):
             whisper_start = 0.0
+        else:
+            # Врезка шёпота режет сегмент на две части, и точка реза обязана
+            # лежать на границе кадра: между кадрами она теряет ещё один кадр —
+            # тот, что не достался ни куску до неё, ни куску после.
+            whisper_start = round(whisper_start * _REEL_FPS) / _REEL_FPS
         clip_norm = norm
         if whisper and not whisper_start:
             # Free pattern interrupt for the hush shot. This changes only the
@@ -6871,25 +7223,42 @@ def composite_storyboard_video(
                 f"[{index}:v]trim=start={head_arg}:end={_trim_end(head + duration)},"
                 f"setpts=PTS-STARTPTS,{clip_norm}"
             )
-            # Clip came back shorter than its slot: freeze the last frame
-            # instead of silently shifting every later shot off-sync.
-            if usable > 0 and deficit > 0.05:
-                chain += f",tpad=stop_mode=clone:stop_duration={deficit:.3f}"
+        # Картинка обязана быть ровно той же длины, что и звук. У звука это уже
+        # сделано — `apad,atrim=end=duration` в `_stitched_voice_filter_parts`
+        # ставит каждый сегмент на точную длину, что бы ни отдал источник. У
+        # картинки такой гарантии не было: дубль, приехавший короче слота (Kling
+        # отдаёт длительность с точностью до кадра, а слот считается от голоса),
+        # укорачивал ролик, и все следующие кадры уезжали вперёд звука. Замыкать
+        # клонированным кадром лучше, чем молча сдвигать монтаж: замирание на
+        # один кадр никто не увидит, а расход синхронизации слышно сразу.
+        #
+        # Считаем кадрами, а не секундами. `_trim_end` отступает полкадра назад,
+        # но здесь, после `fps=30`, таймбаза уже 1/30: полкадра округляется до
+        # целого, отступ попадает ровно на границу — и trim выбрасывает кадр,
+        # который просили оставить (замер на кадре 5: 87 кадров до `trim`, 86
+        # после). У `end_frame` округлять нечего.
+        chain += (f",tpad=stop_mode=clone:stop_duration={duration:.3f},"
+                  f"trim=end_frame={int(round(duration * _REEL_FPS))},"
+                  "setpts=PTS-STARTPTS")
         output_label = f"v{index}base" if whisper_start else f"v{index}"
         filter_parts.append(chain + f"[{output_label}]")
         if whisper_start:
             # Short inline whisper: use one paid lip-sync take, then create the
             # edit locally. The cut lands inside the existing pause and only
             # the post-marker picture is punched; audio and PTS stay untouched.
+            # Обе половины режем по номеру кадра от одной и той же точки: так
+            # они складываются обратно в ровно ту длину, что была у сегмента, и
+            # кадр на стыке не пропадает между «до» и «после».
+            cut_frame = int(round(whisper_start * _REEL_FPS))
             filter_parts.append(
                 f"[{output_label}]split=2[v{index}pre][v{index}whisper]"
             )
             filter_parts.append(
-                f"[v{index}pre]trim=start=0:end={_trim_end(whisper_start)},"
+                f"[v{index}pre]trim=end_frame={cut_frame},"
                 f"setpts=PTS-STARTPTS[v{index}pretrim]"
             )
             filter_parts.append(
-                f"[v{index}whisper]trim=start={whisper_start:.3f}:end={_trim_end(duration)},"
+                f"[v{index}whisper]trim=start_frame={cut_frame},"
                 f"setpts=PTS-STARTPTS,{whisper_punch}[v{index}whisperzoom]"
             )
             filter_parts.append(
@@ -6898,8 +7267,18 @@ def composite_storyboard_video(
             )
         concat_parts.append(f"[v{index}]")
     filter_parts.append(
-        f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0,"
-        "fps=30,settb=expr=1/30,setpts=N/(30*TB),setsar=1[vout]"
+        f"{''.join(concat_parts)}concat=n={len(clips)}:v=1:a=0,fps=30,"
+        # Последний кадр держится ещё три кадра. `-shortest` равняет не по
+        # длительности видео, а по метке последнего кадра: у 482 кадров она
+        # 16.033, а не 16.067, и звук за неё уже не пускают — плюс кодек пишет
+        # звук кусками по 1024 отсчёта и последний неполный кусок теряется.
+        # Вдвоём это отрезало 0.07 с от последнего слова. Три кадра дают звуку
+        # дойти до конца; на глаз стоп-кадр такой длины не читается.
+        #
+        # Строго до `settb`: за ним частота кадров у звена уже не указана, и
+        # `tpad` молча не добавляет ничего (замер: 63 кадра на входе, 63 после).
+        "tpad=stop_mode=clone:stop_duration=0.1,"
+        "settb=expr=1/30,setpts=N/(30*TB),setsar=1[vout]"
     )
     filter_parts.append(f"[vout]{sub_filter}[finalv]")
     master_input = str(len(clips))
@@ -7290,12 +7669,33 @@ def _billed_clip_seconds(clip: dict) -> float:
     return _billed_avatar_seconds(window)
 
 
-def _slice_silence_at_edges(sl: dict, words: list) -> tuple:
+def _slice_silence_at_edges(sl: dict, words: list,
+                            voiced: Optional[list] = None,
+                            hop: float = 0.01) -> tuple:
     """Сколько немого времени у куска в начале и в конце.
 
     Речь здесь единственная неприкосновенная величина: слова кадра сняты вместе
     с его губами. Тишина по краям — нет, её можно отдать соседу.
+
+    Край слова меряется по волне (`voiced` — маска из `_speech_onset_mask`), а
+    к расшифровке мы падаем только когда волны под рукой нет. Whisper закрывает
+    слово по последнему разборчивому звуку, а не по последнему звучащему: на
+    ролике saas_a6bea5f1 конец «бессильны» он поставил на 14.32, тогда как слово
+    звенело ещё полсотни миллисекунд. Эти миллисекунды ушли соседу как тишина —
+    вместе с концом реплики.
     """
+    if voiced:
+        first = max(0, int(math.ceil(sl["start"] / hop)))
+        last = min(len(voiced), int(math.floor(sl["end"] / hop)))
+        onset = next((i for i in range(first, last) if voiced[i]), None)
+        if onset is None:
+            span = sl["end"] - sl["start"]
+            return span, span
+        offset = next(i for i in range(last - 1, onset - 1, -1) if voiced[i])
+        return (
+            max(0.0, onset * hop - _AVATAR_SPEECH_PREROLL - sl["start"]),
+            max(0.0, sl["end"] - (offset + 1) * hop),
+        )
     inside = [
         w for w in words
         if float(w.get("start", 0.0)) < sl["end"] and float(w.get("end", 0.0)) > sl["start"]
@@ -7316,7 +7716,8 @@ def _clip_floor_of(sl: dict) -> float:
             else _KLING_AVATAR_MIN_CLIP_SECONDS)
 
 
-def _fill_slices_to_clip_floor(slices: list, words: list) -> tuple:
+def _fill_slices_to_clip_floor(slices: list, words: list,
+                               audio_path: str = "") -> tuple:
     """Отдать кадру всё время, за которое всё равно заплачено.
 
     Клипов короче своего пола ни одна из моделей не отдаёт: под перебивку с
@@ -7336,9 +7737,18 @@ def _fill_slices_to_clip_floor(slices: list, words: list) -> tuple:
     менять их тип значило бы молча переписать раскадровку, а это решение автора —
     ему об этом и скажут.
 
+    И заём здесь всё или ничего. Добор существует ради денег: клип, доросший до
+    пола, перестаёт быть оплаченным впустую. Кадр, которому до пола не дотянуть
+    даже со всей тишиной соседей, от полумеры не выигрывает ничего — модель
+    всё равно снимет и посчитает свой пол, — а сосед за неё платит границей,
+    сдвинутой в его сторону. На ролике saas_a6bea5f1 так вышло дважды: кадры 2
+    и 7 забрали у соседей 0.34 и 0.21 с, остались короче пола и оба раза увели
+    рез внутрь затухающего слова.
+
     Возвращает (сколько добрали, сколько так и осталось короткими).
     """
     floor_of = _clip_floor_of
+    voiced = _speech_onset_mask(audio_path) if audio_path else None
 
     # Меньше этого не двигаем: пара кадров на экране ничего не меняет, а границы
     # кусков озвучки от такого шевеления поедут.
@@ -7348,28 +7758,33 @@ def _fill_slices_to_clip_floor(slices: list, words: list) -> tuple:
         need = floor_of(sl) - (sl["end"] - sl["start"])
         if need <= epsilon:
             continue
+        # Сначала считаем весь заём, потом решаем, брать ли его: сосед не должен
+        # отдавать время под добор, которому всё равно не хватит.
+        plan = []
         # Сначала вперёд: тишина перед следующей мыслью принадлежит ей меньше,
         # чем хвост уже сказанной — предыдущей.
         for neighbour_index, forward in ((index + 1, True), (index - 1, False)):
             if need <= epsilon or not 0 <= neighbour_index < len(slices):
                 continue
             neighbour = slices[neighbour_index]
-            head, tail = _slice_silence_at_edges(neighbour, words)
+            head, tail = _slice_silence_at_edges(neighbour, words, voiced)
             room = (neighbour["end"] - neighbour["start"]) - floor_of(neighbour)
             take = min(need, max(0.0, room), head if forward else tail)
             if take <= epsilon:
                 continue
+            plan.append((neighbour, forward, take))
+            need -= take
+        if need > epsilon:
+            short += 1
+            continue
+        for neighbour, forward, take in plan:
             if forward:
                 sl["end"] += take
                 neighbour["start"] += take
             else:
                 sl["start"] -= take
                 neighbour["end"] -= take
-            need -= take
-        if need > epsilon:
-            short += 1
-        else:
-            filled += 1
+        filled += 1
     return filled, short
 
 
@@ -7610,18 +8025,18 @@ def _broll_slice_shot(shot: dict, slice_duration: float) -> dict:
 
     The clip must cover its voiceover slice, so the duration is rounded UP —
     the composite trims the surplus, while a short clip would end in a freeze.
-    Lips must stay shut: there is no lipsync pass on this footage.
+    Lips must stay shut: there is no lipsync pass on this footage. Сказано это
+    там, где такие требования работают, — в `_BROLL_NEGATIVE_PROMPT`; в
+    положительном промпте остаётся только то, что мы правда хотим видеть.
     """
     v3_shot = dict(shot)
     v3_shot["start"] = 0
     v3_shot["end"] = int(math.ceil(max(1.0, slice_duration)))
-    base = (v3_shot.get("generation_prompt") or "").strip() or _build_storyboard_generation_prompt(v3_shot)
     v3_shot["generation_prompt"] = (
-        f"{base}, anyone in frame keeps their mouth closed and still, "
-        "plain surfaces with nothing written on them, "
-        "any device screens turned away from camera or out of focus, "
-        "voiceover plays over the scene"
+        (v3_shot.get("generation_prompt") or "").strip()
+        or _build_storyboard_generation_prompt(v3_shot)
     )
+    v3_shot["_negative_prompt"] = _BROLL_NEGATIVE_PROMPT
     return v3_shot
 
 
@@ -8021,9 +8436,15 @@ def _flux_reference_frame(
         # Сломалось после генерации (не скачалась готовая картинка) — fal своё
         # уже посчитал. Вычесть вызов здесь значит соврать в отчёте о тратах.
         unreachable = isinstance(e, FalUnreachable)
-        download_failed = generated and isinstance(e, httpx.RequestError)
+        # `FalResultPending` — третий случай в чистом виде: кадр нарисован и
+        # посчитан, не приехал только файл. `generated` до него не доживает, он
+        # ставится после возврата из `_fal_run`, — поэтому спрашиваем по типу.
+        # Иначе рабочий редактор вычёркивается как отказавший, а реальный счёт
+        # недосчитывается на один вызов.
+        paid_but_unfetched = isinstance(e, FalResultPending)
+        download_failed = paid_but_unfetched or (generated and isinstance(e, httpx.RequestError))
         log(f"  ⚠️ {label}: {model} не отработал ({e}){on_failure}")
-        if billing is not None and not generated:
+        if billing is not None and not (generated or paid_but_unfetched):
             billing["calls"] = max(0, billing.get("calls", 1) - 1)
         if actor_photo_path:
             reason = "unreachable" if unreachable else "download" if download_failed else "unavailable"
@@ -8123,17 +8544,22 @@ def _broll_reference_image(
     )
 
 
-# Лицо на плите — это не портрет, а стартовая поза для Kling: он держит найденное
-# на кадре выражение всю реплику и возвращается к нему после каждого слога.
-# Широкая улыбка с зубами, растянутая на две секунды говорения, читается как
-# оскал — поэтому улыбка запрещена прямо («mouth closed, no smile»), а не
-# «спокойное лицо» намёком: мягкое «calm expression, lips gently closed» уже
-# проигрывало улыбающемуся исходнику.
+# Хвоста у плиты больше нет. Он просил «Chest up, mouth closed, no smile,
+# vertical 9:16.» и дописывался к любой первой половине — в том числе к строке
+# камеры. Две его четверти это приказы о кадрировании, и на входе из одного
+# портрета лица они переписывали саму просьбу: «переснимите с другого угла»
+# превращалось в «сделайте из этого лица поясной портрет 9:16, повернув на сорок
+# градусов». Плиты 752×1392 с дорисованным торсом при исходнике 691×736 — его
+# буквальное исполнение (2026-08-06, джоб saas_a6bea5f1, решение юзера).
 #
-# Просили об этом целым абзацем — «override the expression of the reference
-# photo», «no teeth are visible anywhere», «any warmth lives in the eyes alone».
-# Абзац съеден вместе с личностью, светом и фотореализмом: четыре слова в хвосте
-# делают ту же работу, а всё остальное только глушило строку камеры.
+# Что этот хвост держал, чтобы знать цену:
+# - «mouth closed, no smile» — плита становится первым кадром клипа, и Kling
+#   держит с неё выражение всю реплику. Улыбка на плите улыбается две секунды.
+# - «Chest up» — общая дистанция для всех камер: разная крупность на стыке
+#   читалась наездом, а не второй камерой (2026-08-02, джоб saas_bd4a6584).
+# - «vertical 9:16» — формат. У Kontext он и так уходит параметром
+#   (`aspect_ratio`), у Nano Banana и Seedream параметра нет, и просить его
+#   теперь некому.
 
 # Комната приезжает картинкой, а не словами. На фото ведущего место уже снято —
 # со своим светом, мебелью и временем суток, — а текст сета пишется вслепую: та
@@ -8150,24 +8576,19 @@ def _broll_reference_image(
 # местом и фоном тремя предложениями и одним «не копируй» — сработало, но это
 # были сто восемнадцать слов там, где хватает двух: «the same photo». Фраза сама
 # несёт и комнату, и свет, и время суток, и то, что снимок другой.
-_AVATAR_PLATE_TAIL = "Chest up, mouth closed, no smile, vertical 9:16."
 
 
 def _avatar_plate_prompt(framing: str, set_text: str = "", face_first: bool = False,
                          room_last: bool = False) -> str:
-    """Плита одной фразой: что снимаем, откуда — и хвост из трёх требований.
+    """Плита одной фразой: что снимаем и откуда. Больше ничего.
 
-    В хвосте только то, за что уже платили ошибкой. «Chest up» — дистанция,
-    общая для всех камер: разная крупность на стыке читается наездом, а не
-    второй камерой (2026-08-02, джоб saas_bd4a6584). «Mouth closed, no smile» —
-    плита становится первым кадром клипа, и улыбка на ней улыбается всю реплику.
-    «Vertical 9:16» — формат ролика. Личность, свет, фотореализм и «один человек
-    в кадре» не названы намеренно: всё это приезжает картинкой, и слова о ней
-    только мешают (2026-08-05, проверка руками — фраза в двенадцать слов дала
-    ракурс с первого раза).
+    Личность, свет, фотореализм, «один человек в кадре», крупность и формат не
+    названы намеренно: всё это приезжает картинкой, и слова о ней только спорят
+    с той единственной строкой, ради которой плита и рисуется, — со строкой
+    камеры (2026-08-06, джоб saas_a6bea5f1).
     """
     # Ракурс может и не приехать: этой же функцией рисуют кадр, где камеру никто
-    # не заказывал. Тогда фраза просто короче — но не «..., . Chest up».
+    # не заказывал. Тогда фраза просто короче — но не «The same photo, .».
     where = f", {framing}" if framing else ""
     if face_first:
         opening = "The first photo is this person's face. " + (
@@ -8180,7 +8601,7 @@ def _avatar_plate_prompt(framing: str, set_text: str = "", face_first: bool = Fa
     # это просьба её выдумать.
     if room_last:
         opening += "The last photo is the room. "
-    return opening + _AVATAR_PLATE_TAIL
+    return opening.strip()
 
 
 def _avatar_reference_image(
@@ -8213,19 +8634,30 @@ def _avatar_reference_image(
     глушит: 0.060 против 0.633 по повороту головы.
     """
     face = face_photo_path if (face_photo_path and os.path.exists(face_photo_path)) else ""
-    if not face and not (actor_photo_path and os.path.exists(actor_photo_path)):
+    staged = actor_photo_path if (actor_photo_path and os.path.exists(actor_photo_path)) else ""
+    if not face and not staged:
         return ""
-    # Личность держит портрет, поэтому он идёт первым — и первым же его получат
-    # редакторы с одиночным входом. Общий план едет вторым и только туда, где для
-    # него есть место: иначе промпт рассказывал бы про картинку, которой нет.
-    primary = face or actor_photo_path
     # Второй и третий референсы доходят не до всех редакторов: поле под картинку
     # у половины каталога одиночное. Что не отправляем — о том и не рассказываем.
     multi = _avatar_edit_model(edit_model)["field"] == "image_urls"
+    # Личность держит портрет, поэтому он идёт первым — и первым же его получат
+    # редакторы с одиночным входом. Общий план едет вторым и только туда, где для
+    # него есть место: иначе промпт рассказывал бы про картинку, которой нет.
+    primary = face or staged
     body = ""
-    if multi and face and actor_photo_path and os.path.exists(actor_photo_path):
-        if os.path.normpath(actor_photo_path) != os.path.normpath(face):
-            body = actor_photo_path
+    if multi and face and staged and os.path.normpath(staged) != os.path.normpath(face):
+        body = staged
+    if not multi and staged and face and os.path.normpath(staged) != os.path.normpath(face):
+        # Выбор здесь неизбежный и в обе стороны платный: на портрете нет ни
+        # комнаты, ни одежды, а на постановочном фото лицо занимает проценты
+        # кадра и редактор дорисовывает черты сам. Берём лицо (см.
+        # `SaaSFaceReferenceTests`) — но молчать об этом нельзя. 2026-08-05,
+        # ролик saas_a6bea5f1: фронтальную плиту нарисовал редактор на две
+        # картинки, боковую и шёпот — на одну, и ролик склеился из двух разных
+        # комнат в двух разных нарядах. Человек об этом узнал по готовому видео.
+        log("  ⚠️ Этот редактор принимает одну картинку: поедет портрет крупно, "
+            "а комната и одежда с постановочного фото — нет. Плита встанет на "
+            "фоне портрета. Обе картинки берут только Nano Banana и Seedream 4.")
     room = ""
     if multi and set_photo_path and os.path.exists(set_photo_path):
         if os.path.normpath(set_photo_path) not in (os.path.normpath(primary),
@@ -8831,7 +9263,7 @@ def generate_sliced_avatar_clips(
             f"  Липсинк: {onset_adjustments} говорящих кадр(а) начинаются у речи; "
             "ведущая пауза осталась предыдущему визуалу."
         )
-    filled, short = _fill_slices_to_clip_floor(slices, words)
+    filled, short = _fill_slices_to_clip_floor(slices, words, audio_path)
     if filled:
         log(f"  Кадры: {filled} шт. добрали время до полного клипа — "
             "платим за него в любом случае.")
@@ -10359,7 +10791,7 @@ def _storyboard_voice_only_result(
         _retime_talking_slices_to_speech(slices, words, audio_path)
         # Тот же добор, что сделает рендер: иначе смета считала бы перебивки по
         # исходным границам, а платили бы по раздвинутым.
-        _fill_slices_to_clip_floor(slices, words)
+        _fill_slices_to_clip_floor(slices, words, audio_path)
     slices = _split_performance_slices(slices, words)
     # Тот же раскрой, что сделает рендер, но в манифест он не пишется: манифест
     # описывает снятое, а это ещё прогноз — иначе рендер повторил бы разрезы,

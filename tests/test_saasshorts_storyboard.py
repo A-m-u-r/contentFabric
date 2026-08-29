@@ -1595,8 +1595,7 @@ class SaaSFaceReferenceTests(unittest.TestCase):
 
             self.assertEqual(
                 seen["args"]["prompt"],
-                "The same photo, Camera straight ahead. "
-                "Chest up, mouth closed, no smile, vertical 9:16.",
+                "The same photo, Camera straight ahead.",
             )
             self.assertEqual(seen["args"]["image_url"], "http://fal/actor.png")
 

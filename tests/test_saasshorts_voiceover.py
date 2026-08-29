@@ -258,17 +258,22 @@ class BrollSliceShotTests(unittest.TestCase):
 
         self.assertEqual(v3_shot["start"], 0)
         self.assertEqual(v3_shot["end"], 5)
-        self.assertTrue(v3_shot["generation_prompt"].startswith(shot["generation_prompt"]))
-        self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
+        # Положительный промпт — только то, что снимаем. Запрет говорящего рта
+        # живёт в negative_prompt: в положительном слово «mouth» само приводило
+        # в кадр говорящего человека.
+        self.assertEqual(v3_shot["generation_prompt"], shot["generation_prompt"])
+        self.assertNotIn("mouth", v3_shot["generation_prompt"])
+        self.assertIn("moving lips", v3_shot["_negative_prompt"])
         # Оригинальный кадр не мутируется — им ещё пользуются субтитры
         self.assertEqual(shot["start"], 3.2)
-        self.assertNotIn("mouth closed", shot["generation_prompt"])
+        self.assertNotIn("_negative_prompt", shot)
 
     def test_builds_prompt_from_scene_when_missing(self):
         shot = {"visual_type": "broll", "scene": "hands pour coffee", "speech": "текст"}
         v3_shot = _broll_slice_shot(shot, 3.0)
         self.assertIn("hands pour coffee", v3_shot["generation_prompt"])
-        self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
+        self.assertNotIn("voiceover", v3_shot["generation_prompt"])
+        self.assertIn("talking", v3_shot["_negative_prompt"])
 
 
 class CaptionHighlightTests(unittest.TestCase):

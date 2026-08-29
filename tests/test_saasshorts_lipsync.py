@@ -168,12 +168,10 @@ class SaaSLipSyncTests(unittest.TestCase):
             self.assertEqual(payload["image_url"], "https://fal/up.png")
             self.assertIn("kitchen close-up", payload["prompt"])
             self.assertIn("same person", payload["prompt"].lower())
-            # Улыбку запрещаем прямо: Kling держит найденное на плите выражение
-            # всю реплику, и улыбка с зубами, растянутая на две секунды
-            # говорения, читается как оскал. Четырёх слов на это хватает —
-            # абзац про «no teeth are visible anywhere» глушил строку камеры.
-            self.assertIn("mouth closed", payload["prompt"].lower())
-            self.assertIn("no smile", payload["prompt"].lower())
+            # И больше ничего: место, ракурс — всё. Хвост про крупность, мимику
+            # и формат дописывался к любой первой половине и переписывал строку
+            # камеры на кадрирование (2026-08-06, джоб saas_a6bea5f1).
+            self.assertEqual(payload["prompt"], "The same person, in kitchen close-up.")
             self.assertTrue(os.path.exists(f"{out}.prompt.txt"))
 
     def test_avatar_reference_image_falls_back_to_empty_on_failure(self):
@@ -1202,22 +1200,23 @@ class SlicedAvatarTests(unittest.TestCase):
                 # Крупности в постановке нет вовсе: соседние кадры разводит
                 # точка съёмки, иначе склейка читается наездом (2026-08-02, джоб
                 # saas_bd4a6584: 18.0% против 21.4% высоты лица — на смену плана
-                # не хватило, на наезд хватило). Дистанция общая и лежит в
-                # хвосте, одними и теми же словами для всех камер.
+                # не хватило, на наезд хватило). Общей дистанции теперь тоже
+                # никто не диктует: хвост, который её просил, переписывал самy
+                # строку камеры и убран (2026-08-06).
                 for zoom in ("close-up", "close up", "wide", "chest up"):
                     self.assertNotIn(zoom, camera.direction)
-                self.assertIn("Chest up", saasshorts._AVATAR_PLATE_TAIL)
         self.assertIn("forty degrees", cameras["side"].direction)
         self.assertIn("below eye level", cameras["hush"].direction)
 
     def test_framing_line_is_the_last_word_about_the_camera(self):
-        """О камере промпт говорит последним, и говорит дистанцией.
+        """Последнее слово о камере — за ракурсом, и после него не сказано ничего.
 
         Текст места пишет человек, и он вправе написать в нём «medium shot» —
         своя камера в описании комнаты когда-то навязывала план всем кадрам.
-        Спорить с этим абзацем («ignore any camera wording») больше не нужно:
-        дистанция стоит в самом конце, а последнее слово редактор слышит лучше
-        всего.
+        Спорить с этим абзацем («ignore any camera wording») не нужно: ракурс
+        стоит после него, а последнее слово редактор слышит лучше всего. Раньше
+        за ракурсом шёл ещё хвост про крупность и формат — он же и оказывался
+        этим последним словом, переписывая ракурс на кадрирование.
         """
         with tempfile.TemporaryDirectory() as tmp:
             photo = os.path.join(tmp, "avatar.png")
@@ -1239,11 +1238,14 @@ class SlicedAvatarTests(unittest.TestCase):
                 )
 
             prompt = captured["prompt"]
-            self.assertTrue(prompt.rstrip().endswith(saasshorts._AVATAR_PLATE_TAIL), prompt)
-            # Ракурс идёт после текста места, дистанция — после ракурса.
+            # Ракурс идёт после текста места и заканчивает промпт.
             self.assertLess(prompt.index("medium shot"), prompt.index("shoulders cropped"))
-            self.assertLess(prompt.index("shoulders cropped"), prompt.index("Chest up"))
-            # И весь промпт — одна фраза с хвостом, а не абзац объяснений.
+            self.assertTrue(prompt.rstrip().endswith("shoulders cropped."), prompt)
+            # Ни крупности, ни формата: их место — параметры запроса, а в тексте
+            # они спорят с ракурсом (2026-08-06, джоб saas_a6bea5f1).
+            for banned in ("Chest up", "9:16", "vertical"):
+                self.assertNotIn(banned, prompt)
+            # И весь промпт — одна фраза, а не абзац объяснений.
             self.assertLessEqual(len(prompt.split()), 40, prompt)
 
     def test_talking_clips_get_a_push_in_that_never_moves_the_lip_sync(self):
@@ -1468,11 +1470,11 @@ class SlicedAvatarTests(unittest.TestCase):
 
             filter_graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
             self.assertIn("split=2[v0pre][v0whisper]", filter_graph)
-            self.assertIn("[v0pre]trim=start=0:end=2.123", filter_graph)
-            # Слот 3.38 с не укладывается в целое число кадров — монтаж режет по
-            # сетке 30 fps (см. `_whole_frames`), иначе кусок отдаёт кадр лишку и
-            # картинка уползает от озвучки на склейке.
-            self.assertIn("[v0whisper]trim=start=2.140:end=3.350", filter_graph)
+            # Обе половины режутся от одного номера кадра: по секундам они
+            # теряли кадр, который не доставался ни одной из них — 2.14 с это
+            # 64.2 кадра, и он проваливался между «до» и «после».
+            self.assertIn("[v0pre]trim=end_frame=64", filter_graph)
+            self.assertIn("[v0whisper]trim=start_frame=64", filter_graph)
             whisper_chain = next(
                 part for part in filter_graph.split(";")
                 if part.startswith("[v0whisper]")
@@ -1480,7 +1482,8 @@ class SlicedAvatarTests(unittest.TestCase):
             self.assertIn("crop=iw/1.18", whisper_chain)
             self.assertNotIn("*PTS", whisper_chain)
             self.assertIn(
-                "concat=n=1:v=1:a=0,fps=30,settb=expr=1/30,"
+                "concat=n=1:v=1:a=0,fps=30,"
+                "tpad=stop_mode=clone:stop_duration=0.1,settb=expr=1/30,"
                 "setpts=N/(30*TB),setsar=1[vout]",
                 filter_graph,
             )
@@ -1887,8 +1890,8 @@ class SlicedAvatarTests(unittest.TestCase):
             v3_shot = v3_calls[0]["shot"]
             self.assertEqual(v3_shot["start"], 0)
             self.assertEqual(v3_shot["end"], 4)
-            self.assertIn("mouth closed and still", v3_shot["generation_prompt"])
             self.assertIn("vegetables", v3_shot["generation_prompt"])
+            self.assertIn("moving lips", v3_shot["_negative_prompt"])
 
             clips = composite_mock.call_args[0][0]
             self.assertEqual(len(clips), 3)
@@ -1967,12 +1970,65 @@ class ClipFloorTests(unittest.TestCase):
 
         filled, short = saasshorts._fill_slices_to_clip_floor(slices, words)
 
-        # Тишину, какая была, кадр забрал — но до пола всё равно не дотянул,
-        # и об этом скажут вслух, а не спишут молча.
+        # До пола не дотянуть даже со всей тишиной соседа — значит и занимать
+        # нечего: модель всё равно снимет и посчитает свой пол, а сосед за
+        # полумеру заплатит сдвинутой границей. Про недобор скажут вслух.
         self.assertEqual((filled, short), (0, 1))
         self.assertLess(slices[0]["end"] - slices[0]["start"],
                         saasshorts._KLING_AVATAR_MIN_CLIP_SECONDS)
-        self.assertAlmostEqual(slices[0]["end"], slices[1]["start"], places=6)
+        self.assertAlmostEqual(slices[0]["end"], 1.5, places=6)
+        self.assertAlmostEqual(slices[1]["start"], 1.5, places=6)
+
+    def test_a_borrow_that_cannot_reach_the_floor_is_not_taken_at_all(self):
+        """Ролик saas_a6bea5f1: так порезали слово и ничего не выиграли.
+
+        Кадр 7 — пятисловный CTA на 1.54 с при поле Avatar в 2.13. Занял у
+        шестого всю его «тишину», 0.21 с, остался 1.75 с — то есть по-прежнему
+        короче пола и по-прежнему оплачен как 2.13, — а рез уехал внутрь
+        затухающего «бессильны».
+        """
+        slices = self._slices([
+            ("talking", 0.0, 12.0),
+            ("talking", 12.0, 14.53),
+            ("talking", 14.53, 16.07),
+        ])
+        words = [
+            {"word": "раз", "start": 0.1, "end": 11.9},
+            {"word": "бессильны", "start": 12.1, "end": 14.32},
+            {"word": "жми", "start": 14.61, "end": 16.0},
+        ]
+
+        filled, short = saasshorts._fill_slices_to_clip_floor(slices, words)
+
+        self.assertEqual((filled, short), (0, 1))
+        self.assertAlmostEqual(slices[1]["end"], 14.53, places=6)
+        self.assertAlmostEqual(slices[2]["start"], 14.53, places=6)
+
+    def test_the_edge_of_a_word_is_read_off_the_wave_not_off_the_transcript(self):
+        """Whisper закрывает слово раньше, чем оно смолкает.
+
+        На том же ролике конец «бессильны» расшифровка поставила на 14.32, а
+        слово звучало ещё полсотни миллисекунд — и они ушли соседу как тишина.
+        Маска из `_speech_onset_mask` знает про них, и хвост выходит короче.
+        """
+        sl = {"start": 12.0, "end": 14.53}
+        words = [{"word": "бессильны", "start": 12.1, "end": 14.32}]
+        hop = 0.01
+        # Звук идёт до 14.37 — на 50 мс дальше, чем сказала расшифровка.
+        voiced = [1210 <= i < 1437 for i in range(1500)]
+
+        by_asr = saasshorts._slice_silence_at_edges(sl, words)
+        by_wave = saasshorts._slice_silence_at_edges(sl, words, voiced, hop)
+
+        self.assertAlmostEqual(by_asr[1], 0.21, places=6)
+        self.assertAlmostEqual(by_wave[1], 0.16, places=6)
+
+    def test_without_a_wave_the_transcript_still_answers(self):
+        sl = {"start": 12.0, "end": 14.53}
+        words = [{"word": "бессильны", "start": 12.1, "end": 14.32}]
+        head, tail = saasshorts._slice_silence_at_edges(sl, words, None)
+        self.assertAlmostEqual(head, 0.06, places=6)
+        self.assertAlmostEqual(tail, 0.21, places=6)
 
     def test_shots_already_long_enough_are_left_alone(self):
         slices = self._slices([

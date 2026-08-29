@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -13,12 +14,16 @@ from saasshorts import (
     _chunk_request_prompts,
     _ensure_slice_audio,
     _file_fingerprint,
+    _get_media_duration,
     _mp3_encoder_delay,
     _parse_review_issues,
+    _pending_fal_request,
     _reel_layout,
+    _reel_timed_subtitles,
     _room_tone_db,
     _self_voiced_clip,
     _shot_request_prompt,
+    FalResultPending,
     build_kling_v3_storyboard_request,
     composite_storyboard_video,
     generate_sliced_avatar_clips,
@@ -45,7 +50,9 @@ class FreezeVsStretchTest(unittest.TestCase):
     def test_short_broll_is_stretched_not_frozen(self):
         flt = self._filter_for({"visual_type": "broll"}, actual=4.5, slot=5.0)
         self.assertIn("setpts=1.111111*PTS", flt)
-        self.assertNotIn("tpad", flt)
+        # Замыкающий `end_frame` стоит на каждом сегменте — им и меряем длину.
+        # Растяжка закрывает слот целиком, так что клонировать нечего.
+        self.assertIn("trim=end_frame=150", flt)
 
     def test_short_talking_shot_keeps_freeze(self):
         flt = self._filter_for({"visual_type": "talking"}, actual=4.5, slot=5.0)
@@ -62,7 +69,8 @@ class FreezeVsStretchTest(unittest.TestCase):
         # Конец режется на полкадра раньше: `end` ровно по границе кадра
         # отдаёт кадр лишку (см. `_trim_end`).
         self.assertIn("trim=start=0:end=4.983", flt)
-        self.assertNotIn("tpad", flt)
+        self.assertIn("trim=end_frame=150", flt)
+        self.assertNotIn("*PTS,", flt)
 
 
 class LipSyncHeadSkipTest(unittest.TestCase):
@@ -88,7 +96,7 @@ class LipSyncHeadSkipTest(unittest.TestCase):
             actual=5.5,
         )
         self.assertIn("trim=start=0.025:end=5.008", flt)
-        self.assertNotIn("tpad", flt)
+        self.assertIn("trim=end_frame=150", flt)
 
     def test_clip_without_offset_keeps_its_first_frame(self):
         flt = self._filter_for(
@@ -106,7 +114,10 @@ class LipSyncHeadSkipTest(unittest.TestCase):
             actual=5.0,
         )
         self.assertIn("trim=start=0.200:end=5.183", flt)
-        self.assertIn("tpad=stop_mode=clone:stop_duration=0.200", flt)
+        # Картинки на слот не хватает — сегмент всё равно обязан быть в 150
+        # кадров, добор идёт клоном последнего кадра.
+        self.assertIn("tpad=stop_mode=clone", flt)
+        self.assertIn("trim=end_frame=150", flt)
 
     def test_offset_never_eats_the_whole_clip(self):
         flt = self._filter_for(
@@ -433,6 +444,139 @@ class ClipCacheInvalidationTest(unittest.TestCase):
             fal_mock.assert_called_once()
             self.assertEqual(result, "")  # failure path: fell back, stale file removed
             self.assertFalse(os.path.exists(ref))
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None, content=b""):
+        self.status_code = status_code
+        self._payload = payload
+        self.content = content
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"unexpected status {self.status_code}")
+
+
+class _FakeClient:
+    """httpx.Client, отвечающий по префиксу адреса и падающий на незнакомом."""
+
+    def __init__(self, routes):
+        self._routes = routes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None):
+        for prefix, response in self._routes.items():
+            if url.startswith(prefix):
+                return response
+        raise AssertionError(f"unexpected GET {url}")
+
+
+class LostPaidClipRecoveryTest(unittest.TestCase):
+    """Оплаченный клип, результат которого не забрали, не заказывают заново.
+
+    2026-08-05 резолвер в контейнере лёг ровно на скачивании результата: fal
+    досчитал три клипа Kling за 112–136 секунд, а `request_id` потерялся вместе
+    с исключением. Повтор оплатил бы ровно то же самое второй раз — при десяти
+    роликах в день это регулярный счёт, а не разовая неудача.
+    """
+
+    def _shot(self):
+        return {"shot_number": 1, "duration": 5, "scene": "kitchen",
+                "speech": "hi", "generation_prompt": "coffee cup close-up"}
+
+    def _payload(self, shot):
+        _, payload = build_kling_v3_storyboard_request(
+            [shot], tier="standard", generation_mode="single_shot",
+            aspect_ratio="9:16", start_image_url="",
+        )
+        return payload
+
+    def _write_pending(self, clip, payload, request_id="req-1"):
+        with open(f"{clip}.meta.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "payload": payload,
+                "error": "fal.ai result fetch failed",
+                "pending_fal_request": {
+                    "model_id": "fal-ai/kling-video/v3/standard/image-to-video",
+                    "request_id": request_id,
+                    "status_url": "https://queue.fal.run/x/status",
+                    "response_url": f"https://queue.fal.run/x/requests/{request_id}",
+                },
+            }, f)
+
+    def test_a_paid_clip_left_at_fal_is_collected_instead_of_reordered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "shot_01.mp4")
+            shot = self._shot()
+            self._write_pending(clip, self._payload(shot))
+            routes = {
+                "https://queue.fal.run/x/requests/req-1": _FakeResponse(
+                    payload={"video": {"url": "https://cdn.fal/v.mp4"}}),
+                "https://cdn.fal/v.mp4": _FakeResponse(content=b"recovered-clip"),
+            }
+            with patch("saasshorts._resolve_storyboard_start_image_url", return_value=""), \
+                 patch("saasshorts.httpx.Client", lambda *a, **k: _FakeClient(routes)), \
+                 patch("saasshorts._fal_run", side_effect=AssertionError("must not pay again")):
+                result = generate_storyboard_shot_clip(shot, "key", clip)
+            self.assertEqual(result, clip)
+            with open(clip, "rb") as f:
+                self.assertEqual(f.read(), b"recovered-clip")
+            # Забранный результат вытесняет запись о долге: второй раз идти некуда.
+            with open(f"{clip}.meta.json", encoding="utf-8") as f:
+                self.assertNotIn("pending_fal_request", json.load(f))
+
+    def test_a_pending_request_for_another_payload_is_ignored(self):
+        # В очереди лежит клип по другому промпту: «сэкономленный» файл встал бы
+        # не в свой кадр — это хуже второго счёта.
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "shot_01.mp4")
+            self._write_pending(clip, {"prompt": "совсем другой кадр"})
+            with patch("saasshorts._resolve_storyboard_start_image_url", return_value=""), \
+                 patch("saasshorts._fal_collect_pending",
+                       side_effect=AssertionError("must not collect a stranger")), \
+                 patch("saasshorts._fal_run", side_effect=RuntimeError("fal-called")):
+                with self.assertRaisesRegex(RuntimeError, "fal-called"):
+                    generate_storyboard_shot_clip(self._shot(), "key", clip)
+
+    def test_a_dropped_result_leaves_the_request_id_next_to_the_shot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "shot_01.mp4")
+            lost = FalResultPending(
+                "fal.ai result fetch failed", "fal-ai/kling-video/v3/standard/image-to-video",
+                "req-lost", "https://queue.fal.run/x/status",
+                "https://queue.fal.run/x/requests/req-lost",
+            )
+            with patch("saasshorts._resolve_storyboard_start_image_url", return_value=""), \
+                 patch("saasshorts._fal_run", side_effect=lost):
+                with self.assertRaises(FalResultPending):
+                    generate_storyboard_shot_clip(self._shot(), "key", clip)
+            with open(f"{clip}.meta.json", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["pending_fal_request"]["request_id"], "req-lost")
+            self.assertEqual(saved["payload"], self._payload(self._shot()))
+
+    def test_a_plain_failure_leaves_no_debt_to_collect(self):
+        # Не всякое падение оставляет оплаченный результат: приглашать повтор
+        # ходить за несуществующим заданием — это лишний поход в сеть на каждом
+        # кадре и ложная надежда в мете.
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "shot_01.mp4")
+            self._write_pending(clip, self._payload(self._shot()))
+            with open(f"{clip}.meta.json", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertTrue(_pending_fal_request(f"{clip}.meta.json", meta["payload"]))
+            meta.pop("pending_fal_request")
+            with open(f"{clip}.meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            self.assertEqual(_pending_fal_request(f"{clip}.meta.json", meta["payload"]), {})
 
 
 class PromptNegationsTest(unittest.TestCase):
@@ -864,7 +1008,10 @@ class TakeAsDeliveredTest(unittest.TestCase):
         self.assertIn("[0:v]trim=start=0.025:end=1.742", flt)
         self.assertIn("[0:a]aresample=48000", flt)
         self.assertIn("atrim=start=0.025:end=1.758", flt)
-        self.assertNotIn("tpad", flt)
+        # Голова считается по звуку и остаётся дробной; на целое число кадров
+        # сегмент ставит `end_frame`, а не округление головы (см.
+        # `ReelLengthMatchesTheVoiceTest`).
+        self.assertIn("trim=end_frame=52", flt)
 
     def test_take_is_level_matched_and_faded_into_the_seam(self):
         clips = [self._talking()]
@@ -964,6 +1111,230 @@ class TakeAsDeliveredTest(unittest.TestCase):
         clip = self._talking()
         with patch("saasshorts._get_media_stream_duration", return_value=0.0):
             self.assertFalse(_self_voiced_clip(clip))
+
+
+class ReelLengthMatchesTheVoiceTest(unittest.TestCase):
+    """Картинка ролика длится ровно столько, сколько звучит озвучка.
+
+    Юзер: «Видео завершается прерыванием последнего слова» (2026-08-05). На
+    ролике saas_a6bea5f1 замер показал 476 кадров вместо 482: каждый дубль
+    отдавал на кадр меньше своего слота, потому что голова обрезки падала между
+    кадрами, а `trim` пропускает кадры целиком. Шесть кадров подряд — это 0.2 с,
+    на которые картинка уехала вперёд звука, и `-shortest` срезал ими конец
+    последней фразы: 15.787 с вместо 16.070. Звук такую ошибку допустить не мог
+    — у него на каждом сегменте стоит `apad,atrim=end=duration`; теперь то же
+    самое есть и у картинки.
+    """
+
+    # Звука по умолчанию с запасом: эти проверки про кадровую сетку, а не про
+    # короткий дубль — тому посвящён `test_a_take_never_outlives_its_own_sound`.
+    def _graph(self, clips, actual=9.0, own_audio=9.0):
+        with tempfile.TemporaryDirectory() as tmp:
+            subs = os.path.join(tmp, "subs.ass")
+            with open(subs, "w", encoding="utf-8") as f:
+                f.write("[Events]\n")
+            with patch("saasshorts.subprocess.run") as run_mock, \
+                 patch("saasshorts._get_media_duration", return_value=actual), \
+                 patch("saasshorts._take_level_match_db", return_value=0.0), \
+                 patch("saasshorts._measure_final_loudness", return_value=None), \
+                 patch("saasshorts._get_media_stream_duration", return_value=own_audio):
+                composite_storyboard_video(clips, "/tmp/voice.mp3", subs, "/tmp/out.mp4")
+        cmd = run_mock.call_args[0][0]
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    def _take(self, slot, offset):
+        return {"path": "/tmp/t.mp4", "duration": slot, "audio_slice": "/tmp/s.mp3",
+                "speech_offset": offset, "shot": {"visual_type": "talking"}}
+
+    def test_every_segment_is_pinned_to_the_frames_its_slot_is_worth(self):
+        # Головы нарочно дробные — ровно тот случай, что съедал по кадру.
+        slots = [2.48, 1.34, 2.28, 2.92]
+        clips = [self._take(slot, offset)
+                 for slot, offset in zip(slots, (0.0, 0.011, 0.025, 0.017))]
+        graph = self._graph(clips)
+        want = []
+        cursor = 0.0
+        frame_cursor = 0
+        for slot in slots:
+            cursor += slot
+            start, frame_cursor = frame_cursor, int(round(cursor * 30))
+            want.append(frame_cursor - start)
+        self.assertEqual(want, [74, 41, 68, 88])
+        for index, frames in enumerate(want):
+            chain = next(p for p in graph.split(";") if p.startswith(f"[{index}:v]"))
+            self.assertTrue(
+                chain.endswith(f"trim=end_frame={frames},setpts=PTS-STARTPTS[v{index}]"),
+                f"кадр {index + 1} не закреплён на {frames} кадрах: {chain[-80:]}",
+            )
+
+    def test_a_take_shorter_than_its_slot_does_not_shorten_the_reel(self):
+        # Kling отдаёт длину с точностью до кадра, слот считается от голоса —
+        # дубль вполне может приехать на кадр короче. Раньше этот кадр просто
+        # пропадал из монтажа вместе с синхронизацией.
+        graph = self._graph([self._take(2.1667, 0.0)], actual=2.1333)
+        chain = next(p for p in graph.split(";") if p.startswith("[0:v]"))
+        self.assertIn("tpad=stop_mode=clone", chain)
+        self.assertIn("trim=end_frame=65", chain)
+
+    def test_the_inline_whisper_cut_lands_on_a_frame_on_both_sides(self):
+        clip = {"path": "/tmp/t.mp4", "duration": 2.9, "audio_slice": "/tmp/s.mp3",
+                "speech_offset": 0.0,
+                "shot": {"visual_type": "talking", "_performance": "whisper",
+                         "_whisper_start": 0.941}}
+        graph = self._graph([clip], actual=2.9333, own_audio=2.9333)
+        # 0.941 с — это 28.23 кадра. По секундам кадр 28 не доставался ни куску
+        # до реза, ни куску после, и сегмент отдавал 86 кадров вместо 87.
+        self.assertIn("[v0pre]trim=end_frame=28", graph)
+        self.assertIn("[v0whisper]trim=start_frame=28", graph)
+
+    def test_a_rendered_reel_is_as_long_as_the_slots_it_was_built_from(self):
+        """Единственная проверка здесь, которая смотрит на файл, а не на строку.
+
+        Граф, терявший по кадру на дубль, выглядел совершенно правильно — все
+        соседние тесты на нём проходили. Поймать это можно только посчитав
+        кадры в готовом файле, поэтому здесь ffmpeg работает по-настоящему.
+        """
+        def probe(path, stream):
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", stream,
+                 "-count_frames", "-show_entries", "stream=nb_read_frames",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True,
+            )
+            return int((out.stdout or "0").strip() or 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = os.path.join(tmp, "clip.mp4")
+            voice = os.path.join(tmp, "voice.mp3")
+            subs = os.path.join(tmp, "subs.ass")
+            out = os.path.join(tmp, "out.mp4")
+            # Настоящий рендер — значит и субтитры настоящие: пустой заголовок
+            # libass не принимает.
+            with open(subs, "w", encoding="utf-8") as f:
+                f.write(
+                    "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\n"
+                    "PlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, "
+                    "Fontsize, PrimaryColour, Alignment, Encoding\n"
+                    "Style: Default,Arial,60,&H00FFFFFF,2,1\n\n[Events]\n"
+                    "Format: Layer, Start, End, Style, Text\n"
+                    "Dialogue: 0,0:00:00.00,0:00:00.50,Default,ТЕСТ\n"
+                )
+            made = subprocess.run(
+                ["ffmpeg", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "testsrc=size=270x480:rate=30:duration=3",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                 "-shortest", clip],
+                capture_output=True,
+            )
+            if made.returncode:
+                self.skipTest("ffmpeg unavailable")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                 "-i", "sine=frequency=300:duration=8", voice],
+                capture_output=True, check=True,
+            )
+            # Слоты дробные и головы дробные — как у живого ролика: границы
+            # кадров ложатся между кадрами исходника.
+            slots = [2.48, 1.34, 2.28]
+            clips = [{"path": clip, "duration": slot, "audio_slice": voice,
+                      "speech_offset": offset, "shot": {"visual_type": "talking"}}
+                     for slot, offset in zip(slots, (0.0, 0.011, 0.025))]
+            with patch("saasshorts._take_level_match_db", return_value=0.0), \
+                 patch("saasshorts._measure_final_loudness", return_value=None), \
+                 patch("saasshorts._room_tone_db", return_value=-70.0):
+                composite_storyboard_video(clips, voice, subs, out)
+
+            # 74 + 41 + 68 кадров слотов плюс придержанный хвост в 3 кадра.
+            self.assertEqual(probe(out, "v"), 74 + 41 + 68 + 3)
+            # И звук дожил до конца картинки, а не оборвался раньше неё.
+            self.assertGreaterEqual(_get_media_duration(out), sum(slots) - 0.01)
+
+    def test_a_take_that_ends_on_silence_plays_only_to_its_last_word(self):
+        """Пауза, в которой никто не говорит, из ролика уходит.
+
+        Юзер: «если мы отправили 1.4 с аудио и получили 2.14 видео, то видео
+        надо резать где нет аудио» (2026-08-05). На ролике saas_a6bea5f1 таких
+        хвостов набралось 0.8 с — и в самом длинном из них Kling успел
+        улыбнуться под текст про упрямый жир.
+        """
+        with patch("saasshorts._speech_end", return_value=1.2):
+            graph = self._graph([self._take(2.0, 0.0)], actual=2.5, own_audio=2.0)
+        chain = next(p for p in graph.split(";") if p.startswith("[0:v]"))
+        # 1.2 с слов + 0.25 с воздуха = 1.45 с, это 44 кадра из 60 возможных.
+        self.assertIn("trim=end_frame=44", chain)
+
+    def test_a_take_never_outlives_its_own_sound(self):
+        """Дописанной тишине не встать посреди слова.
+
+        Юзер: «между последними двумя кадрами есть аудио затык» (2026-08-05).
+        Кадр 6 ролика saas_a6bea5f1: слот 2.167 с, Kling вернул 2.133 с звука и
+        оборвал его на -23 dB, то есть на слове. Недостающий кадр дописывал
+        `apad` цифровой тишиной, а `afade` стоял в конце слота — уже внутри
+        дописанного — и не срабатывал: голая ступенька со слова в пол.
+        """
+        with patch("saasshorts._speech_end", return_value=2.133):
+            graph = self._graph([self._take(2.1667, 0.0)],
+                                actual=2.1333, own_audio=2.1333)
+        chain = next(p for p in graph.split(";") if p.startswith("[0:v]"))
+        # 64 кадра, а не 65: ровно то, подо что у дубля есть звук.
+        self.assertIn("trim=end_frame=64", chain)
+        # И звук дубля режется там же, откуда картинке хватило кадров.
+        self.assertIn("atrim=start=0.000:end=2.133", graph)
+
+    def test_a_take_without_measurable_silence_keeps_its_whole_slot(self):
+        with patch("saasshorts._speech_end", return_value=None):
+            graph = self._graph([self._take(2.0, 0.0)], actual=2.5, own_audio=2.0)
+        chain = next(p for p in graph.split(";") if p.startswith("[0:v]"))
+        self.assertIn("trim=end_frame=60", chain)
+
+    def test_a_trimmed_take_does_not_drag_the_broll_off_its_words(self):
+        """Перебивка читает мастер по своему месту в озвучке, а не в ролике.
+
+        Ролик стал короче озвучки, а слова вставки остались там же. Считай их
+        код по времени ролика — с каждым обрезанным кадром вставка забирала бы
+        всё больший кусок чужой фразы.
+        """
+        broll = {"path": "/tmp/b.mp4", "duration": 2.0, "shot": {"visual_type": "broll"}}
+        with patch("saasshorts._speech_end", return_value=1.2):
+            graph = self._graph([self._take(2.0, 0.0), broll], actual=2.5, own_audio=2.0)
+        # Место вставки в озвучке — 2.0 с, в ролике она начинается на 1.45 с.
+        self.assertIn("atrim=start=2.000:end=4.000", graph)
+        self.assertNotIn("atrim=start=1.450", graph)
+
+    def test_subtitles_move_onto_the_reel_clock(self):
+        layout = [
+            {"master_start": 0.0, "master_end": 2.0, "duration": 1.45, "window": 2.0,
+             "reel_start": 0.0},
+            {"master_start": 2.0, "master_end": 4.0, "duration": 2.0, "window": 2.0,
+             "reel_start": 1.45},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.ass")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[Events]\n"
+                        "Dialogue: 0,0:00:00.50,0:00:01.00,S,,0,0,0,,раз\n"
+                        "Dialogue: 0,0:00:02.00,0:00:02.50,S,,0,0,0,,два\n"
+                        "Dialogue: 0,0:00:01.60,0:00:01.90,S,,0,0,0,,вырезано\n")
+            out = _reel_timed_subtitles(path, layout)
+            self.assertNotEqual(out, path)
+            with open(out, encoding="utf-8") as f:
+                body = f.read()
+        # Слово до реза стоит на месте, слово после — уехало на 0.55 с назад.
+        self.assertIn("0:00:00.50,0:00:01.00", body)
+        self.assertIn("0:00:01.45,0:00:01.95", body)
+        # Слово, попавшее целиком в вырезанное, схлопнулось и выброшено.
+        self.assertNotIn("вырезано", body)
+
+    def test_the_last_frame_is_held_so_the_voice_is_not_clipped(self):
+        graph = self._graph([self._take(2.48, 0.0)])
+        # `-shortest` равняет по метке последнего кадра, а не по длительности
+        # видео, и звук за неё не пускают. Задержка обязана стоять до `settb`:
+        # за ним частота кадров звену уже не известна и `tpad` молчит.
+        self.assertIn(
+            "fps=30,tpad=stop_mode=clone:stop_duration=0.1,settb=expr=1/30", graph,
+        )
+        self.assertIn("apad=pad_dur=0.25[aout]", graph)
 
 
 if __name__ == "__main__":
