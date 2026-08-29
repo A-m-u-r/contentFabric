@@ -905,6 +905,17 @@ def _finalize_generated_script(script: dict) -> dict:
     # Actor identity belongs to the user's selected/uploaded reference, never to
     # the script model. Drop the field even if a model returns an old schema.
     script.pop("actor_description", None)
+    if isinstance(script.get("full_narration"), str):
+        script["full_narration"] = _sanitize_eleven_v3_audio_tags(
+            script["full_narration"]
+        )
+    for collection_key, text_key in (("shots", "speech"), ("segments", "narration")):
+        collection = script.get(collection_key)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, dict) and isinstance(item.get(text_key), str):
+                item[text_key] = _sanitize_eleven_v3_audio_tags(item[text_key])
     narration = _script_spoken_text(script)
     script["full_narration"] = narration
     script["duration_seconds"] = _estimate_speech_duration(narration)
@@ -1475,6 +1486,37 @@ _CANNED_HOOK_OPENINGS = (
     "\u0441\u043c\u043e\u0442\u0440\u0438 \u0434\u043e \u043a\u043e\u043d\u0446\u0430",
 )
 
+_ELEVEN_V3_PRODUCTION_AUDIO_TAGS = (
+    "laughs",
+    "laughs harder",
+    "starts laughing",
+    "wheezing",
+    "whispers",
+    "sighs",
+    "exhales",
+    "sarcastic",
+    "curious",
+    "excited",
+    "crying",
+    "snorts",
+    "mischievously",
+)
+_ELEVEN_V3_AUDIO_TAGS = frozenset(_ELEVEN_V3_PRODUCTION_AUDIO_TAGS)
+_ELEVEN_V3_AUDIO_TAG_ALIASES = {
+    "laugh": "laughs",
+    "laughing": "laughs",
+    "whisper": "whispers",
+    "whispering": "whispers",
+    "sigh": "sighs",
+    "exhale": "exhales",
+    "exhaling": "exhales",
+    "sarcastically": "sarcastic",
+    "curiously": "curious",
+    "excitedly": "excited",
+    "mischievous": "mischievously",
+}
+
+
 _HOOK_TYPES = frozenset((
     "result_first",
     "mistake_prohibition",
@@ -1483,6 +1525,9 @@ _HOOK_TYPES = frozenset((
     "pain_question",
     "personal_confession_demo",
     "open_loop",
+    "list_specific",
+    "secret_reveal",
+    "identity_callout",
 ))
 
 
@@ -1667,17 +1712,20 @@ def _duration_preset(target: int, beats: tuple, audio_tags: int, pauses: int) ->
         "visual_beats": f"{low}-{high}",
         "audio_tags": audio_tags,
         "pauses": pauses,
-        "words_per_beat": f"{max(2, round(words / high))}-{max(3, round(words / low))}",
+        "words_per_beat": (
+            f"{max(2, round(words / high))}-"
+            f"{max(3, math.ceil((words + 4) / low))}"
+        ),
     }
 
 
 # Биты — сколько склеек держит ритм на этой длине; теги и паузы — сколько
 # актёрских ремарок и многоточий ролик может себе позволить, они стоят времени.
 TARGET_VIDEO_DURATION_PRESETS = {
-    15: _duration_preset(15, (6, 8), audio_tags=3, pauses=2),
-    20: _duration_preset(20, (8, 10), audio_tags=4, pauses=3),
-    30: _duration_preset(30, (11, 15), audio_tags=6, pauses=4),
-    45: _duration_preset(45, (16, 22), audio_tags=9, pauses=6),
+    15: _duration_preset(15, (6, 8), audio_tags=1, pauses=1),
+    20: _duration_preset(20, (8, 10), audio_tags=2, pauses=2),
+    30: _duration_preset(30, (11, 15), audio_tags=3, pauses=3),
+    45: _duration_preset(45, (16, 22), audio_tags=4, pauses=4),
 }
 
 
@@ -1817,13 +1865,27 @@ SPEECH STYLE (critical — the speech/narration text goes straight to TTS and mu
 - Mark natural pauses and hesitations with ellipses "…" and dashes "—": "а сладкое… ну, это самый быстрый путь".
 - Ask the viewer rhetorical questions: "Знакомо?", "Когда? Где?".
 - Write ALL numbers in words: "двадцать минут", never "20 минут".
-- REQUIRED: add 2-3 ElevenLabs audio tags per script inside speech/narration, in English square brackets: [sighs], [excited], [whispers]. They are acting directions and are never spoken; without them the TTS delivery sounds flat and robotic. NEVER put a tag as the last token of a line, and NEVER put tags in overlay_text, captions, or hashtags.
 """
     else:
         lang_instructions = """
 LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in ENGLISH.
 Use natural casual American English like a real person on TikTok. Contractions, slang OK.
 Examples of English UGC hooks: "Three invoice fields prevent this approval error", "Stop approving invoices manually when cash flow is tight", "This dashboard metric exposes the leak"
+"""
+
+    tts_tag_allowlist = ", ".join(
+        f"[{tag}]" for tag in _ELEVEN_V3_PRODUCTION_AUDIO_TAGS
+    )
+    tts_instructions = f"""
+ELEVENLABS V3 DELIVERY:
+- STRICT ELEVEN V3 TAG ALLOWLIST: {tts_tag_allowlist}.
+- Audio tags are optional acting directions, not decoration. Use one only when the voice should audibly perform that action, and stay inside the whole-script tag budget below.
+- Never invent tags such as [confident], [playful], [calm], [pause], [music], or [softly]. The application removes every tag outside the strict allowlist.
+- Put tags only in speech/narration, never in overlay_text, captions, or hashtags. Never leave a tag as the last token of a line.
+- Eleven v3 does not support SSML <break>. Create natural pacing with sentence structure, commas, dashes, and occasional ellipses instead.
+- Isolate [whispers] in one dedicated short talking shot or segment. Do not switch between normal speech and whisper inside one generated talking clip.
+- Prefer [sighs] or [exhales] under an immediately relevant B-roll insert unless seeing the actor perform it matters to the point.
+- Match the tag to the chosen voice and context. A mismatched tag is worse than no tag.
 """
 
     topic_instructions = ""
@@ -1844,7 +1906,8 @@ Every generated script MUST focus on this exact topic. Do not drift into generic
 HOOK REQUIREMENTS:
 - Start with a topic-specific claim, mistake, question, result, data point, confession, demo, or open loop. Never put filler before the actual claim.
 - Do not use greetings, "watch until the end" filler, or canned openings such as "stop stop stop", "okay listen", or "all right enough".
-- Every script MUST include `hook_type` with exactly one of: result_first, mistake_prohibition, counterintuitive_claim, data_point, pain_question, personal_confession_demo, open_loop.
+- Every script MUST include `hook_type` with exactly one of: result_first, mistake_prohibition, counterintuitive_claim, data_point, pain_question, personal_confession_demo, open_loop, list_specific, secret_reveal, identity_callout.
+- Use list_specific only when the opening names a concrete count and subject; secret_reveal only when the script resolves a real information gap; identity_callout only when the first line names the viewer precisely. Never use a category as empty clickbait.
 - Every script in this batch MUST use a different hook type and a different first-three-word opening.
 - The first spoken words must carry topic-specific meaning, not a generic pattern interrupt.{supplied_hook_instruction}
 """
@@ -1887,6 +1950,7 @@ HOOK REQUIREMENTS:
         prompt = f"""You are a senior short-form ad storyboard writer for TikTok/Instagram Reels.
 Generate {num_scripts} storyboard-based video scripts for this product/business.
 {lang_instructions}
+{tts_instructions}
 {topic_instructions}
 {hook_instructions}
 PRODUCT ANALYSIS:
@@ -2020,6 +2084,7 @@ STORYBOARD PACING PROFILE:
     prompt = f"""You are a viral short-form video scriptwriter for TikTok/Instagram Reels.
 Generate {num_scripts} video scripts to promote this product/business.
 {lang_instructions}
+{tts_instructions}
 {topic_instructions}
 {hook_instructions}
 PRODUCT ANALYSIS:
@@ -3017,7 +3082,21 @@ def generate_actor_image(
 
 
 _AUDIO_TAG_RE = re.compile(r"\[[A-Za-z][^\]\n]*\]")
+_BRACKET_TAG_RE = re.compile(r"\[([^\]\n]+)\]")
 _WHISPER_TAG_RE = re.compile(r"\[(?:whispers?|whispering)\]", re.IGNORECASE)
+
+def _sanitize_eleven_v3_audio_tags(text: str) -> str:
+    """Apply the conservative production voice-tag allowlist and aliases."""
+    def replace_tag(match: re.Match) -> str:
+        raw_tag = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        tag = _ELEVEN_V3_AUDIO_TAG_ALIASES.get(raw_tag, raw_tag)
+        return f"[{tag}]" if tag in _ELEVEN_V3_AUDIO_TAGS else " "
+
+    sanitized = _BRACKET_TAG_RE.sub(replace_tag, text or "")
+    sanitized = re.sub(r"[ \t]+([,.;:!?…])", r"\1", sanitized)
+    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+    sanitized = re.sub(r" *\n *", "\n", sanitized)
+    return sanitized.strip()
 
 
 def _strip_audio_tags(text: str) -> str:
@@ -3041,8 +3120,8 @@ def generate_voiceover(
 ) -> str:
     """Generate voiceover audio using ElevenLabs TTS. Returns the model actually used.
 
-    Defaults to eleven_v3 in Creative mode (stability 0.0): lively human
-    delivery that honors [sighs]/[excited]-style audio tags in the text.
+    Defaults to eleven_v3 in Natural mode (stability 0.5): balanced delivery
+    that honors supported audio tags without Creative mode's extra variance.
     Falls back to multilingual_v2 with the legacy settings when the account
     has no v3 access; tags are stripped there since v2 would voice them.
     The fallback voice sounds noticeably more robotic, so the caller must
@@ -3061,9 +3140,9 @@ def generate_voiceover(
     def request_body(model: str) -> dict:
         if model == "eleven_v3":
             return {
-                "text": text,
+                "text": _sanitize_eleven_v3_audio_tags(text),
                 "model_id": model,
-                "voice_settings": {"stability": 0.0},
+                "voice_settings": {"stability": 0.5},
             }
         return {
             "text": _strip_audio_tags(text),

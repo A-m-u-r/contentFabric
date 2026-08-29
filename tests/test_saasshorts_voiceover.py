@@ -55,8 +55,35 @@ class StripAudioTagsTests(unittest.TestCase):
         self.assertEqual(_strip_audio_tags(text), text)
 
 
+class SanitizeElevenV3AudioTagsTests(unittest.TestCase):
+    def test_normalizes_known_aliases_and_removes_unknown_tags(self):
+        module = __import__("saasshorts")
+        sanitizer = getattr(module, "_sanitize_eleven_v3_audio_tags", None)
+
+        self.assertIsNotNone(sanitizer)
+        self.assertEqual(
+            sanitizer("[confident] Привет. [whispering] Это секрет. [music]"),
+            "Привет. [whispers] Это секрет.",
+        )
+
+
 class GenerateVoiceoverV3Tests(unittest.TestCase):
-    def test_defaults_to_v3_creative_with_tags_preserved(self):
+    def test_sanitizes_v3_tags_before_sending_text(self):
+        cm, client = _fake_http_client([_response(200)])
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            out = os.path.join(tmp, "voice.mp3")
+            with patch("saasshorts.httpx.Client", return_value=cm):
+                generate_voiceover(
+                    "[confident] Привет. [whispering] Это секрет. [music]",
+                    "key",
+                    out,
+                    voice_id="v1",
+                )
+
+        body = client.post.call_args.kwargs["json"]
+        self.assertEqual(body["text"], "Привет. [whispers] Это секрет.")
+
+    def test_defaults_to_v3_natural_with_supported_tags_preserved(self):
         cm, client = _fake_http_client([_response(200)])
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             out = os.path.join(tmp, "voice.mp3")
@@ -67,7 +94,7 @@ class GenerateVoiceoverV3Tests(unittest.TestCase):
         self.assertEqual(client.post.call_count, 1)
         body = client.post.call_args.kwargs["json"]
         self.assertEqual(body["model_id"], "eleven_v3")
-        self.assertEqual(body["voice_settings"], {"stability": 0.0})
+        self.assertEqual(body["voice_settings"], {"stability": 0.5})
         self.assertIn("[sighs]", body["text"])
 
     def test_falls_back_to_multilingual_v2_with_stripped_tags(self):
@@ -287,6 +314,23 @@ class CaptionHighlightTests(unittest.TestCase):
 
 
 class ScriptDurationAndHookTests(unittest.TestCase):
+    def test_finalize_sanitizes_audio_tags_in_storyboard_shots(self):
+        script = {
+            "shots": [
+                {"speech": "[confident] Первая фраза."},
+                {"speech": "[whispering] Вторая фраза. [music]"},
+            ],
+        }
+
+        _finalize_generated_script(script)
+
+        self.assertEqual(script["shots"][0]["speech"], "Первая фраза.")
+        self.assertEqual(script["shots"][1]["speech"], "[whispers] Вторая фраза.")
+        self.assertEqual(
+            script["full_narration"],
+            "Первая фраза. [whispers] Вторая фраза.",
+        )
+
     def test_estimate_ignores_audio_tag_words_and_counts_tag_pause_time(self):
         text = "[sighs] one two three four five six seven eight nine ten eleven ... [whispers]"
         self.assertEqual(_estimate_speech_duration(text), 7)
@@ -427,6 +471,15 @@ class ScriptDurationAndHookTests(unittest.TestCase):
 
         self.assertEqual(ask.call_count, 1)
         self.assertEqual(len(scripts), 2)
+
+    def test_extended_hook_taxonomy_accepts_lists_secrets_and_identity(self):
+        scripts = [
+            {"hook_type": "list_specific", "segments": [{"narration": "Three dinner rules simplify evenings"}]},
+            {"hook_type": "secret_reveal", "segments": [{"narration": "The hidden reset starts at lunch"}]},
+            {"hook_type": "identity_callout", "segments": [{"narration": "Busy mothers need a smaller fallback"}]},
+        ]
+
+        self.assertEqual(_validate_script_batch_hooks(scripts), [])
 
     def test_substantive_stop_prohibition_is_not_canned_filler(self):
         scripts = [{"segments": [{"narration": "Stop approving invoices manually"}]}]

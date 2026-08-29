@@ -2217,6 +2217,22 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertEqual(saasshorts.normalize_target_duration(29), 20)
         self.assertEqual(saasshorts.normalize_target_duration(None), 20)
 
+    def test_audio_direction_budget_stays_sparse_as_reels_get_longer(self):
+        expected = {
+            15: (1, 1),
+            20: (2, 2),
+            30: (3, 3),
+            45: (4, 4),
+        }
+
+        for target, (tags, pauses) in expected.items():
+            with self.subTest(target=target):
+                preset = saasshorts.TARGET_VIDEO_DURATION_PRESETS[target]
+                self.assertEqual(preset["audio_tags"], tags)
+                self.assertEqual(preset["pauses"], pauses)
+                low, high = (int(part) for part in preset["words_per_beat"].split("-"))
+                self.assertLess(low, high)
+
     def test_storyboard_duration_presets_use_dynamic_visual_beat_ranges(self):
         # Верх диапазона упирается в то, что ролик может оплатить: каждый бит —
         # отдельный клип, а клип короче своего пола не бывает. Прежние верхние
@@ -2258,15 +2274,24 @@ class SaaSStoryboardTests(unittest.TestCase):
         self.assertIn("28-32 seconds", prompt)
         # Бюджет слов — это остаток от 30 секунд после оплаты тегов и пауз, а не
         # отдельное подобранное число: см. `_duration_preset`.
-        self.assertIn("52-56 spoken words", prompt)
-        self.assertIn("at most 6 tags", prompt)
+        self.assertIn("58-62 spoken words", prompt)
+        self.assertIn("at most 3 tags", prompt)
         self.assertIn("11-12 visual beats", prompt)
         # Слова на реплику посчитаны от бюджета и битов. Пока правило жило само
         # («4-8 слов»), 8 битов давали 48 слов при бюджете 26 — и это формально
         # не нарушало ни одного пункта.
-        self.assertIn("carrying 4-5 spoken words", prompt)
-        self.assertIn("ONE spoken phrase of 4-5 words", prompt)
+        self.assertIn("carrying 5-6 spoken words", prompt)
+        self.assertIn("ONE spoken phrase of 5-6 words", prompt)
         self.assertIn("Adding a shot does NOT add words", prompt)
+        self.assertIn("STRICT ELEVEN V3 TAG ALLOWLIST", prompt)
+        self.assertIn("[laughs harder]", prompt)
+        self.assertIn("Never invent tags such as [confident]", prompt)
+        self.assertIn("does not support SSML <break>", prompt)
+        self.assertIn("Isolate [whispers] in one dedicated short talking shot", prompt)
+        self.assertNotIn("REQUIRED: add 2-3 ElevenLabs audio tags", prompt)
+        self.assertIn("list_specific", prompt)
+        self.assertIn("secret_reveal", prompt)
+        self.assertIn("identity_callout", prompt)
         self.assertIn("STORYBOARD PACING PROFILE", prompt)
         self.assertIn("35-45% of the spoken timeline", prompt)
         self.assertIn("25-50% is an acceptable soft range", prompt)
@@ -2448,7 +2473,7 @@ class SaaSStoryboardTests(unittest.TestCase):
         # после него, и их промпты про хронометраж ничего не знают.
         prompt = client.models.generate_content.call_args_list[0].kwargs["contents"][0]
         self.assertIn("43-47 seconds", prompt)
-        self.assertIn("78-82 spoken words", prompt)
+        self.assertIn("88-92 spoken words", prompt)
         self.assertIn("five segments", prompt.casefold())
         self.assertIn('"end": 45', prompt)
         self.assertNotIn("18-22 seconds total", prompt)
