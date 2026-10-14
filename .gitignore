@@ -78,3 +78,6 @@ dist/
 build/
 .pytest_cache/
 *.tsbuildinfo
+
+# Public showcase media are maintained in the separate content-fabric repository.
+docs/media/showcase/
