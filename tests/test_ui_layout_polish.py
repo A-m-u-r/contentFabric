@@ -61,18 +61,20 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("Не начат", tab)
         self.assertIn("Сценарий", tab)
         self.assertIn("Кадры", tab)
-        self.assertIn("Видео", tab)
+        self.assertIn("Готово", tab)
+        self.assertIn("Файл недоступен", tab)
         self.assertIn("Ошибка", tab)
 
     def test_content_plan_merges_local_workspace_badges_and_uses_utf8_russian_labels(self):
         tab = CONTENT_PLAN.read_text(encoding="utf-8")
 
-        self.assertIn("const localWorkspace = loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item });", tab)
-        self.assertIn("chooseNewestWorkspace(localWorkspace, workspaceSummaries[item.item_id])", tab)
+        self.assertIn("export function contentPlanItemProgress(local, remote, manualDone = false)", tab)
+        self.assertIn("chooseNewestWorkspace(local, remote)", tab)
+        self.assertIn("loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item })", tab)
         self.assertIn("not_started: 'Не начат'", tab)
         self.assertIn("script: 'Сценарий'", tab)
         self.assertIn("frames: 'Кадры'", tab)
-        self.assertIn("video: 'Видео'", tab)
+        self.assertIn("video: 'Файл недоступен'", tab)
         self.assertIn("failed: 'Ошибка'", tab)
 
     def test_content_plan_sets_structured_pending_context_without_removing_legacy_topic(self):

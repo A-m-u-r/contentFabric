@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { CalendarDays, Sparkles, Loader2, AlertCircle, RefreshCw, Check, Target, ChevronRight } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { CalendarDays, Sparkles, Loader2, AlertCircle, RefreshCw, Check, Target, ChevronRight, Download, Play, SquarePen } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -38,7 +38,7 @@ const WORKSPACE_STAGE_LABELS = {
   not_started: 'Не начат',
   script: 'Сценарий',
   frames: 'Кадры',
-  video: 'Видео',
+  video: 'Файл недоступен',
   failed: 'Ошибка',
 };
 
@@ -72,10 +72,41 @@ function upgradePlan(plan) {
   return itemIdsChanged || doneChanged ? { ...plan, items, done } : plan;
 }
 
+export function mergeContentPlans(local, remote) {
+  local = upgradePlan(local);
+  remote = upgradePlan(remote);
+  if (!remote) return local;
+  if (!local) return remote;
+  const remoteItems = ensurePlanItemIds(remote.items);
+  const remoteIds = new Set(remoteItems.map((item) => item.item_id));
+  return {
+    ...local,
+    ...remote,
+    items: [...remoteItems, ...ensurePlanItemIds(local.items).filter((item) => !remoteIds.has(item.item_id))],
+    done: { ...(local.done || {}), ...(remote.done || {}) },
+  };
+}
+
 function itemTopic(item) {
   return [item.topic, item.hook ? `Хук: ${item.hook}` : '', item.cta ? `CTA: ${item.cta}` : '']
     .filter(Boolean)
     .join('\n');
+}
+
+export function contentPlanItemProgress(local, remote, manualDone = false) {
+  const workspace = chooseNewestWorkspace(local, remote);
+  let video = null;
+  if (remote && Object.prototype.hasOwnProperty.call(remote, 'video')) {
+    video = remote.video;
+  } else {
+    const result = workspace?.genResult || workspace?.result;
+    const url = result?.video_url;
+    if (workspaceStage(workspace) === 'video' && typeof url === 'string' && url.startsWith('/videos/saas_')) {
+      video = { video_url: url, duration: result.duration, filename: url.split('/').pop() };
+    }
+  }
+  return { workspace, stage: workspace ? workspaceStage(workspace) : null,
+    video: video || null, done: Boolean(video) || Boolean(manualDone) };
 }
 
 export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKeys = false, onCreateVideo, onOpenProjects }) {
@@ -87,6 +118,8 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
   const [plan, setPlan] = useState(null);
   const [workspaceSummaries, setWorkspaceSummaries] = useState({});
   const [openingItemId, setOpeningItemId] = useState('');
+  const [downloadingItemId, setDownloadingItemId] = useState('');
+  const planChangeRef = useRef(0);
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
   const isManagedKey = (value) => value === '__saved__' || value === '__platform__';
@@ -101,17 +134,61 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
         if (Array.isArray(data.profiles) && data.profiles.length > 0) {
           setProfiles(data.profiles);
           saveBusinessProfiles(data.profiles);
+          setSelectedId((current) => {
+            if (current && data.profiles.some((profile) => profileId(profile) === current)) return current;
+            const firstId = profileId(data.profiles[0]);
+            saveSelectedProfileId(firstId);
+            return firstId;
+          });
         }
       })
       .catch(() => {});
   }, [authToken]);
 
   useEffect(() => {
+    planChangeRef.current += 1;
     const loadedPlan = selectedId ? loadPlan(selectedId) : null;
     const upgradedPlan = upgradePlan(loadedPlan);
     setPlan(upgradedPlan);
     if (selectedId && upgradedPlan !== loadedPlan) savePlan(selectedId, upgradedPlan);
   }, [selectedId]);
+
+  useEffect(() => {
+    if (!authToken || !selectedId) return;
+    const version = planChangeRef.current;
+    let cancelled = false;
+    fetch(getApiUrl(`/api/user/content-plan/${encodeURIComponent(selectedId)}`), { headers: authHeaders() })
+      .then((res) => (res.ok ? res.json() : { plan: null }))
+      .then((data) => {
+        if (cancelled || version !== planChangeRef.current || !data.plan) return;
+        const merged = upgradePlan(mergeContentPlans(loadPlan(selectedId), data.plan));
+        setPlan(merged);
+        savePlan(selectedId, merged);
+        if (JSON.stringify(merged) !== JSON.stringify(data.plan)) {
+          fetch(getApiUrl(`/api/user/content-plan/${encodeURIComponent(selectedId)}`), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({ plan: merged }),
+          }).catch(() => {});
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [authToken, selectedId]);
+
+  const persistPlan = (profileId, nextPlan) => {
+    planChangeRef.current += 1;
+    setPlan(nextPlan);
+    savePlan(profileId, nextPlan);
+    if (!authToken) return;
+    fetch(getApiUrl(`/api/user/content-plan/${encodeURIComponent(profileId)}`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ plan: nextPlan }),
+    }).then((res) => {
+      if (!res.ok) throw new Error('Не удалось сохранить контент-план в аккаунте. Локальная копия сохранена.');
+    }).catch((saveError) => setError(saveError.message));
+  };
 
   useEffect(() => {
     if (!authToken || !selectedId) {
@@ -140,6 +217,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
 
   const handleGenerate = async () => {
     if (!selectedProfile) return;
+    if (plan?.items?.length && !window.confirm('Заменить текущий контент-план новым? Черновики роликов сохранятся отдельно.')) return;
     if (!geminiApiKey) {
       setError('Нужен Gemini API ключ — задай его в Настройках.');
       return;
@@ -175,8 +253,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
         generatedAt: new Date().toISOString(),
         done: {},
       };
-      setPlan(nextPlan);
-      savePlan(selectedId, nextPlan);
+      persistPlan(selectedId, nextPlan);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -187,8 +264,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
   const toggleDone = (itemId) => {
     if (!plan) return;
     const nextPlan = { ...plan, done: { ...plan.done, [itemId]: !plan.done?.[itemId] } };
-    setPlan(nextPlan);
-    savePlan(selectedId, nextPlan);
+    persistPlan(selectedId, nextPlan);
   };
 
   const handleCreateVideo = async (item) => {
@@ -219,7 +295,14 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
         } catch { /* local workspace remains usable */ }
       }
       const newestWorkspace = chooseNewestWorkspace(localWorkspace, remoteWorkspace);
-      const workspace = saveLocalWorkspace(context, newestWorkspace || {});
+      const readyVideo = contentPlanItemProgress(localWorkspace, workspaceSummaries[item.item_id], false).video;
+      const initialWorkspace = newestWorkspace || (item.full_narration ? {
+        scriptMode: 'custom',
+        scriptFormat: item.format_hint || 'storyboard_v3',
+        customScript: item.full_narration,
+        targetDurationSeconds: item.target_duration_seconds || 20,
+      } : {});
+      const workspace = saveLocalWorkspace(context, readyVideo ? { ...initialWorkspace, step: 2 } : initialWorkspace);
       setWorkspaceSummaries((current) => ({
         ...current,
         [item.item_id]: { ...workspace, item_id: item.item_id },
@@ -232,7 +315,34 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
     }
   };
 
-  const doneCount = plan ? Object.values(plan.done || {}).filter(Boolean).length : 0;
+  const handleDownloadVideo = async (item, video) => {
+    if (downloadingItemId) return;
+    setDownloadingItemId(item.item_id);
+    setError('');
+    try {
+      const url = video.download_url || video.video_url;
+      const response = await fetch(getApiUrl(url), { headers: authHeaders() });
+      if (!response.ok) throw new Error('Не удалось скачать видео. Обнови контент-план и попробуй ещё раз.');
+      const blobUrl = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = video.filename || `reel-${item.item_id}.mp4`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (downloadError) {
+      setError(downloadError.message);
+    } finally {
+      setDownloadingItemId('');
+    }
+  };
+
+  const itemProgress = (item) => contentPlanItemProgress(
+    loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item }),
+    workspaceSummaries[item.item_id], plan?.done?.[item.item_id],
+  );
+  const doneCount = plan ? plan.items.filter((item) => itemProgress(item).done).length : 0;
 
   return (
     <div className="h-full overflow-y-auto custom-scrollbar">
@@ -338,7 +448,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-semibold flex items-center gap-2">
                     <Sparkles size={18} className="text-primary" />
-                    План на месяц
+                    {plan.title || 'План на месяц'}
                   </h2>
                   <span className="text-xs text-zinc-500">
                     {doneCount}/{plan.items.length} сделано
@@ -347,20 +457,22 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
 
                 <div className="space-y-3">
                   {plan.items.map((item) => {
-                    const done = Boolean(plan.done?.[item.item_id]);
+                    const { done, stage, video } = itemProgress(item);
                     const goalClass = GOAL_STYLES[item.goal] || 'bg-white/5 text-zinc-400 border-white/10';
-                    const localWorkspace = loadLocalWorkspace({ profileId: selectedId, itemId: item.item_id, item });
-                    const workspace = chooseNewestWorkspace(localWorkspace, workspaceSummaries[item.item_id]);
-                    const stage = workspace ? workspaceStage(workspace) : null;
                     return (
                       <div
                         key={item.item_id}
-                        className={`glass-panel p-4 flex gap-4 transition-opacity ${done ? 'opacity-50' : ''}`}
+                        data-content-plan-item={item.item_id}
+                        className={`glass-panel p-4 grid grid-cols-[24px,minmax(0,1fr)] sm:grid-cols-[24px,minmax(0,1fr),auto] gap-3 transition-opacity ${done && !video ? 'opacity-50' : ''}`}
                       >
                         <button
                           type="button"
                           onClick={() => toggleDone(item.item_id)}
-                          aria-label={done ? 'Отметить как несделанное' : 'Отметить как сделанное'}
+                          role="checkbox"
+                          aria-checked={done}
+                          disabled={Boolean(video)}
+                          aria-label={video ? 'Ролик готов' : done ? 'Отметить как несделанное' : 'Отметить как сделанное'}
+                          title={video ? 'Ролик готов' : done ? 'Отметить как несделанное' : 'Отметить как сделанное'}
                           className={`mt-0.5 w-6 h-6 shrink-0 rounded-lg border flex items-center justify-center transition-all ${
                             done
                               ? 'border-emerald-500/60 bg-emerald-500/20 text-emerald-300'
@@ -375,7 +487,7 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                             <span className="text-[10px] font-mono bg-white/10 text-zinc-300 px-2 py-0.5 rounded-full">
                               День {item.day}
                             </span>
-                            <h3 className={`text-sm font-semibold ${done ? 'line-through text-zinc-500' : 'text-zinc-100'}`}>
+                            <h3 className={`text-sm font-semibold ${done && !video ? 'line-through text-zinc-500' : 'text-zinc-100'}`}>
                               {item.title}
                             </h3>
                             {item.goal && (
@@ -383,10 +495,13 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                                 {item.goal}
                               </span>
                             )}
-                            {stage && (
-                              <span className="text-[10px] px-2 py-0.5 rounded-full border border-cyan-400/20 bg-cyan-400/10 text-cyan-200">
-                                {WORKSPACE_STAGE_LABELS[stage]}
+                            {(video || stage) && (
+                              <span className={`text-[10px] px-2 py-0.5 rounded-full border ${video ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-200' : 'border-cyan-400/20 bg-cyan-400/10 text-cyan-200'}`}>
+                                {video ? 'Готово' : WORKSPACE_STAGE_LABELS[stage]}
                               </span>
+                            )}
+                            {video && Number(video.duration) > 0 && (
+                              <span className="text-[10px] text-zinc-500">{Number(video.duration).toFixed(1)} с</span>
                             )}
                           </div>
                           {item.hook && (
@@ -398,16 +513,41 @@ export default function ContentPlanTab({ geminiApiKey, authToken, usePlatformKey
                           {item.cta && (
                             <p className="text-[11px] text-zinc-600">CTA: {item.cta}</p>
                           )}
+                          {item.full_narration && (
+                            <details className="text-xs text-zinc-300">
+                              <summary className="cursor-pointer text-violet-300">Текст озвучки</summary>
+                              <p className="mt-2 whitespace-pre-wrap leading-relaxed">{item.full_narration}</p>
+                            </details>
+                          )}
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={() => handleCreateVideo(item)}
-                          disabled={openingItemId === item.item_id}
-                          className="btn-secondary self-center px-3 py-2 text-xs flex items-center gap-1.5 shrink-0 text-violet-300"
-                        >
-                          <Sparkles size={12} /> Сделать ролик
-                        </button>
+                        <div className="col-start-2 sm:col-start-auto flex flex-wrap items-center gap-2 sm:self-center">
+                          {video && (
+                            <>
+                              <a href={getApiUrl(video.video_url)} target="_blank" rel="noreferrer"
+                                aria-label={`Посмотреть: ${item.title}`} title="Посмотреть видео"
+                                className="btn-secondary p-2 text-xs inline-flex items-center justify-center">
+                                <Play size={15} />
+                              </a>
+                              <button type="button" onClick={() => handleDownloadVideo(item, video)}
+                                disabled={Boolean(downloadingItemId)} title="Скачать видео"
+                                aria-label={`Скачать: ${item.title}`}
+                                className="btn-secondary p-2 text-xs inline-flex items-center justify-center disabled:opacity-50">
+                                {downloadingItemId === item.item_id ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+                              </button>
+                            </>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleCreateVideo(item)}
+                            disabled={openingItemId === item.item_id}
+                            className="btn-secondary px-3 py-2 text-xs flex items-center gap-1.5 text-violet-300"
+                          >
+                            {openingItemId === item.item_id ? <Loader2 size={12} className="animate-spin" />
+                              : video ? <SquarePen size={12} /> : <Sparkles size={12} />}
+                            {video ? 'Редактировать' : stage && stage !== 'not_started' ? 'Продолжить' : 'Сделать ролик'}
+                          </button>
+                        </div>
                       </div>
                     );
                   })}

@@ -48,6 +48,13 @@ videos/
 output/
 uploads/
 .claude/
+.env
+.env.*
+!.env.example
+.pptx-build/
+tmp/
+voice_test/
+screenshots/
 
 # Docker
 Dockerfile
@@ -57,6 +64,7 @@ docker-compose.yml
 # Docs
 README.md
 *.md
+!THIRD_PARTY_NOTICES.md
 
 
 

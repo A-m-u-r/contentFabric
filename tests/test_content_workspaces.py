@@ -1,7 +1,9 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
+import uuid
 
 import app
 
@@ -146,6 +148,86 @@ class ContentWorkspaceTests(unittest.TestCase):
                     self.profile["id"], "invalid", request, authorization,
                 ))
             self.assertEqual(error.exception.status_code, 400)
+
+    def _ready_video(self, owner=None, filename="final.mp4"):
+        job_id = str(uuid.uuid4())
+        job_dir = os.path.join(app.OUTPUT_DIR, f"saas_{job_id}")
+        os.makedirs(job_dir)
+        with open(os.path.join(job_dir, filename), "wb") as handle:
+            handle.write(b"saved video bytes")
+        metadata = {"owner_user_id": owner or self.owner["id"],
+                    "video_url": f"/videos/saas_{job_id}/{filename}", "duration": 18.9}
+        with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+        return job_dir, metadata
+
+    def test_summary_exposes_owned_ready_video_without_large_snapshot(self):
+        _, metadata = self._ready_video()
+        self._save(stage="video", snapshot={"genStatus": "completed", "genResult": metadata,
+                                           "customScript": "Keep this text"})
+        summary = app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0]
+        self.assertNotIn("snapshot", summary)
+        self.assertEqual(summary.get("video", {}).get("video_url"), metadata["video_url"])
+        self.assertEqual(summary["video"]["duration"], 18.9)
+        self.assertEqual(summary["video"]["download_url"],
+                         f"/api/user/content-workspaces/{self.profile['id']}/item-1/video")
+        self.assertEqual(app.get_content_workspace(self.owner["id"], self.profile["id"], "item-1")
+                         ["snapshot"]["customScript"], "Keep this text")
+
+    def test_summary_and_download_use_latest_gallery_edit_not_stale_snapshot(self):
+        job_dir, metadata = self._ready_video(filename="food_photos.mp4")
+        with open(os.path.join(job_dir, "old.mp4"), "wb") as handle:
+            handle.write(b"old video")
+        self._save(stage="video", snapshot={"result": {
+            "video_url": metadata["video_url"].replace("food_photos", "old")}})
+        summary = app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0]
+        self.assertEqual(summary.get("video", {}).get("filename"), "food_photos.mp4")
+        auth = f"Bearer {app.create_session(self.owner['id'])}"
+        response = asyncio.run(app.user_content_workspace_video(self.profile["id"], "item-1", auth))
+        self.assertEqual(response.path, os.path.join(job_dir, "food_photos.mp4"))
+        self.assertIn("attachment", response.headers["content-disposition"])
+
+    def test_missing_file_is_not_marked_ready(self):
+        job_dir, metadata = self._ready_video()
+        os.remove(os.path.join(job_dir, "final.mp4"))
+        self._save(stage="video", snapshot={"result": metadata})
+        summary = app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0]
+        self.assertIsNone(summary.get("video"))
+
+    def test_another_owners_job_cannot_be_downloaded_through_own_workspace(self):
+        _, metadata = self._ready_video(owner="someone-else")
+        self._save(stage="video", snapshot={"result": metadata})
+        summary = app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0]
+        self.assertIsNone(summary.get("video"))
+        auth = f"Bearer {app.create_session(self.owner['id'])}"
+        with self.assertRaises(app.HTTPException) as error:
+            asyncio.run(app.user_content_workspace_video(self.profile["id"], "item-1", auth))
+        self.assertEqual(error.exception.status_code, 404)
+
+    def test_gallery_path_escape_is_not_downloadable(self):
+        job_dir, metadata = self._ready_video()
+        self._save(stage="video", snapshot={"result": metadata})
+        metadata["video_url"] = metadata["video_url"].replace("final.mp4", "../private.mp4")
+        with open(os.path.join(job_dir, "gallery_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+        self.assertIsNone(app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0].get("video"))
+
+    def test_frames_preview_is_not_a_completed_video(self):
+        _, metadata = self._ready_video()
+        self._save(stage="frames", snapshot={"genStatus": "completed", "result": metadata})
+        self.assertIsNone(app.list_content_workspace_summaries(self.owner["id"], self.profile["id"])[0].get("video"))
+
+    def test_video_download_requires_authentication_and_profile_ownership(self):
+        _, metadata = self._ready_video()
+        self._save(stage="video", snapshot={"result": metadata})
+        with self.assertRaises(app.HTTPException) as error:
+            asyncio.run(app.user_content_workspace_video(self.profile["id"], "item-1", None))
+        self.assertEqual(error.exception.status_code, 401)
+        other = app.create_user("downloader@example.com", "secret123")
+        auth = f"Bearer {app.create_session(other['id'])}"
+        with self.assertRaises(app.HTTPException) as error:
+            asyncio.run(app.user_content_workspace_video(self.profile["id"], "item-1", auth))
+        self.assertEqual(error.exception.status_code, 404)
 
 
 if __name__ == "__main__":

@@ -141,6 +141,125 @@ class GenerateVoiceoverV3Tests(unittest.TestCase):
             self.assertEqual(call.kwargs["json"]["model_id"], "eleven_v3")
 
 
+class GenerateVoiceoverV4Tests(unittest.TestCase):
+    def test_v4_uses_requested_model_and_preserves_russian_tags(self):
+        cm, client = _fake_http_client([_response(200)])
+        text = "[curious] Привет. [whispers] Это секрет. [exhales]"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "voice.mp3")
+            with patch("saasshorts.httpx.Client", return_value=cm):
+                model = generate_voiceover(text, "key", out, voice_id="v1", model_id="eleven_v4")
+            with open(out, "rb") as audio:
+                self.assertEqual(audio.read(), b"mp3-bytes")
+        self.assertEqual(model, "eleven_v4")
+        self.assertEqual(client.post.call_count, 1)
+        self.assertEqual(client.post.call_args.args[0], "https://api.elevenlabs.io/v1/text-to-speech/v1")
+        self.assertEqual(client.post.call_args.kwargs["json"]["text"], text)
+        self.assertEqual(client.post.call_args.kwargs["json"]["model_id"], "eleven_v4")
+        self.assertEqual(client.post.call_args.kwargs["json"]["voice_settings"], {
+            "stability": 0.5, "similarity_boost": 0.75,
+        })
+
+    def test_v4_custom_settings_reach_provider(self):
+        cm, client = _fake_http_client([_response(200)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("saasshorts.httpx.Client", return_value=cm):
+                generate_voiceover(
+                    "Привет", "key", os.path.join(tmp, "voice.mp3"),
+                    voice_id="v1", model_id="eleven_v4",
+                    stability=0.35, similarity=0.9,
+                )
+        self.assertEqual(client.post.call_args.kwargs["json"]["voice_settings"], {
+            "stability": 0.35, "similarity_boost": 0.9,
+        })
+
+    def test_v4_transient_failure_is_not_retried_to_avoid_duplicate_charges(self):
+        cm, client = _fake_http_client([_response(503), _response(200)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("saasshorts.httpx.Client", return_value=cm):
+                with self.assertRaisesRegex(Exception, "503"):
+                    generate_voiceover("Привет", "key", os.path.join(tmp, "voice.mp3"), model_id="eleven_v4")
+        self.assertEqual(client.post.call_count, 1)
+
+    def test_v4_error_does_not_automatically_charge_for_v2(self):
+        cm, client = _fake_http_client([_response(403)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("saasshorts.httpx.Client", return_value=cm):
+                with self.assertRaisesRegex(Exception, "403"):
+                    generate_voiceover("Привет", "key", os.path.join(tmp, "voice.mp3"), model_id="eleven_v4")
+        self.assertEqual(client.post.call_count, 1)
+
+    def test_selected_model_reaches_elevenlabs_provider(self):
+        import saasshorts
+        with patch("saasshorts.generate_voiceover", return_value="eleven_v4") as generate:
+            result = saasshorts.generate_voiceover_with_fallback(
+                "Привет", "unused.mp3", provider="elevenlabs", fal_key="",
+                elevenlabs_key="key", elevenlabs_model="eleven_v4", log=lambda _: None,
+            )
+        self.assertEqual(generate.call_args.kwargs["model_id"], "eleven_v4")
+        self.assertEqual(result["model"], "eleven_v4")
+
+    def test_v4_settings_reach_elevenlabs_provider(self):
+        import saasshorts
+        with patch("saasshorts.generate_voiceover", return_value="eleven_v4") as generate:
+            saasshorts.generate_voiceover_with_fallback(
+                "Привет", "unused.mp3", provider="elevenlabs", fal_key="",
+                elevenlabs_key="key", elevenlabs_model="eleven_v4",
+                elevenlabs_stability=0.35, elevenlabs_similarity=0.9,
+            )
+        self.assertEqual(generate.call_args.kwargs["stability"], 0.35)
+        self.assertEqual(generate.call_args.kwargs["similarity"], 0.9)
+
+    def test_v4_auto_without_key_does_not_use_minimax(self):
+        import saasshorts
+        with patch("saasshorts.generate_voiceover_minimax") as minimax:
+            with self.assertRaisesRegex(Exception, "ElevenLabs API key"):
+                saasshorts.generate_voiceover_with_fallback(
+                    "Привет", "unused.mp3", provider="auto", fal_key="key",
+                    elevenlabs_key=None, elevenlabs_model="eleven_v4", log=lambda _: None,
+                )
+        minimax.assert_not_called()
+
+    def test_api_request_accepts_v4_and_defaults_to_calm_v4(self):
+        from app import SaaSGenerateRequest
+        script = {"title": "Тест", "narration": "Привет"}
+        self.assertEqual(SaaSGenerateRequest(script=script).elevenlabs_model, "eleven_v4")
+        self.assertEqual(SaaSGenerateRequest(script=script).elevenlabs_stability, 0.65)
+        self.assertEqual(SaaSGenerateRequest(script=script, elevenlabs_model="eleven_v4").elevenlabs_model, "eleven_v4")
+        with self.assertRaises(ValueError):
+            SaaSGenerateRequest(script=script, elevenlabs_model="eleven_v5")
+
+    def test_api_rejects_out_of_range_v4_settings(self):
+        from app import SaaSGenerateRequest
+        script = {"title": "Тест", "narration": "Привет"}
+        with self.assertRaises(ValueError):
+            SaaSGenerateRequest(script=script, elevenlabs_stability=1.1)
+        with self.assertRaises(ValueError):
+            SaaSGenerateRequest(script=script, elevenlabs_similarity=-0.1)
+
+    def test_signature_keeps_legacy_v3_cache_but_separates_v4(self):
+        import saasshorts
+        arguments = ("[curious] Привет", "elevenlabs", "voice1", "minimax1", "ru", "female")
+        old = saasshorts._tts_signature(*arguments)
+        self.assertEqual(old, saasshorts._tts_signature(*arguments, elevenlabs_model="eleven_v3"))
+        self.assertNotEqual(old, saasshorts._tts_signature(*arguments, elevenlabs_model="eleven_v4"))
+
+    def test_v4_settings_invalidate_only_v4_audio_cache(self):
+        import saasshorts
+        args = ("Привет", "elevenlabs", "anna", "minimax", "ru", "female")
+        baseline = saasshorts._tts_signature(*args, elevenlabs_model="eleven_v4")
+        changed = saasshorts._tts_signature(
+            *args, elevenlabs_model="eleven_v4",
+            elevenlabs_stability=0.35, elevenlabs_similarity=0.9,
+        )
+        self.assertNotEqual(baseline, changed)
+        self.assertEqual(
+            saasshorts._tts_signature(*args, elevenlabs_model="eleven_v3"),
+            saasshorts._tts_signature(*args, elevenlabs_model="eleven_v3",
+                                       elevenlabs_stability=0.35, elevenlabs_similarity=0.9),
+        )
+
+
 class SlicedAvatarShotVarietyTests(unittest.TestCase):
     def test_first_shot_keeps_original_reference(self):
         result = _avatar_reference_variant("/img/actor.png", "/img/ref_01.png", 1)

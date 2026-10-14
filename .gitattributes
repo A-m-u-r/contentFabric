@@ -1,0 +1,21 @@
+* text=auto
+
+*.py text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ttf binary
+*.mp3 binary
+*.wav binary

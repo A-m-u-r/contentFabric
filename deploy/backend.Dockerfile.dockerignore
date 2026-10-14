@@ -1,0 +1,20 @@
+# Allowlist application code and runtime assets; never send user state or keys.
+**
+!*.py
+!requirements.txt
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!fonts/
+!fonts/**
+!assets/
+!assets/fonts/
+!assets/fonts/**
+!assets/music/
+!assets/music/**
+
+**/.env
+**/.env.*
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/__pycache__/

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import MusicPicker, { musicPreferencesFromVideo, musicRequestSettings } from './MusicPicker';
 import {
   Film,
   Download,
@@ -17,6 +18,8 @@ import {
 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { galleryVideoModeBadge } from './videoModeBadge';
+import { galleryCostSummary } from './galleryCosts';
+import VideoCostBreakdown from './VideoCostBreakdown';
 
 const LIPSYNC_MODEL_OPTIONS = [
   {
@@ -152,6 +155,18 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
     } finally {
       setVoiceSaving('');
     }
+  };
+
+  const handleMusicChange = async (video, preferences) => {
+    const response = await fetch(getApiUrl('/api/saasshorts/music'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ job_id: video.job_id || jobIdFromVideoUrl(video.video_url),
+        ...musicRequestSettings(preferences.backgroundMusic, preferences.musicTrack, preferences.musicVolume) }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось сохранить музыку');
+    setVideos((current) => current.map((item) => item.video_id === video.video_id ? data.video : item));
+    setSelectedVideo(data.video);
   };
 
   const handleCopy = (text, id) => {
@@ -643,6 +658,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
           onModelChange={setLipSyncModel}
           onLipSync={handleLipSync}
           onSaveHeadTemplate={handleSaveHeadTemplate}
+          onMusicChange={authToken ? handleMusicChange : null}
           onEditStoryboard={(video) => {
             try {
               localStorage.setItem(PENDING_STORYBOARD_KEY, JSON.stringify({
@@ -659,6 +675,16 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
                 shots: video.shots || [],
                 shots_archived: video.shots_archived || [],
                 storyboard_generation_mode: video.storyboard_generation_mode,
+                generation_preset: video.generation_preset,
+                voice_id: video.voice_id,
+                voice_name: video.voice_name,
+                voice_model: video.voice_model,
+                voice_settings: video.voice_settings,
+                tts_provider: video.tts_provider,
+                background_music: video.background_music,
+                music_track: video.music_track,
+                music_volume: video.music_volume,
+                video_mode: video.video_mode,
               }));
             } catch (e) {
               console.warn('Не удалось передать раскадровку', e);
@@ -766,6 +792,7 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
   };
 
   const modeBadge = galleryVideoModeBadge(video.video_mode);
+  const cost = galleryCostSummary(video);
 
   return (
     <button
@@ -781,7 +808,7 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
         <video
           ref={videoRef}
           src={mediaUrl(video.video_url)}
-          poster={mediaUrl(video.actor_url)}
+          poster={mediaUrl(video.cover_url || video.actor_url)}
           muted
           playsInline
           preload="metadata"
@@ -806,8 +833,8 @@ function VideoCard({ video, onOpen, lipSyncJob }) {
 
       <div className="p-2 space-y-1">
         <h3 className="text-[11px] font-semibold text-zinc-200 truncate">{video.title || 'Untitled'}</h3>
-        <p className="text-[9px] text-zinc-500">
-          {video.duration?.toFixed(0)}s · ${video.cost_estimate?.total?.toFixed(2) || '?'}
+        <p className="text-[9px] text-zinc-500" title={`${cost.totalLabel}: ${cost.totalText}`}>
+          {video.duration?.toFixed(0)}s · {cost.compactText}
         </p>
         {video.voice_name && (
           <p
@@ -841,8 +868,24 @@ function VideoActionModal({
   onLipSync,
   onSaveHeadTemplate,
   onEditStoryboard,
+  onMusicChange,
 }) {
+  const [musicPrefs, setMusicPrefs] = useState(() => musicPreferencesFromVideo(video));
+  const [musicSaving, setMusicSaving] = useState(false);
+  const [musicError, setMusicError] = useState('');
+  useEffect(() => {
+    setMusicPrefs(musicPreferencesFromVideo(video));
+    setMusicError('');
+  }, [video.video_id, video.music_track, video.music_volume, video.background_music]);
+  const saveMusic = async () => {
+    setMusicSaving(true);
+    setMusicError('');
+    try { await onMusicChange(video, musicPrefs); }
+    catch (error) { setMusicError(error.message); }
+    finally { setMusicSaving(false); }
+  };
   const caption = video.caption || '';
+  const cost = galleryCostSummary(video);
   const hashtags = (video.hashtags || []).join(' ');
   const isProcessing = lipSyncJob?.status === 'processing';
   const isSavingHeadTemplate = headTemplateJob?.status === 'processing';
@@ -869,7 +912,7 @@ function VideoActionModal({
             <p className="text-[11px] uppercase tracking-wide text-violet-300">Готовый ролик</p>
             <h3 className="text-lg font-bold text-zinc-100">{video.title || 'Untitled'}</h3>
             <p className="text-xs text-zinc-500">
-              {video.duration?.toFixed(1) || '?'}s В· ${video.cost_estimate?.total?.toFixed(2) || '?'}
+              {video.duration?.toFixed(1) || '?'}s · {cost.compactText}
             </p>
             {video.voice_name && (
               <p className="mt-1 text-xs text-sky-300/80">
@@ -894,7 +937,7 @@ function VideoActionModal({
             <div className="rounded-2xl overflow-hidden bg-black border border-white/10">
               <video
                 src={mediaUrl(video.video_url)}
-                poster={mediaUrl(video.actor_url)}
+                poster={mediaUrl(video.cover_url || video.actor_url)}
                 controls
                 playsInline
                 className="w-full aspect-[9/16] object-contain bg-black"
@@ -919,6 +962,12 @@ function VideoActionModal({
             </div>
             {/* Раскадровка сохраняется вместе с роликом — её можно открыть в
                 редакторе, доснять кадры и пересобрать видео. */}
+            {video.cover_url && (
+              <a href={mediaUrl(video.cover_url)} download
+                className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-200 hover:bg-white/10">
+                <Download size={15} /> Скачать обложку
+              </a>
+            )}
             {(video.shots || []).length > 0 && onEditStoryboard && (
               <button
                 type="button"
@@ -1019,6 +1068,22 @@ function VideoActionModal({
           </div>
 
           <div className="space-y-5">
+            <VideoCostBreakdown video={video} />
+            {isLocalSaasVideo && video.script_format === 'storyboard_v3' && onMusicChange && (
+              <section className="space-y-3 border-b border-white/10 pb-4">
+                <MusicPicker enabled={musicPrefs.backgroundMusic} value={musicPrefs.musicTrack} volume={musicPrefs.musicVolume}
+                  onEnabledChange={(value) => setMusicPrefs((prefs) => ({ ...prefs, backgroundMusic: value }))}
+                  onChange={(value) => setMusicPrefs((prefs) => ({ ...prefs, musicTrack: value }))}
+                  onVolumeChange={(value) => setMusicPrefs((prefs) => ({ ...prefs, musicVolume: value }))}
+                  disabled={musicSaving || isProcessing} />
+                <button type="button" onClick={saveMusic} disabled={musicSaving || isProcessing}
+                  className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/15 px-3 py-2 text-sm text-zinc-200 hover:bg-white/5 disabled:opacity-50">
+                  {musicSaving ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />}
+                  {musicSaving ? 'Сохраняю...' : 'Сохранить музыку · $0'}
+                </button>
+                {musicError && <p role="alert" className="text-xs text-red-300">{musicError}</p>}
+              </section>
+            )}
             <section className="space-y-2">
               <div className="flex items-center justify-between gap-3">
                 <h4 className="text-sm font-semibold text-zinc-300">Caption</h4>

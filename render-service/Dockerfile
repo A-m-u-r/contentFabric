@@ -11,6 +11,8 @@ ENV OUTPUT_DIR=/output
 
 WORKDIR /app
 
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
+
 # Copy render service source
 COPY render-service/package.json render-service/package-lock.json ./
 RUN npm ci --no-audit --no-fund

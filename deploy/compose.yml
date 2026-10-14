@@ -1,0 +1,105 @@
+# Run from this directory after setup has created .env.
+# Fixed names preserve data when the checkout or deployment directory changes.
+name: content-fabric
+
+services:
+  volume-init:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX in images.env}-backend:${IMAGE_TAG:-latest}
+    user: root
+    entrypoint: ["sh", "-c"]
+    command: ["chown appuser:appuser /app/output /app/uploads"]
+    volumes:
+      - output:/app/output
+      - uploads:/app/uploads
+    restart: "no"
+
+  backend:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX in images.env}-backend:${IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    environment:
+      OPENSHORTS_DB_PATH: /app/output/openshorts.db
+      RENDER_SERVICE_URL: http://renderer:3100
+    ports:
+      # Required by the dashboard's existing localhost API configuration.
+      - "${BACKEND_BIND_ADDRESS:-0.0.0.0}:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - output:/app/output
+      - uploads:/app/uploads
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    dns_opt:
+      - single-request-reopen
+      - timeout:2
+      - attempts:5
+    cpus: 3.0
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/config', timeout=5).read()"]
+      interval: 20s
+      timeout: 8s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  renderer:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX in images.env}-renderer:${IMAGE_TAG:-latest}
+    environment:
+      REMOTION_BUNDLE_PATH: /app/remotion
+      OUTPUT_DIR: /output
+      PORT: "3100"
+    volumes:
+      - output:/output
+    cpus: 1.0
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 8s
+      start_period: 120s
+      retries: 5
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX in images.env}-frontend:${IMAGE_TAG:-latest}
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-0.0.0.0}:${FRONTEND_PORT:-5175}:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      backend:
+        condition: service_healthy
+      renderer:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  output:
+    name: content-fabric-output
+  uploads:
+    name: content-fabric-uploads

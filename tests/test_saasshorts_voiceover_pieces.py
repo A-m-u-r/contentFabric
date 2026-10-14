@@ -103,6 +103,34 @@ class IncrementalVoiceoverTests(unittest.TestCase):
             for number, before in pieces.items():
                 self.assertEqual(digest(os.path.join(tmp, f"{SLUG}_speech_{number:02d}.wav")), before)
 
+    def test_switching_v3_to_v4_revoices_each_shot_once(self):
+        shots = [shot(1, "Первая реплика."), shot(2, "Вторая реплика.")]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(shots, tmp, elevenlabs_model="eleven_v3")
+            self.spoken.clear()
+            changed = self.build(shots, tmp, elevenlabs_model="eleven_v4")
+            self.assertEqual(self.spoken, ["Первая реплика. Вторая реплика."])
+            self.assertEqual(changed["changed_shots"], [1, 2])
+            self.spoken.clear()
+            cached = self.build(shots, tmp, elevenlabs_model="eleven_v4")
+            self.assertEqual(self.spoken, [])
+            self.assertEqual(cached["changed_shots"], [])
+
+    def test_tuning_v4_revoices_once_then_reuses_audio(self):
+        shots = [shot(1, "Первая реплика."), shot(2, "Вторая реплика.")]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(shots, tmp, elevenlabs_model="eleven_v4")
+            self.spoken.clear()
+            changed = self.build(shots, tmp, elevenlabs_model="eleven_v4",
+                                 elevenlabs_stability=0.3, elevenlabs_similarity=0.9)
+            self.assertEqual(changed["changed_shots"], [1, 2])
+            self.assertEqual(self.spoken, ["Первая реплика. Вторая реплика."])
+            self.spoken.clear()
+            cached = self.build(shots, tmp, elevenlabs_model="eleven_v4",
+                                elevenlabs_stability=0.3, elevenlabs_similarity=0.9)
+            self.assertEqual(cached["changed_shots"], [])
+            self.assertEqual(self.spoken, [])
+
     def test_restoring_deleted_shots_only_voices_the_restored_ones(self):
         kept = [shot(1, "Первая реплика."), shot(2, "Вторая реплика.")]
         restored = kept + [shot(3, "Третья реплика."), shot(4, "Четвёртая реплика.")]
@@ -418,9 +446,11 @@ class VoiceOnlyPreviewTests(unittest.TestCase):
 
     def setUp(self):
         self.spoken = []
+        self.tts_settings = []
 
     def fake_tts(self, text, output_path, **kwargs):
         self.spoken.append(text)
+        self.tts_settings.append(kwargs)
         saasshorts._encode_audio_samples(spoken_audio(text), output_path)
         return {"path": output_path, "provider": "elevenlabs",
                 "voice_id": "voice_ru", "model": "eleven_v3"}
@@ -519,6 +549,20 @@ class VoiceOnlyPreviewTests(unittest.TestCase):
             self.preview(tmp)
 
             self.assertEqual(self.spoken, [])
+
+    def test_anna_v4_settings_reach_voice_preview(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.preview(tmp, config={
+                "voice_id": "anna-id", "voice_name": "Anna",
+                "elevenlabs_model": "eleven_v4",
+                "elevenlabs_stability": 0.3,
+                "elevenlabs_similarity": 0.9,
+            })
+        self.assertEqual(len(self.tts_settings), 1)
+        self.assertEqual(self.tts_settings[0]["elevenlabs_voice_id"], "anna-id")
+        self.assertEqual(self.tts_settings[0]["elevenlabs_model"], "eleven_v4")
+        self.assertEqual(self.tts_settings[0]["elevenlabs_stability"], 0.3)
+        self.assertEqual(self.tts_settings[0]["elevenlabs_similarity"], 0.9)
 
     def test_the_take_moves_into_the_render_instead_of_being_read_again(self):
         # Ради этого всё и делается: снимать надо под тот дубль, который человек

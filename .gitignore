@@ -26,6 +26,11 @@ output/
 
 # Secrets
 .env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
 
 # Generated metadata
 *_metadata.json
@@ -48,3 +53,28 @@ voice_test/*.png
 
 # Local debug artifacts (preserved failed jobs, assembled test videos)
 debug/
+
+# Local experiments, old showcase media and academic materials stay on disk.
+tmp/
+voice_test/
+screenshots/
+.superpowers/
+.pptx-build/
+docs/diploma/
+docs/presentation/
+docs/superpowers/
+bug-hunt-plan-*.md
+CLAUDE.md
+verify_aesthetic.py
+verify_custom_hook.py
+verify_hooks.py
+dashboard/README.md
+dashboard/src/assets/react.svg
+dashboard/public/vite.svg
+
+# Dependencies and generated builds
+node_modules/
+dist/
+build/
+.pytest_cache/
+*.tsbuildinfo

@@ -3,6 +3,7 @@ import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Load
 import { getApiUrl } from '../config';
 import FrameEditorBlockedModal from './FrameEditorBlockedModal';
 import ImageLightbox from './ImageLightbox';
+import MusicPicker, { musicRequestSettings } from './MusicPicker';
 import {
   loadBusinessProfiles,
   saveBusinessProfiles,
@@ -38,6 +39,85 @@ export function buildSaaSAnalyzeHeaders({
   };
 }
 
+export function isManualStoryboardImport(scriptMode, scriptFormat, text) {
+  return scriptMode === 'custom' && scriptFormat === 'storyboard_v3'
+    && /^\s*(?:#+\s*)?(?:КАДР|РљРђР”Р |SHOT)\s*\d+[^\n]*/im.test(text || '');
+}
+
+export function contentPlanScriptDefaults(item) {
+  return item?.full_narration
+    ? { scriptMode: 'custom', scriptFormat: item.format_hint || 'storyboard_v3', customScript: item.full_narration }
+    : {};
+}
+
+export function videoPrefsForContentItem(item, saved = {}) {
+  if (!item?.voice_id || (item.voice_preset_version && saved.voicePresetVersion === item.voice_preset_version)) {
+    return saved;
+  }
+  const preset = {
+    selectedVoice: item.voice_id,
+    selectedVoiceName: item.voice_name || item.voice_id,
+    voiceSelectionSource: 'manual',
+    ttsProvider: item.tts_provider || 'elevenlabs',
+    elevenLabsModel: item.elevenlabs_model || 'eleven_v4',
+    elevenLabsStability: item.elevenlabs_stability ?? 0.5,
+    elevenLabsSimilarity: item.elevenlabs_similarity ?? 0.75,
+    voicePresetVersion: item.voice_preset_version || '',
+  };
+  return item.voice_preset_version ? { ...saved, ...preset } : { ...preset, ...saved };
+}
+
+const GENERATION_PRESET_VERSION = 'calm-ugc-20261004';
+
+export function generationPresetPreferences(preset, saved = {}) {
+  if (preset !== 'calm_ugc') return { ...saved, generationPreset: 'expressive' };
+  return {
+    ...saved,
+    generationPreset: preset,
+    generationPresetVersion: GENERATION_PRESET_VERSION,
+    ttsProvider: 'elevenlabs',
+    elevenLabsModel: 'eleven_v4',
+    elevenLabsStability: 0.65,
+    elevenLabsSimilarity: 0.75,
+    backgroundMusic: true,
+    storyboardGenerationMode: 'sliced_avatar',
+    videoMode: 'storyboard_v3_standard',
+  };
+}
+
+export function initializeGenerationPreferences(saved = {}) {
+  if (saved.generationPreset === 'expressive'
+    || (saved.generationPreset === 'calm_ugc' && saved.generationPresetVersion === GENERATION_PRESET_VERSION)) {
+    return saved;
+  }
+  return generationPresetPreferences('calm_ugc', saved);
+}
+
+function GenerationPresetPicker({ value, onChange, disabled }) {
+  return (
+    <fieldset disabled={disabled} data-section="generation-preset-section">
+      <legend className="mb-2 text-sm font-medium text-zinc-300">Подача</legend>
+      <div className="inline-flex max-w-full rounded-lg border border-white/10 p-1 bg-black/20">
+        {[['calm_ugc', 'Спокойный UGC'], ['expressive', 'Выразительная']].map(([id, label]) => (
+          <button key={id} type="button" aria-pressed={value === id} onClick={() => onChange(id)}
+            className={`min-h-10 px-3 py-2 rounded-md text-xs font-medium transition-colors disabled:opacity-50 ${
+              value === id ? 'bg-white/10 text-white' : 'text-zinc-400 hover:text-white'
+            }`}>
+            {label}
+          </button>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
+export function generationSpeech(text, preset) {
+  const speech = text || '';
+  return preset === 'calm_ugc'
+    ? speech.replace(/\[[A-Za-z][^\]\n]*\]/g, ' ').replace(/\s{2,}/g, ' ').trim()
+    : speech.trim();
+}
+
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'Разговор в камеру', desc: 'Живо и по-человечески, как сторис у знакомой' },
   { id: 'educational', label: 'Обучающий', desc: 'Проблема → 2-3 конкретных шага → вывод' },
@@ -68,6 +148,17 @@ const TTS_PROVIDER_OPTIONS = [
   { id: 'elevenlabs', label: 'ElevenLabs', desc: 'Best voice quality, may need paid plan' },
   { id: 'fal_minimax', label: 'fal MiniMax', desc: 'Russian TTS via fal.ai balance' },
 ];
+
+const ELEVENLABS_MODEL_OPTIONS = [
+  { id: 'eleven_v3', label: 'Eleven v3' },
+  { id: 'eleven_v4', label: 'Eleven v4' },
+];
+
+export function elevenLabsTtsSettings(model, stability, similarity) {
+  return model === 'eleven_v4'
+    ? { elevenlabs_model: model, elevenlabs_stability: stability, elevenlabs_similarity: similarity }
+    : { elevenlabs_model: model };
+}
 
 const BROLL_MODE_OPTIONS = [
   { id: 'mockup', label: 'Кадры с товаром', desc: 'Аккуратные вставки с продуктом, без ИИ-стоков' },
@@ -694,12 +785,17 @@ export default function SaaShortsTab({
   const activeWorkspaceKey = activeContentPlanContext
     ? workspaceStorageKey(activeContentPlanContext)
     : CACHE_KEY;
-  const [initialVideoPrefs] = useState(() => loadVideoPrefs(activeWorkspaceKey));
   const [initialCache] = useState(() => (
     activeContentPlanContext
       ? loadLocalWorkspace(activeContentPlanContext)
       : loadCache(activeWorkspaceKey)
   ));
+  const [initialVideoPrefs] = useState(() => initializeGenerationPreferences(
+    initialCache?.videoPrefs || videoPrefsForContentItem(
+      activeContentPlanContext?.item, loadVideoPrefs(activeWorkspaceKey),
+    ),
+  ));
+  const planScriptDefaults = contentPlanScriptDefaults(activeContentPlanContext?.item);
   const [pendingTopicOnMount] = useState(() => peekPendingTopic());
   const initialHasProgress = workspaceHasProgress(initialCache);
 
@@ -720,7 +816,8 @@ export default function SaaShortsTab({
 
   // Step 0: Business brief
   const [url] = useState('');
-  const [videoMode, setVideoMode] = useState('standard'); // "lowcost", "standard", or "premium"
+  const [generationPreset, setGenerationPreset] = useState(initialVideoPrefs.generationPreset);
+  const [videoMode, setVideoMode] = useState(initialVideoPrefs.videoMode || 'standard');
   const [description, setDescription] = useState(() => initialCache?.description || '');
   const [topic, setTopic] = useState(() => (
     initialCache?.topic ?? activeContentPlanContext?.topic ?? activeContentPlanContext?.item?.topic ?? ''
@@ -730,21 +827,21 @@ export default function SaaShortsTab({
   const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => (
     initialCache?.businessProfileId || activeContentPlanContext?.profileId || loadSelectedProfileId() || ''
   ));
-  const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || 'ai'); // "ai" or "custom"
-  const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || 'ugc');
-  // Не ставить два говорящих кадра подряд. По умолчанию выключено: каждая
-  // перебивка — отдельный платный клип, который тарифицируется от трёх секунд.
+  const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || planScriptDefaults.scriptMode || 'ai'); // "ai" or "custom"
+  const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || planScriptDefaults.scriptFormat
+    || (initialVideoPrefs.generationPreset === 'calm_ugc' ? 'storyboard_v3' : 'ugc'));
   const [changingLocations, setChangingLocations] = useState(
     () => Boolean(initialCache?.changingLocations),
   );
   const [brollBetweenTalking, setBrollBetweenTalking] = useState(
-    () => Boolean(initialCache?.brollBetweenTalking),
+    () => initialCache?.brollBetweenTalking ?? initialVideoPrefs.generationPreset === 'calm_ugc',
   );
   const [targetDurationSeconds, setTargetDurationSeconds] = useState(
     () => initialCache?.targetDurationSeconds || 20,
   );
   const [textModel, setTextModel] = useState(() => initialCache?.textModel || 'fast');
-  const [customScript, setCustomScript] = useState(() => initialCache?.customScript || '');
+  const [customScript, setCustomScript] = useState(() => initialCache?.customScript || planScriptDefaults.customScript || '');
+  const manualStoryboardImport = isManualStoryboardImport(scriptMode, scriptFormat, customScript);
   const [style, setStyle] = useState('ugc');
   const [language, setLanguage] = useState('ru');
   const [actorGender, setActorGender] = useState('female');
@@ -771,11 +868,18 @@ export default function SaaShortsTab({
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
   const [ttsProvider, setTtsProvider] = useState(() => initialVideoPrefs.ttsProvider || 'auto');
+  const [elevenLabsModel, setElevenLabsModel] = useState(() => initialVideoPrefs.elevenLabsModel || 'eleven_v4');
+  const [elevenLabsStability, setElevenLabsStability] = useState(() => initialVideoPrefs.elevenLabsStability ?? 0.65);
+  const [elevenLabsSimilarity, setElevenLabsSimilarity] = useState(() => initialVideoPrefs.elevenLabsSimilarity ?? 0.75);
   const [brollMode, setBrollMode] = useState('mockup');
-  const [storyboardGenerationMode, setStoryboardGenerationMode] = useState('sliced_avatar');
+  const [storyboardGenerationMode, setStoryboardGenerationMode] = useState(initialVideoPrefs.storyboardGenerationMode || 'sliced_avatar');
   // Тонкие настройки пайплайна: по умолчанию всё включено, «!== false» —
   // чтобы старые prefs без этих полей не выключали фичи.
   const [backgroundMusic, setBackgroundMusic] = useState(() => initialVideoPrefs.backgroundMusic !== false);
+  const [musicTrack, setMusicTrack] = useState(() => initialVideoPrefs.musicTrack || 'auto');
+  const [musicVolume, setMusicVolume] = useState(() => initialVideoPrefs.musicVolume ?? 1);
+  const [musicSaving, setMusicSaving] = useState(false);
+  const [musicError, setMusicError] = useState('');
   const [clipVisionQc, setClipVisionQc] = useState(() => initialVideoPrefs.clipVisionQc !== false);
   const [brollImageFirst, setBrollImageFirst] = useState(() => initialVideoPrefs.brollImageFirst !== false);
   const [selectedVoice, setSelectedVoice] = useState(() => initialVideoPrefs.selectedVoice || 'D5RRIJYa9pFwxiSpbGbR');
@@ -886,6 +990,54 @@ export default function SaaShortsTab({
   const workspaceHydratedRef = useRef(!authToken || !activeContentPlanContext);
   const [workspaceHydrationVersion, setWorkspaceHydrationVersion] = useState(0);
 
+  const currentVideoPrefs = {
+    generationPreset,
+    generationPresetVersion: GENERATION_PRESET_VERSION,
+    selectedVoice, selectedVoiceName, voiceSelectionSource,
+    voiceKey: `${language}-${actorGender}`,
+    ttsProvider, elevenLabsModel, elevenLabsStability, elevenLabsSimilarity,
+    voicePresetVersion: activeContentPlanContext?.item?.voice_preset_version || '',
+    selectedActor: selectedActor || '', selectedFace: selectedFace || '', plateUrls,
+    uploadedActorUrl: uploadedActorPreview?.serverUrl || '',
+    backgroundMusic, musicTrack, musicVolume, clipVisionQc, brollImageFirst, videoMode, storyboardGenerationMode,
+    minimaxVoice, language, actorGender,
+  };
+
+  const restoreVideoPreferences = (prefs) => {
+    setGenerationPreset(prefs.generationPreset);
+    if (prefs.ttsProvider) setTtsProvider(prefs.ttsProvider);
+    if (prefs.elevenLabsModel) setElevenLabsModel(prefs.elevenLabsModel);
+    if (prefs.elevenLabsStability != null) setElevenLabsStability(prefs.elevenLabsStability);
+    if (prefs.elevenLabsSimilarity != null) setElevenLabsSimilarity(prefs.elevenLabsSimilarity);
+    if (prefs.backgroundMusic != null) setBackgroundMusic(prefs.backgroundMusic);
+    if (prefs.musicTrack != null) setMusicTrack(prefs.musicTrack);
+    if (prefs.musicVolume != null) setMusicVolume(prefs.musicVolume);
+    if (prefs.videoMode) setVideoMode(prefs.videoMode);
+    if (prefs.storyboardGenerationMode) setStoryboardGenerationMode(prefs.storyboardGenerationMode);
+    if (prefs.selectedVoice) setSelectedVoice(prefs.selectedVoice);
+    if (prefs.selectedVoiceName != null) setSelectedVoiceName(prefs.selectedVoiceName);
+    if (prefs.voiceSelectionSource) setVoiceSelectionSource(prefs.voiceSelectionSource);
+    if (prefs.selectedActor != null) setSelectedActor(prefs.selectedActor || null);
+    if (prefs.selectedFace != null) setSelectedFace(prefs.selectedFace || null);
+    if (prefs.plateUrls) setPlateUrls(prefs.plateUrls);
+    if (prefs.uploadedActorUrl != null) setUploadedActorPreview(prefs.uploadedActorUrl
+      ? { localPreview: getApiUrl(prefs.uploadedActorUrl), serverUrl: prefs.uploadedActorUrl } : null);
+    if (prefs.clipVisionQc != null) setClipVisionQc(prefs.clipVisionQc);
+    if (prefs.brollImageFirst != null) setBrollImageFirst(prefs.brollImageFirst);
+    if (prefs.language) setLanguage(prefs.language);
+    if (prefs.actorGender) setActorGender(prefs.actorGender);
+    if (prefs.minimaxVoice) setMinimaxVoice(prefs.minimaxVoice);
+  };
+
+  const selectGenerationPreset = (preset) => {
+    restoreVideoPreferences(generationPresetPreferences(preset, currentVideoPrefs));
+    if (preset === 'calm_ugc') {
+      setScriptFormat('storyboard_v3');
+      setBrollBetweenTalking(true);
+      setChangingLocations(false);
+    }
+  };
+
   const workspaceEndpoint = (context = activeContentPlanContext) => {
     const profileId = context?.profileId || '';
     const itemId = context?.itemId ?? context?.item?.item_id ?? '';
@@ -897,17 +1049,18 @@ export default function SaaShortsTab({
   // генерации нельзя.
   const applyWorkspaceSnapshot = (snapshot, { restoreStep = true } = {}) => {
     if (!snapshot) return;
+    if (snapshot.videoPrefs) restoreVideoPreferences(initializeGenerationPreferences(snapshot.videoPrefs));
     setDescription(snapshot.description || '');
     setTopic(snapshot.topic ?? activeContentPlanContext?.topic ?? activeContentPlanContext?.item?.topic ?? '');
     setBusinessName(snapshot.businessName || '');
     setSelectedBusinessProfileId(snapshot.businessProfileId || activeContentPlanContext?.profileId || '');
-    setScriptMode(snapshot.scriptMode || 'ai');
-    setScriptFormat(snapshot.scriptFormat || 'ugc');
+    setScriptMode(snapshot.scriptMode || planScriptDefaults.scriptMode || 'ai');
+    setScriptFormat(snapshot.scriptFormat || planScriptDefaults.scriptFormat || 'ugc');
     setTargetDurationSeconds(snapshot.targetDurationSeconds || 20);
     setBrollBetweenTalking(Boolean(snapshot.brollBetweenTalking));
     setChangingLocations(Boolean(snapshot.changingLocations));
     setTextModel(snapshot.textModel || 'fast');
-    setCustomScript(snapshot.customScript || '');
+    setCustomScript(snapshot.customScript || planScriptDefaults.customScript || '');
     setAnalysis(snapshot.analysis || null);
     setWebResearch(snapshot.webResearch || null);
     setScripts(snapshot.scripts || []);
@@ -933,6 +1086,7 @@ export default function SaaShortsTab({
     brollBetweenTalking,
     changingLocations,
     textModel,
+    videoPrefs: currentVideoPrefs,
     customScript: scriptMode === 'custom' ? customScript.trim() : '',
     analysis,
     webResearch,
@@ -1025,6 +1179,9 @@ export default function SaaShortsTab({
         targetDurationSeconds: snapshot.targetDurationSeconds,
         textModel: snapshot.textModel,
         customScript: snapshot.customScript,
+        videoPrefs: snapshot.videoPrefs,
+        brollBetweenTalking: snapshot.brollBetweenTalking,
+        changingLocations: snapshot.changingLocations,
       },
       snapshot.analysis,
       snapshot.webResearch,
@@ -1110,6 +1267,10 @@ export default function SaaShortsTab({
     jobId,
     genStatus,
     genResult,
+    generationPreset, videoMode, storyboardGenerationMode, selectedVoice, selectedVoiceName,
+    voiceSelectionSource, ttsProvider, elevenLabsModel, elevenLabsStability, elevenLabsSimilarity,
+    selectedActor, selectedFace, plateUrls, uploadedActorPreview, backgroundMusic, musicTrack, musicVolume,
+    clipVisionQc, brollImageFirst, language, actorGender, minimaxVoice,
     workspaceHydrationVersion,
   ]);
 
@@ -1221,6 +1382,10 @@ export default function SaaShortsTab({
             _voice_seconds: result?.duration || 0,
             _voice_clips: result?.voice_clips_planned || 0,
             _voice_model: result?.voice_model || '',
+            _voice_requested_model: elevenLabsModel,
+            _voice_generation_preset: generationPreset,
+            _voice_requested_stability: elevenLabsStability,
+            _voice_requested_similarity: elevenLabsSimilarity,
             _voice_provider: result?.voice_provider || '',
             _voice_id: result?.voice_id || '',
             _voice_name: result?.voice_name || '',
@@ -1350,21 +1515,11 @@ export default function SaaShortsTab({
 
   // Персистим выбор озвучки и актёра (см. loadVideoPrefs)
   useEffect(() => {
-    saveVideoPrefs(activeWorkspaceKey, {
-      selectedVoice,
-      selectedVoiceName,
-      voiceSelectionSource,
-      voiceKey: `${language}-${actorGender}`,
-      ttsProvider,
-      selectedActor: selectedActor || '',
-      selectedFace: selectedFace || '',
-      plateUrls,
-      uploadedActorUrl: uploadedActorPreview?.serverUrl || '',
-      backgroundMusic,
-      clipVisionQc,
-      brollImageFirst,
-    });
-  }, [activeWorkspaceKey, selectedVoice, selectedVoiceName, voiceSelectionSource, ttsProvider, selectedActor, selectedFace, plateUrls, uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
+    saveVideoPrefs(activeWorkspaceKey, currentVideoPrefs);
+  }, [activeWorkspaceKey, generationPreset, videoMode, storyboardGenerationMode, minimaxVoice,
+    selectedVoice, selectedVoiceName, voiceSelectionSource, ttsProvider, elevenLabsModel,
+    elevenLabsStability, elevenLabsSimilarity, selectedActor, selectedFace, plateUrls,
+    uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
 
   useEffect(() => {
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
@@ -1440,8 +1595,10 @@ export default function SaaShortsTab({
     setBusinessName(profile.name || '');
     setDescription(profile.description || '');
     setTopic(profile.topic || '');
-    if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
-    if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
+    if (!planScriptDefaults.customScript) {
+      if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
+      if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
+    }
     if (profile.targetDurationSeconds || profile.target_duration_seconds) {
       setTargetDurationSeconds(Number(profile.targetDurationSeconds || profile.target_duration_seconds) || 20);
     }
@@ -1455,7 +1612,7 @@ export default function SaaShortsTab({
     const isCustom = scriptMode === 'custom';
     if (isCustom && !customScript.trim()) return;
     if (!isCustom && !description.trim()) return;
-    if (!isCustom && !geminiApiKey) {
+    if (!manualStoryboardImport && !geminiApiKey) {
       setAnalyzeError('Gemini API key required. Set it in Settings.');
       return;
     }
@@ -1478,10 +1635,11 @@ export default function SaaShortsTab({
           topic: topic.trim() || undefined,
           script_mode: scriptMode,
           script_format: scriptFormat,
+          generation_preset: generationPreset,
           target_duration_seconds: targetDurationSeconds,
           text_model: textModel,
           custom_script: isCustom ? customScript.trim() : undefined,
-          num_scripts: numScripts,
+          num_scripts: isCustom ? 1 : numScripts,
           style,
           language,
           actor_gender: actorGender,
@@ -1564,6 +1722,7 @@ export default function SaaShortsTab({
       actor_description: pendingStoryboard.actor_description || '',
       language: pendingStoryboard.language || 'ru',
       format: 'storyboard_v3',
+      generation_preset: pendingStoryboard.generation_preset || 'expressive',
       shots: pendingStoryboard.shots,
       shots_archived: pendingStoryboard.shots_archived || [],
       _source_video_id: pendingStoryboard.video_id || '',
@@ -1584,6 +1743,21 @@ export default function SaaShortsTab({
     if (pendingStoryboard.storyboard_generation_mode) {
       setStoryboardGenerationMode(pendingStoryboard.storyboard_generation_mode);
     }
+    restoreVideoPreferences({
+      generationPreset: pendingStoryboard.generation_preset || 'expressive',
+      selectedVoice: pendingStoryboard.voice_id,
+      selectedVoiceName: pendingStoryboard.voice_name,
+      voiceSelectionSource: pendingStoryboard.voice_id ? 'manual' : undefined,
+      elevenLabsModel: ['eleven_v3', 'eleven_v4'].includes(pendingStoryboard.voice_model)
+        ? pendingStoryboard.voice_model : undefined,
+      elevenLabsStability: pendingStoryboard.voice_settings?.stability,
+      elevenLabsSimilarity: pendingStoryboard.voice_settings?.similarity_boost,
+      ttsProvider: pendingStoryboard.tts_provider,
+      backgroundMusic: pendingStoryboard.background_music,
+      musicTrack: pendingStoryboard.music_track || 'auto',
+      musicVolume: pendingStoryboard.music_volume ?? 1,
+      videoMode: pendingStoryboard.video_mode,
+    });
     setStep(2);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2047,6 +2221,7 @@ export default function SaaShortsTab({
           voice_name: selectedVoiceLabel,
           voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
+          ...elevenLabsTtsSettings(elevenLabsModel, elevenLabsStability, elevenLabsSimilarity),
           minimax_voice_id: minimaxVoice,
           minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
@@ -2056,11 +2231,13 @@ export default function SaaShortsTab({
           selected_face_url: selectedFace || undefined,
           plate_urls: plateUrls,
           video_mode: videoMode,
+          generation_preset: generationPreset,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
           use_platform_keys: usePlatformKeys,
           broll_image_first: brollImageFirst,
           frames_only: true,
+          ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume),
           frames_only_shot: shotNumber ?? undefined,
           avatar_edit_model: editModel || undefined,
         }),
@@ -2171,6 +2348,7 @@ export default function SaaShortsTab({
           voice_name: selectedVoiceLabel,
           voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
+          ...elevenLabsTtsSettings(elevenLabsModel, elevenLabsStability, elevenLabsSimilarity),
           minimax_voice_id: minimaxVoice,
           minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
@@ -2180,10 +2358,12 @@ export default function SaaShortsTab({
           selected_face_url: selectedFace || undefined,
           plate_urls: plateUrls,
           video_mode: videoMode,
+          generation_preset: generationPreset,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
           use_platform_keys: usePlatformKeys,
           voice_only: true,
+          ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume),
           // Галочка «одним дублем» действует в момент записи — иначе человек
           // слушал бы дорожку со стыками, а ролик снимался бы под другую.
           revoice_all: everything || revoiceAll,
@@ -2277,6 +2457,7 @@ export default function SaaShortsTab({
           voice_name: selectedVoiceLabel,
           voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
+          ...elevenLabsTtsSettings(elevenLabsModel, elevenLabsStability, elevenLabsSimilarity),
           minimax_voice_id: minimaxVoice,
           minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
@@ -2286,6 +2467,7 @@ export default function SaaShortsTab({
           selected_face_url: selectedFace || undefined,
           plate_urls: plateUrls,
           video_mode: videoMode,
+          generation_preset: generationPreset,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
           // Кадры ведущего в платном рендере рисует та же модель, что выбрана в
@@ -2294,7 +2476,7 @@ export default function SaaShortsTab({
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
-          background_music: backgroundMusic,
+          ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume),
           clip_vision_qc: clipVisionQc,
           broll_image_first: brollImageFirst,
           // Пересъёмка готового ролика: снятые кадры переезжают из прошлого
@@ -2365,6 +2547,7 @@ export default function SaaShortsTab({
           voice_name: selectedVoiceLabel,
           voice_selection_source: voiceSelectionSource,
           tts_provider: ttsProvider,
+          ...elevenLabsTtsSettings(elevenLabsModel, elevenLabsStability, elevenLabsSimilarity),
           minimax_voice_id: minimaxVoice,
           minimax_voice_name: minimaxVoiceLabel,
           actor_gender: actorGender,
@@ -2375,6 +2558,7 @@ export default function SaaShortsTab({
           plate_urls: plateUrls,
           retry_job_id: jobId,
           video_mode: videoMode,
+          generation_preset: generationPreset,
           broll_mode: storyboardSelected ? 'off' : brollMode,
           storyboard_generation_mode: storyboardGenerationMode,
           avatar_edit_model: avatarEditModel || undefined,
@@ -2385,7 +2569,7 @@ export default function SaaShortsTab({
           reusable_head_template_id: selectedHeadTemplate || undefined,
           reusable_lipsync_model: lipSyncModel,
           use_platform_keys: usePlatformKeys,
-          background_music: backgroundMusic,
+          ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume),
           clip_vision_qc: clipVisionQc,
           broll_image_first: brollImageFirst,
         }),
@@ -2814,6 +2998,12 @@ export default function SaaShortsTab({
       seconds: Number(currentScript?._voice_seconds || 0),
       clips: Number(currentScript?._voice_clips || 0),
       model: currentScript?._voice_model || '',
+      requestedModel: currentScript?._voice_requested_model || '',
+      settingsChanged: (currentScript?._voice_generation_preset != null
+          && currentScript._voice_generation_preset !== generationPreset)
+        || (currentScript?._voice_requested_stability != null && elevenLabsModel === 'eleven_v4'
+          && (currentScript._voice_requested_stability !== elevenLabsStability
+            || currentScript._voice_requested_similarity !== elevenLabsSimilarity)),
       voiceId: currentScript?._voice_id || '',
       voiceName: currentScript?._voice_name || '',
       voiceSource: currentScript?._voice_selection_source || '',
@@ -2822,7 +3012,7 @@ export default function SaaShortsTab({
       // услышать их до готового ролика можно только записав озвучку ещё раз.
       stale: shots
         .filter((shot) => typeof shot.voice_speech === 'string'
-          && (shot.speech || '').trim() !== shot.voice_speech)
+          && generationSpeech(shot.speech, generationPreset) !== shot.voice_speech)
         .map((shot, index) => shot.shot_number ?? (index + 1)),
     };
   })();
@@ -3099,6 +3289,8 @@ export default function SaaShortsTab({
                 </div>
               </div>
 
+              <GenerationPresetPicker value={generationPreset} onChange={selectGenerationPreset} disabled={analyzing} />
+
               <div data-section="text-model-section">
                 <label className="block text-sm font-medium text-zinc-300 mb-3">Модель текста</label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -3197,14 +3389,12 @@ export default function SaaShortsTab({
                     );
                   })}
                 </div>
+                <div className="mt-4">
+                  <MusicPicker enabled={backgroundMusic} value={musicTrack} volume={musicVolume}
+                    onEnabledChange={setBackgroundMusic} onChange={setMusicTrack} onVolumeChange={setMusicVolume} />
+                </div>
                 <div className="flex flex-wrap gap-2 mt-3">
                   {[
-                    {
-                      checked: backgroundMusic,
-                      toggle: () => setBackgroundMusic((v) => !v),
-                      label: '🎵 Фоновая музыка',
-                      hint: 'Тихая музыкальная подложка под озвучкой',
-                    },
                     {
                       checked: clipVisionQc,
                       toggle: () => setClipVisionQc((v) => !v),
@@ -3644,6 +3834,51 @@ export default function SaaShortsTab({
                   </div>
                 )}
 
+                {ttsProvider !== 'fal_minimax' && (
+                  <div>
+                    <label className="block text-sm font-medium text-zinc-300 mb-2">Модель ElevenLabs</label>
+                    <div role="group" aria-label="Модель ElevenLabs" className="grid grid-cols-2 gap-2">
+                      {ELEVENLABS_MODEL_OPTIONS.map((option) => (
+                        <button
+                          key={option.id}
+                          type="button"
+                          aria-pressed={elevenLabsModel === option.id}
+                          onClick={() => setElevenLabsModel(option.id)}
+                          className={`min-h-11 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                            elevenLabsModel === option.id
+                              ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
+                              : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                          }`}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                    {elevenLabsModel === 'eleven_v4' && (
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                        <label className="block text-xs text-zinc-300">
+                          <span className="flex justify-between"><span>Стабильность</span><span>{elevenLabsStability.toFixed(2)}</span></span>
+                          <input
+                            type="range" min="0" max="1" step="0.05"
+                            value={elevenLabsStability}
+                            onChange={(event) => setElevenLabsStability(Number(event.target.value))}
+                            className="mt-2 w-full accent-violet-500"
+                          />
+                        </label>
+                        <label className="block text-xs text-zinc-300">
+                          <span className="flex justify-between"><span>Сходство с голосом</span><span>{elevenLabsSimilarity.toFixed(2)}</span></span>
+                          <input
+                            type="range" min="0" max="1" step="0.05"
+                            value={elevenLabsSimilarity}
+                            onChange={(event) => setElevenLabsSimilarity(Number(event.target.value))}
+                            className="mt-2 w-full accent-violet-500"
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Голос озвучки (ElevenLabs) */}
                 {ttsProvider !== 'fal_minimax' && (() => {
                   const boundVoice = actorGallery.find((a) => a.url === selectedActor)?.voice;
@@ -3684,10 +3919,20 @@ export default function SaaShortsTab({
                             .sort((a, b) => voiceLanguageScore(a, language) - voiceLanguageScore(b, language))
                           : [];
                         const hasLanguageVoice = filtered.some((v) => voiceLanguageScore(v, language) === 0);
+                        const selectedVoiceMissing = selectedVoice && !voices.some((v) => v.voice_id === selectedVoice);
 
                         if (filtered.length > 0) {
                           return (
                             <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
+                              {selectedVoiceMissing && (
+                                <div className="w-full flex items-center gap-3 p-2.5 rounded-lg border border-violet-500/50 bg-violet-500/10 text-violet-200">
+                                  <div className="min-w-0 flex-1">
+                                    <div className="text-sm font-medium truncate">{selectedVoiceName || selectedVoice}</div>
+                                    <div className="text-[10px] text-zinc-400">Выбранный голос · ID сохранён</div>
+                                  </div>
+                                  <Check size={14} className="shrink-0" />
+                                </div>
+                              )}
                               {filtered.map((v) => (
                                 <div
                                   key={v.voice_id}
@@ -3929,7 +4174,7 @@ export default function SaaShortsTab({
                       type="checkbox"
                       checked={brollBetweenTalking}
                       onChange={(event) => setBrollBetweenTalking(event.target.checked)}
-                      disabled={scriptMode === 'custom'}
+                      disabled={manualStoryboardImport}
                       className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
                     />
                     <span className="min-w-0">
@@ -3956,7 +4201,7 @@ export default function SaaShortsTab({
                       type="checkbox"
                       checked={changingLocations}
                       onChange={(event) => setChangingLocations(event.target.checked)}
-                      disabled={scriptMode === 'custom'}
+                      disabled={manualStoryboardImport}
                       className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
                     />
                     <span className="min-w-0">
@@ -3974,7 +4219,7 @@ export default function SaaShortsTab({
                 </div>
               )}
 
-              <div>
+              {scriptMode !== 'custom' && <div>
                 <div className="flex items-center justify-between gap-3 mb-2">
                   <label className="block text-sm font-medium text-zinc-300">Количество вариантов сценария</label>
                   <span className="text-[11px] text-zinc-500">Сейчас: {numScripts}</span>
@@ -3994,7 +4239,7 @@ export default function SaaShortsTab({
                     </button>
                   ))}
                 </div>
-              </div>
+              </div>}
 
               {analyzeError && (
                 <div className="flex items-center gap-2 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">
@@ -4011,12 +4256,12 @@ export default function SaaShortsTab({
                 {analyzing ? (
                   <>
                     <Loader2 size={16} className="animate-spin" />
-                    {scriptMode === 'custom' ? 'Готовим ваш текст...' : (url.trim() ? 'Изучаем сайт и пишем сценарии... (45-90с)' : 'Пишем сценарии... (20-40с)')}
+                    {scriptMode === 'custom' ? (manualStoryboardImport ? 'Импортируем раскадровку...' : 'ИИ раскадрирует ваш текст...') : (url.trim() ? 'Изучаем сайт и пишем сценарии... (45-90с)' : 'Пишем сценарии... (20-40с)')}
                   </>
                 ) : (
                   <>
                     <Sparkles size={16} />
-                    {scriptMode === 'custom' ? 'Подготовить мой текст' : (url.trim() ? 'Изучить сайт и написать сценарии' : 'Написать сценарии')}
+                    {scriptMode === 'custom' ? (manualStoryboardImport ? 'Импортировать раскадровку' : 'Создать раскадровку с ИИ') : (url.trim() ? 'Изучить сайт и написать сценарии' : 'Написать сценарии')}
                   </>
                 )}
               </button>
@@ -4325,6 +4570,33 @@ export default function SaaShortsTab({
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             <div className="glass-panel p-4 sm:p-6 space-y-5">
               <h2 className="text-lg font-semibold">Настройка ролика</h2>
+              <GenerationPresetPicker value={generationPreset} onChange={selectGenerationPreset}
+                disabled={generating || framesGenerating || voiceGenerating} />
+              <MusicPicker enabled={backgroundMusic} value={musicTrack} volume={musicVolume}
+                onEnabledChange={setBackgroundMusic} onChange={setMusicTrack} onVolumeChange={setMusicVolume}
+                disabled={generating || framesGenerating || voiceGenerating || musicSaving} />
+              {sourceJobId && renderPlan.reshoot.length === 0 && (
+                <button type="button" disabled={generating || framesGenerating || voiceGenerating || musicSaving}
+                  onClick={async () => {
+                    setMusicSaving(true); setMusicError('');
+                    try {
+                      const response = await fetch(getApiUrl('/api/saasshorts/music'), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                        body: JSON.stringify({ job_id: sourceJobId, ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume) }),
+                      });
+                      const data = await response.json();
+                      if (!response.ok) throw new Error(data.detail || 'Не удалось сохранить музыку');
+                      setGenResult((previous) => ({ ...previous, ...data.video }));
+                      setGenStatus('completed'); setJobId(sourceJobId); setStep(4);
+                    } catch (error) { setMusicError(error.message); }
+                    finally { setMusicSaving(false); }
+                  }}
+                  className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/15 px-3 py-2 text-sm text-zinc-200 hover:bg-white/5 disabled:opacity-50">
+                  {musicSaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+                  {musicSaving ? 'Сохраняю...' : 'Сохранить музыку · $0'}
+                </button>
+              )}
+              {musicError && <p role="alert" className="text-sm text-red-300">{musicError}</p>}
               <p className="text-sm text-zinc-500">
                 Сценарий: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
@@ -4575,6 +4847,15 @@ export default function SaaShortsTab({
                             После записи изменились реплики {voicePreview.stale.join(', ')}.
                             При съёмке они перезапишутся сами, но услышать их заранее можно,
                             только записав озвучку ещё раз.
+                          </p>
+                        )}
+                        {ttsProvider !== 'fal_minimax'
+                          && (voicePreview.settingsChanged || (voicePreview.requestedModel
+                            ? voicePreview.requestedModel !== elevenLabsModel
+                            : elevenLabsModel === 'eleven_v4' && voicePreview.model !== 'eleven_v4')) && (
+                          <p className="text-[11px] text-amber-100/80">
+                            Параметры этой записи отличаются от выбранных. При следующей генерации
+                            озвучка будет записана заново; сначала обнови её для прослушивания.
                           </p>
                         )}
                       </div>

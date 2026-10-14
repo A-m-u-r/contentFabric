@@ -1,0 +1,22 @@
+# Only the production dashboard source and Nginx config enter this build.
+**
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!dashboard/
+!dashboard/**
+!deploy/
+!deploy/nginx.conf
+!remotion/
+!remotion/public/
+!remotion/public/fonts/
+!remotion/public/fonts/**
+
+dashboard/node_modules/
+dashboard/dist/
+**/.env
+**/.env.*
+**/.cache/
+**/__pycache__/
+**/*.db
+**/*.sqlite
+**/*.sqlite3

@@ -17,15 +17,15 @@ import secrets
 import sqlite3
 import tempfile
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from dotenv import load_dotenv
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Literal
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel, field_validator
+from fastapi.responses import HTMLResponse, Response, FileResponse
+from pydantic import BaseModel, Field, field_validator
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
 load_dotenv()
@@ -174,6 +174,18 @@ def init_auth_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, business_profile_id, item_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_plans (
+                user_id TEXT NOT NULL,
+                business_profile_id TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, business_profile_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
         )
@@ -580,7 +592,60 @@ def list_content_workspace_summaries(user_id: str, profile_id: str) -> List[dict
             """,
             (user_id, profile_id),
         ).fetchall()
-    return [_content_workspace(row, include_snapshot=False) for row in rows]
+    summaries = []
+    for row in rows:
+        summary = _content_workspace(row, include_snapshot=False)
+        video = _content_workspace_ready_video(user_id, row["stage"], json.loads(row["snapshot_json"]))
+        summary["video"] = {key: value for key, value in video.items() if key != "path"} if video else None
+        if video:
+            summary["video"]["download_url"] = (
+                f"/api/user/content-workspaces/{quote(profile_id, safe='')}/{quote(row['item_id'], safe='')}/video"
+            )
+        summaries.append(summary)
+    return summaries
+
+
+def _content_workspace_ready_video(user_id: str, stage: str, snapshot: dict) -> Optional[dict]:
+    if stage != "video":
+        return None
+    result = snapshot.get("genResult") or snapshot.get("result") or {}
+    if not isinstance(result, dict):
+        return None
+    source_url = result.get("video_url") or snapshot.get("video_url")
+    if not isinstance(source_url, str) or not source_url.startswith("/videos/saas_"):
+        return None
+    job_id = _job_id_from_saas_video_url(source_url)
+    try:
+        job_dir = _owned_saas_job_dir(job_id, {"id": user_id}, "job_id")
+    except HTTPException:
+        return None
+    if not job_dir:
+        return None
+    metadata = _read_local_gallery_meta(job_dir) or {}
+    # A workspace belongs to a user; its supplied URL must not grant ownership
+    # of a different user's file or an unclaimed legacy job.
+    if metadata.get("owner_user_id") != user_id:
+        return None
+    latest_url = metadata.get("video_url") or source_url
+    if not isinstance(latest_url, str):
+        return None
+    video_url = _strip_url_cache_bust(latest_url)
+    prefix = f"/videos/saas_{job_id}/"
+    if not isinstance(video_url, str) or not video_url.startswith(prefix):
+        return None
+    filename = video_url[len(prefix):]
+    if not filename.lower().endswith(".mp4") or os.path.basename(filename) != filename or "\\" in filename:
+        return None
+    path = _safe_output_subpath(video_url)
+    if not path or os.path.dirname(path) != os.path.realpath(job_dir):
+        return None
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return None
+    except OSError:
+        return None
+    return {"video_url": video_url, "filename": filename,
+            "duration": metadata.get("duration", result.get("duration")), "path": path}
 
 
 def delete_content_workspace(user_id: str, profile_id: str, item_id: str) -> bool:
@@ -602,6 +667,38 @@ def _user_owns_business_profile(user_id: str, profile_id: str) -> bool:
             (profile_id, user_id),
         ).fetchone()
     return row is not None
+
+
+def get_content_plan(user_id: str, profile_id: str) -> Optional[dict]:
+    with _auth_db() as conn:
+        row = conn.execute(
+            "SELECT plan_json FROM content_plans WHERE user_id = ? AND business_profile_id = ?",
+            (user_id, profile_id),
+        ).fetchone()
+    return json.loads(row["plan_json"]) if row else None
+
+
+def save_content_plan(user_id: str, profile_id: str, plan: dict) -> dict:
+    items = plan.get("items") if isinstance(plan, dict) else None
+    done = plan.get("done", {}) if isinstance(plan, dict) else None
+    if not isinstance(items, list) or len(items) > 100 or not isinstance(done, dict):
+        raise ValueError("Content plan must contain up to 100 items and a done map")
+    item_ids = [item.get("item_id") for item in items if isinstance(item, dict)]
+    if len(item_ids) != len(items) or any(not isinstance(i, str) or not i for i in item_ids) or len(set(item_ids)) != len(items):
+        raise ValueError("Content plan items need unique string IDs")
+    stored = {**plan, "done": {key: bool(value) for key, value in done.items() if key in item_ids}}
+    with _auth_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO content_plans (user_id, business_profile_id, plan_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, business_profile_id) DO UPDATE SET
+                plan_json = excluded.plan_json,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, profile_id, json.dumps(stored, ensure_ascii=False), _utc_now()),
+        )
+    return stored
 
 
 def _require_owned_business_profile(user_id: str, profile_id: str) -> None:
@@ -889,6 +986,10 @@ class ContentWorkspaceRequest(BaseModel):
     revision: int
     stage: str = "not_started"
     snapshot: Dict[str, Any]
+
+
+class ContentPlanSaveRequest(BaseModel):
+    plan: Dict[str, Any]
 
 
 class AdminSubscriptionRequest(BaseModel):
@@ -1180,6 +1281,30 @@ async def user_delete_business_profile(
     return {"profiles": list_business_profiles(user["id"])}
 
 
+@app.get("/api/user/content-plan/{profile_id}")
+async def user_content_plan(
+    profile_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    return {"plan": get_content_plan(user["id"], profile_id)}
+
+
+@app.put("/api/user/content-plan/{profile_id}")
+async def user_save_content_plan(
+    profile_id: str,
+    req: ContentPlanSaveRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    try:
+        return {"plan": save_content_plan(user["id"], profile_id, req.plan)}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
 @app.get("/api/user/content-workspaces")
 async def user_content_workspace_summaries(
     profile_id: str,
@@ -1202,6 +1327,21 @@ async def user_content_workspace(
     if not workspace:
         raise HTTPException(status_code=404, detail="Content workspace not found")
     return {"workspace": workspace}
+
+
+@app.get("/api/user/content-workspaces/{profile_id}/{item_id}/video")
+async def user_content_workspace_video(
+    profile_id: str,
+    item_id: str,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user = require_user_from_authorization(authorization)
+    _require_owned_business_profile(user["id"], profile_id)
+    workspace = get_content_workspace(user["id"], profile_id, item_id)
+    video = _content_workspace_ready_video(user["id"], workspace["stage"], workspace["snapshot"]) if workspace else None
+    if not video:
+        raise HTTPException(status_code=404, detail="Готовое видео не найдено")
+    return FileResponse(video["path"], media_type="video/mp4", filename=video["filename"])
 
 
 @app.put("/api/user/content-workspaces/{profile_id}/{item_id}")
@@ -3171,6 +3311,9 @@ from saasshorts import (
     fill_storyboard_shot_details,
     generate_storyboard_sets,
     build_custom_script,
+    generate_custom_script,
+    apply_generation_preset,
+    is_custom_storyboard,
     GeminiTemporaryError,
     generate_full_video,
     adopt_job_artifacts,
@@ -3218,6 +3361,7 @@ def _derive_product_name(description: str = "", topic: str = "", fallback: str =
 
 
 class SaaSAnalyzeRequest(BaseModel):
+    generation_preset: Literal["calm_ugc", "expressive"] = "calm_ugc"
     url: Optional[str] = None
     description: Optional[str] = None  # Manual product/business description
     topic: Optional[str] = None
@@ -3253,9 +3397,10 @@ async def saasshorts_analyze(
 ):
     """Analyze a URL or manual description and generate video scripts."""
     is_custom = req.script_mode == "custom"
+    is_manual_storyboard = is_custom and req.script_format == "storyboard_v3" and is_custom_storyboard(req.custom_script)
     user = get_user_from_authorization(authorization)
     try:
-        gemini_key = resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
+        gemini_key = None if is_manual_storyboard else resolve_effective_api_key("gemini", user, x_gemini_key, req.use_platform_keys)
     except SubscriptionRequiredError as e:
         raise HTTPException(status_code=402, detail=str(e))
     except PlatformKeyUnavailableError as e:
@@ -3268,7 +3413,7 @@ async def saasshorts_analyze(
             )
         except PlatformKeyUnavailableError:
             fal_key = None
-    if not is_custom and not gemini_key:
+    if not is_manual_storyboard and not gemini_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key")
 
     if is_custom and not (req.custom_script or "").strip():
@@ -3284,7 +3429,6 @@ async def saasshorts_analyze(
             web_research = None
 
             if is_custom:
-                context = (req.description or req.topic or "Custom video").strip()
                 analysis = {
                     "product_name": _derive_product_name(req.description, req.topic, fallback="Custom Script"),
                     "description": req.description or req.topic or "",
@@ -3295,17 +3439,18 @@ async def saasshorts_analyze(
                     "tone": "custom user-provided narration",
                     "topic": req.topic or "",
                 }
-                scripts = [
-                    build_custom_script(
-                        req.custom_script,
-                        analysis,
-                        req.style,
-                        req.language,
-                        req.actor_gender,
-                        topic=req.topic,
-                        script_format=req.script_format,
-                    )
-                ]
+                options = dict(style=req.style, language=req.language, actor_gender=req.actor_gender,
+                               topic=req.topic, script_format=req.script_format)
+                if is_manual_storyboard:
+                    scripts = [build_custom_script(req.custom_script, analysis, **options)]
+                else:
+                    scripts = [generate_custom_script(
+                        req.custom_script, analysis, gemini_key, **options,
+                        text_model=req.text_model,
+                        broll_between_talking=req.broll_between_talking,
+                        changing_locations=req.changing_locations,
+                        generation_preset=req.generation_preset,
+                    )]
             elif req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
@@ -3339,6 +3484,7 @@ async def saasshorts_analyze(
                     target_duration_seconds=req.target_duration_seconds,
                     broll_between_talking=req.broll_between_talking,
                     changing_locations=req.changing_locations,
+                    generation_preset=req.generation_preset,
                     fal_key=fal_key,
                     fal_fallback_enabled=True,
                 )
@@ -3368,9 +3514,11 @@ async def saasshorts_analyze(
                     target_duration_seconds=req.target_duration_seconds,
                     broll_between_talking=req.broll_between_talking,
                     changing_locations=req.changing_locations,
+                    generation_preset=req.generation_preset,
                     fal_key=fal_key,
                     fal_fallback_enabled=True,
                 )
+            scripts = [apply_generation_preset(script, req.generation_preset) for script in scripts]
             return {
                 "analysis": analysis,
                 "scripts": scripts,
@@ -4468,10 +4616,14 @@ async def saasshorts_set_avatar_voice(
 
 class SaaSGenerateRequest(BaseModel):
     script: dict
+    generation_preset: Literal["calm_ugc", "expressive"] = "calm_ugc"
     voice_id: Optional[str] = None
     voice_name: Optional[str] = None
     voice_selection_source: Optional[str] = None
     tts_provider: str = "auto"  # "auto", "elevenlabs", or "fal_minimax"
+    elevenlabs_model: Literal["eleven_v3", "eleven_v4"] = "eleven_v4"
+    elevenlabs_stability: float = Field(default=0.65, ge=0, le=1)
+    elevenlabs_similarity: float = Field(default=0.75, ge=0, le=1)
     minimax_voice_id: Optional[str] = None
     minimax_voice_name: Optional[str] = None
     actor_gender: Optional[str] = None
@@ -4489,7 +4641,7 @@ class SaaSGenerateRequest(BaseModel):
     video_mode: str = "standard"  # "lowcost", "standard", or "premium"
     broll_mode: str = "mockup"  # "off", "mockup", or "ai"
     punch_in_cuts: bool = True  # jump-cut talking head with alternating punch-in zoom
-    storyboard_generation_mode: str = "per_shot"  # "per_shot", "multi_shot", or "sliced_avatar"
+    storyboard_generation_mode: str = "sliced_avatar"  # "per_shot", "multi_shot", or "sliced_avatar"
     revoice_all: bool = False  # re-read the whole script in one take instead of per-shot pieces
     reusable_head_template_id: Optional[str] = None
     reusable_lipsync_model: str = "sync-3"
@@ -4497,6 +4649,8 @@ class SaaSGenerateRequest(BaseModel):
     clip_vision_qc: bool = True  # advisory Gemini review of each generated clip
     broll_image_first: bool = True  # Flux still -> image-to-video for b-roll shots
     background_music: bool = True  # ducked music bed under the voiceover
+    music_track: str = "auto"
+    music_volume: float = Field(default=1.0, ge=0, le=2)
     frames_only: bool = False  # generate only the Flux start frames (no paid video)
     frames_only_shot: Optional[int] = None  # regenerate a single shot's frame
     # Записать (и посчитать) только озвучку — платного видео не будет. Дорожка
@@ -4652,6 +4806,136 @@ def _voice_slug_of_job(job_dir: str) -> str:
     return _storyboard_slug_of_job(job_dir)
 
 
+@app.get("/api/saasshorts/music-tracks")
+async def saasshorts_music_tracks():
+    from saasshorts import list_background_music
+    return {"tracks": list_background_music()}
+
+
+@app.get("/api/saasshorts/music-tracks/{track}")
+async def saasshorts_music_preview(track: str):
+    from saasshorts import _pick_background_music
+    if track == "auto":
+        raise HTTPException(status_code=404, detail="Choose a track to preview")
+    try:
+        path = _pick_background_music("", track)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    return FileResponse(path)
+
+
+class SaaSMusicRequest(BaseModel):
+    job_id: str
+    music_track: str = "auto"
+    music_volume: float = Field(default=1.0, ge=0, le=2)
+    background_music: bool = True
+
+
+_music_remix_locks: Dict[str, threading.Lock] = {}
+
+
+def _sync_music_workspaces(owner: str, job_id: str, metadata: dict):
+    # Patch only this rendered result; leave authored text and other reels alone.
+    with _auth_db() as conn:
+        rows = conn.execute("SELECT * FROM content_workspaces WHERE user_id = ? AND stage = 'video'", (owner,)).fetchall()
+        for row in rows:
+            snapshot = json.loads(row["snapshot_json"])
+            result = snapshot.get("genResult") or snapshot.get("result") or {}
+            if snapshot.get("jobId") != job_id and _job_id_from_saas_video_url(result.get("video_url")) != job_id:
+                continue
+            for key in ("genResult", "result"):
+                if isinstance(snapshot.get(key), dict):
+                    snapshot[key].update({field: metadata[field] for field in
+                                          ("video_url", "duration", "background_music", "music_track", "music_volume", "versions")
+                                          if field in metadata})
+            snapshot.setdefault("videoPrefs", {}).update(backgroundMusic=metadata["background_music"],
+                                                         musicTrack=metadata["music_track"], musicVolume=metadata["music_volume"])
+            revision = row["revision"] + 1
+            snapshot.update(revision=revision, timestamp=int(time.time() * 1000))
+            conn.execute("""UPDATE content_workspaces SET revision = ?, snapshot_json = ?, updated_at = ?
+                            WHERE user_id = ? AND business_profile_id = ? AND item_id = ? AND revision = ?""",
+                         (revision, json.dumps(snapshot, ensure_ascii=False), _utc_now(), owner,
+                          row["business_profile_id"], row["item_id"], row["revision"]))
+
+
+def remix_local_saas_music(job_id: str, user: dict, music_track: str, music_volume: float, background_music: bool) -> dict:
+    from saasshorts import _pick_background_music, composite_storyboard_video, _get_media_duration, _mp3_encoder_delay
+    job_dir = _owned_saas_job_dir(job_id, user, "job_id")
+    if not job_dir:
+        raise HTTPException(status_code=404, detail="Video not found")
+    lock = _music_remix_locks.setdefault(job_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Music edit is already in progress")
+    try:
+        if (saas_jobs.get(job_id) or {}).get("status") == "processing":
+            raise HTTPException(status_code=409, detail="Wait for video generation to finish")
+        metadata = _read_local_gallery_meta(job_dir) or {}
+        if metadata.get("script_format") != "storyboard_v3" or not metadata.get("shots"):
+            raise HTTPException(status_code=400, detail="Music editing requires a saved storyboard")
+        try:
+            music_path = _pick_background_music(metadata.get("title", ""), music_track) if background_music else None
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        if not 0 <= music_volume <= 2:
+            raise HTTPException(status_code=400, detail="Music volume must be between 0 and 2")
+        clips = []
+        prefix = f"/videos/saas_{job_id}/"
+        slug = _storyboard_slug_of_job(job_dir)
+        for shot in metadata["shots"]:
+            url = shot.get("clip_url") or ""
+            filename = url[len(prefix):] if url.startswith(prefix) else ""
+            if not filename or os.path.basename(filename) != filename or "\\" in filename:
+                raise HTTPException(status_code=400, detail="Missing local source clip")
+            path = os.path.join(job_dir, filename)
+            if not os.path.isfile(path):
+                raise HTTPException(status_code=409, detail="Cached clips are no longer available")
+            duration = float(shot["end"]) - float(shot["start"])
+            if duration <= 0:
+                raise HTTPException(status_code=400, detail="Invalid saved shot timing")
+            slice_name = next((name for name in shot.get("_render_files", [])
+                               if isinstance(name, str) and "_slice_" in name and name.endswith(".mp3")
+                               and os.path.basename(name) == name and "\\" not in name),
+                              f"{slug}_slice_{int(shot['shot_number']):02d}.mp3")
+            audio_slice = os.path.join(job_dir, slice_name)
+            offset = _mp3_encoder_delay(audio_slice) if shot.get("visual_type") != "broll" and os.path.isfile(audio_slice) else 0.0
+            clips.append({"path": path, "duration": duration, "shot": shot,
+                          "audio_slice": audio_slice, "speech_offset": offset})
+        audio = os.path.join(job_dir, f"{slug}_voice.mp3")
+        subtitles = os.path.join(job_dir, f"{slug}_subs.ass")
+        if not os.path.isfile(audio) or not os.path.isfile(subtitles):
+            raise HTTPException(status_code=409, detail="Cached voiceover or subtitles are no longer available")
+        filename = f"__music_{uuid.uuid4().hex}.mp4"
+        output = os.path.join(job_dir, filename)
+        # This is deliberately only FFmpeg: no TTS, image, video or vision API calls.
+        composite_storyboard_video(clips, audio, subtitles, output, music_path=music_path, music_volume=music_volume)
+        versions = _build_saas_video_versions(metadata, prefix + filename, "", "", None)
+        versions[-1].update(label="Музыка" if background_music else "Без музыки", edit_kind="music",
+                            music_track=music_track, music_volume=music_volume, additional_cost=0)
+        metadata.update(video_url=prefix + filename, music_track=music_track, music_volume=music_volume,
+                        background_music=background_music, duration=round(_get_media_duration(output), 3), versions=versions)
+        temporary = os.path.join(job_dir, f".gallery_music_{uuid.uuid4().hex}.json")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary, os.path.join(job_dir, "gallery_metadata.json"))
+        _sync_music_workspaces(user["id"], job_id, metadata)
+        result = (saas_jobs.get(job_id) or {}).get("result")
+        if isinstance(result, dict):
+            result.update({key: metadata[key] for key in ("video_url", "duration", "music_track", "music_volume", "background_music")})
+        return metadata
+    finally:
+        lock.release()
+
+
+@app.post("/api/saasshorts/music")
+async def saasshorts_edit_music(req: SaaSMusicRequest, authorization: Optional[str] = Header(None, alias="Authorization")):
+    import functools
+    user = require_user_from_authorization(authorization)
+    loop = asyncio.get_running_loop()
+    video = await loop.run_in_executor(None, functools.partial(remix_local_saas_music, req.job_id, user,
+                                                              req.music_track, req.music_volume, req.background_music))
+    return {"video": video, "paid_generation": False}
+
+
 @app.post("/api/saasshorts/generate")
 async def saasshorts_generate(
     req: SaaSGenerateRequest,
@@ -4661,6 +4945,12 @@ async def saasshorts_generate(
 ):
     """Generate a UGC video from a script. Returns a job_id for polling."""
     user = get_user_from_authorization(authorization)
+    if req.background_music and req.music_track != "auto":
+        from saasshorts import _pick_background_music
+        try:
+            _pick_background_music("", req.music_track)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
     try:
         fal_key = resolve_effective_api_key("fal", user, x_fal_key, req.use_platform_keys)
         elevenlabs_key = resolve_effective_api_key("elevenlabs", user, x_elevenlabs_key, req.use_platform_keys)
@@ -4856,6 +5146,7 @@ async def saasshorts_generate(
             raise HTTPException(status_code=404, detail=str(e))
 
     resolved_language = req.language or req.script.get("language") or "en"
+    req.script = apply_generation_preset(req.script, req.generation_preset)
 
     # Gemini is optional here: it powers advisory vision QC of generated clips,
     # so a missing key must never block the (paid) generation itself.
@@ -4865,12 +5156,15 @@ async def saasshorts_generate(
         gemini_key = None
 
     config = {
+        "generation_preset": req.generation_preset,
         "fal_key": fal_key,
         "elevenlabs_key": elevenlabs_key,
         "gemini_key": gemini_key,
         "clip_vision_qc": req.clip_vision_qc,
         "broll_image_first": req.broll_image_first,
         "background_music": req.background_music,
+        "music_track": req.music_track,
+        "music_volume": req.music_volume,
         "frames_only": req.frames_only,
         "frames_only_shot": req.frames_only_shot,
         "voice_only": req.voice_only,
@@ -4879,6 +5173,9 @@ async def saasshorts_generate(
         "voice_name": eleven_voice_audit["voice_name"],
         "voice_selection_source": requested_voice_audit["voice_selection_source"],
         "tts_provider": req.tts_provider or "auto",
+        "elevenlabs_model": req.elevenlabs_model,
+        "elevenlabs_stability": req.elevenlabs_stability,
+        "elevenlabs_similarity": req.elevenlabs_similarity,
         "minimax_voice_id": req.minimax_voice_id,
         "minimax_voice_name": req.minimax_voice_name,
         "actor_gender": req.actor_gender or "female",
@@ -4889,7 +5186,7 @@ async def saasshorts_generate(
         "pinned_plates": pinned_plates,
         "video_mode": req.video_mode,
         "broll_mode": req.broll_mode or "mockup",
-        "punch_in_cuts": req.punch_in_cuts,
+        "punch_in_cuts": req.punch_in_cuts and req.generation_preset != "calm_ugc",
         "storyboard_generation_mode": req.storyboard_generation_mode or "per_shot",
         "revoice_all": req.revoice_all,
         "reusable_head_template_id": reusable_head.get("template_id") if reusable_head else None,
@@ -4942,6 +5239,11 @@ async def saasshorts_generate(
                     "quality_warnings": result.get("quality_warnings", []),
                     "talking_head_quality": result.get("talking_head_quality", {}),
                     "language": resolved_language,
+                    "generation_preset": result.get("generation_preset", req.generation_preset),
+                    "background_music": req.background_music,
+                    "music_track": req.music_track,
+                    "music_volume": req.music_volume,
+                    "voice_settings": {"stability": req.elevenlabs_stability, "similarity_boost": req.elevenlabs_similarity},
                     "script": req.script,
                     "script_format": req.script.get("format") or req.script.get("script_format") or "ugc",
                     "shots": result.get("storyboard_shots") or req.script.get("shots", []),
@@ -4983,6 +5285,11 @@ async def saasshorts_generate(
                         "actor_description": req.script.get("actor_description", ""),
                         "style": req.script.get("style", "ugc"),
                         "language": resolved_language,
+                        "generation_preset": result.get("generation_preset", req.generation_preset),
+                        "background_music": req.background_music,
+                        "music_track": req.music_track,
+                        "music_volume": req.music_volume,
+                        "voice_settings": {"stability": req.elevenlabs_stability, "similarity_boost": req.elevenlabs_similarity},
                         "duration": result.get("duration", 0),
                         "video_mode": req.video_mode,
                         "tts_provider": result.get("tts_provider", req.tts_provider),

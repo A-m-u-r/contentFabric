@@ -1,0 +1,174 @@
+name: CI and home deployment
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push must never interrupt an update already running on the home server.
+concurrency:
+  group: content-fabric-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backend-checks:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image_prefix: ${{ steps.registry.outputs.image_prefix }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install test dependencies
+        # Generation providers are mocked; CI does not install the ML models.
+        run: >-
+          python -m pip install
+          fastapi==0.136.1 python-multipart==0.0.27 httpx==0.28.1
+          python-dotenv==1.2.2 google-genai==1.75.0 numpy==2.4.6
+          Pillow==12.2.0 boto3==1.43.4 beautifulsoup4==4.14.3
+
+      - name: Install FFmpeg for media tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
+      - name: Run backend tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run deployment helper tests
+        run: python -m unittest discover -s deploy -p 'test_*.py' -v
+
+      - name: Set registry image prefix
+        id: registry
+        shell: bash
+        run: echo "image_prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+  frontend-checks:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run frontend tests
+        run: node --test --test-concurrency=1 --test-timeout=60000 src/components/*.test.mjs
+
+      - name: Build frontend
+        run: npm run build
+
+  images:
+    name: Build ${{ matrix.service }} image
+    needs: [backend-checks, frontend-checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: backend
+            dockerfile: deploy/backend.Dockerfile
+          - service: frontend
+            dockerfile: deploy/frontend.Dockerfile
+          - service: renderer
+            dockerfile: render-service/Dockerfile
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish commit image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          tags: ${{ needs.backend-checks.outputs.image_prefix }}-${{ matrix.service }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Update home N100
+    needs: [backend-checks, images]
+    # PRs only use GitHub-hosted runners. Enable CD after server setup is complete.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.event.repository.private == true &&
+      vars.ENABLE_HOME_DEPLOY == 'true'
+    runs-on: [self-hosted, content-fabric]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out deployment source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Pull images and update application
+        # Python's custom shell works with both Linux and Windows runners.
+        shell: python {0}
+        env:
+          IMAGE_PREFIX: ${{ needs.backend-checks.outputs.image_prefix }}
+          IMAGE_TAG: ${{ github.sha }}
+          CONTENT_FABRIC_DEPLOY_DIR: ${{ vars.CONTENT_FABRIC_DEPLOY_DIR }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import runpy
+          runpy.run_path('deploy/deploy.py', run_name='__main__')

@@ -24,8 +24,13 @@ class FrontendGalleryMediaAndKeysTests(unittest.TestCase):
 
         self.assertIn("const mediaUrl = (url) => getApiUrl(url || '')", gallery)
         self.assertIn("src={mediaUrl(video.video_url)}", gallery)
-        self.assertIn("poster={mediaUrl(video.actor_url)}", gallery)
+        self.assertEqual(gallery.count("poster={mediaUrl(video.cover_url || video.actor_url)}"), 2)
         self.assertIn("href={mediaUrl(version.video_url)}", gallery)
+
+    def test_cover_is_downloadable_without_replacing_actor_reference(self):
+        gallery = GALLERY.read_text(encoding="utf-8")
+        self.assertIn("href={mediaUrl(video.cover_url)}", gallery)
+        self.assertIn("Скачать обложку", gallery)
 
     def test_settings_show_account_key_status_for_replaceable_provider_keys(self):
         app = APP.read_text(encoding="utf-8")

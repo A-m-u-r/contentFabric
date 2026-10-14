@@ -2722,7 +2722,8 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             target_duration_seconds=15,
             language="ru",
         )
-        with patch("app.resolve_effective_api_key", return_value=""):
+        with patch("app.resolve_effective_api_key", return_value="key"), \
+             patch("app.generate_custom_script", return_value={"full_narration": narration}) as director:
             result = asyncio.run(app.saasshorts_analyze(
                 request,
                 x_gemini_key=None,
@@ -2731,6 +2732,7 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
 
         self.assertEqual(result["scripts"][0]["full_narration"], narration)
         self.assertNotIn("target_duration_seconds", result["scripts"][0])
+        self.assertNotIn("target_duration_seconds", director.call_args.kwargs)
 
     def test_storyboard_ass_has_no_top_overlay_plates(self):
         # User decision 2026-07-10: top hook/overlay plates are visual clutter.
