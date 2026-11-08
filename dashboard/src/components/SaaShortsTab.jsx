@@ -1,14 +1,20 @@
-import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
-import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload, Pencil, Save, Plus, Trash2, Undo2, GripVertical, Settings2 } from 'lucide-react';
+import React, { useState, useEffect, useId, useRef, useLayoutEffect } from 'react';
+import { Sparkles, Download, Copy, Check, ArrowLeft, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, ChevronUp, RefreshCw, MessageSquare, Share2, Calendar, Upload, Save, Plus, Trash2 } from 'lucide-react';
 import { getApiUrl } from '../config';
 import FrameEditorBlockedModal from './FrameEditorBlockedModal';
 import ImageLightbox from './ImageLightbox';
 import MusicPicker, { musicRequestSettings } from './MusicPicker';
+import StoryboardEditor from './StoryboardEditor';
+import MediaPlayer from './MediaPlayer';
+import './ShortsWorkflow.css';
 import {
   loadBusinessProfiles,
   saveBusinessProfiles,
   loadSelectedProfileId,
   saveSelectedProfileId,
+  presenterFromPreferences,
+  preferencesFromPresenter,
+  mergeProjectMetadata,
   profileId as businessProfileKey,
   peekPendingTopic,
   clearPendingTopic,
@@ -478,9 +484,11 @@ const TYPICAL_VIDEO_SECONDS = 35; // до генерации сценария д
 // Textarea that grows to fit its content instead of clipping to a fixed number
 // of rows and showing the ugly native scrollbar. `minRows` sets the resting
 // height; it never scrolls — it just gets taller as you type.
+const useTextareaLayout = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
 function AutoTextarea({ value, minRows = 3, className = '', ...props }) {
   const ref = useRef(null);
-  useLayoutEffect(() => {
+  useTextareaLayout(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = 'auto';
@@ -779,6 +787,7 @@ export default function SaaShortsTab({
   authToken,
   usePlatformKeys = false,
   onManageProjects,
+  onOpenSettings,
 }) {
   const [workspaceContextState, setWorkspaceContextState] = useState(resolveActiveWorkspaceContext);
   const { activeContentPlanContext, pendingContentPlanContext } = workspaceContextState;
@@ -824,9 +833,18 @@ export default function SaaShortsTab({
   ));
   const [businessName, setBusinessName] = useState(() => initialCache?.businessName || '');
   const [businessProfiles, setBusinessProfiles] = useState(() => loadBusinessProfiles());
+  const [profilesLoading, setProfilesLoading] = useState(Boolean(authToken));
+  const [profilesError, setProfilesError] = useState('');
+  const [profilesReload, setProfilesReload] = useState(0);
+  const [presenterSaving, setPresenterSaving] = useState(false);
+  const [presenterSaveStatus, setPresenterSaveStatus] = useState(null);
   const [selectedBusinessProfileId, setSelectedBusinessProfileId] = useState(() => (
     initialCache?.businessProfileId || activeContentPlanContext?.profileId || loadSelectedProfileId() || ''
   ));
+  const selectedBusinessProfile = businessProfiles.find((profile) =>
+    String(businessProfileKey(profile)) === String(selectedBusinessProfileId));
+  const profileContextRef = useRef(null);
+  profileContextRef.current = { id: selectedBusinessProfileId, description, topic };
   const [scriptMode, setScriptMode] = useState(() => initialCache?.scriptMode || planScriptDefaults.scriptMode || 'ai'); // "ai" or "custom"
   const [scriptFormat, setScriptFormat] = useState(() => initialCache?.scriptFormat || planScriptDefaults.scriptFormat
     || (initialVideoPrefs.generationPreset === 'calm_ugc' ? 'storyboard_v3' : 'ugc'));
@@ -842,10 +860,11 @@ export default function SaaShortsTab({
   const [textModel, setTextModel] = useState(() => initialCache?.textModel || 'fast');
   const [customScript, setCustomScript] = useState(() => initialCache?.customScript || planScriptDefaults.customScript || '');
   const manualStoryboardImport = isManualStoryboardImport(scriptMode, scriptFormat, customScript);
-  const [style, setStyle] = useState('ugc');
-  const [language, setLanguage] = useState('ru');
-  const [actorGender, setActorGender] = useState('female');
-  const [numScripts, setNumScripts] = useState(3);
+  const analyzeNeedsGemini = !manualStoryboardImport && !geminiApiKey;
+  const [style, setStyle] = useState(initialCache?.style || 'ugc');
+  const [language, setLanguage] = useState(initialVideoPrefs.language || 'ru');
+  const [actorGender, setActorGender] = useState(initialVideoPrefs.actorGender || 'female');
+  const [numScripts, setNumScripts] = useState(initialCache?.numScripts || 3);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState('');
   const [fromCache, setFromCache] = useState(initialHasProgress);
@@ -858,12 +877,7 @@ export default function SaaShortsTab({
   // Undo stack for storyboard shot edits: snapshots of shots before each
   // add / delete / reorder, tagged with the script they belong to.
   const [shotHistory, setShotHistory] = useState([]);
-  // Drag-and-drop reordering of storyboard shots.
-  const [dragShotIndex, setDragShotIndex] = useState(null);
-  const [dragOverShotIndex, setDragOverShotIndex] = useState(null);
-  // Which shots have the (optional, technical) "prompt for the AI" field open.
-  const [openPromptShots, setOpenPromptShots] = useState({});
-  const [openAdvancedShots, setOpenAdvancedShots] = useState({});
+  const storyboardFieldId = useId();
 
   // Step 2: Configure
   const [voices, setVoices] = useState([]);
@@ -887,14 +901,14 @@ export default function SaaShortsTab({
   const [voiceSelectionSource, setVoiceSelectionSource] = useState(
     () => initialVideoPrefs.voiceSelectionSource || 'default',
   );
-  const [minimaxVoice, setMinimaxVoice] = useState('Russian_AmbitiousWoman');
+  const [minimaxVoice, setMinimaxVoice] = useState(initialVideoPrefs.minimaxVoice || 'Russian_AmbitiousWoman');
   const [actorDescription, setActorDescription] = useState('');
   const [editedNarration, setEditedNarration] = useState(() => initialCache?.editedNarration || '');
   const [actorOptions, setActorOptions] = useState([]);
   const [selectedActor, setSelectedActor] = useState(() => initialVideoPrefs.selectedActor || null);
   // Блок ведущего свёрнут до одной строки «кто говорит + каким голосом».
   // Сетка аватаров сама открывается, пока ведущий не выбран.
-  const [avatarPickerOpen, setAvatarPickerOpen] = useState(() => !initialVideoPrefs.selectedActor);
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   // Кадры, которые сейчас дозаполняет ИИ (сцена/камера/действие), и ошибка этого запроса.
   const [fillingShots, setFillingShots] = useState([]);
@@ -1014,7 +1028,7 @@ export default function SaaShortsTab({
     if (prefs.musicVolume != null) setMusicVolume(prefs.musicVolume);
     if (prefs.videoMode) setVideoMode(prefs.videoMode);
     if (prefs.storyboardGenerationMode) setStoryboardGenerationMode(prefs.storyboardGenerationMode);
-    if (prefs.selectedVoice) setSelectedVoice(prefs.selectedVoice);
+    if (prefs.selectedVoice != null) setSelectedVoice(prefs.selectedVoice);
     if (prefs.selectedVoiceName != null) setSelectedVoiceName(prefs.selectedVoiceName);
     if (prefs.voiceSelectionSource) setVoiceSelectionSource(prefs.voiceSelectionSource);
     if (prefs.selectedActor != null) setSelectedActor(prefs.selectedActor || null);
@@ -1061,6 +1075,8 @@ export default function SaaShortsTab({
     setChangingLocations(Boolean(snapshot.changingLocations));
     setTextModel(snapshot.textModel || 'fast');
     setCustomScript(snapshot.customScript || planScriptDefaults.customScript || '');
+    setStyle(snapshot.style || 'ugc');
+    setNumScripts(snapshot.numScripts || 3);
     setAnalysis(snapshot.analysis || null);
     setWebResearch(snapshot.webResearch || null);
     setScripts(snapshot.scripts || []);
@@ -1087,7 +1103,9 @@ export default function SaaShortsTab({
     changingLocations,
     textModel,
     videoPrefs: currentVideoPrefs,
-    customScript: scriptMode === 'custom' ? customScript.trim() : '',
+    customScript,
+    style,
+    numScripts,
     analysis,
     webResearch,
     scripts,
@@ -1179,6 +1197,8 @@ export default function SaaShortsTab({
         targetDurationSeconds: snapshot.targetDurationSeconds,
         textModel: snapshot.textModel,
         customScript: snapshot.customScript,
+        style: snapshot.style,
+        numScripts: snapshot.numScripts,
         videoPrefs: snapshot.videoPrefs,
         brollBetweenTalking: snapshot.brollBetweenTalking,
         changingLocations: snapshot.changingLocations,
@@ -1258,6 +1278,8 @@ export default function SaaShortsTab({
     changingLocations,
     textModel,
     customScript,
+    style,
+    numScripts,
     analysis,
     webResearch,
     scripts,
@@ -1330,6 +1352,7 @@ export default function SaaShortsTab({
     const title = result?.script?.title;
     if (!Array.isArray(genShots) || !genShots.length || !title) return;
     const byNumber = new Map(genShots.map((s, i) => [s.shot_number ?? (i + 1), s]));
+    const renderedJobId = (result.frames_only || result.voice_only) ? '' : jobIdFromVideoUrl(result.video_url);
     // Перерисованный кадр ложится по тому же адресу: ракурс общий на весь ролик,
     // имя файла не меняется. Браузер отдаёт картинку из кэша, и «Перегенерить»
     // выглядит как «ничего не произошло» даже когда кадр честно нарисован заново.
@@ -1338,11 +1361,12 @@ export default function SaaShortsTab({
       if (script.title !== title || !Array.isArray(script.shots) || !script.shots.length) return script;
       const shots = script.shots.map((shot, i) => {
         const g = byNumber.get(shot.shot_number ?? (i + 1));
-        if (!g) return shot;
+        if (!g) return renderedJobId ? { ...shot, timeline_start: undefined, timeline_end: undefined } : shot;
         return {
           ...shot,
           preview_frame_url: g.preview_frame_url || shot.preview_frame_url,
           clip_url: g.clip_url || shot.clip_url,
+          ...(renderedJobId ? { timeline_start: g.timeline_start, timeline_end: g.timeline_end } : {}),
           // Frames-only render also attaches the start frame the video will reuse.
           image_url: g.image_url || shot.image_url,
           local_url: g.local_url || shot.local_url,
@@ -1365,9 +1389,6 @@ export default function SaaShortsTab({
       // Снятый ролик становится новым источником для пересъёмки, а его кадры —
       // точкой отсчёта: с этого момента «изменённым» считается то, что правили
       // после рендера. Превью кадров (frames_only) роликом не является.
-      const renderedJobId = (result?.frames_only || result?.voice_only)
-        ? ''
-        : jobIdFromVideoUrl(result?.video_url);
       if (!renderedJobId) {
         // Джоб предпросмотра: клипов в нём нет, зато есть оплаченные кадры и
         // утверждённые дубли. Рендер заберёт их оттуда — иначе он переделал бы
@@ -1398,6 +1419,8 @@ export default function SaaShortsTab({
         ...script,
         shots,
         _source_job_id: renderedJobId,
+        _source_video_url: result.video_url,
+        _source_waveform: undefined,
         _render_baseline: shots,
         // Снятый ролик сам стал источником звука и кадров, а папки превью
         // вычищаются через сутки — держать ссылки на них уже не на что.
@@ -1461,17 +1484,34 @@ export default function SaaShortsTab({
   }, []);
 
   useEffect(() => {
-    if (!authToken) return;
+    if (!authToken) { setProfilesLoading(false); return; }
+    let cancelled = false;
+    setProfilesLoading(true);
+    setProfilesError('');
     fetch(getApiUrl('/api/user/business-profiles'), { headers: authHeaders() })
-      .then((res) => res.ok ? res.json() : { profiles: [] })
+      .then((res) => {
+        if (!res.ok) throw new Error('Не удалось загрузить проекты из аккаунта.');
+        return res.json();
+      })
       .then((data) => {
-        if (Array.isArray(data.profiles) && data.profiles.length > 0) {
-          setBusinessProfiles(data.profiles);
-          saveBusinessProfiles(data.profiles);
+        if (cancelled) return;
+        if (!Array.isArray(data.profiles)) throw new Error('Не удалось загрузить проекты из аккаунта.');
+        // Keep browser-only projects available until the user saves them to the account.
+        const local = loadBusinessProfiles();
+        const next = mergeProjectMetadata(data.profiles, local, { includeLocalOnly: true });
+        setBusinessProfiles(next);
+        saveBusinessProfiles(next);
+        const context = profileContextRef.current;
+        const profile = next.find((item) => String(businessProfileKey(item)) === String(context.id));
+        if (profile && !context.description.trim()) {
+          handleLoadBusinessProfile(profile, { preserveScriptChoices: true,
+            preserveTopic: Boolean(context.topic) || Boolean(activeContentPlanContext) });
         }
       })
-      .catch(() => {});
-  }, [authToken]);
+      .catch(() => { if (!cancelled) setProfilesError('Не удалось загрузить проекты из аккаунта. Проверь подключение и повтори.'); })
+      .finally(() => { if (!cancelled) setProfilesLoading(false); });
+    return () => { cancelled = true; };
+  }, [authToken, profilesReload]);
 
   // Fetch voices on mount
   useEffect(() => {
@@ -1489,7 +1529,7 @@ export default function SaaShortsTab({
   const voiceAutoKeyRef = useRef(initialVideoPrefs.voiceKey || '');
   useEffect(() => {
     const comboKey = `${language}-${actorGender}`;
-    if (voiceAutoKeyRef.current === comboKey) return;
+    if (voiceAutoKeyRef.current === comboKey && selectedVoice) return;
     const prevLang = voiceAutoKeyRef.current.split('-')[0] || '';
     voiceAutoKeyRef.current = comboKey;
     const genderDefaults = {
@@ -1521,9 +1561,18 @@ export default function SaaShortsTab({
     elevenLabsStability, elevenLabsSimilarity, selectedActor, selectedFace, plateUrls,
     uploadedActorPreview, language, actorGender, backgroundMusic, clipVisionQc, brollImageFirst]);
 
+  const minimaxAutoKeyRef = useRef(`${initialVideoPrefs.language || 'ru'}-${initialVideoPrefs.actorGender || 'female'}`);
   useEffect(() => {
+    const comboKey = `${language}-${actorGender}`;
+    if (minimaxAutoKeyRef.current === comboKey) return;
+    minimaxAutoKeyRef.current = comboKey;
     setMinimaxVoice(defaultMiniMaxVoice(language, actorGender));
   }, [actorGender, language]);
+
+  useEffect(() => {
+    setPresenterSaveStatus(null);
+  }, [selectedActor, selectedFace, plateUrls, selectedVoice, selectedVoiceName,
+    minimaxVoice, ttsProvider, elevenLabsModel, elevenLabsStability, elevenLabsSimilarity]);
 
   useEffect(() => {
     const allowed = activeVideoModeOptions(scriptFormat).map((option) => option.id);
@@ -1587,15 +1636,15 @@ export default function SaaShortsTab({
     }
   };
 
-  const handleLoadBusinessProfile = (profile) => {
+  const handleLoadBusinessProfile = (profile, { preserveScriptChoices = false, preserveTopic = false } = {}) => {
     if (!profile) return;
     const id = businessProfileKey(profile);
     setSelectedBusinessProfileId(id);
     saveSelectedProfileId(id);
     setBusinessName(profile.name || '');
     setDescription(profile.description || '');
-    setTopic(profile.topic || '');
-    if (!planScriptDefaults.customScript) {
+    if (!preserveTopic) setTopic(profile.topic || '');
+    if (!preserveScriptChoices && !planScriptDefaults.customScript) {
       if (profile.scriptMode || profile.script_mode) setScriptMode(profile.scriptMode || profile.script_mode);
       if (profile.scriptFormat || profile.script_format) setScriptFormat(profile.scriptFormat || profile.script_format);
     }
@@ -1606,14 +1655,72 @@ export default function SaaShortsTab({
     if (profile.style) setStyle(profile.style);
     if (profile.language) setLanguage(profile.language);
     if (profile.actorGender || profile.actor_gender) setActorGender(profile.actorGender || profile.actor_gender);
+    if (profile.presenter !== undefined) {
+      const prefs = preferencesFromPresenter(profile.presenter);
+      if (!profile.presenter?.minimax_voice_id) prefs.minimaxVoice = defaultMiniMaxVoice(
+        profile.language || language, profile.actorGender || profile.actor_gender || actorGender);
+      // Applying a project is an explicit voice choice, including across languages.
+      voiceAutoKeyRef.current = `${profile.language || language}-${profile.actorGender || profile.actor_gender || actorGender}`;
+      minimaxAutoKeyRef.current = voiceAutoKeyRef.current;
+      restoreVideoPreferences({ ...currentVideoPrefs, ...prefs });
+      if (profile.language) setLanguage(profile.language);
+      if (profile.actorGender || profile.actor_gender) setActorGender(profile.actorGender || profile.actor_gender);
+    }
+    setPresenterSaveStatus(null);
+  };
+
+  const handleSaveProjectPresenter = async () => {
+    if (!selectedBusinessProfile || presenterSaving) return;
+    const profile = selectedBusinessProfile;
+    const id = String(businessProfileKey(profile));
+    const presenter = presenterFromPreferences({ ...currentVideoPrefs, selectedVoiceName: selectedVoiceLabel });
+    const updated = { ...profile, presenter, updatedAt: new Date().toISOString() };
+    setPresenterSaving(true);
+    setPresenterSaveStatus(null);
+    try {
+      let saved = updated;
+      if (authToken) {
+        const existingAccountProfile = Boolean(profile.created_at);
+        const res = await fetch(getApiUrl(existingAccountProfile
+          ? `/api/user/business-profiles/${encodeURIComponent(id)}/presenter` : '/api/user/business-profiles'), {
+          method: existingAccountProfile ? 'PATCH' : 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(existingAccountProfile ? { presenter } : {
+            ...updated, id,
+            actor_gender: profile.actorGender || profile.actor_gender || 'female',
+            script_mode: profile.scriptMode || profile.script_mode || 'ai',
+            script_format: profile.scriptFormat || profile.script_format || 'ugc',
+            target_duration_seconds: profile.targetDurationSeconds || profile.target_duration_seconds || null,
+            text_model: profile.textModel || profile.text_model || 'fast',
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось сохранить. Попробуй ещё раз.');
+        saved = data.profiles?.find((item) => String(businessProfileKey(item)) === id);
+        if (!saved || !saved.presenter) throw new Error('Сервер пока не поддерживает сохранение ведущего. Обнови сервер и повтори.');
+      }
+      setBusinessProfiles((current) => {
+        const next = current.map((item) => String(businessProfileKey(item)) === id
+          ? mergeProjectMetadata([saved], [updated])[0] : item);
+        saveBusinessProfiles(next);
+        return next;
+      });
+      if (String(profileContextRef.current.id) === id) setPresenterSaveStatus({
+        text: authToken ? `Аватар и голос сохранены в проекте «${profile.name}».` : 'Сохранено в проекте в этом браузере.',
+      });
+    } catch (error) {
+      if (String(profileContextRef.current.id) === id) setPresenterSaveStatus({ text: error.message, error: true });
+    } finally {
+      setPresenterSaving(false);
+    }
   };
 
   const handleAnalyze = async () => {
     const isCustom = scriptMode === 'custom';
     if (isCustom && !customScript.trim()) return;
     if (!isCustom && !description.trim()) return;
-    if (!manualStoryboardImport && !geminiApiKey) {
-      setAnalyzeError('Gemini API key required. Set it in Settings.');
+    if (analyzeNeedsGemini) {
+      setAnalyzeError('Подключи ключ Gemini в настройках, чтобы создать сценарий с ИИ.');
       return;
     }
 
@@ -1671,7 +1778,6 @@ export default function SaaShortsTab({
         step: 1,
         selectedScript: 0,
         editedNarration: firstNarration,
-        customScript: isCustom ? customScript.trim() : '',
       });
 
       // Pre-fill actor description and narration from first script
@@ -1726,6 +1832,7 @@ export default function SaaShortsTab({
       shots: pendingStoryboard.shots,
       shots_archived: pendingStoryboard.shots_archived || [],
       _source_video_id: pendingStoryboard.video_id || '',
+      _source_video_url: pendingStoryboard.video_url || '',
       // Джоб с оплаченными клипами + слепок кадров на момент открытия: по нему
       // видно, что пользователь реально изменил, а значит — за что платить.
       _source_job_id: pendingStoryboard.job_id || '',
@@ -2128,11 +2235,7 @@ export default function SaaShortsTab({
   };
 
   // Drag-and-drop reorder: move the dragged shot to the drop target's slot.
-  const dropShotOnto = (toIndex) => {
-    const from = dragShotIndex;
-    setDragShotIndex(null);
-    setDragOverShotIndex(null);
-    if (from == null || from === toIndex) return;
+  const reorderSelectedScriptShot = (from, toIndex) => {
     mutateSelectedScriptShots((shots) => {
       const [moved] = shots.splice(from, 1);
       shots.splice(toIndex, 0, moved);
@@ -3117,7 +3220,7 @@ export default function SaaShortsTab({
   const storyboardSeconds = scripts[selectedScript]
     ? estimateStoryboardSeconds(scripts[selectedScript], '')
     : 0;
-  const durationGap = storyboardSeconds && targetDurationSeconds
+  const durationGap = scriptMode !== 'custom' && storyboardSeconds && targetDurationSeconds
     && Math.abs(storyboardSeconds - targetDurationSeconds) > 2
     ? storyboardSeconds - targetDurationSeconds
     : 0;
@@ -3138,314 +3241,1064 @@ export default function SaaShortsTab({
   const previousReadyStep = [...stepReady.keys()].filter((i) => i < step && stepReady[i]).pop();
   const nextReadyStep = [...stepReady.keys()].find((i) => i > step && stepReady[i]);
 
-  // ─── Render Steps ─────────────────────────────────────────────────
 
-  return (
-    <div className="h-full overflow-y-auto custom-scrollbar">
-      {/* На телефоне вложенные отступы (страница → панель → блок кадров →
-          карточка) съедали 39% ширины экрана — на узких экранах поля меньше. */}
-      <div className="max-w-5xl mx-auto p-4 pb-28 sm:p-6 md:pb-8 lg:p-8">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-8">
+  const renderGenerationSettings = (isLight = false) => (
+    <>
+      <GenerationPresetPicker value={generationPreset} onChange={selectGenerationPreset}
+        disabled={generating || framesGenerating || voiceGenerating} />
+      <MusicPicker enabled={backgroundMusic} value={musicTrack} volume={musicVolume}
+        onEnabledChange={setBackgroundMusic} onChange={setMusicTrack} onVolumeChange={setMusicVolume}
+        disabled={generating || framesGenerating || voiceGenerating || musicSaving} />
+      {sourceJobId && renderPlan.reshoot.length === 0 && (
+        <button type="button" disabled={generating || framesGenerating || voiceGenerating || musicSaving}
+          onClick={async () => {
+            setMusicSaving(true); setMusicError('');
+            try {
+              const response = await fetch(getApiUrl('/api/saasshorts/music'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify({ job_id: sourceJobId, ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume) }),
+              });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.detail || 'Не удалось сохранить музыку');
+              setGenResult((previous) => ({ ...previous, ...data.video }));
+              setGenStatus('completed'); setJobId(sourceJobId); setStep(4);
+            } catch (error) { setMusicError(error.message); }
+            finally { setMusicSaving(false); }
+          }}
+          className={isLight ? 'storyboard-editor__button' : 'inline-flex min-h-10 items-center gap-2 rounded-md border border-white/15 px-3 py-2 text-sm text-zinc-200 hover:bg-white/5 disabled:opacity-50'}>
+          {musicSaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+          {musicSaving ? 'Сохраняю...' : 'Сохранить музыку · $0'}
+        </button>
+      )}
+      {musicError && <p role="alert" className={isLight ? 'storyboard-editor__notice' : 'text-sm text-red-300'} data-tone="error">{musicError}</p>}
+    </>
+  );
+
+  const renderCostEstimate = (isLight = false) => {
+    const estimate = estimateSaasVideoCost({
+      text: editedNarration,
+      videoMode,
+      ttsProvider,
+      brollMode,
+      hasSelectedActor: Boolean(selectedActor),
+      hasReusableHead: !isLight && Boolean(selectedHeadTemplate),
+      lipsyncModel: lipSyncModel,
+      script: scripts[selectedScript],
+      storyboardGenerationMode,
+    });
+    const costDetails =
+      !isLight && selectedHeadTemplate
+        ? 'Сохранённый talking-head + новая озвучка + Sync Lipsync. Быстрее, чем заново генерировать Kling/Hailuo.'
+        : videoMode === 'storyboard_v3_standard'
+        ? (storyboardGenerationMode === 'sliced_avatar'
+            ? 'Озвучка ElevenLabs. Говорящие кадры — Kling Avatar (липсинк), b-roll — Kling V3; под каждый кадр ещё Flux-кадр.'
+            : 'Озвучка ElevenLabs + видео Kling V3: кадры генерятся отдельно, липсинк не гарантирован.')
+        : videoMode === 'storyboard_v3_pro'
+        ? 'Озвучка ElevenLabs + видео Kling V3 Pro: выше детализация лиц и движений, тариф выше.'
+        : videoMode === 'storyboard_veo31_quality'
+        ? 'Озвучка ElevenLabs + видео Google Veo 3.1 — самая качественная и самая дорогая картинка.'
+        : videoMode === 'lowcost'
+        ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешёвый черновик: качество может плыть.'
+        : videoMode === 'premium'
+          ? 'Озвучка + Kling Avatar v2 Pro: чётче лицо и движения, тариф примерно вдвое выше.'
+          : 'Озвучка + Kling Avatar v2 Standard. Основной режим: хорошее качество по разумной цене.';
+
+    // Пересъёмка: в счёт идёт только то, что снимается заново, —
+    // иначе карточка обещала бы полную цену рядом с кнопкой
+    // «Пересобрать ролик (бесплатно)».
+    const shotCount = (currentScript?.shots || []).length;
+    const rows = reshootEstimate
+      ? [
+          ['Длительность', `~${estimate.seconds} сек`],
+          ['Переснимаем', `${renderPlan.reshoot.length} из ${shotCount}`],
+          ['Озвучка', formatUsd(reshootEstimate.voiceCost)],
+          ['Видео', formatUsd(reshootEstimate.videoCost)],
+          ['B-roll', formatUsd(reshootEstimate.brollCost)],
+        ]
+      : [
+          ['Длительность', `~${estimate.seconds} сек`],
+          ['Озвучка', formatUsd(estimate.voiceCost)],
+          ['Видео', formatUsd(estimate.videoCost)],
+          ['Аватар', formatUsd(estimate.actorCost)],
+          ['B-roll', formatUsd(estimate.brollCost)],
+        ];
+
+    return (
+      <div className={isLight ? 'storyboard-editor__section' : 'max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10'}>
+        <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold flex items-center gap-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-violet-500 to-fuchsia-500 rounded-xl flex items-center justify-center">
-                <Zap size={20} className="text-white" />
-              </div>
-              AI Shorts
-            </h1>
-            <p className="text-sm text-zinc-500 mt-1">
-              Generate viral UGC videos for any product or business
+            <div className={isLight ? 'text-sm font-semibold' : 'text-sm font-semibold text-zinc-300'}>
+              {reshootEstimate ? 'Стоимость пересъёмки' : 'Примерная стоимость'}
+            </div>
+            <div className={isLight ? 'text-xs text-[#545967] mt-1' : 'text-[11px] text-zinc-600 mt-1'}>
+              {reshootEstimate
+                ? `Кадры, которые не менялись, переезжают из прошлого рендера бесплатно. С нуля этот ролик стоил бы ${formatUsd(estimate.total)}.`
+                : costDetails}
+            </div>
+          </div>
+          <span className={isLight ? 'text-lg font-semibold whitespace-nowrap' : 'text-lg text-green-400 font-semibold whitespace-nowrap'}>
+            {formatUsd(reshootEstimate ? reshootEstimate.total : estimate.total)}
+          </span>
+        </div>
+
+        <div className={isLight ? 'storyboard-editor__estimate-lines mt-4' : 'mt-4 space-y-2 text-sm'}>
+          {rows.map(([label, value]) => (
+            <div key={label} className={isLight ? 'flex justify-between gap-4' : 'flex items-center justify-between gap-4 border-t border-white/5 pt-2 first:border-t-0 first:pt-0'}>
+              <span className={isLight ? 'text-[#545967]' : 'text-zinc-500'}>{label}</span>
+              <span className={isLight ? 'tabular-nums' : 'font-mono text-zinc-300'}>{value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderStoryboardSettings = () => (
+    <>
+      {renderGenerationSettings(true)}
+      {/* Место действия — одно на весь ролик и своё поле. Пока оно
+          жило внутри кадра 1, в плиты вместе с комнатой уезжало всё,
+          что там оказалось: «static camera» — и обе камеры выходили
+          одним анфасом, «a beautiful woman» — и редактор рисовал своё
+          лицо вместо выбранного. */}
+      <div className="rounded-md border border-[#dfe1e7] bg-[#f7f7fa] p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[12px] font-semibold text-[#545967]">
+            Место действия ролика
+          </span>
+          <button
+            type="button"
+            onClick={pickReelSet}
+            disabled={pickingSet}
+            className="inline-flex items-center gap-1 rounded-md border border-[#dfe1e7] px-2 py-0.5 text-xs text-[#545967] transition-colors hover:border-primary/40 hover:text-[#574585] disabled:opacity-50"
+            title="Подобрать место по тексту ролика (Gemini, бесплатно)"
+          >
+            {pickingSet
+              ? (<><Loader2 size={11} className="animate-spin" /> Подбираю…</>)
+              : (<><Sparkles size={11} /> Подобрать ИИ</>)}
+          </button>
+        </div>
+        <textarea
+          className="storyboard-editor__input min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+          value={currentScript?.set_scene || ''}
+          onChange={(event) => updateSelectedScript({
+            set_scene: event.target.value,
+            set_prompt: event.target.value,
+            set_source: 'user',
+          })}
+          placeholder="Комната, свет, поверхности, что на них стоит — здесь снят весь ролик"
+        />
+        {/* Что сейчас в силе — видно, а не угадывается. Описание,
+            подобранное ИИ, фото ведущего не видело: там уже снята
+            своя комната, и текст её перекрашивал (светлая дневная
+            кухня уезжала в вечернюю). Поэтому текст вступает в дело
+            только когда место вписал человек. */}
+        {reelLocations.length > 1 && (
+          <ul className="space-y-0.5 text-xs leading-snug text-[#545967]">
+            {reelLocations.map((place, index) => (
+              <li key={`${index}-${place.slice(0, 12)}`}>
+                <span className="text-[#545967]">Локация {index + 1}:</span> {place}
+                {index === 0 ? ' (её и правит поле выше)' : ''}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs leading-snug text-[#545967]">
+          {reelLocations.length > 1
+            ? 'Локации меняются по ходу ролика — каждая снимается своими постановочными кадрами.'
+            : setChosenByUser
+              ? 'Снимаем в этом месте — текст перебивает комнату с фото ведущего.'
+              : 'Сейчас комната берётся с фото ведущего — та же, что за спиной на портрете. Впиши своё место, если нужна другая.'}
+          {' '}Только место: людей, ракурс и внешность сюда писать не нужно — человека
+          ставит приложение, камеры чередует само. Пока кадры не отрисованы,
+          переподбор ничего не стоит.
+        </p>
+      </div>
+
+      {/* Озвучка идёт первой: её длина — это длина ролика, её паузы —
+          границы кадров, а длинная реплика режется на несколько
+          платных клипов. Стоит копейки, поэтому слушаем до съёмки. */}
+      <div className="rounded-md border border-sky-500/20 bg-sky-500/[0.04] p-3 space-y-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div className="max-w-md">
+            <h4 className="text-[12px] font-semibold text-[#574585] flex items-center gap-1.5">
+              <Volume2 size={13} /> Озвучка
+            </h4>
+            <p className="text-xs text-[#545967] mt-0.5">
+              По ней собирается ролик: её длина задаёт длину видео, паузы — границы кадров,
+              а длинная реплика снимается несколькими платными клипами.
+              Послушай и перезапиши до съёмки — после неё голос уже не поменять,
+              не переснимая всё заново.
             </p>
           </div>
-          {step > 0 && (
-            <button onClick={handleReset} className="text-sm text-zinc-400 hover:text-white flex items-center gap-1 transition-colors">
-              <RefreshCw size={14} /> Start over
+          <div className="flex shrink-0 flex-col gap-1.5">
+            <button
+              type="button"
+              onClick={() => handleGenerateVoice(null, false)}
+              disabled={voiceGenerating}
+              className="storyboard-editor__button px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {voiceGenerating && voiceShot === null
+                ? (<><Loader2 size={13} className="animate-spin" /> Записываю…</>)
+                : voicePreview
+                  ? (<><RefreshCw size={13} /> Обновить озвучку</>)
+                  : (<><Volume2 size={13} /> Записать озвучку</>)}
             </button>
-          )}
-        </div>
-
-        {/* Progress Steps — сама полоска и есть навигация: шаг с данными
-            открывается кликом, стрелки ходят по доступным шагам в обе стороны. */}
-        <div className="flex items-center gap-2 mb-8">
-          <button
-            type="button"
-            onClick={() => setStep(previousReadyStep)}
-            disabled={previousReadyStep === undefined}
-            title="Назад"
-            aria-label="Назад"
-            className="shrink-0 w-7 h-7 rounded-full bg-white/5 text-zinc-400 flex items-center justify-center transition-colors enabled:hover:bg-white/10 enabled:hover:text-white disabled:opacity-25"
-          >
-            <ChevronLeft size={14} />
-          </button>
-          {['Setup', 'Analysis', 'Configure', 'Generate', 'Result'].map((label, i) => (
-            <React.Fragment key={i}>
-              {i > 0 && <div className={`flex-1 h-px ${i <= step ? 'bg-violet-500' : 'bg-white/10'}`} />}
+            {voicePreview && (
               <button
                 type="button"
-                onClick={() => setStep(i)}
-                disabled={!stepReady[i] || i === step}
-                title={stepReady[i] ? label : `${label} — пока нечего показать`}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
-                  i === step ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' :
-                  stepReady[i] ? 'bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 hover:text-violet-300' :
-                  'bg-white/5 text-zinc-600 cursor-not-allowed'
-                }`}
+                onClick={() => handleGenerateVoice(null, true)}
+                disabled={voiceGenerating}
+                title="Перечитать весь текст одним дублем: ни одного стыка, но все реплики звучат заново"
+                className="rounded-md border border-[#dfe1e7] px-2.5 py-1 text-xs text-[#545967] transition-colors hover:border-sky-400/40 hover:text-[#574585] disabled:opacity-50"
               >
-                <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                  i < step ? 'bg-violet-500 text-white' :
-                  i === step ? 'bg-violet-500/30 text-violet-300' :
-                  stepReady[i] ? 'bg-violet-500/20 text-violet-300' :
-                  'bg-white/10 text-zinc-600'
-                }`}>
-                  {i < step ? <Check size={10} /> : i + 1}
-                </span>
-                <span className="hidden sm:inline">{label}</span>
+                Перечитать всё одним дублем
               </button>
-            </React.Fragment>
-          ))}
-          <button
-            type="button"
-            onClick={() => setStep(nextReadyStep)}
-            disabled={nextReadyStep === undefined}
-            title="Вперёд"
-            aria-label="Вперёд"
-            className="shrink-0 w-7 h-7 rounded-full bg-white/5 text-zinc-400 flex items-center justify-center transition-colors enabled:hover:bg-white/10 enabled:hover:text-white disabled:opacity-25"
-          >
-            <ChevronRight size={14} />
-          </button>
+            )}
+          </div>
         </div>
 
-        {/* ── Step 0: URL Input ────────────────────────────────── */}
-        {step === 0 && (
-          <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
-            <div className="glass-panel p-8 space-y-6">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+        {voicePreview && (
+          <div className="space-y-2">
+            <MediaPlayer
+              kind="audio"
+              label="Озвучка ролика"
+              preload="metadata"
+              src={voicePreview.url}
+              className="w-full"
+            />
+            <p className="text-xs font-medium text-[#574585]">
+              Голос: {voicePreview.voiceName || selectedVoiceLabel}
+              {voicePreview.voiceId ? ` · ${voicePreview.voiceId}` : ''}
+            </p>
+            <p className="text-xs text-[#545967]">
+              {voicePreview.seconds ? `${voicePreview.seconds.toFixed(1)} с` : 'длина неизвестна'}
+              {voicePreview.clips
+                ? ` · снимется ${voicePreview.clips} ${pluralClips(voicePreview.clips)}${
+                    voicePreview.shootCost != null ? ` (~${formatUsd(voicePreview.shootCost)})` : ''
+                  }`
+                : ''}
+              {voicePreview.model ? ` · ${voicePreview.model}` : ''}
+            </p>
+            {voicePreview.stale.length > 0 && (
+              <p className="text-xs text-[#674619]">
+                После записи изменились реплики {voicePreview.stale.join(', ')}.
+                При съёмке они перезапишутся сами, но услышать их заранее можно,
+                только записав озвучку ещё раз.
+              </p>
+            )}
+            {ttsProvider !== 'fal_minimax'
+              && (voicePreview.settingsChanged || (voicePreview.requestedModel
+                ? voicePreview.requestedModel !== elevenLabsModel
+                : elevenLabsModel === 'eleven_v4' && voicePreview.model !== 'eleven_v4')) && (
+              <p className="text-xs text-[#674619]">
+                Параметры этой записи отличаются от выбранных. При следующей генерации
+                озвучка будет записана заново; сначала обнови её для прослушивания.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {voiceNotice && (
+        <div className="rounded-md border border-amber-500/25 bg-amber-500/[0.06] p-3">
+          <p className="text-xs text-[#674619]">{voiceNotice}</p>
+        </div>
+      )}
+
+      {/* Сгенерировать стартовые кадры (Flux) до платного видео,
+          чтобы увидеть и утвердить композицию каждого шота. */}
+      <div className="rounded-md border border-primary/20 bg-primary/[0.04] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-xs text-[#545967] max-w-md">
+          Сгенерируй стартовые кадры и проверь композицию до платной генерации видео.
+          Говорящие кадры снимаются двумя общими ракурсами — за них платишь дважды,
+          сколько бы их ни было; у каждой перебивки свой кадр. Готовые пропускаются.
+          Перегенерить кадр или заменить его своим фото можно по кнопке на самом кадре.
+        </p>
+        <button
+          type="button"
+          onClick={() => handleGenerateFrames(null)}
+          disabled={framesGenerating || missingFrameCount === 0}
+          className="storyboard-editor__button shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+        >
+          {framesGenerating && framesShot === null
+            ? (<><Loader2 size={13} className="animate-spin" /> Генерирую…</>)
+            : missingFrameCount === 0
+              ? (<><Check size={13} /> Все кадры готовы</>)
+              : (<><Sparkles size={13} /> Сгенерить недостающие: {missingFrameCount} (~{formatUsd(billableFrameCount * 0.05)})</>)}
+        </button>
+      </div>
+
+      {framesNotice && (
+        <div className="rounded-md border border-amber-500/25 bg-amber-500/[0.06] p-3">
+          <p className="text-xs text-[#674619]">{framesNotice}</p>
+        </div>
+      )}
+
+      {/* Какой моделью рисуется ведущий. Строка появляется, как
+          только бэкенд прислал каталог: до этого выбирать не из чего. */}
+      {avatarEditModels.length > 0 && (
+        <div className="rounded-md border border-[#dfe1e7] bg-[#f7f7fa] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-[#545967]">
+            Ведущего в кадр ставит{' '}
+            <span className="text-[#545967]">
+              {(avatarEditModels.find((m) => m.id === avatarEditModel) || avatarEditModels[0]).title}
+            </span>
+            . Если модель откажет — предложу сменить её, подменять сама она не будет.
+          </p>
+          <select
+            value={avatarEditModel || avatarEditModels[0].id}
+            onChange={(e) => setAvatarEditModel(e.target.value)}
+            disabled={framesGenerating}
+            className="storyboard-editor__input shrink-0 text-[12px] py-1.5"
+          >
+            {avatarEditModels.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.title}{model.blocked ? ' — уже отказала' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      <div>
+        <label className="block text-sm font-medium text-[#545967] mb-2 flex items-center gap-2">
+          <Film size={14} /> Способ генерации видео
+        </label>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {STORYBOARD_GENERATION_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              onClick={() => setStoryboardGenerationMode(option.id)}
+              className={`p-3 rounded-md border text-left transition-all ${
+                storyboardGenerationMode === option.id
+                  ? 'border-violet-500/50 bg-violet-500/10 text-[#574585]'
+                  : 'border-[#dfe1e7] bg-[#f7f7fa] text-[#545967] hover:bg-[#f7f7fa]'
+              }`}
+            >
+              <div className="text-sm font-semibold">{option.label}</div>
+              <div className="text-xs text-[#545967] mt-1">{option.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+      {/* Пересъёмка готового ролика: клипы прошлого рендера
+          переносятся в новый джоб, поэтому неизменённые кадры
+          ничего не стоят — платим за то, что правили. */}
+      {renderPlan.isReshoot && (
+        <div className="rounded-md border border-green-500/20 bg-green-500/[0.05] p-3">
+          <p className="text-xs text-[#35634d]">
+            Ролик уже снят. {renderPlan.reshoot.length === 0
+              ? (<>
+                  Все {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} возьмём
+                  из прошлого рендера — пересборка бесплатна.
+                  Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
+                </>)
+              : (<>
+                  Возьмём {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} из прошлого
+                  рендера бесплатно, снимем заново {renderPlan.reshoot.length}
+                  {reshootCost !== null ? ` (~${formatUsd(reshootCost)})` : ''}.
+                  Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
+                </>)}
+          </p>
+          {/* Пошотная озвучка оставляет на границе правки один стык.
+              Замеры говорят, что он тише обычного перехода между
+              предложениями, но если он всё же слышен — вот выход. */}
+          <label className="mt-2 flex items-start gap-2 text-xs text-[#35634d]">
+            <input
+              type="checkbox"
+              checked={revoiceAll}
+              onChange={(event) => setRevoiceAll(event.target.checked)}
+              className="mt-0.5 w-3.5 h-3.5 rounded border-green-500/40 bg-white text-[#35634d] focus:ring-green-500"
+            />
+            <span>
+              Перечитать весь текст одним дублем
+              <span className="text-[#35634d]"> — ни одного стыка в озвучке, но тогда переснимаются все говорящие кадры</span>
+            </span>
+          </label>
+        </div>
+      )}
+      {/* Реплики исходного сценария, которых нет ни в одном кадре —
+          для старых роликов это всё, что уцелело от удалённых кадров. */}
+      {leftoverNarration.length > 0 && (
+        <details className="rounded-md border border-[#dfe1e7] bg-[#f7f7fa]">
+          <summary className="cursor-pointer list-none px-3 py-2 text-xs text-[#545967] hover:text-[#545967]">
+            Текст сценария вне кадров ({leftoverNarration.length}) — можно вернуть кадром
+          </summary>
+          <div className="space-y-2 border-t border-[#dfe1e7] p-3">
+            {leftoverNarration.map((sentence, i) => (
+              <div key={i} className="flex items-start gap-2 rounded-md border border-[#dfe1e7] bg-[#f7f7fa] p-2">
+                <p className="min-w-0 flex-1 text-xs text-[#545967]">{sentence}</p>
+                <button
+                  type="button"
+                  onClick={() => addShotWithSpeech(sentence)}
+                  className="shrink-0 rounded-md border border-[#dfe1e7] px-2 py-1 text-xs text-[#545967] transition-colors hover:border-primary/40 hover:text-[#574585]"
+                >
+                  Добавить кадром
+                </button>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {/* Удалённые кадры: текст никуда не девается, кадр возвращается
+          одной кнопкой. Уезжает в метаданные ролика вместе с раскадровкой. */}
+      {(scripts[selectedScript].shots_archived || []).length > 0 && (
+        <details className="rounded-md border border-[#dfe1e7] bg-[#f7f7fa]">
+          <summary className="cursor-pointer list-none px-3 py-2 text-xs text-[#545967] hover:text-[#545967]">
+            Удалённые кадры ({(scripts[selectedScript].shots_archived || []).length}) — текст сохранён, вернутся на свои места
+          </summary>
+          <div className="space-y-2 border-t border-[#dfe1e7] p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-[#545967]">
+                Кадры помнят свои позиции — можно спокойно разобрать раскадровку
+                на тестовый рендер и собрать обратно.
+              </p>
+              <button
+                type="button"
+                onClick={restoreAllArchivedShots}
+                className="shrink-0 rounded-md border border-primary/40 px-2 py-1 text-xs text-[#574585] transition-colors hover:bg-primary/10"
+              >
+                Вернуть все ({(scripts[selectedScript].shots_archived || []).length})
+              </button>
+            </div>
+            {(scripts[selectedScript].shots_archived || []).map((shot, i) => (
+              <div key={i} className="flex items-start gap-2 rounded-md border border-[#dfe1e7] bg-[#f7f7fa] p-2">
                 <div className="min-w-0 flex-1">
-                  <label className="block text-sm font-medium text-zinc-300 mb-2">
-                    <span className="inline-flex items-center gap-1.5"><Target size={14} className="text-violet-300" /> Проект</span>
-                  </label>
-                  {businessProfiles.length > 0 ? (
-                    <OptionPicker
-                      value={selectedBusinessProfileId}
-                      onChange={(value) => {
-                        const profile = businessProfiles.find((item) => businessProfileKey(item) === value);
-                        if (profile) handleLoadBusinessProfile(profile);
-                      }}
-                      options={businessProfiles.map((profile) => ({
-                        value: businessProfileKey(profile),
-                        label: profile.name,
-                      }))}
-                      placeholder="Выбери сохранённый проект..."
-                    />
-                  ) : (
-                    <p className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-xs text-zinc-500">
-                      Нет сохранённых проектов — можно заполнить описание вручную или создать проект.
-                    </p>
+                  <p className="truncate text-xs text-[#545967]">{shot.speech || shot.scene || 'Пустой кадр'}</p>
+                  {shot.scene && shot.speech && (
+                    <p className="truncate text-xs text-[#545967]">{shot.scene}</p>
                   )}
                 </div>
                 <button
                   type="button"
-                  onClick={() => onManageProjects?.()}
-                  className="btn-secondary px-4 py-3 text-sm flex items-center justify-center gap-2 shrink-0"
+                  onClick={() => restoreArchivedShot(i)}
+                  className="shrink-0 rounded-md border border-[#dfe1e7] px-2 py-1 text-xs text-[#545967] transition-colors hover:border-primary/40 hover:text-[#574585]"
                 >
-                  <Settings2 size={14} /> Управлять проектами
+                  Вернуть
+                </button>
+                <button
+                  type="button"
+                  onClick={() => dropArchivedShot(i)}
+                  aria-label="Забыть кадр"
+                  title="Забыть окончательно"
+                  className="shrink-0 rounded-md p-1 text-[#545967] transition-colors hover:text-[#8f263b]"
+                >
+                  <Trash2 size={13} />
                 </button>
               </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </>
+  );
 
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  Описание бизнеса / продукта <span className="text-zinc-600">(обязательно)</span>
-                </label>
-                <AutoTextarea
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  minRows={3}
-                  className="input-field text-sm"
-                  placeholder="Что продаём, кому, какой результат, какие ограничения, тон коммуникации."
-                />
-              </div>
+  const renderStoryboardShot = ({ shot, imageUrl, clipUrl, shotNumber, markedForReshoot, plannedSeconds }, shotIndex) => {
+    const isBroll = isBrollShot(shot);
+    const clipFloorSeconds = shotClipFloorSeconds(shot);
+    const shotIsShorterThanItsClip = plannedSeconds > 0 && plannedSeconds < clipFloorSeconds - 0.05;
+    return (
+      <>
+        <label className="storyboard-editor__field">
+          <span>Тип кадра</span>
+          <select className="storyboard-editor__input" value={isBroll ? 'broll' : 'avatar'}
+            onChange={(event) => handleSelectedScriptShot(shotIndex, 'visual_type', event.target.value)}>
+            <option value="avatar">{actorGender === 'male' ? 'Ведущий' : 'Ведущая'}</option>
+            <option value="broll">Перебивка</option>
+          </select>
+        </label>
+        <label className="storyboard-editor__field">
+          <span>{isBroll ? 'Текст за кадром' : 'Реплика'}</span>
+          <textarea
+            className="storyboard-editor__input min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+            value={shot.speech || ''}
+            onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
+            placeholder={isBroll ? 'Что звучит голосом, пока показываем вставку (можно оставить пустым)' : 'Реплика для этого кадра'}
+          />
+          {/* Реплика короче пола клипа — единственное место,
+              где счёт растёт молча: на экране кадр мелькнёт,
+              а модель снимет и посчитает свой минимум. Видно
+              это должно быть здесь, до оплаты, а не в отчёте
+              после. Сборка потом дотянет кадр соседней
+              тишиной, но занимать её не всегда есть у кого. */}
+          {shotIsShorterThanItsClip && (
+            <p className="text-xs leading-snug text-[#674619]">
+              Коротко: {plannedSeconds.toFixed(1)} с речи при клипе от{' '}
+              {clipFloorSeconds.toFixed(1)} с — платим за полный.
+              Добавь слов или слей с соседним кадром.
+            </p>
+          )}
+        </label>
+        <div className="storyboard-editor__field">
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor={storyboardFieldId + '-scene'}>
+              {isBroll
+                ? 'Что в кадре'
+                : (shotIndex === setDefiningShotIndex && !hasOwnSet
+                  ? 'Что в кадре — место действия всего ролика'
+                  : 'Что делает')}
+            </label>
+            {/* Пустая сцена = случайная картинка: промпт для
+                видео-модели строится именно отсюда. */}
+            <button
+              type="button"
+              onClick={() => fillShotDetails([shotNumber])}
+              disabled={fillingShots.includes(shotNumber)}
+              className="inline-flex items-center gap-1 rounded-md border border-[#dfe1e7] px-2 py-0.5 text-xs text-[#545967] transition-colors hover:border-primary/40 hover:text-[#574585] disabled:opacity-50"
+              title="Заполнить сцену, камеру и действие по реплике (Gemini, бесплатно)"
+            >
+              {fillingShots.includes(shotNumber)
+                ? (<><Loader2 size={11} className="animate-spin" /> Заполняю…</>)
+                : (<><Sparkles size={11} /> Заполнить ИИ</>)}
+            </button>
+          </div>
+          <textarea
+            id={storyboardFieldId + '-scene'}
+            className="storyboard-editor__input min-h-[58px] resize-y py-2 text-sm leading-relaxed"
+            value={shot.scene || ''}
+            onChange={(event) => handleSelectedScriptShot(shotIndex, 'scene', event.target.value)}
+            placeholder={isBroll
+              ? 'Опиши, что видно в кадре'
+              : (shotIndex === setDefiningShotIndex && !hasOwnSet
+                ? 'Комната, свет, что в руках — это место остаётся до конца ролика'
+                : 'Поза, взгляд, что делают руки')}
+          />
+          {/* Место и камеру у говорящих кадров задаём не
+              словами: комната одна на весь ролик, ракурсы
+              чередует сборка. Без этой строчки поле снова
+              заполняли текстом вида «ракурс чуть сменился»,
+              которого в картинке никогда не будет. */}
+          {!isBroll && (hasOwnSet || shotIndex !== setDefiningShotIndex) && (
+            <p className="text-xs leading-snug text-[#545967]">
+              {setChosenByUser
+                ? 'Место — из настроек ролика'
+                : (hasOwnSet
+                  ? 'Место — с фото ведущего, одно на весь ролик'
+                  : `Место то же, что в кадре ${setDefiningShotIndex + 1}`)}
+              {'. Опиши здесь позу, взгляд или жест ведущего.'}
+            </p>
+          )}
+        </div>
+        {/* Записанная реплика: послушать именно её, увидеть
+            её длину (её задаёт голос, а не поле «секунды»)
+            и заказать другой дубль, не трогая остальные. */}
+        {(shot.voice_url || shot.voice_seconds > 0) && (
+          <div className="-mt-1 flex flex-wrap items-center gap-2">
+            {shot.voice_url && (
+              <MediaPlayer
+                kind="audio"
+                label={`Реплика ${shotNumber}`}
+                compact
+                preload="none"
+                src={getApiUrl(shot.voice_url)}
+                className="w-full max-w-[280px]"
+              />
+            )}
+            <span className="text-xs text-[#545967]">
+              {Number(shot.voice_seconds || 0).toFixed(1)} с
+              {shot.voice_clips > 1 ? ` · ${shot.voice_clips} ${pluralClips(shot.voice_clips)}` : ''}
+            </span>
+            {typeof shot.voice_speech === 'string'
+              && (shot.speech || '').trim() !== shot.voice_speech && (
+              <span className="text-xs text-[#674619]">текст изменился после записи</span>
+            )}
+            <button
+              type="button"
+              onClick={() => handleGenerateVoice(shotNumber)}
+              disabled={voiceGenerating}
+              title="Прочитать эту реплику заново. Остальные дубли останутся как есть."
+              className="inline-flex items-center gap-1 rounded-md border border-[#dfe1e7] px-2 py-0.5 text-xs text-[#545967] transition-colors hover:border-sky-400/40 hover:text-[#574585] disabled:opacity-50"
+            >
+              {voiceGenerating && voiceShot === shotNumber
+                ? (<><Loader2 size={11} className="animate-spin" /> Пишу…</>)
+                : (<><Volume2 size={11} /> Перезаписать</>)}
+            </button>
+          </div>
+        )}
+        {isBroll && (
+          <div className="-mt-1.5 space-y-1.5">
+            <p className="text-xs text-[#545967]">
+              В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
+            </p>
+            {/* Кадр перебивки рисуется отдельно от аватара, поэтому по
+                тексту сцены мы не угадаем, наш это человек или чужой.
+                Без галочки «женский силуэт со спины» — посторонняя
+                женщина посреди ролика. */}
+            <label className="flex items-start gap-2 text-xs text-[#545967]">
+              <input
+                type="checkbox"
+                checked={Boolean(shot.actor_in_frame)}
+                onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_in_frame', event.target.checked)}
+                className="mt-0.5 w-3.5 h-3.5 rounded border-[#afb3c0] bg-white text-[#574585] focus:ring-violet-500"
+              />
+              <span>
+                В кадре наш персонаж
+                <span className="text-[#545967]"> — со спины, руки или силуэт: кадр снимем с фото аватара, лицо не покажем</span>
+              </span>
+            </label>
+          </div>
+        )}
+        <details className="storyboard-editor__disclosure">
+          <summary>Камера и промпт <ChevronDown size={15} /></summary>
+          {!isBroll && talkingCameras[shotIndex] && (
+            <p className="mb-2 text-xs text-[#545967]">Ракурс ведущего при сборке: {CAMERA_LABELS[talkingCameras[shotIndex]]}.</p>
+          )}
+          <label className="storyboard-editor__field">
+            <span>Камера</span>
+            <input className="storyboard-editor__input" value={shot.camera || ''}
+              onChange={(event) => handleSelectedScriptShot(shotIndex, 'camera', event.target.value)}
+              placeholder="Крупный план, лёгкая ручная камера" />
+          </label>
+          <label className="storyboard-editor__field">
+            <span>Действие актёра</span>
+            <textarea className="storyboard-editor__input" rows={2} value={shot.actor_action || shot.action || ''}
+              onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_action', event.target.value)} />
+          </label>
+          <label className="storyboard-editor__field">
+            <span>Промпт кадра</span>
+            <input className="storyboard-editor__input" value={shot.generation_prompt || ''}
+              onChange={(event) => updateSelectedScriptShot(shotIndex, { generation_prompt: event.target.value, prompt_manual: true })}
+              placeholder="Промпт на английском" />
+          </label>
+          {shot.prompt_manual && (
+            <button type="button" className="storyboard-editor__button storyboard-editor__button--plain"
+              onClick={() => updateSelectedScriptShot(shotIndex, { prompt_manual: false })}>Использовать описание кадра</button>
+          )}
+          <label className="storyboard-editor__field">
+            <span>Роль кадра</span>
+            <input className="storyboard-editor__input" value={shot.role || ''}
+              onChange={(event) => handleSelectedScriptShot(shotIndex, 'role', event.target.value)}
+              placeholder="hook / problem / cta" />
+          </label>
+          <label className="storyboard-editor__field">
+            <span>Переход после кадра</span>
+            <input className="storyboard-editor__input" value={shot.transition || ''}
+              onChange={(event) => handleSelectedScriptShot(shotIndex, 'transition', event.target.value)}
+              placeholder="cut / smooth_0.3s" />
+          </label>
+        </details>
+        <details className="storyboard-editor__disclosure">
+          <summary>Изображение и пересъёмка <ChevronDown size={15} /></summary>
+          <div className="storyboard-editor__actions">
+            <input id={storyboardFieldId + '-photo'} type="file" accept="image/*" className="sr-only"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) handleStoryboardFrameUpload(shotIndex, file);
+                event.target.value = '';
+              }} />
+            <label htmlFor={storyboardFieldId + '-photo'} className="storyboard-editor__button cursor-pointer"><Upload size={15} /> Загрузить фото</label>
+            <button type="button" className="storyboard-editor__button" onClick={() => handleGenerateFrames(shotNumber)} disabled={framesGenerating}>
+              {framesGenerating && framesShot === shotNumber ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+              {imageUrl ? 'Обновить кадр' : 'Создать кадр'}
+            </button>
+            {clipUrl && renderPlan.isReshoot && (
+              <button type="button" className="storyboard-editor__button" aria-pressed={markedForReshoot}
+                onClick={() => setReshootShots((previous) => (
+                  previous.includes(shotNumber) ? previous.filter((number) => number !== shotNumber) : [...previous, shotNumber]
+                ))}>
+                <RefreshCw size={15} /> {markedForReshoot ? 'Не переснимать' : 'Переснять'}
+              </button>
+            )}
+          </div>
+        </details>
+        {shot.frame_status && <p className="storyboard-editor__notice" role="status">{shot.frame_status}</p>}
+      </>
+    );
+  };
 
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Источник сценария</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {[
-                    { id: 'ai', label: 'Сгенерировать варианты', desc: 'ИИ возьмёт проект, тему и формат как бриф' },
-                    { id: 'custom', label: 'Мой точный текст', desc: 'Не переписывать озвучку перед генерацией' },
-                  ].map((mode) => (
-                    <button
-                      key={mode.id}
-                      onClick={() => setScriptMode(mode.id)}
-                      className={`p-3 rounded-xl border text-left transition-all ${
-                        scriptMode === mode.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{mode.label}</div>
-                      <div className="text-[10px] text-zinc-500 mt-0.5">{mode.desc}</div>
+  const storyboardEditor = step === 2 && storyboardSelected;
+  const storyboardFrames = storyboardEditor ? (currentScript.shots || []).map((shot, index) => {
+    const imageUrl = shot.image_preview
+      || (shot.local_url ? getApiUrl(shot.local_url) : '')
+      || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url)
+      || (shot.preview_frame_url ? getApiUrl(shot.preview_frame_url) : '');
+    const clipUrl = shot.clip_url ? getApiUrl(shot.clip_url) : '';
+    const shotNumber = shot.shot_number ?? (index + 1);
+    const markedForReshoot = reshootShots.includes(shotNumber);
+    const plannedSeconds = shotPlannedSeconds(currentScript, shot, storyboardSeconds);
+    return {
+      shot, imageUrl, clipUrl, shotNumber, markedForReshoot, plannedSeconds,
+      status: markedForReshoot && clipUrl ? 'reshoot' : clipUrl || imageUrl ? 'ready' : 'missing',
+      statusLabel: clipUrl ? (markedForReshoot ? 'Переснимем' : 'Снят') : imageUrl ? 'Кадр готов' : 'Без кадра',
+    };
+  }) : [];
+  const storyboardBaseline = currentScript?._render_baseline;
+  const storyboardSourceVideo = storyboardEditor && currentScript._source_video_url
+    && storyboardFrames.length === storyboardBaseline?.length
+    && storyboardFrames.every(({ shot }, index) => {
+      const previous = storyboardBaseline[index];
+      return previous && [
+        'shot_number', 'speech', 'scene', 'generation_prompt', 'prompt_manual', 'visual_type', 'start', 'end',
+        'actor_in_frame', 'actor_action', 'camera', 'transition', 'role',
+        'image_path', 'image_url', 'image_preview', 'local_url', 'clip_url', 'timeline_start', 'timeline_end',
+      ].every((field) => shot[field] === previous[field]);
+    }) ? getApiUrl(currentScript._source_video_url) : '';
+  const storyboardVoice = voicePreview && !voicePreview.settingsChanged && !voicePreview.stale.length
+    && storyboardFrames.every(({ shot }) => !shot.speech?.trim() || typeof shot.voice_speech === 'string')
+    ? voicePreview : null;
+  const storyboardPrice = storyboardEditor
+    ? reshootCost ?? estimateSaasVideoCost({
+        text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor),
+        hasReusableHead: false, lipsyncModel: lipSyncModel, script: currentScript, storyboardGenerationMode,
+      }).total
+    : 0;
+  const storyboardMissingKey = !falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey);
+  const storyboardNotice = storyboardEditor && (durationGap || emptyShotNumbers.length > 0 || fillError || storyboardMissingKey || framesNotice || voiceNotice) && (
+    <div className="storyboard-editor__notices">
+      {durationGap !== 0 && <p className="storyboard-editor__notice" data-tone="warning">
+        Сценарий {durationGap > 0 ? 'длиннее' : 'короче'} цели на {Math.abs(durationGap)} с.
+        {' '}Озвучка займёт около {storyboardSeconds} с при цели {targetDurationSeconds} с.
+      </p>}
+      {/* Кадры без описания сцены: ИИ-генерация видео читает промпт,
+          собранный из «Что в кадре», а не реплику. */}
+      {emptyShotNumbers.length > 0 && (
+        <div className="flex flex-col gap-2 rounded-md border border-amber-500/25 bg-amber-500/[0.06] p-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="max-w-md text-xs text-[#674619]">
+            В {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} есть реплика, но не описано, что в кадре.
+            Без этого нейросеть нарисует случайную сцену.
+          </p>
+          <button
+            type="button"
+            onClick={() => fillShotDetails(emptyShotNumbers)}
+            disabled={fillingShots.length > 0}
+            className="storyboard-editor__button shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
+          >
+            {fillingShots.length > 0
+              ? (<><Loader2 size={13} className="animate-spin" /> Заполняю…</>)
+              : (<><Sparkles size={13} /> Заполнить {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} ИИ</>)}
+          </button>
+        </div>
+      )}
+      {fillError && (
+        <p className="text-xs text-[#8f263b]">{fillError}</p>
+      )}
+      {storyboardMissingKey && <p className="storyboard-editor__notice" data-tone="warning">
+        {falKey ? 'Добавь ключ ElevenLabs в настройках.' : 'Добавь ключ fal.ai в настройках.'}
+      </p>}
+      {framesNotice && <p className="storyboard-editor__notice" role="status">{framesNotice}</p>}
+      {voiceNotice && <p className="storyboard-editor__notice" role="status">{voiceNotice}</p>}
+    </div>
+  );
+
+  const studioStep = step === 0 || step === 1;
+  const stepTitle = ['Бриф ролика', 'Сценарий', 'Настройка ролика', 'Сборка ролика', 'Готовый ролик'][step];
+  const resetDraft = () => {
+    if (window.confirm('Сбросить текущий черновик и начать заново?')) handleReset();
+  };
+  const workflowNav = (
+    <nav aria-label="Этапы создания ролика">
+      <ol className="shorts-workflow__steps">
+        {['Бриф', 'Сценарий', currentScript && !storyboardSelected ? 'Настройка' : 'Раскадровка', 'Сборка', 'Результат'].map((label, index) => (
+          <li key={label}>
+            <button type="button" aria-label={label} aria-current={index === step ? 'step' : undefined}
+              disabled={!stepReady[index] || index === step} onClick={() => setStep(index)}>
+              <span aria-hidden="true">{index + 1}</span><span>{label}</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </nav>
+  );
+
+  const briefProductField = (
+    <div className="shorts-workflow__field">
+      <label htmlFor="shorts-setup-description">
+        Что ты предлагаешь и кому{' '}
+        <span className="shorts-workflow__required">{scriptMode === 'custom' ? 'Необязательно' : 'Обязательно'}</span>
+      </label>
+      <AutoTextarea
+        id="shorts-setup-description"
+        aria-required={scriptMode !== 'custom'}
+        value={description}
+        onChange={(event) => setDescription(event.target.value)}
+        minRows={3}
+        className="shorts-workflow__input"
+        placeholder="Например, я тренер. Помогаю женщинам после 30 наладить питание и заниматься дома."
+      />
+    </div>
+  );
+  const briefExtras = (
+    <>
+      <div className="shorts-workflow__field">
+        <label htmlFor="shorts-setup-topic">
+          Тема ролика <span className="shorts-workflow__muted">· необязательно</span>
+        </label>
+        <AutoTextarea
+          id="shorts-setup-topic"
+          value={topic}
+          onChange={(event) => setTopic(event.target.value)}
+          minRows={1}
+          className="shorts-workflow__input"
+          placeholder="Например, ужин за 15 минут"
+        />
+      </div>
+
+    </>
+  );
+
+  // ─── Render Steps ─────────────────────────────────────────────────
+
+  return (
+    <>
+      {storyboardEditor ? (
+        <StoryboardEditor
+          key={activeWorkspaceKey + ':' + selectedScript}
+          title={currentScript.title || topic || 'Новый ролик'}
+          projectName={businessName}
+          shots={storyboardFrames}
+          sourceVideo={storyboardSourceVideo}
+          voice={storyboardVoice}
+          waveform={currentScript._source_waveform}
+          onBack={() => setStep(previousReadyStep)}
+          onResult={nextReadyStep !== undefined ? () => setStep(nextReadyStep) : undefined}
+          resultLabel={nextReadyStep === 3 ? 'К генерации' : 'К результату'}
+          onAdd={() => addSelectedScriptShot()}
+          onDuplicate={duplicateSelectedScriptShot}
+          onRemove={removeSelectedScriptShot}
+          onMove={moveSelectedScriptShot}
+          onReorder={reorderSelectedScriptShot}
+          onUndo={shotHistory.some((entry) => entry.scriptIndex === selectedScript) ? undoShotChange : undefined}
+          onEnlarge={(src, index) => setLightbox({ src, alt: 'Кадр ' + (index + 1), caption: 'Кадр ' + (index + 1) })}
+          settingsBlocked={Boolean(frameBlock)}
+          settings={renderStoryboardSettings()}
+          estimate={renderCostEstimate(true)}
+          renderShot={renderStoryboardShot}
+          notice={storyboardNotice}
+          renderAction={(
+            <button type="button" className="storyboard-editor__button storyboard-editor__button--primary"
+              disabled={storyboardMissingKey || generating || storyboardFrames.length === 0} onClick={handleGenerate}>
+              {generating && <Loader2 size={15} className="animate-spin" />}
+              {generating ? 'Собираю…' : reshootEstimate
+                ? (renderPlan.reshoot.length === 0 ? 'Пересобрать бесплатно' : 'Переснять ' + renderPlan.reshoot.length + ' ' + pluralShots(renderPlan.reshoot.length))
+                : 'Собрать ролик'}
+              {(!reshootEstimate || renderPlan.reshoot.length > 0) && <span>≈ {formatUsd(storyboardPrice)}</span>}
+            </button>
+          )}
+        />
+      ) : (
+    <div key={studioStep ? step : 'workflow'} className="shorts-workflow" data-shorts-workflow={step}
+      data-shorts-studio={studioStep || undefined}>
+      <div className="shorts-workflow__layout">
+        {studioStep ? (
+          <header className="shorts-workflow__studio-header">
+            <div className="shorts-workflow__studio-toolbar">
+              <div className="shorts-workflow__studio-leading">
+                {step === 1 ? (
+                  <>
+                    <button type="button" onClick={() => setStep(0)} className="shorts-workflow__button shorts-workflow__button--plain">
+                      <ArrowLeft size={16} aria-hidden="true" /> <span>Назад</span>
                     </button>
-                  ))}
-                </div>
-              </div>
-
-              <GenerationPresetPicker value={generationPreset} onChange={selectGenerationPreset} disabled={analyzing} />
-
-              <div data-section="text-model-section">
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Модель текста</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {TEXT_MODEL_OPTIONS.map((model) => (
-                    <button
-                      key={model.id}
-                      onClick={() => setTextModel(model.id)}
-                      className={`p-3 rounded-xl border text-left transition-all ${
-                        textModel === model.id
-                          ? model.id === 'pro'
-                            ? 'border-amber-500/50 bg-amber-500/10 text-amber-200'
-                            : 'border-blue-500/50 bg-blue-500/10 text-blue-200'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold">{model.label}</span>
-                        {model.id === 'pro' && (
-                          <span className="text-[10px] rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-300">paid</span>
-                        )}
-                      </div>
-                      <div className="text-[10px] text-zinc-500 mt-0.5">{model.desc}</div>
+                    <button type="button" onClick={resetDraft} className="shorts-workflow__button shorts-workflow__button--icon"
+                      aria-label="Сбросить черновик" title="Сбросить черновик">
+                      <RefreshCw size={15} aria-hidden="true" />
                     </button>
-                  ))}
-                </div>
-                <p className="text-[10px] text-zinc-600 mt-1">
-                  Pro дороже и медленнее, но лучше подходит для сильного оффера, точной раскадровки и русского текста.
-                </p>
-              </div>
-
-              <div data-section="script-format-section">
-                <label className="block text-sm font-medium text-zinc-300 mb-3">Формат сценария</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {SCRIPT_FORMAT_OPTIONS.map((format) => (
-                    <button
-                      key={format.id}
-                      onClick={() => setScriptFormat(format.id)}
-                      className={`p-3 rounded-xl border text-left transition-all ${
-                        scriptFormat === format.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{format.label}</div>
-                      <div className="text-[10px] text-zinc-500 mt-0.5">{format.desc}</div>
-                    </button>
-                  ))}
-                </div>
-                {scriptFormat === 'storyboard_v3' && (
-                  <p className="text-[10px] text-zinc-500 mt-2">
-                    ИИ сгенерирует кадры, действия, текст на экране и промпты для выбранной видео-модели.
-                  </p>
+                  </>
+                ) : (
+                  <button type="button" className="shorts-workflow__button shorts-workflow__button--plain"
+                    aria-controls="shorts-brief-resources" onClick={() => {
+                      const resources = document.getElementById('shorts-brief-resources');
+                      resources?.scrollIntoView({ block: 'start' });
+                      resources?.querySelector('select, button')?.focus({ preventScroll: true });
+                    }}>
+                    <User size={15} aria-hidden="true" /> Ведущий и голос
+                  </button>
                 )}
               </div>
+              <div className="shorts-workflow__studio-heading">
+                <h1>{stepTitle}</h1>
+                <span>{businessName || 'Создание ролика'}</span>
+              </div>
+              <div className="shorts-workflow__studio-actions">
+                {step === 0 ? (
+                  <span className="shorts-workflow__step-status">Шаг 1 из 5</span>
+                ) : (
+                  <button type="button" onClick={() => setStep(2)} disabled={!currentScript}
+                    className="shorts-workflow__button shorts-workflow__button--primary">
+                    {storyboardSelected ? 'К раскадровке' : 'К настройке ролика'} <ChevronRight size={15} aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="shorts-workflow__studio-nav">
+              {workflowNav}
 
-              {/* Video Mode Selector */}
-              <div data-section="video-mode-section">
-                <label className="block text-sm font-medium text-zinc-300 mb-1">Модель видео и качество</label>
-                <p className="text-[11px] text-zinc-500 mb-3">Какая ИИ-модель нарисует картинку и насколько детально. Цена — оценка за весь ролик.</p>
-                <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))' }}>
-                  {activeVideoModeOptions(scriptFormat).map((mode) => {
-                    const active = videoMode === mode.id;
-                    const activeClass =
-                      mode.id === 'lowcost' ? 'border-green-500/50 bg-green-500/10 ring-1 ring-green-500/30' :
-                      mode.id === 'storyboard_veo31_quality' ? 'border-amber-500/50 bg-amber-500/10 ring-1 ring-amber-500/30' :
-                      mode.id === 'standard' || mode.id === 'storyboard_v3_standard' ? 'border-blue-500/50 bg-blue-500/10 ring-1 ring-blue-500/30' :
-                      'border-violet-500/50 bg-violet-500/10 ring-1 ring-violet-500/30';
-                    const textClass =
-                      active && mode.id === 'lowcost' ? 'text-green-300' :
-                      active && mode.id === 'storyboard_veo31_quality' ? 'text-amber-300' :
-                      active && (mode.id === 'standard' || mode.id === 'storyboard_v3_standard') ? 'text-blue-300' :
-                      active && (mode.id === 'premium' || mode.id === 'storyboard_v3_pro') ? 'text-violet-300' :
-                      'text-zinc-300';
-                    const priceClass =
-                      mode.id === 'lowcost' ? 'text-green-400 bg-green-500/10' :
-                      mode.id === 'storyboard_veo31_quality' ? 'text-amber-400 bg-amber-500/10' :
-                      mode.id === 'standard' || mode.id === 'storyboard_v3_standard' ? 'text-blue-400 bg-blue-500/10' :
-                      'text-violet-400 bg-violet-500/10';
+            </div>
+          </header>
+        ) : (
+          <header className="shorts-workflow__header">
+            <div className="shorts-workflow__headline">
+              <h1>{stepTitle}</h1>
+              <button type="button" className="shorts-workflow__button shorts-workflow__button--plain shorts-workflow__reset"
+                aria-label="Сбросить черновик" onClick={resetDraft}>
+                <span>Сбросить черновик</span><span aria-hidden="true">Сбросить</span>
+              </button>
+            </div>
+            {workflowNav}
+          </header>
+        )}
 
-                    return (
-                      <button
-                        key={mode.id}
-                        onClick={() => setVideoMode(mode.id)}
-                        className={`p-4 rounded-xl border text-left transition-all ${
-                          active ? activeClass : 'border-white/10 bg-white/5 hover:bg-white/10'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <span className={`text-sm font-semibold ${textClass}`}>{mode.label}</span>
-                          <span className={`text-xs font-mono px-2 py-0.5 rounded-full whitespace-nowrap ${priceClass}`}>
-                            {estimateModePriceLabel(mode.id)}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-zinc-500 leading-relaxed">{mode.desc}</p>
-                      </button>
-                    );
-                  })}
+        {/* ── Step 0: Brief ────────────────────────────────────── */}
+        {step === 0 && (
+          <div className="shorts-workflow__page shorts-workflow__setup" data-shorts-setup>
+            <section className="shorts-workflow__project-start" aria-labelledby="shorts-project-start-title">
+              <div className="shorts-workflow__project-heading">
+                <h2 id="shorts-project-start-title">Выбери проект</h2>
+                <p className="shorts-workflow__muted">Описание, сохранённый аватар и голос подставятся автоматически.</p>
+              </div>
+              <div className="shorts-workflow__field shorts-workflow__saved-project">
+                <label htmlFor="shorts-setup-project">Сохранённый проект</label>
+                <select id="shorts-setup-project" className="shorts-workflow__input"
+                  disabled={presenterSaving || (profilesLoading && !businessProfiles.length)}
+                  value={selectedBusinessProfile ? String(businessProfileKey(selectedBusinessProfile)) : ''}
+                  onChange={(event) => {
+                    const profile = businessProfiles.find((item) => String(businessProfileKey(item)) === event.target.value);
+                    if (profile) handleLoadBusinessProfile(profile, { preserveScriptChoices: true });
+                    else {
+                      setSelectedBusinessProfileId('');
+                      saveSelectedProfileId('');
+                      setBusinessName('');
+                      setPresenterSaveStatus(null);
+                    }
+                  }}>
+                  <option value="">{profilesLoading && !businessProfiles.length ? 'Загружаем проекты…' : 'Без проекта — заполнить вручную'}</option>
+                  {businessProfiles.map((profile) => <option key={businessProfileKey(profile)} value={businessProfileKey(profile)}>{profile.name}</option>)}
+                </select>
+                {onManageProjects && <button type="button" onClick={onManageProjects}
+                  className="shorts-workflow__button shorts-workflow__button--plain">{businessProfiles.length ? 'Управлять проектами' : 'Создать проект'}</button>}
+              </div>
+              {profilesError ? <p className="shorts-workflow__notice" data-tone="error" role="alert">
+                {profilesError} <button type="button" className="shorts-workflow__button" onClick={() => setProfilesReload((value) => value + 1)}>Повторить</button>
+              </p> : !profilesLoading && !businessProfiles.length && <p className="shorts-workflow__muted">
+                {authToken ? 'В этом аккаунте пока нет сохранённых проектов.' : 'В этом браузере пока нет сохранённых проектов.'} Можно создать проект или заполнить бриф ниже.
+              </p>}
+            </section>
+            <div className="shorts-workflow__setup-main">
+              <div className="shorts-workflow__intro">
+                <h2>Подготовим сценарий</h2>
+                <p>{selectedBusinessProfile ? `Используем проект «${selectedBusinessProfile.name}». Выбери, как подготовить текст.` : 'Достаточно описания продукта или твоего готового текста.'}</p>
+              </div>
+              <section className="shorts-workflow__section" aria-labelledby="shorts-setup-script">
+                <div className="shorts-workflow__section-heading">
+                  <span className="shorts-workflow__section-number" aria-hidden="true">1</span>
+                  <h3 id="shorts-setup-script">Как подготовим текст?</h3>
                 </div>
-                <div className="mt-4">
-                  <MusicPicker enabled={backgroundMusic} value={musicTrack} volume={musicVolume}
-                    onEnabledChange={setBackgroundMusic} onChange={setMusicTrack} onVolumeChange={setMusicVolume} />
-                </div>
-                <div className="flex flex-wrap gap-2 mt-3">
+                <div className="shorts-workflow__choices" role="group" aria-labelledby="shorts-setup-script">
                   {[
-                    {
-                      checked: clipVisionQc,
-                      toggle: () => setClipVisionQc((v) => !v),
-                      label: '👁 ИИ-проверка кадров',
-                      hint: 'Gemini ищет брак в готовых клипах (~$0.001 за ролик), только предупреждает',
-                    },
-                    {
-                      checked: brollImageFirst,
-                      toggle: () => setBrollImageFirst((v) => !v),
-                      label: '🖼 B-roll через кадр-референс',
-                      hint: 'Сначала Flux-картинка, потом анимация — стабильнее композиция (+$0.05 за b-roll кадр)',
-                    },
-                  ].map((opt) => (
-                    <button
-                      key={opt.label}
-                      type="button"
-                      onClick={opt.toggle}
-                      title={opt.hint}
-                      className={`px-3 py-1.5 rounded-full border text-[11px] transition-all ${
-                        opt.checked
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-500 hover:text-zinc-300'
-                      }`}
-                    >
-                      {opt.checked ? '✓ ' : ''}{opt.label}
+                    { id: 'ai', label: 'Написать с ИИ', description: 'Опиши продукт — получишь варианты' },
+                    { id: 'custom', label: 'Вставить готовый текст', description: 'Используем твои реплики' },
+                  ].map((mode) => (
+                    <button key={mode.id} type="button" aria-pressed={scriptMode === mode.id}
+                      onClick={() => { setScriptMode(mode.id); setAnalyzeError(''); }}
+                      className="shorts-workflow__choice">
+                      <span className="shorts-workflow__choice-mark" aria-hidden="true">
+                        {scriptMode === mode.id && <Check size={14} />}
+                      </span>
+                      <span className="shorts-workflow__choice-copy">
+                        <strong>{mode.label}</strong>
+                        <span className="shorts-workflow__muted">{mode.description}</span>
+                      </span>
                     </button>
                   ))}
                 </div>
-              </div>
-
-              {/* ── Ведущий: аватар + голос ─────────────────────────────
-                  Выбор аватара и озвучки живёт здесь (на Setup), ДО платного
-                  превью кадров на шаге раскадровки — чтобы кадры сразу строились
-                  с нужным лицом и голосом, а не переигрывались после. */}
-              <div data-section="presenter-section" className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-                <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300">
-                    <User size={14} /> Аватар проекта{' '}
-                    {(scriptFormat === 'storyboard_v3' || String(videoMode || '').startsWith('storyboard')) && (
-                      <span className="text-zinc-600">(необязательно)</span>
+              </section>
+              <section className="shorts-workflow__section" aria-labelledby="shorts-setup-brief">
+                <div className="shorts-workflow__section-heading">
+                  <span className="shorts-workflow__section-number" aria-hidden="true">2</span>
+                  <h3 id="shorts-setup-brief">{scriptMode === 'custom' ? 'Добавь свой текст' : selectedBusinessProfile ? 'Описание из проекта' : 'Расскажи о продукте'}</h3>
+                </div>
+                {scriptMode === 'custom' ? (
+                  <div className="shorts-workflow__field">
+                    <label htmlFor="shorts-setup-narration">
+                      Текст озвучки <span className="shorts-workflow__required">Обязательно</span>
+                    </label>
+                    <AutoTextarea id="shorts-setup-narration" aria-required="true"
+                      aria-describedby="shorts-setup-narration-help" value={customScript}
+                      onChange={(event) => setCustomScript(event.target.value)} minRows={4}
+                      className="shorts-workflow__input" placeholder="Вставь текст, который должен произнести ведущий." />
+                    <p id="shorts-setup-narration-help" className="shorts-workflow__muted">
+                      {manualStoryboardImport
+                        ? 'Готовая раскадровка распознана. Можно импортировать кадры.'
+                        : 'Этот текст станет озвучкой. ИИ предложит кадры к нему.'}
+                    </p>
+                    {!manualStoryboardImport && isManualStoryboardImport('custom', 'storyboard_v3', customScript) && (
+                      <div className="shorts-workflow__notice">
+                        <span>В тексте уже есть заголовки кадров.</span>
+                        <button type="button" className="shorts-workflow__button" onClick={() => setScriptFormat('storyboard_v3')}>
+                          Использовать формат раскадровки
+                        </button>
+                      </div>
                     )}
-                  </label>
-                  <p className="text-xs text-zinc-500 mt-2 mb-3">
-                    Лицо ведущего берётся из фото. Без аватара система придумает случайного человека —
-                    в каждом ролике разного.
+                  </div>
+                ) : selectedBusinessProfile && description.trim() ? (
+                  <>
+                    <p className="shorts-workflow__muted">Описание уже заполнено. Можно сразу написать сценарии или уточнить его для этого ролика.</p>
+                    <details className="shorts-workflow__details shorts-workflow__project-description">
+                      <summary>Посмотреть или изменить описание <ChevronDown size={15} aria-hidden="true" /></summary>
+                      {briefProductField}
+                    </details>
+                  </>
+                ) : briefProductField}
+              </section>
+              <div className="shorts-workflow__next-step">
+                <div className="shorts-workflow__next-copy">
+                  <h3>{manualStoryboardImport ? 'Дальше — проверка сценария' : 'Дальше — выбор сценария'}</h3>
+                  <p id="shorts-brief-next-help">
+                    {(scriptMode === 'custom' ? !customScript.trim() : !description.trim())
+                      ? (scriptMode === 'custom' ? 'Вставь текст в поле выше, чтобы продолжить.' : 'Добавь описание продукта в поле выше, чтобы продолжить.')
+                      : manualStoryboardImport ? 'Проверь импортированные кадры, затем открой раскадровку.'
+                        : 'Проверь варианты и выбери тот, который пойдёт в ролик.'}
                   </p>
+                </div>
+                <button type="button" onClick={handleAnalyze}
+                  disabled={analyzing || analyzeNeedsGemini || (scriptMode === 'custom' ? !customScript.trim() : !description.trim())}
+                  aria-describedby="shorts-brief-next-help" className="shorts-workflow__button shorts-workflow__button--primary">
+                  {analyzing && <Loader2 size={16} className="animate-spin" aria-hidden="true" />}
+                  {analyzing
+                    ? (manualStoryboardImport ? 'Импортируем раскадровку…' : 'Готовим сценарий…')
+                    : manualStoryboardImport ? 'Импортировать раскадровку'
+                      : scriptMode === 'custom' ? 'Подготовить ролик' : 'Написать сценарии'}
+                </button>
+                {(analyzeNeedsGemini || analyzeError) && (
+                  <div className="shorts-workflow__studio-feedback">
+                    {analyzeNeedsGemini && (
+                      <div className="shorts-workflow__notice" data-shorts-api-note>
+                        <span>Для сценариев с ИИ нужен ключ Gemini.</span>
+                        {onOpenSettings && <button type="button" className="shorts-workflow__button" onClick={onOpenSettings}>Подключить Gemini</button>}
+                      </div>
+                    )}
+                    {analyzeError && (
+                      <p className="shorts-workflow__notice" data-tone="error" role="alert">
+                        <AlertCircle size={16} aria-hidden="true" /> {analyzeError}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+              <details className="shorts-workflow__details shorts-workflow__project-details">
+                <summary>
+                  {scriptMode === 'custom' ? 'Описание продукта и тема' : 'Уточнить тему ролика'}
+                  <span className="shorts-workflow__muted">Необязательно</span><ChevronDown size={15} aria-hidden="true" />
+                </summary>
+                <div className="shorts-workflow__section">
+                  {scriptMode === 'custom' && briefProductField}
+                  {briefExtras}
+                </div>
+              </details>
+            </div>
 
+            <aside id="shorts-brief-resources" className="shorts-workflow__resources"
+              aria-labelledby="shorts-brief-resources-title">
+              <div className="shorts-workflow__studio-panel-head">
+                <h2 id="shorts-brief-resources-title">Ведущий и голос</h2>
+              </div>
+              <section data-section="presenter-section" className="shorts-workflow__section" aria-labelledby="shorts-setup-presenter">
+                <div>
+                  <h3 id="shorts-setup-presenter" className="shorts-workflow__section-title">Аватар и озвучка</h3>
                   {/* Что выбрано сейчас: одна строка вместо простыни настроек.
                       Всё остальное раскрывается по кнопке. */}
-                  <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-black/20 p-2.5">
-                    <div className="h-12 w-9 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                  <div className="shorts-workflow__presenter-summary">
+                    <div className="h-12 w-9 shrink-0 overflow-hidden rounded-md border border-slate-200 bg-slate-100">
                       {selectedActorPreviewUrl ? (
                         <button
                           type="button"
@@ -3457,83 +4310,101 @@ export default function SaaShortsTab({
                           title="Открыть аватар на весь экран"
                           className="h-full w-full cursor-zoom-in"
                         >
-                          <img src={selectedActorPreviewUrl} alt="Выбранный аватар" className="h-full w-full object-cover" />
+                          <img src={getApiUrl(selectedActorPreviewUrl)} alt="Выбранный аватар" className="h-full w-full object-cover" />
                         </button>
                       ) : (
-                        <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                        <div className="flex h-full w-full items-center justify-center text-slate-600">
                           <User size={14} />
                         </div>
                       )}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-xs font-medium text-zinc-200">
+                      <p className="truncate text-sm font-medium">
                         {selectedActor
                           ? (actorGallery.find((actor) => actor.url === selectedActor)?.description || 'Аватар выбран')
-                          : 'Случайное лицо (аватар не выбран)'}
+                          : 'Аватар не выбран'}
                       </p>
-                      <p className="truncate text-[11px] text-zinc-500">
+                      <p className="shorts-workflow__muted truncate">
                         Голос: {selectedVoiceLabel}
                       </p>
                     </div>
                     <button
                       type="button"
+                      aria-expanded={avatarPickerOpen}
                       onClick={() => setAvatarPickerOpen((open) => !open)}
-                      className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                      className="shorts-workflow__button shorts-workflow__button--plain"
                     >
-                      {avatarPickerOpen ? 'Свернуть' : 'Сменить аватар'}
+                      {avatarPickerOpen ? 'Скрыть аватары' : selectedActor ? 'Сменить аватар' : 'Выбрать аватар'}
                     </button>
                     <button
                       type="button"
+                      aria-expanded={voicePickerOpen}
                       onClick={() => setVoicePickerOpen((open) => !open)}
-                      className="rounded-lg border border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
+                      className="shorts-workflow__button shorts-workflow__button--plain"
                     >
-                      {voicePickerOpen ? 'Свернуть' : 'Сменить голос'}
+                      {voicePickerOpen ? 'Скрыть настройки голоса' : 'Выбрать голос'}
                     </button>
+                  </div>
+
+                  <div className="shorts-workflow__presenter-save">
+                    {selectedBusinessProfile ? <>
+                      <p className="shorts-workflow__muted">{selectedBusinessProfile.presenter
+                        ? `Для проекта «${selectedBusinessProfile.name}». Сохрани изменения, чтобы использовать их в следующих роликах.`
+                        : 'Сохрани аватар и голос в проект — они будут выбираться автоматически.'}</p>
+                      <button type="button" className="shorts-workflow__button" disabled={presenterSaving}
+                        onClick={handleSaveProjectPresenter}>
+                        {presenterSaving ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}
+                        {presenterSaving ? 'Сохраняем…' : 'Сохранить в проект'}
+                      </button>
+                    </> : <p className="shorts-workflow__muted">Чтобы запомнить аватар и голос, выбери проект в начале брифа.</p>}
+                    {presenterSaveStatus && <p role="status" className="shorts-workflow__muted"
+                      data-tone={presenterSaveStatus.error ? 'error' : undefined}>{presenterSaveStatus.text}</p>}
                   </div>
 
                   {avatarPickerOpen && (<>
                   {/* Пол актёра */}
                   <div className="mb-3 flex flex-wrap items-center gap-3">
-                    <span className="text-xs font-medium text-zinc-400">Пол</span>
-                    <div className="flex gap-1 rounded-lg bg-white/5 p-1">
+                    <span className="text-xs font-medium text-slate-700">Пол</span>
+                    <div className="flex gap-1 rounded-md bg-slate-50 p-1">
                       {[
-                        { id: 'female', label: '👩 Женщина' },
-                        { id: 'male', label: '👨 Мужчина' },
+                        { id: 'female', label: 'Женщина' },
+                        { id: 'male', label: 'Мужчина' },
                       ].map((g) => (
                         <button
                           key={g.id}
                           type="button"
+                          aria-pressed={actorGender === g.id}
                           onClick={() => setActorGender(g.id)}
                           className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                             actorGender === g.id
-                              ? 'bg-violet-500/25 text-violet-200'
-                              : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
+                              ? 'bg-slate-200 text-slate-900'
+                              : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                           }`}
                         >
                           {g.label}
                         </button>
                       ))}
                     </div>
-                    <span className="text-[10px] text-zinc-600">влияет на голос по умолчанию и генерацию аватара</span>
+                    <span className="text-xs text-slate-600">влияет на голос по умолчанию и генерацию аватара</span>
                   </div>
 
                   {/* Сохранённые аватары. Ряды НЕ обрезаем: скролл с фиксированной
                       высотой резал плитки пополам — казалось, что вёрстка поехала. */}
                   <div className="space-y-3">
                     <div className="flex items-center justify-between gap-3">
-                      <p className="text-xs font-semibold text-zinc-300">Сохранённые аватары ({actorGallery.length})</p>
+                      <p className="text-xs font-semibold text-slate-800">Сохранённые аватары ({actorGallery.length})</p>
                       {selectedActor && (
                         <button
                           type="button"
                           onClick={() => setSelectedActor(null)}
-                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                          className="text-xs text-slate-600 hover:text-slate-900"
                         >
                           Сбросить выбор
                         </button>
                       )}
                     </div>
                     {loadingGallery ? (
-                      <p className="text-xs text-zinc-500 flex items-center gap-1">
+                      <p className="text-xs text-slate-600 flex items-center gap-1">
                         <Loader2 size={12} className="animate-spin" /> Загружаю сохранённые аватары...
                       </p>
                     ) : (
@@ -3552,10 +4423,10 @@ export default function SaaShortsTab({
                                 setVoiceSelectionSource('avatar_binding');
                               }
                             }}
-                            className={`relative rounded-lg overflow-hidden border-2 transition-all aspect-[3/4] ${
+                            className={`relative rounded-md overflow-hidden border-2 transition-all aspect-[3/4] ${
                               selectedActor === img.url
-                                ? 'border-violet-500 ring-2 ring-violet-500/30 scale-[1.02]'
-                                : 'border-white/10 hover:border-white/30'
+                                ? 'border-slate-500 ring-2 ring-slate-300'
+                                : 'border-slate-200 hover:border-slate-400'
                             }`}
                             title={
                               img.voice?.voice_name
@@ -3565,12 +4436,12 @@ export default function SaaShortsTab({
                           >
                             <img src={img.url} alt={`Actor ${i + 1}`} className="w-full h-full object-cover" />
                             {img.voice?.voice_id && (
-                              <span className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-0.5 bg-violet-600/80 py-0.5 text-[8px] font-semibold text-white">
+                              <span className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-0.5 bg-slate-800/80 py-0.5 text-[8px] font-semibold text-white">
                                 <Volume2 size={8} />голос
                               </span>
                             )}
                             {selectedActor === img.url && (
-                              <div className="absolute top-1 right-1 w-5 h-5 bg-violet-500 rounded-full flex items-center justify-center shadow-lg">
+                              <div className="absolute top-1 right-1 w-5 h-5 bg-slate-700 rounded-full flex items-center justify-center">
                                 <Check size={10} className="text-white" />
                               </div>
                             )}
@@ -3580,7 +4451,7 @@ export default function SaaShortsTab({
                             широкая кнопка и висящее сбоку превью выглядели как
                             два оторванных друг от друга элемента. Загруженное
                             фото сразу выбирается и приезжает в сетку. */}
-                        <label className="flex aspect-[3/4] cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-white/15 bg-white/5 text-center text-[10px] leading-tight text-zinc-500 transition-colors hover:border-primary/40 hover:text-violet-200">
+                        <label className="flex aspect-[3/4] cursor-pointer flex-col items-center justify-center gap-1 rounded-md border-2 border-dashed border-slate-300 bg-slate-50 text-center text-xs leading-tight text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-900 focus-within:ring-2 focus-within:ring-slate-400">
                           {uploadedActorPreview && !uploadedActorPreview.serverUrl ? (
                             <Loader2 size={14} className="animate-spin" />
                           ) : (
@@ -3592,7 +4463,7 @@ export default function SaaShortsTab({
                           <input
                             type="file"
                             accept="image/*"
-                            className="hidden"
+                            className="sr-only"
                             onChange={async (e) => {
                               const file = e.target.files?.[0];
                               await handleActorUpload(file);
@@ -3603,12 +4474,12 @@ export default function SaaShortsTab({
                       </div>
                     )}
                     {!loadingGallery && actorGallery.length === 0 && (
-                      <p className="text-[11px] text-zinc-500">
+                      <p className="text-xs text-slate-600">
                         Сохранённых аватаров пока нет — загрузи фото, чтобы у роликов было одно лицо.
                       </p>
                     )}
                     {actorUploadStatus && (
-                      <p className={`text-[10px] ${/не удалось|fail/i.test(actorUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                      <p className={`text-xs ${/не удалось|fail/i.test(actorUploadStatus) ? 'text-red-700' : 'text-slate-600'}`}>
                         {actorUploadStatus}
                       </p>
                     )}
@@ -3617,25 +4488,25 @@ export default function SaaShortsTab({
                   {/* Портрет крупно — отдельно от аватара. На общем плане лицо
                       занимает проценты кадра, и генератор дорисовывает черты
                       сам: отсюда «человек меняется» между дублями. */}
-                  <div className="mt-4 space-y-2 rounded-xl border border-white/10 bg-black/20 p-3">
+                  <div className="mt-4 space-y-2 rounded-md border border-slate-200 bg-slate-50 p-3">
                     <div className="flex items-center justify-between gap-3">
-                      <p className="text-xs font-semibold text-zinc-300">Портрет крупно (источник лица)</p>
+                      <p className="text-xs font-semibold text-slate-800">Портрет крупно (источник лица)</p>
                       {selectedFace && (
                         <button
                           type="button"
                           onClick={() => { setSelectedFace(null); setFaceUploadStatus(''); }}
-                          className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                          className="text-xs text-slate-600 hover:text-slate-900"
                         >
                           Убрать
                         </button>
                       )}
                     </div>
-                    <p className="text-[11px] leading-relaxed text-zinc-500">
+                    <p className="text-xs leading-relaxed text-slate-600">
                       Необязательно. Лицо берётся отсюда, а причёска, фигура и одежда — с аватара выше.
                       Нужен один человек, вертикальный кадр по грудь, лицо крупно и в резкости.
                     </p>
                     <div className="flex items-center gap-3">
-                      <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                      <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md border border-slate-200 bg-slate-100">
                         {selectedFace ? (
                           <button
                             type="button"
@@ -3650,12 +4521,12 @@ export default function SaaShortsTab({
                             <img src={getApiUrl(selectedFace)} alt="Портрет ведущего" className="h-full w-full object-cover" />
                           </button>
                         ) : (
-                          <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                          <div className="flex h-full w-full items-center justify-center text-slate-600">
                             <User size={14} />
                           </div>
                         )}
                       </div>
-                      <label className="cursor-pointer rounded-lg border border-dashed border-white/15 px-3 py-2 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200">
+                      <label className="cursor-pointer rounded-md border border-dashed border-slate-300 px-3 py-2 text-xs text-slate-700 transition-colors hover:border-slate-400 hover:text-slate-900 focus-within:ring-2 focus-within:ring-slate-400">
                         {uploadingFace ? (
                           <span className="flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Загружаю...</span>
                         ) : (
@@ -3664,7 +4535,7 @@ export default function SaaShortsTab({
                         <input
                           type="file"
                           accept="image/*"
-                          className="hidden"
+                          className="sr-only"
                           onChange={async (e) => {
                             const file = e.target.files?.[0];
                             await handleFaceUpload(file);
@@ -3674,7 +4545,7 @@ export default function SaaShortsTab({
                       </label>
                     </div>
                     {faceUploadStatus && (
-                      <p className={`text-[10px] ${/не удалось|fail/i.test(faceUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                      <p className={`text-xs ${/не удалось|fail/i.test(faceUploadStatus) ? 'text-red-700' : 'text-slate-600'}`}>
                         {faceUploadStatus}
                       </p>
                     )}
@@ -3683,9 +4554,9 @@ export default function SaaShortsTab({
                   {/* Свои ракурсы. Всё, что загружено сюда, не рисуется: ни
                       одного платного вызова на постановку, и лицо ровно то,
                       которое человек выбрал, — генератор его не пересочиняет. */}
-                  <div className="mt-4 space-y-2 rounded-xl border border-white/10 bg-black/20 p-3">
-                    <p className="text-xs font-semibold text-zinc-300">Свои ракурсы ведущего</p>
-                    <p className="text-[11px] leading-relaxed text-zinc-500">
+                  <div className="mt-4 space-y-2 rounded-md border border-slate-200 bg-slate-50 p-3">
+                    <p className="text-xs font-semibold text-slate-800">Свои ракурсы ведущего</p>
+                    <p className="text-xs leading-relaxed text-slate-600">
                       Необязательно. Загруженный ракурс становится общим для всех говорящих
                       кадров этой камеры и не генерируется — это ноль платных кадров на
                       постановку. Шёпотные кадры берут фронтальный.
@@ -3697,7 +4568,7 @@ export default function SaaShortsTab({
                       ].map((slot) => (
                         <div key={slot.key} className="space-y-1.5">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[11px] font-medium text-zinc-400">{slot.label}</span>
+                            <span className="text-xs font-medium text-slate-700">{slot.label}</span>
                             {plateUrls[slot.key] && (
                               <button
                                 type="button"
@@ -3709,14 +4580,14 @@ export default function SaaShortsTab({
                                   });
                                   setPlateUploadStatus('');
                                 }}
-                                className="text-[10px] text-zinc-500 hover:text-zinc-200"
+                                className="text-xs text-slate-600 hover:text-slate-900"
                               >
                                 Убрать
                               </button>
                             )}
                           </div>
                           <div className="flex items-center gap-2">
-                            <div className="h-16 w-9 shrink-0 overflow-hidden rounded-md border border-white/10 bg-zinc-900">
+                            <div className="h-16 w-9 shrink-0 overflow-hidden rounded-md border border-slate-200 bg-slate-100">
                               {plateUrls[slot.key] ? (
                                 <button
                                   type="button"
@@ -3735,12 +4606,12 @@ export default function SaaShortsTab({
                                   />
                                 </button>
                               ) : (
-                                <div className="flex h-full w-full items-center justify-center text-zinc-700">
+                                <div className="flex h-full w-full items-center justify-center text-slate-600">
                                   <User size={14} />
                                 </div>
                               )}
                             </div>
-                            <label className="cursor-pointer rounded-lg border border-dashed border-white/15 px-2 py-1.5 text-[10px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200">
+                            <label className="cursor-pointer rounded-md border border-dashed border-slate-300 px-2 py-1.5 text-xs text-slate-700 transition-colors hover:border-slate-400 hover:text-slate-900 focus-within:ring-2 focus-within:ring-slate-400">
                               {uploadingPlate === slot.key ? (
                                 <span className="flex items-center gap-1"><Loader2 size={11} className="animate-spin" /> Загружаю...</span>
                               ) : (
@@ -3749,7 +4620,7 @@ export default function SaaShortsTab({
                               <input
                                 type="file"
                                 accept="image/*"
-                                className="hidden"
+                                className="sr-only"
                                 onChange={async (e) => {
                                   const file = e.target.files?.[0];
                                   await handlePlateUpload(slot.key, file);
@@ -3762,7 +4633,7 @@ export default function SaaShortsTab({
                       ))}
                     </div>
                     {plateUploadStatus && (
-                      <p className={`text-[10px] ${/не удалось|fail/i.test(plateUploadStatus) ? 'text-red-300' : 'text-zinc-500'}`}>
+                      <p className={`text-xs ${/не удалось|fail/i.test(plateUploadStatus) ? 'text-red-700' : 'text-slate-600'}`}>
                         {plateUploadStatus}
                       </p>
                     )}
@@ -3773,32 +4644,34 @@ export default function SaaShortsTab({
                 {/* Движок озвучки (TTS provider) */}
                 {voicePickerOpen && (<>
                 <div>
-                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                  <label className="block text-sm font-medium text-slate-800 mb-2 flex items-center gap-2">
                     <Volume2 size={14} /> Движок озвучки
                   </label>
                   <div className="grid sm:grid-cols-3 gap-2">
                     {TTS_PROVIDER_OPTIONS.map((option) => (
                       <button
                         key={option.id}
+                        type="button"
+                        aria-pressed={ttsProvider === option.id}
                         onClick={() => setTtsProvider(option.id)}
-                        className={`p-3 rounded-lg border text-left transition-all ${
+                        className={`p-3 rounded-md border text-left transition-all ${
                           ttsProvider === option.id
-                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
-                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                            ? 'border-slate-400 bg-slate-100 text-slate-900'
+                            : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
                         }`}
                       >
                         <div className="text-sm font-semibold">{option.label}</div>
-                        <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
+                        <div className="text-xs text-slate-600 mt-1">{option.desc}</div>
                       </button>
                     ))}
                   </div>
                   {ttsProvider === 'auto' && (
-                    <p className="text-[10px] text-zinc-500 mt-2">
+                    <p className="text-xs text-slate-600 mt-2">
                       Сначала ElevenLabs. Если голос из библиотеки требует платный план или падает — озвучка продолжится через fal MiniMax.
                     </p>
                   )}
                   {ttsProvider === 'fal_minimax' && (
-                    <p className="text-[10px] text-zinc-500 mt-2">
+                    <p className="text-xs text-slate-600 mt-2">
                       Озвучка через баланс fal.ai. Ключ ElevenLabs в этом режиме не нужен.
                     </p>
                   )}
@@ -3806,7 +4679,7 @@ export default function SaaShortsTab({
 
                 {(ttsProvider === 'auto' || ttsProvider === 'fal_minimax') && (
                   <div>
-                    <label className="block text-sm font-medium text-zinc-300 mb-2">
+                    <label className="block text-sm font-medium text-slate-800 mb-2">
                       Голос fal MiniMax (резервный)
                     </label>
                     <OptionPicker
@@ -3822,13 +4695,13 @@ export default function SaaShortsTab({
                         <div className="flex items-center justify-between gap-3">
                           <div className="min-w-0">
                             <div className="text-sm font-semibold truncate">{option.name}</div>
-                            <div className="text-[10px] text-zinc-500 truncate">{option.desc}</div>
+                            <div className="text-xs text-slate-600 truncate">{option.desc}</div>
                           </div>
-                          {option.value === minimaxVoice && <Check size={14} className="text-violet-300 shrink-0" />}
+                          {option.value === minimaxVoice && <Check size={14} className="text-slate-700 shrink-0" />}
                         </div>
                       )}
                     />
-                    <p className="text-[10px] text-zinc-600 mt-1">
+                    <p className="text-xs text-slate-600 mt-1">
                       Используется сразу в режиме fal MiniMax или как запасной, если ElevenLabs не сработал в режиме Auto.
                     </p>
                   </div>
@@ -3836,7 +4709,7 @@ export default function SaaShortsTab({
 
                 {ttsProvider !== 'fal_minimax' && (
                   <div>
-                    <label className="block text-sm font-medium text-zinc-300 mb-2">Модель ElevenLabs</label>
+                    <label className="block text-sm font-medium text-slate-800 mb-2">Модель ElevenLabs</label>
                     <div role="group" aria-label="Модель ElevenLabs" className="grid grid-cols-2 gap-2">
                       {ELEVENLABS_MODEL_OPTIONS.map((option) => (
                         <button
@@ -3844,10 +4717,10 @@ export default function SaaShortsTab({
                           type="button"
                           aria-pressed={elevenLabsModel === option.id}
                           onClick={() => setElevenLabsModel(option.id)}
-                          className={`min-h-11 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                          className={`min-h-11 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
                             elevenLabsModel === option.id
-                              ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
-                              : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                              ? 'border-slate-400 bg-slate-100 text-slate-900'
+                              : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
                           }`}
                         >
                           {option.label}
@@ -3856,22 +4729,22 @@ export default function SaaShortsTab({
                     </div>
                     {elevenLabsModel === 'eleven_v4' && (
                       <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                        <label className="block text-xs text-zinc-300">
+                        <label className="block text-xs text-slate-800">
                           <span className="flex justify-between"><span>Стабильность</span><span>{elevenLabsStability.toFixed(2)}</span></span>
                           <input
                             type="range" min="0" max="1" step="0.05"
                             value={elevenLabsStability}
                             onChange={(event) => setElevenLabsStability(Number(event.target.value))}
-                            className="mt-2 w-full accent-violet-500"
+                            className="mt-2 w-full accent-slate-700"
                           />
                         </label>
-                        <label className="block text-xs text-zinc-300">
+                        <label className="block text-xs text-slate-800">
                           <span className="flex justify-between"><span>Сходство с голосом</span><span>{elevenLabsSimilarity.toFixed(2)}</span></span>
                           <input
                             type="range" min="0" max="1" step="0.05"
                             value={elevenLabsSimilarity}
                             onChange={(event) => setElevenLabsSimilarity(Number(event.target.value))}
-                            className="mt-2 w-full accent-violet-500"
+                            className="mt-2 w-full accent-slate-700"
                           />
                         </label>
                       </div>
@@ -3889,14 +4762,14 @@ export default function SaaShortsTab({
                   );
                   return (
                     <div>
-                      <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
+                      <label className="block text-sm font-medium text-slate-800 mb-2 flex items-center gap-2">
                         <Volume2 size={14} /> Голос озвучки {language === 'es' ? '(испанский)' : language === 'ru' ? '(русский)' : '(английский)'}
                       </label>
                       {boundVoice?.voice_id && (
-                        <div className={`mb-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
+                        <div className={`mb-2 flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${
                           manualVoiceOverridesBinding
-                            ? 'border-amber-400/30 bg-amber-500/10 text-amber-100'
-                            : 'border-violet-400/30 bg-violet-500/10 text-violet-200'
+                            ? 'border-amber-400/30 bg-amber-500/10 text-amber-900'
+                            : 'border-slate-300 bg-slate-100 text-slate-900'
                         }`}>
                           <Volume2 size={12} className="mt-0.5 shrink-0" />
                           {manualVoiceOverridesBinding ? (
@@ -3925,10 +4798,10 @@ export default function SaaShortsTab({
                           return (
                             <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar">
                               {selectedVoiceMissing && (
-                                <div className="w-full flex items-center gap-3 p-2.5 rounded-lg border border-violet-500/50 bg-violet-500/10 text-violet-200">
+                                <div className="w-full flex items-center gap-3 p-2.5 rounded-md border border-slate-400 bg-slate-100 text-slate-900">
                                   <div className="min-w-0 flex-1">
                                     <div className="text-sm font-medium truncate">{selectedVoiceName || selectedVoice}</div>
-                                    <div className="text-[10px] text-zinc-400">Выбранный голос · ID сохранён</div>
+                                    <div className="text-xs text-slate-700">Выбранный голос · ID сохранён</div>
                                   </div>
                                   <Check size={14} className="shrink-0" />
                                 </div>
@@ -3937,30 +4810,31 @@ export default function SaaShortsTab({
                                 <div
                                   key={v.voice_id}
                                   role="button"
+                                  aria-pressed={selectedVoice === v.voice_id}
                                   tabIndex={0}
                                   onClick={() => selectVoiceManually(v.voice_id, v.name)}
                                   onKeyDown={(e) => {
-                                    if (e.key === 'Enter' || e.key === ' ') {
+                                    if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
                                       e.preventDefault();
                                       selectVoiceManually(v.voice_id, v.name);
                                     }
                                   }}
-                                  className={`w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-all ${
+                                  className={`w-full flex items-center gap-3 p-2.5 rounded-md border text-left transition-all ${
                                     selectedVoice === v.voice_id
-                                      ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                                      : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
+                                      ? 'border-slate-400 bg-slate-100 text-slate-700'
+                                      : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
                                   }`}
                                 >
                                   <div className="flex-1 min-w-0">
                                     <div className="text-sm font-medium truncate">{v.name}</div>
-                                    <div className="text-[10px] text-zinc-500">
+                                    <div className="text-xs text-slate-600">
                                       {[voiceLanguageSummary(v), v.labels?.accent, v.labels?.gender, v.category].filter(Boolean).join(' · ')}
                                     </div>
                                     {language === 'ru' && (
                                       <span className={`inline-flex mt-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${
                                         voiceLanguageScore(v, language) === 0
-                                          ? 'bg-green-500/15 text-green-300'
-                                          : 'bg-amber-500/15 text-amber-300'
+                                          ? 'bg-green-500/15 text-green-800'
+                                          : 'bg-amber-500/15 text-amber-900'
                                       }`}>
                                         {voiceFitLabel(v, language)}
                                       </span>
@@ -3969,17 +4843,18 @@ export default function SaaShortsTab({
                                   {v.preview_url && (
                                     <button
                                       onClick={(e) => { e.stopPropagation(); new Audio(v.preview_url).play(); }}
-                                      className="shrink-0 w-7 h-7 rounded-full bg-white/10 hover:bg-violet-500/30 flex items-center justify-center transition-colors"
-                                      title="Preview voice"
+                                      className="shrink-0 w-7 h-7 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-colors"
+                                      aria-label={`Послушать голос ${v.name}`}
+                                      title="Послушать голос"
                                     >
                                       <Volume2 size={12} />
                                     </button>
                                   )}
-                                  {selectedVoice === v.voice_id && <Check size={14} className="text-violet-400 shrink-0" />}
+                                  {selectedVoice === v.voice_id && <Check size={14} className="text-slate-700 shrink-0" />}
                                 </div>
                               ))}
                               {language === 'ru' && !hasLanguageVoice && (
-                                <p className="text-[10px] text-amber-400/80 pt-1">
+                                <p className="text-xs text-amber-800 pt-1">
                                   No Russian-accent ElevenLabs voice found. Add or select a Russian voice for natural Russian speech.
                                 </p>
                               )}
@@ -4034,7 +4909,7 @@ export default function SaaShortsTab({
 
                         if (!selectedVoiceMeta) {
                           return (
-                            <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                            <div className="mt-2 p-2.5 rounded-md border border-amber-500/20 bg-amber-500/10 text-xs text-amber-900">
                               Голос задан вручную по ID. Убедись, что он русский или с русским акцентом.
                             </div>
                           );
@@ -4044,524 +4919,445 @@ export default function SaaShortsTab({
                         if (selectedScore === 0) return null;
 
                         return (
-                          <div className="mt-2 p-2.5 rounded-lg border border-amber-500/20 bg-amber-500/10 text-[11px] text-amber-200">
+                          <div className="mt-2 p-2.5 rounded-md border border-amber-500/20 bg-amber-500/10 text-xs text-amber-900">
                             Голос не похож на русский ({selectedVoiceMeta.labels?.accent || 'акцент неизвестен'}).
                             Для естественной русской речи выбери русский голос или вставь его ID ниже.
                           </div>
                         );
                       })()}
                       {/* Ручной ID нужен раз в год — прячем, чтобы не мозолил глаза. */}
-                      <details className="mt-3 rounded-lg border border-white/10 bg-black/20">
-                        <summary className="cursor-pointer list-none px-3 py-2 text-[11px] text-zinc-500 hover:text-zinc-300">
+                      <details className="mt-3 rounded-md border border-slate-200 bg-slate-50">
+                        <summary className="cursor-pointer list-none px-3 py-2 text-xs text-slate-600 hover:text-slate-800">
                           Ввести ID голоса вручную
                         </summary>
-                        <div className="border-t border-white/10 p-3">
+                        <div className="border-t border-slate-200 p-3">
                           <input
                             value={selectedVoice}
                             onChange={(e) => selectVoiceManually(e.target.value.trim())}
-                            className="input-field text-xs font-mono"
+                            className="shorts-workflow__input font-mono" aria-label="ID голоса ElevenLabs"
                             placeholder="voice_id из ElevenLabs..."
                           />
-                          <p className="text-[10px] text-zinc-600 mt-1">
+                          <p className="text-xs text-slate-600 mt-1">
                             Пригодится, если нужный голос есть в ElevenLabs, но не попал в список выше.
                           </p>
                         </div>
                       </details>
-                      <p className="text-[10px] text-zinc-600 mt-1">
+                      <p className="text-xs text-slate-600 mt-1">
                         {actorGender === 'female' ? 'Женские' : 'Мужские'} голоса · нажми на динамик, чтобы послушать
                       </p>
                     </div>
                   );
                 })()}
                 </>)}
-              </div>
+              </section>
 
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  Тема текущего ролика <span className="text-zinc-600">(необязательно, но лучше заполнить)</span>
-                </label>
-                <AutoTextarea
-                  value={topic}
-                  onChange={(e) => setTopic(e.target.value)}
-                  minRows={2}
-                  className="input-field text-sm"
-                  placeholder="Напр.: Почему вечерний срыв начинается утром; Что съесть в 17:00, чтобы не тянуло на сладкое вечером..."
-                />
-                <p className="text-[10px] text-zinc-600 mt-1">В ИИ-режиме варианты сценариев строятся вокруг этой темы. В ручном режиме тема нужна для заголовка, caption и визуальных подсказок.</p>
-              </div>
-
-              {scriptMode === 'custom' && (
-                <div>
-                  <label className="block text-sm font-medium text-zinc-300 mb-2">
-                    Точный текст озвучки <span className="text-zinc-600">(обязательно)</span>
-                  </label>
-                  <AutoTextarea
-                    value={customScript}
-                    onChange={(e) => setCustomScript(e.target.value)}
-                    minRows={7}
-                    className="input-field font-mono text-xs"
-                    placeholder={`Ты срываешься вечером не потому, что слабая.\nЧасто проблема начинается утром: кофе вместо завтрака, маленький обед...\nНапиши "НЕДЕЛЯ" - пришлю чеклист антисрыв-вечера.`}
-                  />
-                  <p className="text-[10px] text-zinc-600 mt-1">
-                    {customScript.length} символов &middot; ~{Math.max(1, Math.round(customScript.trim().split(/\s+/).filter(Boolean).length / 2.5))} сек озвучки. Этот текст не будет переписан перед генерацией.
-                  </p>
-                </div>
-              )}
-
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">Стиль ролика</label>
-                <p className="text-[11px] text-zinc-500 mb-3">Задаёт структуру сценария: с чего начнётся ролик и как построен рассказ.</p>
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                  {STYLE_OPTIONS.map((s) => (
-                    <button
-                      key={s.id}
-                      onClick={() => setStyle(s.id)}
-                      className={`p-3 rounded-xl border text-left transition-all ${
-                        style === s.id
-                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                          : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                      }`}
+            <details className="shorts-workflow__setup-side">
+              <summary className="shorts-workflow__studio-panel-head">
+                <h2>Настройки ролика</h2><span>Необязательно</span><ChevronDown size={16} aria-hidden="true" />
+                <span className="shorts-workflow__settings-summary">
+                  {scriptMode === 'custom' ? 'Длина по тексту' : '≈ ' + targetDurationSeconds + ' с'} · {selectedVoiceLabel}
+                </span>
+              </summary>
+              <div className="shorts-workflow__side-content">
+                <div className="shorts-workflow__form-grid">
+                  <div className="shorts-workflow__field" data-section="script-format-section">
+                    <label htmlFor="shorts-setup-format">Формат сценария</label>
+                    <select
+                      id="shorts-setup-format"
+                      className="shorts-workflow__input"
+                      value={scriptFormat}
+                      onChange={(event) => setScriptFormat(event.target.value)}
                     >
-                      <div className="text-xs font-medium">{s.label}</div>
-                      <div className="text-[10px] text-zinc-500 mt-0.5">{s.desc}</div>
-                    </button>
-                  ))}
+                      {SCRIPT_FORMAT_OPTIONS.map((option) => (
+                        <option key={option.id} value={option.id}>{option.label}</option>
+                      ))}
+                    </select>
+                    <p className="shorts-workflow__muted">
+                      {manualStoryboardImport
+                        ? 'В раскадровку попадут ваши кадры и реплики.'
+                        : SCRIPT_FORMAT_OPTIONS.find((option) => option.id === scriptFormat)?.desc}
+                    </p>
+                  </div>
+                  <div className="shorts-workflow__field" data-section="target-duration-section">
+                    <label htmlFor="shorts-setup-duration">Длина ролика</label>
+                    <select
+                      id="shorts-setup-duration"
+                      className="shorts-workflow__input"
+                      disabled={scriptMode === 'custom'}
+                      value={scriptMode === 'custom' ? 'speech' : targetDurationSeconds}
+                      onChange={(event) => setTargetDurationSeconds(Number(event.target.value))}
+                    >
+                      {scriptMode === 'custom' && <option value="speech">По длительности озвучки</option>}
+                      {TARGET_DURATION_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                    <p className="shorts-workflow__muted">
+                      {scriptMode === 'custom'
+                        ? 'Длительность зависит от текста и темпа речи.'
+                        : (TARGET_DURATION_OPTIONS.find((option) => option.value === Number(targetDurationSeconds))?.desc
+                          || 'Ориентир для сценария') + '. Итог зависит от темпа речи.'}
+                    </p>
+                  </div>
                 </div>
-              </div>
-
-              <div data-section="target-duration-section">
-                <div id="target-duration-label" className="block text-sm font-medium text-zinc-300 mb-1">Длина ролика</div>
-                <p className="text-[11px] text-zinc-500 mb-3">
-                  {scriptMode === 'custom'
-                    ? 'Для своего текста длительность определяется фактической озвучкой.'
-                    : 'Применяется ко всем вариантам сценария. Итог может отличаться на пару секунд из-за темпа озвучки.'}
-                </p>
-                <div
-                  role="group"
-                  aria-labelledby="target-duration-label"
-                  className="grid grid-cols-2 sm:grid-cols-4 gap-2"
-                >
-                  {TARGET_DURATION_OPTIONS.map((option) => {
-                    const active = targetDurationSeconds === option.value;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        aria-pressed={active}
-                        disabled={scriptMode === 'custom'}
-                        onClick={() => setTargetDurationSeconds(option.value)}
-                        className={`min-h-[64px] rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                          active
-                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
-                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                        }`}
+              <details className="shorts-workflow__details">
+                <summary>
+                  <strong>Параметры генерации</strong>
+                  <span className="shorts-workflow__muted">{videoModeOption(videoMode).label}</span>
+                  <ChevronDown size={15} aria-hidden="true" />
+                </summary>
+                <div className="shorts-workflow__section">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="shorts-workflow__field" data-section="generation-preset-section">
+                      <label htmlFor="shorts-setup-preset">Подача</label>
+                      <select
+                        id="shorts-setup-preset"
+                        className="shorts-workflow__input"
+                        value={generationPreset}
+                        disabled={analyzing}
+                        onChange={(event) => selectGenerationPreset(event.target.value)}
                       >
-                        <span className="block text-sm font-medium">{option.label}</span>
-                        <span className="mt-1 block text-[10px] leading-4 text-zinc-500">{option.desc}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+                        <option value="calm_ugc">Спокойный UGC</option>
+                        <option value="expressive">Выразительная</option>
+                      </select>
+                    </div>
+                    <div className="shorts-workflow__field">
+                      <label htmlFor="shorts-setup-style">Стиль ролика</label>
+                      <select
+                        id="shorts-setup-style"
+                        className="shorts-workflow__input"
+                        value={style}
+                        onChange={(event) => setStyle(event.target.value)}
+                      >
+                        {STYLE_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>{option.label}</option>
+                        ))}
+                      </select>
+                      <p className="shorts-workflow__muted">{STYLE_OPTIONS.find((option) => option.id === style)?.desc}</p>
+                    </div>
+                    <div className="shorts-workflow__field" data-section="text-model-section">
+                      <label htmlFor="shorts-setup-text-model">Модель текста</label>
+                      <select
+                        id="shorts-setup-text-model"
+                        className="shorts-workflow__input"
+                        value={textModel}
+                        onChange={(event) => setTextModel(event.target.value)}
+                      >
+                        {TEXT_MODEL_OPTIONS.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}{model.id === 'pro' ? ' · платно' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="shorts-workflow__muted">{TEXT_MODEL_OPTIONS.find((model) => model.id === textModel)?.desc}</p>
+                    </div>
+                    <div className="shorts-workflow__field" data-section="video-mode-section">
+                      <label htmlFor="shorts-setup-video-model">Модель видео и качество</label>
+                      <select
+                        id="shorts-setup-video-model"
+                        className="shorts-workflow__input"
+                        value={videoMode}
+                        onChange={(event) => setVideoMode(event.target.value)}
+                      >
+                        {activeVideoModeOptions(scriptFormat).map((mode) => (
+                          <option key={mode.id} value={mode.id}>{mode.label} · {estimateModePriceLabel(mode.id)}</option>
+                        ))}
+                      </select>
+                      <p className="shorts-workflow__muted">{videoModeOption(videoMode).desc} Цена указана за ролик.</p>
+                    </div>
+                    {scriptMode !== 'custom' && (
+                      <div className="shorts-workflow__field">
+                        <label htmlFor="shorts-setup-count">Количество вариантов сценария</label>
+                        <select
+                          id="shorts-setup-count"
+                          className="shorts-workflow__input"
+                          value={numScripts}
+                          onChange={(event) => setNumScripts(Number(event.target.value))}
+                        >
+                          {[1, 2, 3, 5].map((count) => <option key={count} value={count}>{count}</option>)}
+                        </select>
+                      </div>
+                    )}
+                  </div>
 
-              {/* Ритм перебивок. Умолчание — редкая перебивка: она стоит целый
-                  клип и тарифицируется от трёх секунд, поэтому чередование
-                  заметно поднимает смету. Опция для тех, кому важнее монтаж. */}
-              {scriptFormat === 'storyboard_v3' && (
-                <div data-section="broll-rhythm-section">
-                  <label className="flex cursor-pointer items-start gap-2.5">
-                    <input
-                      type="checkbox"
-                      checked={brollBetweenTalking}
-                      onChange={(event) => setBrollBetweenTalking(event.target.checked)}
-                      disabled={manualStoryboardImport}
-                      className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
-                    />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium text-zinc-300">
-                        Перебивка между кадрами с ведущим
+                  <div className="grid gap-3">
+                    {scriptFormat === 'storyboard_v3' && (
+                      <>
+                        <label className="flex items-start gap-3" data-section="broll-rhythm-section">
+                          <input
+                            type="checkbox"
+                            checked={brollBetweenTalking}
+                            onChange={(event) => setBrollBetweenTalking(event.target.checked)}
+                            disabled={manualStoryboardImport}
+                            className="mt-1"
+                          />
+                          <span>
+                            Перебивка между кадрами с ведущим
+                            <span className="shorts-workflow__muted block">Каждая вставка считается отдельным клипом от трёх секунд.</span>
+                          </span>
+                        </label>
+                        <label className="flex items-start gap-3" data-section="changing-locations-section">
+                          <input
+                            type="checkbox"
+                            checked={changingLocations}
+                            onChange={(event) => setChangingLocations(event.target.checked)}
+                            disabled={manualStoryboardImport}
+                            className="mt-1"
+                          />
+                          <span>
+                            Менять локации по ходу ролика
+                            <span className="shorts-workflow__muted block">ИИ подбирает до трёх мест. Для каждой локации нужны отдельные постановочные кадры.</span>
+                          </span>
+                        </label>
+                      </>
+                    )}
+                    <label className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={clipVisionQc}
+                        onChange={(event) => setClipVisionQc(event.target.checked)}
+                        className="mt-1"
+                      />
+                      <span>
+                        ИИ-проверка кадров
+                        <span className="shorts-workflow__muted block">Gemini отмечает возможный брак в готовом видео. Примерно $0.001 за ролик.</span>
                       </span>
-                      <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">
-                        Два говорящих кадра подряд не ставятся — между ними всегда вставка.
-                        Ролик монтажнее, но дороже: перебивка это отдельный клип, и короче трёх
-                        секунд он не тарифицируется.
+                    </label>
+                    <label className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={brollImageFirst}
+                        onChange={(event) => setBrollImageFirst(event.target.checked)}
+                        className="mt-1"
+                      />
+                      <span>
+                        Подготовить изображение для каждой перебивки
+                        <span className="shorts-workflow__muted block">Сначала изображение, затем анимация. Доплата $0.05 за кадр перебивки.</span>
                       </span>
-                    </span>
-                  </label>
-                </div>
-              )}
+                    </label>
+                  </div>
 
-              {/* Смена локаций. Умолчание — одно место на ролик: так он читается
-                  как одна съёмка и стоит две плиты. Каждая новая комната — своя
-                  плита на каждую снимающую в ней камеру, поэтому опция. */}
-              {scriptFormat === 'storyboard_v3' && (
-                <div data-section="changing-locations-section">
-                  <label className="flex cursor-pointer items-start gap-2.5">
-                    <input
-                      type="checkbox"
-                      checked={changingLocations}
-                      onChange={(event) => setChangingLocations(event.target.checked)}
-                      disabled={manualStoryboardImport}
-                      className="mt-0.5 h-4 w-4 shrink-0 accent-violet-500 disabled:opacity-40"
-                    />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium text-zinc-300">
-                        Менять локации по ходу ролика
-                      </span>
-                      <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">
-                        ИИ подбирает до трёх мест и меняет их каждые три говорящих кадра —
-                        другой угол той же квартиры или другое место, как ляжет по тексту.
-                        Дороже: каждая комната это свои постановочные кадры. Комнату с фото
-                        ведущего при этом заменяет выдуманная.
-                      </span>
-                    </span>
-                  </label>
+                  <MusicPicker
+                    enabled={backgroundMusic}
+                    value={musicTrack}
+                    volume={musicVolume}
+                    onEnabledChange={setBackgroundMusic}
+                    onChange={setMusicTrack}
+                    onVolumeChange={setMusicVolume}
+                  />
                 </div>
-              )}
-
-              {scriptMode !== 'custom' && <div>
-                <div className="flex items-center justify-between gap-3 mb-2">
-                  <label className="block text-sm font-medium text-zinc-300">Количество вариантов сценария</label>
-                  <span className="text-[11px] text-zinc-500">Сейчас: {numScripts}</span>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {[1, 2, 3, 5].map((n) => (
-                    <button
-                      key={n}
-                      onClick={() => setNumScripts(n)}
-                      className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                        numScripts === n
-                          ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30'
-                          : 'bg-white/5 text-zinc-400 border border-white/10 hover:bg-white/10'
-                      }`}
-                    >
-                      {n} {n === 1 ? 'вариант' : n < 5 ? 'варианта' : 'вариантов'}
-                    </button>
-                  ))}
-                </div>
-              </div>}
-
-              {analyzeError && (
-                <div className="flex items-center gap-2 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">
-                  <AlertCircle size={14} />
-                  {analyzeError}
-                </div>
-              )}
-
-              <button
-                onClick={handleAnalyze}
-                disabled={analyzing || (scriptMode === 'custom' ? !customScript.trim() : (!url.trim() && !description.trim()))}
-                className="btn-primary w-full py-3 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                {analyzing ? (
-                  <>
-                    <Loader2 size={16} className="animate-spin" />
-                    {scriptMode === 'custom' ? (manualStoryboardImport ? 'Импортируем раскадровку...' : 'ИИ раскадрирует ваш текст...') : (url.trim() ? 'Изучаем сайт и пишем сценарии... (45-90с)' : 'Пишем сценарии... (20-40с)')}
-                  </>
-                ) : (
-                  <>
-                    <Sparkles size={16} />
-                    {scriptMode === 'custom' ? (manualStoryboardImport ? 'Импортировать раскадровку' : 'Создать раскадровку с ИИ') : (url.trim() ? 'Изучить сайт и написать сценарии' : 'Написать сценарии')}
-                  </>
-                )}
-              </button>
-            </div>
-
-            {/* Info cards */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="glass-panel p-4">
-                <Target size={16} className="text-violet-400 mb-2" />
-                <h3 className="text-sm font-medium text-zinc-300">Deep Research</h3>
-                <p className="text-xs text-zinc-500 mt-1">AI analyzes your product via URL scraping + web research, or generates directly from your description.</p>
+              </details>
               </div>
-              <div className="glass-panel p-4">
-                <MessageSquare size={16} className="text-violet-400 mb-2" />
-                <h3 className="text-sm font-medium text-zinc-300">Pain Point Scripts</h3>
-                <p className="text-xs text-zinc-500 mt-1">Generates hook-problem-solution scripts targeting your audience&apos;s real pain points.</p>
-              </div>
-              <div className="glass-panel p-4">
-                <Film size={16} className="text-violet-400 mb-2" />
-                <h3 className="text-sm font-medium text-zinc-300">Ваши ИИ-ролики</h3>
-                <p className="text-xs text-zinc-500 mt-1">Realistic AI-generated actors with lip-sync, b-roll, and viral subtitles. From ~$0.50/video.</p>
-              </div>
-            </div>
+            </details>
+            </aside>
           </div>
         )}
 
         {/* ── Step 1: Analysis Results ─────────────────────────── */}
         {step === 1 && analysis && (
-          <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
-            {/* Analysis Summary */}
-            <div className="glass-panel p-6">
-              <div className="flex items-start justify-between gap-3 mb-4">
-                <h2 className="text-lg font-semibold flex items-start gap-2 min-w-0">
-                  <Eye size={18} className="text-violet-400 shrink-0 mt-1" />
-                  <span className="break-words">{analysis.product_name || 'Analysis'}</span>
-                </h2>
-                <div className="flex items-center gap-2 shrink-0">
-                  {fromCache && (
-                    <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full border border-amber-500/20 flex items-center gap-1">
-                      Cached
-                      <button onClick={() => { setStep(0); setFromCache(false); }} className="hover:text-white ml-1" title="Re-analyze">
-                        <RefreshCw size={9} />
-                      </button>
-                    </span>
-                  )}
-                  {analysis.industry && (
-                    <span className="text-xs bg-violet-500/10 text-violet-400 px-2 py-1 rounded-full border border-violet-500/20">
-                      {analysis.industry}
-                    </span>
-                  )}
-                </div>
-              </div>
-              {(analysis.one_liner || analysis.description) && (
-                <p className="text-sm text-zinc-400 mb-4">{analysis.one_liner || analysis.description}</p>
-              )}
-
-              {((analysis.pain_points || []).length > 0 || (analysis.emotional_hooks || []).length > 0) ? (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {(analysis.pain_points || []).length > 0 && (
-                    <div>
-                      <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Pain Points</h3>
-                      <div className="space-y-1.5">
-                        {(analysis.pain_points || []).map((pp, i) => (
-                          <div key={i} className="flex items-start gap-2 text-sm">
-                            <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${
-                              pp.intensity === 'high' ? 'bg-red-400' : pp.intensity === 'medium' ? 'bg-yellow-400' : 'bg-green-400'
-                            }`} />
-                            <div>
-                              <span className="text-zinc-300">{pp.pain}</span>
-                              {pp.source && pp.source !== 'website' && (
-                                <span className="ml-1.5 text-[9px] bg-primary/10 text-violet-300 px-1 py-0.5 rounded">{pp.source}</span>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {(analysis.emotional_hooks || []).length > 0 && (
-                    <div>
-                      <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Emotional Hooks</h3>
-                      <div className="space-y-1.5">
-                        {(analysis.emotional_hooks || []).map((h, i) => (
-                          <div key={i} className="text-sm text-zinc-300 flex items-start gap-2">
-                            <TrendingUp size={12} className="text-violet-400 mt-1 shrink-0" />
-                            {h}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <p className="text-xs text-zinc-600">
-                  Быстрый режим: сценарии построены напрямую из описания проекта, без глубокого анализа болей аудитории.
-                </p>
-              )}
+          <div className="shorts-workflow__page shorts-workflow__review">
+            <div className="shorts-workflow__intro">
+              <h2>Выбери сценарий</h2>
+              <p>Нажми на вариант, прочитай текст и открой его в {storyboardSelected ? 'раскадровке' : 'настройках ролика'}.</p>
             </div>
-
-            {/* Web Research Results */}
-            {webResearch && (
-              <div className="glass-panel p-6">
-                <h3 className="text-sm font-semibold text-zinc-300 mb-3 flex items-center gap-2">
-                  <Globe size={14} className="text-violet-400" />
-                  Web Research (Google Search)
-                  {webResearch.grounding_sources && (
-                    <span className="text-[10px] bg-primary/10 text-violet-300 px-2 py-0.5 rounded-full ml-auto">
-                      {webResearch.grounding_sources.length} sources
-                    </span>
-                  )}
-                </h3>
-
-                {/* Real user reviews */}
-                {webResearch.real_reviews && webResearch.real_reviews.length > 0 && (
-                  <div className="mb-4">
-                    <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Real User Reviews</h4>
-                    <div className="space-y-2">
-                      {webResearch.real_reviews.slice(0, 5).map((review, i) => (
-                        <div key={i} className="text-xs bg-white/5 rounded-lg p-2.5 border border-white/5">
-                          <p className="text-zinc-300 italic">&quot;{review.quote}&quot;</p>
-                          <div className="flex items-center gap-2 mt-1">
-                            <span className="text-zinc-600">{review.source}</span>
-                            <span className={`px-1 py-0.5 rounded text-[9px] ${
-                              review.sentiment === 'positive' ? 'bg-green-500/10 text-green-400' :
-                              review.sentiment === 'negative' ? 'bg-red-500/10 text-red-400' :
-                              'bg-zinc-500/10 text-zinc-400'
-                            }`}>{review.sentiment}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Competitors */}
-                {webResearch.competitors && webResearch.competitors.length > 0 && (
-                  <div className="mb-4">
-                    <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Competitors</h4>
-                    <div className="flex flex-wrap gap-2">
-                      {webResearch.competitors.map((c, i) => (
-                        <span key={i} className="text-xs bg-white/5 px-2 py-1 rounded-lg text-zinc-400 border border-white/5" title={c.comparison}>
-                          {c.name}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Sources */}
-                {webResearch.grounding_sources && webResearch.grounding_sources.length > 0 && (
-                  <div>
-                    <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Sources</h4>
-                    <div className="flex flex-wrap gap-1.5">
-                      {webResearch.grounding_sources.slice(0, 8).map((src, i) => (
-                        <a
-                          key={i}
-                          href={src.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-[10px] text-violet-400 hover:text-violet-300 bg-primary/5 px-2 py-0.5 rounded-full border border-primary/10 hover:border-primary/30 transition-colors truncate max-w-[200px]"
-                          title={src.title}
-                        >
-                          {src.title || (() => { try { return new URL(src.url).hostname; } catch { return src.url; } })()}
-                        </a>
-                      ))}
-                    </div>
-                  </div>
-                )}
+            <section className="shorts-workflow__review-options" aria-labelledby="shorts-review-options">
+              <div className="shorts-workflow__studio-panel-head">
+                <h2 id="shorts-review-options">Варианты сценария</h2>
+                <span>{scripts.length}</span>
               </div>
-            )}
-
-            {/* Scripts */}
-            <div>
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                <Sparkles size={18} className="text-yellow-400" />
-                Generated Scripts
-                <span className="text-xs bg-white/10 px-2 py-0.5 rounded-full ml-auto">
-                  {scripts.length} {scripts.length === 1 ? 'сценарий' : scripts.length < 5 ? 'сценария' : 'сценариев'}
-                </span>
-              </h2>
-
-              <div className="grid grid-cols-1 gap-4">
-                {scripts.map((script, i) => (
-                  <div
-                    key={i}
-                    onClick={() => handleSelectScript(i)}
-                    className={`glass-panel p-5 cursor-pointer transition-all ${
-                      selectedScript === i
-                        ? 'border-violet-500/50 bg-violet-500/5 ring-1 ring-violet-500/20'
-                        : 'hover:bg-white/5'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-3">
-                        <span className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${
-                          selectedScript === i ? 'bg-violet-500 text-white' : 'bg-white/10 text-zinc-400'
-                        }`}>
-                          {i + 1}
-                        </span>
-                        <div>
-                          <h3 className="text-sm font-semibold text-zinc-200">{script.title}</h3>
-                          <span className="text-[10px] text-zinc-500">
+              {scripts.length > 0 ? (
+                <ul className="shorts-workflow__review-list">
+                  {scripts.map((script, i) => (
+                    <li key={i}>
+                      <button
+                        type="button"
+                        className="shorts-workflow__choice"
+                        data-shorts-script-option={i + 1}
+                        aria-pressed={selectedScript === i}
+                        aria-controls="shorts-review-preview"
+                        onClick={() => handleSelectScript(i)}
+                      >
+                        <span className="shorts-workflow__muted">{String(i + 1).padStart(2, '0')}</span>
+                        <span className="min-w-0">
+                          <span className="block font-medium break-words">{script.title || 'Вариант ' + (i + 1)}</span>
+                          <span className="shorts-workflow__muted block">
                             {[
-                              `≈${estimateStoryboardSeconds(script, script.full_narration || '')} сек`,
-                              script.style,
-                              script.target_platform,
+                              '≈ ' + estimateStoryboardSeconds(script, script.full_narration || '') + ' с',
+                              script.shots?.length ? script.shots.length + ' ' + pluralShots(script.shots.length) : null,
                             ].filter(Boolean).join(' · ')}
                           </span>
+                        </span>
+                        {selectedScript === i && <span className="shorts-workflow__selection-status"><Check size={14} aria-hidden="true" /> Выбран</span>}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="shorts-workflow__notice" data-empty>Вариантов пока нет.</p>
+              )}
+            </section>
+
+            <section id="shorts-review-preview" className="shorts-workflow__review-detail" data-shorts-script-detail
+              aria-label="Выбранный сценарий">
+              <div className="shorts-workflow__studio-panel-head">
+                <h2>Предпросмотр сценария</h2>
+                {currentScript && <span>Вариант {String(selectedScript + 1).padStart(2, '0')}</span>}
+              </div>
+              <div className="shorts-workflow__review-content">
+                {currentScript ? (
+                  <>
+                    <div className="shorts-workflow__review-meta">
+                      <h3>{currentScript.title || 'Вариант ' + (selectedScript + 1)}</h3>
+                      <p className="shorts-workflow__muted">
+                        {[
+                          '≈ ' + estimateStoryboardSeconds(currentScript, currentScript.full_narration || '') + ' с',
+                          isStoryboardScript(currentScript) && currentScript.shots?.length
+                            ? currentScript.shots.length + ' ' + pluralShots(currentScript.shots.length) : null,
+                        ].filter(Boolean).join(' · ')}
+                      </p>
+                    </div>
+                    {isStoryboardScript(currentScript) && (currentScript.shots || []).length > 0 ? (
+                      <ol className="shorts-workflow__review-rows">
+                        {currentScript.shots.map((shot, j) => (
+                          <li key={j} className="shorts-workflow__review-row">
+                            <span className="shorts-workflow__shot-label">Кадр {shot.shot_number || j + 1}</span>
+                            <div className="min-w-0 break-words">
+                              {shot.speech && <p className="whitespace-pre-wrap">{shot.speech}</p>}
+                              {(shot.scene || shot.generation_prompt) && (
+                                <p className="shorts-workflow__scene-note"><span>В кадре</span> {shot.scene || shot.generation_prompt}</p>
+                              )}
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (currentScript.segments || []).length > 0 ? (
+                      <ol className="shorts-workflow__review-rows">
+                        {currentScript.segments.map((segment, j) => (
+                          <li key={j} className="shorts-workflow__review-row">
+                            <div className="shorts-workflow__muted">
+                              <p>{{ hook: 'Начало', problem: 'Проблема', solution: 'Решение', cta: 'Призыв' }[segment.type] || segment.type}</p>
+                              {segment.start != null && segment.end != null && <p>{segment.start}–{segment.end} с</p>}
+                            </div>
+                            <p className="min-w-0 whitespace-pre-wrap break-words">{segment.narration}</p>
+                          </li>
+                        ))}
+                      </ol>
+                    ) : currentScript.full_narration && (
+                      <p className="mt-3 whitespace-pre-wrap break-words">{currentScript.full_narration}</p>
+                    )}
+                    {(currentScript.hashtags || []).length > 0 && (
+                      <p className="shorts-workflow__muted mt-3 break-words">{currentScript.hashtags.slice(0, 4).join(' · ')}</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="shorts-workflow__notice" data-empty>Сценарии пока не готовы. Вернись к брифу, чтобы создать варианты.</p>
+                )}
+
+                <details className="shorts-workflow__details shorts-workflow__review-analysis">
+                  <summary>Анализ проекта и источники <ChevronDown size={15} /></summary>
+                  <div className="space-y-4">
+                    <div>
+                      <h3 className="font-semibold break-words">{analysis.product_name || 'Анализ проекта'}</h3>
+                      {analysis.industry && <p className="shorts-workflow__muted">{analysis.industry}</p>}
+                      {(analysis.one_liner || analysis.description) && <p className="mt-2 break-words">{analysis.one_liner || analysis.description}</p>}
+                      {fromCache && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <span className="shorts-workflow__muted">Сохранённый анализ</span>
+                          <button
+                            type="button"
+                            className="shorts-workflow__button shorts-workflow__button--plain"
+                            onClick={() => { setStep(0); setFromCache(false); }}
+                          >
+                            <RefreshCw size={14} /> Повторить анализ
+                          </button>
                         </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {selectedScript === i && (
-                          <span className="text-[10px] bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-full">Выбран</span>
-                        )}
-                        <button
-                          type="button"
-                          aria-label="Открыть раскадровку"
-                          onClick={(event) => { event.stopPropagation(); setSelectedScript(i); setStep(2); }}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:border-violet-400/40 hover:bg-violet-500/10 hover:text-violet-100"
-                        >
-                          <Pencil size={12} /> Раскадровка
-                        </button>
-                      </div>
+                      )}
                     </div>
 
-                    {(
-                      <>
-                        {isStoryboardScript(script) ? (
-                          <div className="space-y-2">
-                            {(script.shots || []).map((shot, j) => (
-                              <div key={j} className="grid gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 text-xs md:grid-cols-[82px,minmax(0,1fr)]">
-                                <div className="text-violet-300 font-semibold">
-                                  КАДР {shot.shot_number || j + 1}
-                                </div>
-                                <div className="min-w-0 space-y-1">
-                                  <p className="text-zinc-300 leading-relaxed">{shot.scene || shot.generation_prompt}</p>
-                                  {shot.speech && <p className="text-zinc-500 leading-relaxed">«{shot.speech}»</p>}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <>
-                            {/* Segments preview */}
-                            <div className="flex gap-1 mb-3">
-                              {(script.segments || []).map((seg, j) => (
-                                <div
-                                  key={j}
-                                  className={`h-1.5 rounded-full ${
-                                    seg.type === 'hook' ? 'bg-red-400' :
-                                    seg.type === 'problem' ? 'bg-yellow-400' :
-                                    seg.type === 'solution' ? 'bg-green-400' :
-                                    'bg-blue-400'
-                                  }`}
-                                  style={{ flex: (seg.end - seg.start) }}
-                                  title={`${seg.type}: ${seg.start}s-${seg.end}s`}
-                                />
-                              ))}
-                            </div>
+                    {(analysis.pain_points || []).length > 0 && (
+                      <div>
+                        <h3 className="font-semibold">Проблемы аудитории</h3>
+                        <ul className="mt-2 space-y-2">
+                          {analysis.pain_points.map((point, i) => (
+                            <li key={i}>
+                              <p>{point.pain}</p>
+                              <p className="shorts-workflow__muted">
+                                {[
+                                  { high: 'Сильная', medium: 'Средняя', low: 'Слабая' }[point.intensity],
+                                  point.source !== 'website' && point.source,
+                                ].filter(Boolean).join(' · ')}
+                              </p>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {(analysis.emotional_hooks || []).length > 0 && (
+                      <div>
+                        <h3 className="font-semibold">Что привлечёт внимание</h3>
+                        <ul className="mt-2 list-disc space-y-1 pl-4">
+                          {analysis.emotional_hooks.map((hook, i) => <li key={i}>{hook}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                    {(analysis.pain_points || []).length === 0 && (analysis.emotional_hooks || []).length === 0 && (
+                      <p className="shorts-workflow__muted">В быстром режиме сценарии строятся по описанию проекта.</p>
+                    )}
 
-                            <div className="space-y-2">
-                              {(script.segments || []).map((seg, j) => (
-                                <div key={j} className="flex gap-3 text-xs">
-                                  <span className={`shrink-0 px-1.5 py-0.5 rounded font-mono uppercase tracking-wider ${
-                                    seg.type === 'hook' ? 'bg-red-500/20 text-red-300' :
-                                    seg.type === 'problem' ? 'bg-yellow-500/20 text-yellow-300' :
-                                    seg.type === 'solution' ? 'bg-green-500/20 text-green-300' :
-                                    'bg-blue-500/20 text-blue-300'
-                                  }`}>
-                                    {seg.type}
-                                  </span>
-                                  <span className="text-zinc-400 leading-relaxed">{seg.narration}</span>
-                                </div>
+                    {webResearch && (
+                      <section className="space-y-3">
+                        <h3 className="font-semibold">Исследование в интернете</h3>
+                        {(webResearch.real_reviews || []).length > 0 && (
+                          <div>
+                            <h4 className="font-medium">Отзывы</h4>
+                            <ul className="mt-2 space-y-2">
+                              {webResearch.real_reviews.slice(0, 5).map((review, i) => (
+                                <li key={i}>
+                                  <p className="break-words">«{review.quote}»</p>
+                                  <p className="shorts-workflow__muted">
+                                    {[
+                                      review.source,
+                                      { positive: 'Положительный', negative: 'Отрицательный', neutral: 'Нейтральный' }[review.sentiment],
+                                    ].filter(Boolean).join(' · ')}
+                                  </p>
+                                </li>
                               ))}
-                            </div>
-                          </>
-                        )}
-
-                        {(script.hashtags || []).length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-white/5 flex items-center gap-3 flex-wrap">
-                            {(script.hashtags || []).slice(0, 4).map((tag, j) => (
-                              <span key={j} className="text-[10px] text-zinc-500">{tag}</span>
-                            ))}
+                            </ul>
                           </div>
                         )}
-                      </>
+                        {(webResearch.competitors || []).length > 0 && (
+                          <div>
+                            <h4 className="font-medium">Конкуренты</h4>
+                            <ul className="mt-2 space-y-2">
+                              {webResearch.competitors.map((competitor, i) => (
+                                <li key={i}>
+                                  <p>{competitor.name}</p>
+                                  {competitor.comparison && <p className="shorts-workflow__muted">{competitor.comparison}</p>}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {(webResearch.grounding_sources || []).length > 0 && (
+                          <div>
+                            <h4 className="font-medium">Источники <span className="shorts-workflow__muted">{webResearch.grounding_sources.length}</span></h4>
+                            <ul className="mt-2 space-y-1">
+                              {webResearch.grounding_sources.slice(0, 8).map((source, i) => (
+                                <li key={i}>
+                                  <a href={source.url} target="_blank" rel="noopener noreferrer" className="break-words underline underline-offset-2">
+                                    {source.title || source.url}
+                                  </a>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </section>
                     )}
                   </div>
-                ))}
+                </details>
               </div>
-            </div>
-
-            <div className="flex justify-between">
-              <button onClick={() => setStep(0)} className="btn-secondary px-4 py-2 text-sm flex items-center gap-2">
-                <ChevronLeft size={14} /> Назад
-              </button>
-              <button onClick={() => setStep(2)} className="btn-primary px-6 py-2 text-sm flex items-center gap-2">
-                К настройке ролика <ChevronRight size={14} />
-              </button>
-            </div>
+            </section>
           </div>
         )}
 
@@ -4570,951 +5366,10 @@ export default function SaaShortsTab({
           <div className="animate-[fadeIn_0.3s_ease-out] space-y-6">
             <div className="glass-panel p-4 sm:p-6 space-y-5">
               <h2 className="text-lg font-semibold">Настройка ролика</h2>
-              <GenerationPresetPicker value={generationPreset} onChange={selectGenerationPreset}
-                disabled={generating || framesGenerating || voiceGenerating} />
-              <MusicPicker enabled={backgroundMusic} value={musicTrack} volume={musicVolume}
-                onEnabledChange={setBackgroundMusic} onChange={setMusicTrack} onVolumeChange={setMusicVolume}
-                disabled={generating || framesGenerating || voiceGenerating || musicSaving} />
-              {sourceJobId && renderPlan.reshoot.length === 0 && (
-                <button type="button" disabled={generating || framesGenerating || voiceGenerating || musicSaving}
-                  onClick={async () => {
-                    setMusicSaving(true); setMusicError('');
-                    try {
-                      const response = await fetch(getApiUrl('/api/saasshorts/music'), {
-                        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-                        body: JSON.stringify({ job_id: sourceJobId, ...musicRequestSettings(backgroundMusic, musicTrack, musicVolume) }),
-                      });
-                      const data = await response.json();
-                      if (!response.ok) throw new Error(data.detail || 'Не удалось сохранить музыку');
-                      setGenResult((previous) => ({ ...previous, ...data.video }));
-                      setGenStatus('completed'); setJobId(sourceJobId); setStep(4);
-                    } catch (error) { setMusicError(error.message); }
-                    finally { setMusicSaving(false); }
-                  }}
-                  className="inline-flex min-h-10 items-center gap-2 rounded-md border border-white/15 px-3 py-2 text-sm text-zinc-200 hover:bg-white/5 disabled:opacity-50">
-                  {musicSaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
-                  {musicSaving ? 'Сохраняю...' : 'Сохранить музыку · $0'}
-                </button>
-              )}
-              {musicError && <p role="alert" className="text-sm text-red-300">{musicError}</p>}
+              {renderGenerationSettings()}
               <p className="text-sm text-zinc-500">
                 Сценарий: <strong className="text-zinc-300">{scripts[selectedScript].title}</strong>
               </p>
-
-              {storyboardSelected && (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 sm:p-4 space-y-4">
-                  <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
-                    <div>
-                      <h3 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
-                        <Film size={14} /> Кадры ролика
-                      </h3>
-                      <p className="text-[11px] text-zinc-500 mt-0.5 max-w-xl">
-                        Ролик собирается по кадрам. Для каждого укажи, что в кадре и что человек говорит.
-                        Кадры можно добавлять, дублировать, удалять и перетаскивать за уголок <GripVertical size={11} className="inline align-[-1px] text-zinc-500" />, чтобы поменять порядок.
-                      </p>
-                      {/* Одно место на все говорящие кадры и своя очередь камер —
-                          иначе непонятно, почему описание «другой ракурс» ничего
-                          не меняет, а фон вдруг остаётся прежним. */}
-                      {setDefiningShotIndex >= 0 && (
-                        <p className="text-[11px] text-zinc-500 mt-1 max-w-xl">
-                          {reelLocations.length > 1
-                            ? `Место меняется по ходу ролика: ${reelLocations.length} локации, каждые три говорящих кадра.`
-                            : <>Все говорящие кадры сняты в одном месте — {hasOwnSet
-                              ? 'оно в поле «Место действия ролика» ниже'
-                              : `его задаёт кадр ${setDefiningShotIndex + 1}`}.</>}
-                          {' '}Между ними чередуются камеры, поэтому ракурс в описании кадра указывать не нужно.
-                        </p>
-                      )}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {shotHistory.some((entry) => entry.scriptIndex === selectedScript) && (
-                        <button
-                          type="button"
-                          onClick={undoShotChange}
-                          title="Отменить последнее действие с кадрами"
-                          className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
-                        >
-                          <Undo2 size={13} /> Отменить
-                        </button>
-                      )}
-                      <span className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400">
-                        {(scripts[selectedScript].shots || []).length} {pluralShots((scripts[selectedScript].shots || []).length)}
-                      </span>
-                      <span
-                        className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400"
-                        title="≈ длина озвучки. По ней собирается ролик — видео не длиннее речи, лишние кадры не оплачиваются."
-                      >
-                        ~{storyboardSeconds} сек
-                      </span>
-                      {durationGap !== 0 && (
-                        <span
-                          className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200"
-                          title={`Хронометраж выбран на первом шаге: ~${targetDurationSeconds} сек. Длину ролика задаёт озвучка, так что лишний текст — это лишние секунды и лишние оплаченные кадры. Уберите или сократите реплики, либо смените цель.`}
-                        >
-                          {durationGap > 0 ? 'длиннее' : 'короче'} цели
-                          на {Math.abs(durationGap)} сек
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Пересъёмка готового ролика: клипы прошлого рендера
-                      переносятся в новый джоб, поэтому неизменённые кадры
-                      ничего не стоят — платим за то, что правили. */}
-                  {renderPlan.isReshoot && (
-                    <div className="rounded-xl border border-green-500/20 bg-green-500/[0.05] p-3">
-                      <p className="text-[11px] text-green-100/80">
-                        Ролик уже снят. {renderPlan.reshoot.length === 0
-                          ? (<>
-                              Все {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} возьмём
-                              из прошлого рендера — пересборка бесплатна.
-                              Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
-                            </>)
-                          : (<>
-                              Возьмём {renderPlan.reused.length} {pluralShots(renderPlan.reused.length)} из прошлого
-                              рендера бесплатно, снимем заново {renderPlan.reshoot.length}
-                              {reshootCost !== null ? ` (~${formatUsd(reshootCost)})` : ''}.
-                              Кнопка «Переснять» на кадре заставит его сняться ещё раз, даже если текст не менялся.
-                            </>)}
-                      </p>
-                      {/* Пошотная озвучка оставляет на границе правки один стык.
-                          Замеры говорят, что он тише обычного перехода между
-                          предложениями, но если он всё же слышен — вот выход. */}
-                      <label className="mt-2 flex items-start gap-2 text-[11px] text-green-100/70">
-                        <input
-                          type="checkbox"
-                          checked={revoiceAll}
-                          onChange={(event) => setRevoiceAll(event.target.checked)}
-                          className="mt-0.5 w-3.5 h-3.5 rounded border-green-500/40 bg-black/40 text-green-400 focus:ring-green-500"
-                        />
-                        <span>
-                          Перечитать весь текст одним дублем
-                          <span className="text-green-100/40"> — ни одного стыка в озвучке, но тогда переснимаются все говорящие кадры</span>
-                        </span>
-                      </label>
-                    </div>
-                  )}
-
-                  {/* Кадры без описания сцены: ИИ-генерация видео читает промпт,
-                      собранный из «Что в кадре», а не реплику. */}
-                  {emptyShotNumbers.length > 0 && (
-                    <div className="flex flex-col gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 sm:flex-row sm:items-center sm:justify-between">
-                      <p className="max-w-md text-[11px] text-amber-100/80">
-                        В {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} есть реплика, но не описано, что в кадре.
-                        Без этого нейросеть нарисует случайную сцену.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => fillShotDetails(emptyShotNumbers)}
-                        disabled={fillingShots.length > 0}
-                        className="btn-secondary shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
-                      >
-                        {fillingShots.length > 0
-                          ? (<><Loader2 size={13} className="animate-spin" /> Заполняю…</>)
-                          : (<><Sparkles size={13} /> Заполнить {emptyShotNumbers.length} {pluralShots(emptyShotNumbers.length)} ИИ</>)}
-                      </button>
-                    </div>
-                  )}
-                  {fillError && (
-                    <p className="text-[11px] text-red-300">{fillError}</p>
-                  )}
-
-                  {/* Место действия — одно на весь ролик и своё поле. Пока оно
-                      жило внутри кадра 1, в плиты вместе с комнатой уезжало всё,
-                      что там оказалось: «static camera» — и обе камеры выходили
-                      одним анфасом, «a beautiful woman» — и редактор рисовал своё
-                      лицо вместо выбранного. */}
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[12px] font-semibold text-zinc-200">
-                        Место действия ролика
-                      </span>
-                      <button
-                        type="button"
-                        onClick={pickReelSet}
-                        disabled={pickingSet}
-                        className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200 disabled:opacity-50"
-                        title="Подобрать место по тексту ролика (Gemini, бесплатно)"
-                      >
-                        {pickingSet
-                          ? (<><Loader2 size={11} className="animate-spin" /> Подбираю…</>)
-                          : (<><Sparkles size={11} /> Подобрать ИИ</>)}
-                      </button>
-                    </div>
-                    <textarea
-                      className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
-                      value={currentScript?.set_scene || ''}
-                      onChange={(event) => updateSelectedScript({
-                        set_scene: event.target.value,
-                        set_prompt: event.target.value,
-                        set_source: 'user',
-                      })}
-                      placeholder="Комната, свет, поверхности, что на них стоит — здесь снят весь ролик"
-                    />
-                    {/* Что сейчас в силе — видно, а не угадывается. Описание,
-                        подобранное ИИ, фото ведущего не видело: там уже снята
-                        своя комната, и текст её перекрашивал (светлая дневная
-                        кухня уезжала в вечернюю). Поэтому текст вступает в дело
-                        только когда место вписал человек. */}
-                    {reelLocations.length > 1 && (
-                      <ul className="space-y-0.5 text-[10px] leading-snug text-zinc-500">
-                        {reelLocations.map((place, index) => (
-                          <li key={`${index}-${place.slice(0, 12)}`}>
-                            <span className="text-zinc-400">Локация {index + 1}:</span> {place}
-                            {index === 0 ? ' (её и правит поле выше)' : ''}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    <p className="text-[10px] leading-snug text-zinc-500">
-                      {reelLocations.length > 1
-                        ? 'Локации меняются по ходу ролика — каждая снимается своими постановочными кадрами.'
-                        : setChosenByUser
-                          ? 'Снимаем в этом месте — текст перебивает комнату с фото ведущего.'
-                          : 'Сейчас комната берётся с фото ведущего — та же, что за спиной на портрете. Впиши своё место, если нужна другая.'}
-                      {' '}Только место: людей, ракурс и внешность сюда писать не нужно — человека
-                      ставит приложение, камеры чередует само. Пока кадры не отрисованы,
-                      переподбор ничего не стоит.
-                    </p>
-                  </div>
-
-                  {/* Озвучка идёт первой: её длина — это длина ролика, её паузы —
-                      границы кадров, а длинная реплика режется на несколько
-                      платных клипов. Стоит копейки, поэтому слушаем до съёмки. */}
-                  <div className="rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-3 space-y-3">
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="max-w-md">
-                        <h4 className="text-[12px] font-semibold text-sky-100 flex items-center gap-1.5">
-                          <Volume2 size={13} /> Озвучка
-                        </h4>
-                        <p className="text-[11px] text-zinc-400 mt-0.5">
-                          По ней собирается ролик: её длина задаёт длину видео, паузы — границы кадров,
-                          а длинная реплика снимается несколькими платными клипами.
-                          Послушай и перезапиши до съёмки — после неё голос уже не поменять,
-                          не переснимая всё заново.
-                        </p>
-                      </div>
-                      <div className="flex shrink-0 flex-col gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => handleGenerateVoice(null, false)}
-                          disabled={voiceGenerating}
-                          className="btn-secondary px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
-                        >
-                          {voiceGenerating && voiceShot === null
-                            ? (<><Loader2 size={13} className="animate-spin" /> Записываю…</>)
-                            : voicePreview
-                              ? (<><RefreshCw size={13} /> Обновить озвучку</>)
-                              : (<><Volume2 size={13} /> Записать озвучку</>)}
-                        </button>
-                        {voicePreview && (
-                          <button
-                            type="button"
-                            onClick={() => handleGenerateVoice(null, true)}
-                            disabled={voiceGenerating}
-                            title="Перечитать весь текст одним дублем: ни одного стыка, но все реплики звучат заново"
-                            className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-300 transition-colors hover:border-sky-400/40 hover:text-sky-200 disabled:opacity-50"
-                          >
-                            Перечитать всё одним дублем
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {voicePreview && (
-                      <div className="space-y-2">
-                        <audio
-                          controls
-                          preload="metadata"
-                          src={voicePreview.url}
-                          className="h-9 w-full"
-                        />
-                        <p className="text-[11px] font-medium text-sky-100">
-                          Голос: {voicePreview.voiceName || selectedVoiceLabel}
-                          {voicePreview.voiceId ? ` · ${voicePreview.voiceId}` : ''}
-                        </p>
-                        <p className="text-[11px] text-zinc-400">
-                          {voicePreview.seconds ? `${voicePreview.seconds.toFixed(1)} с` : 'длина неизвестна'}
-                          {voicePreview.clips
-                            ? ` · снимется ${voicePreview.clips} ${pluralClips(voicePreview.clips)}${
-                                voicePreview.shootCost != null ? ` (~${formatUsd(voicePreview.shootCost)})` : ''
-                              }`
-                            : ''}
-                          {voicePreview.model ? ` · ${voicePreview.model}` : ''}
-                        </p>
-                        {voicePreview.stale.length > 0 && (
-                          <p className="text-[11px] text-amber-100/80">
-                            После записи изменились реплики {voicePreview.stale.join(', ')}.
-                            При съёмке они перезапишутся сами, но услышать их заранее можно,
-                            только записав озвучку ещё раз.
-                          </p>
-                        )}
-                        {ttsProvider !== 'fal_minimax'
-                          && (voicePreview.settingsChanged || (voicePreview.requestedModel
-                            ? voicePreview.requestedModel !== elevenLabsModel
-                            : elevenLabsModel === 'eleven_v4' && voicePreview.model !== 'eleven_v4')) && (
-                          <p className="text-[11px] text-amber-100/80">
-                            Параметры этой записи отличаются от выбранных. При следующей генерации
-                            озвучка будет записана заново; сначала обнови её для прослушивания.
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  {voiceNotice && (
-                    <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3">
-                      <p className="text-[11px] text-amber-100/80">{voiceNotice}</p>
-                    </div>
-                  )}
-
-                  {/* Сгенерировать стартовые кадры (Flux) до платного видео,
-                      чтобы увидеть и утвердить композицию каждого шота. */}
-                  <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                    <p className="text-[11px] text-zinc-400 max-w-md">
-                      Сгенерируй стартовые кадры и проверь композицию до платной генерации видео.
-                      Говорящие кадры снимаются двумя общими ракурсами — за них платишь дважды,
-                      сколько бы их ни было; у каждой перебивки свой кадр. Готовые пропускаются.
-                      Перегенерить кадр или заменить его своим фото можно по кнопке на самом кадре.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => handleGenerateFrames(null)}
-                      disabled={framesGenerating || missingFrameCount === 0}
-                      className="btn-secondary shrink-0 px-3 py-2 text-[12px] flex items-center justify-center gap-1.5 disabled:opacity-50"
-                    >
-                      {framesGenerating && framesShot === null
-                        ? (<><Loader2 size={13} className="animate-spin" /> Генерирую…</>)
-                        : missingFrameCount === 0
-                          ? (<><Check size={13} /> Все кадры готовы</>)
-                          : (<><Sparkles size={13} /> Сгенерить недостающие: {missingFrameCount} (~{formatUsd(billableFrameCount * 0.05)})</>)}
-                    </button>
-                  </div>
-
-                  {framesNotice && (
-                    <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3">
-                      <p className="text-[11px] text-amber-100/80">{framesNotice}</p>
-                    </div>
-                  )}
-
-                  {/* Какой моделью рисуется ведущий. Строка появляется, как
-                      только бэкенд прислал каталог: до этого выбирать не из чего. */}
-                  {avatarEditModels.length > 0 && (
-                    <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                      <p className="text-[11px] text-zinc-400">
-                        Ведущего в кадр ставит{' '}
-                        <span className="text-zinc-200">
-                          {(avatarEditModels.find((m) => m.id === avatarEditModel) || avatarEditModels[0]).title}
-                        </span>
-                        . Если модель откажет — предложу сменить её, подменять сама она не будет.
-                      </p>
-                      <select
-                        value={avatarEditModel || avatarEditModels[0].id}
-                        onChange={(e) => setAvatarEditModel(e.target.value)}
-                        disabled={framesGenerating}
-                        className="input-field shrink-0 text-[12px] py-1.5"
-                      >
-                        {avatarEditModels.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.title}{model.blocked ? ' — уже отказала' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
-
-                  <div className="space-y-2.5">
-                    {(scripts[selectedScript].shots || []).map((shot, shotIndex) => {
-                      const shots = scripts[selectedScript].shots || [];
-                      const previewUrl = shot.image_preview
-                        || (shot.local_url ? getApiUrl(shot.local_url) : '')
-                        || (shot.image_url?.startsWith('/videos/') ? getApiUrl(shot.image_url) : shot.image_url)
-                        || (shot.preview_frame_url ? getApiUrl(shot.preview_frame_url) : '');
-                      // After a render the shot carries its generated frame/clip; a manually
-                      // uploaded photo still wins so the user's choice isn't overwritten.
-                      const isGeneratedPreview = !shot.image_preview && !shot.local_url && !shot.image_url && Boolean(shot.preview_frame_url);
-                      const clipUrl = shot.clip_url ? getApiUrl(shot.clip_url) : '';
-                      const shotNumber = shot.shot_number ?? (shotIndex + 1);
-                      const markedForReshoot = reshootShots.includes(shotNumber);
-                      const inputId = `storyboard-frame-${selectedScript}-${shotIndex}`;
-                      const isBroll = isBrollShot(shot);
-                      // Сколько экрана достанется кадру и сколько мы за него
-                      // заплатим. Расходятся они у коротких реплик: клип короче
-                      // пола модель не отдаёт, а счёт выставляет по отданному.
-                      const plannedSeconds = shotPlannedSeconds(scripts[selectedScript], shot, storyboardSeconds);
-                      const clipFloorSeconds = shotClipFloorSeconds(shot);
-                      const shotIsShorterThanItsClip = plannedSeconds > 0
-                        && plannedSeconds < clipFloorSeconds - 0.05;
-
-                      return (
-                        <div
-                          key={shotIndex}
-                          onDragOver={(event) => {
-                            if (dragShotIndex === null) return;
-                            event.preventDefault();
-                            if (dragOverShotIndex !== shotIndex) setDragOverShotIndex(shotIndex);
-                          }}
-                          onDrop={(event) => { event.preventDefault(); dropShotOnto(shotIndex); }}
-                          className={`rounded-xl border bg-black/20 p-3 transition-all ${
-                            dragShotIndex === shotIndex
-                              ? 'border-primary/40 opacity-50'
-                              : dragOverShotIndex === shotIndex && dragShotIndex !== null
-                                ? 'border-primary/60 ring-1 ring-primary/40'
-                                : 'border-white/10'
-                          }`}
-                        >
-                          {/* Header: drag handle + number + actions. The shot
-                              type is set (and shown) by the Говорит/Перебивка
-                              toggle below, so no separate read-only badge here. */}
-                          <div className="mb-3 flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                draggable
-                                onDragStart={() => setDragShotIndex(shotIndex)}
-                                onDragEnd={() => { setDragShotIndex(null); setDragOverShotIndex(null); }}
-                                aria-label="Перетащить кадр"
-                                title="Потяни, чтобы поменять порядок"
-                                className="cursor-grab rounded-md p-1 text-zinc-600 transition-colors hover:text-zinc-300 active:cursor-grabbing"
-                              >
-                                <GripVertical size={15} />
-                              </button>
-                              <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-primary/15 px-2 text-xs font-semibold text-violet-200">
-                                {shotIndex + 1}
-                              </span>
-                              {/* Что по этому кадру уже оплачено и лежит на диске:
-                                  снятый клип или только стартовый кадр. */}
-                              {clipUrl && markedForReshoot ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                                  <RefreshCw size={10} /> Переснимем
-                                </span>
-                              ) : clipUrl ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-semibold text-green-300">
-                                  <Check size={10} /> Снят
-                                </span>
-                              ) : previewUrl ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-300">
-                                  <Check size={10} /> Кадр готов
-                                </span>
-                              ) : (
-                                <span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-zinc-500">
-                                  Без кадра
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-0.5">
-                              <button
-                                type="button"
-                                onClick={() => moveSelectedScriptShot(shotIndex, -1)}
-                                disabled={shotIndex === 0}
-                                aria-label="Переместить кадр выше"
-                                title="Выше"
-                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200 disabled:opacity-30 disabled:hover:bg-transparent"
-                              >
-                                <ChevronUp size={15} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => moveSelectedScriptShot(shotIndex, 1)}
-                                disabled={shotIndex === shots.length - 1}
-                                aria-label="Переместить кадр ниже"
-                                title="Ниже"
-                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200 disabled:opacity-30 disabled:hover:bg-transparent"
-                              >
-                                <ChevronDown size={15} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => duplicateSelectedScriptShot(shotIndex)}
-                                aria-label="Дублировать кадр"
-                                title="Дублировать кадр"
-                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200"
-                              >
-                                <Copy size={15} />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => removeSelectedScriptShot(shotIndex)}
-                                disabled={shots.length <= 1}
-                                aria-label="Удалить кадр"
-                                title="Удалить кадр"
-                                className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-30 disabled:hover:bg-transparent"
-                              >
-                                <Trash2 size={15} />
-                              </button>
-                            </div>
-                          </div>
-
-                          <div className="grid gap-3 sm:grid-cols-[120px,minmax(0,1fr)]">
-                            {/* Кадр вертикальный: во всю ширину карточки он вырастал
-                                на полтора экрана и растягивал раскадровку на десять
-                                тысяч пикселей. Держим превью миниатюрой, а на
-                                телефоне ставим кнопки рядом с ним, а не под ним. */}
-                            <div className="flex gap-2 sm:block">
-                              <div className="aspect-[9/16] w-[104px] shrink-0 overflow-hidden rounded-lg border border-white/10 bg-zinc-950 sm:mb-2 sm:w-full">
-                                {previewUrl ? (
-                                  // Кнопка, а не картинка с onClick: кадр открывается
-                                  // и с клавиатуры, и читалка называет его вслух.
-                                  <button
-                                    type="button"
-                                    onClick={() => setLightbox({
-                                      src: previewUrl,
-                                      alt: `Кадр ${shotIndex + 1}`,
-                                      caption: `Кадр ${shotIndex + 1} — нажми на фон или Esc, чтобы закрыть`,
-                                    })}
-                                    title="Открыть кадр на весь экран"
-                                    className="group h-full w-full cursor-zoom-in"
-                                  >
-                                    <img
-                                      src={previewUrl}
-                                      alt={`Кадр ${shotIndex + 1}`}
-                                      className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.03]"
-                                    />
-                                  </button>
-                                ) : (
-                                  <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-[10px] text-zinc-600">
-                                    <Upload size={18} />
-                                    Своё фото
-                                  </div>
-                                )}
-                              </div>
-                              <div className="flex min-w-0 flex-1 flex-col gap-2">
-                              <input
-                                id={inputId}
-                                type="file"
-                                accept="image/*"
-                                className="hidden"
-                                onChange={(event) => {
-                                  const file = event.target.files?.[0];
-                                  if (file) handleStoryboardFrameUpload(shotIndex, file);
-                                  event.target.value = '';
-                                }}
-                              />
-                              <label htmlFor={inputId} className="btn-secondary w-full cursor-pointer px-2 py-2 text-[11px] flex items-center justify-center gap-1.5">
-                                <Upload size={12} /> Загрузить фото
-                              </label>
-                              <button
-                                type="button"
-                                onClick={() => handleGenerateFrames(shot.shot_number ?? (shotIndex + 1))}
-                                disabled={framesGenerating}
-                                title="Сгенерировать/перегенерировать кадр по описанию"
-                                className="btn-secondary w-full px-2 py-2 text-[11px] flex items-center justify-center gap-1.5 disabled:opacity-50"
-                              >
-                                {framesGenerating && framesShot === (shot.shot_number ?? (shotIndex + 1))
-                                  ? (<><Loader2 size={12} className="animate-spin" /> Кадр…</>)
-                                  : (<><RefreshCw size={12} /> {previewUrl ? 'Перегенерить' : 'Сгенерить кадр'}</>)}
-                              </button>
-                              {isGeneratedPreview && (
-                                <p className="text-[10px] text-violet-300/80">Сгенерённый кадр</p>
-                              )}
-                              {clipUrl && (
-                                <a
-                                  href={clipUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="btn-secondary w-full px-2 py-1.5 text-[11px] flex items-center justify-center gap-1.5"
-                                >
-                                  ▶ Клип
-                                </a>
-                              )}
-                              {/* Кадр уже снят: без явной отметки следующий рендер
-                                  возьмёт готовый клип и денег не потратит. */}
-                              {clipUrl && renderPlan.isReshoot && (
-                                <button
-                                  type="button"
-                                  onClick={() => setReshootShots((prev) => (
-                                    prev.includes(shotNumber)
-                                      ? prev.filter((num) => num !== shotNumber)
-                                      : [...prev, shotNumber]
-                                  ))}
-                                  title={markedForReshoot
-                                    ? 'Не переснимать — оставить снятый клип'
-                                    : 'Снять этот кадр заново при следующей генерации видео'}
-                                  className={`w-full rounded-lg border px-2 py-1.5 text-[11px] flex items-center justify-center gap-1.5 transition-colors ${
-                                    markedForReshoot
-                                      ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
-                                      : 'border-white/10 text-zinc-400 hover:border-amber-500/40 hover:text-amber-200'
-                                  }`}
-                                >
-                                  <RefreshCw size={12} /> {markedForReshoot ? 'Не переснимать' : 'Переснять'}
-                                </button>
-                              )}
-                              {shot.frame_status && (
-                                <p className="text-[10px] text-zinc-500">{shot.frame_status}</p>
-                              )}
-                              </div>
-                            </div>
-
-                            <div className="space-y-3">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="inline-flex overflow-hidden rounded-lg border border-white/10 text-[11px]">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleSelectedScriptShot(shotIndex, 'visual_type', 'avatar')}
-                                    className={`px-2.5 py-1 transition-colors ${!isBroll ? 'bg-primary/15 text-violet-200' : 'text-zinc-500 hover:text-zinc-300'}`}
-                                  >
-                                    Говорит
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleSelectedScriptShot(shotIndex, 'visual_type', 'broll')}
-                                    className={`px-2.5 py-1 transition-colors ${isBroll ? 'bg-primary/15 text-violet-200' : 'text-zinc-500 hover:text-zinc-300'}`}
-                                  >
-                                    Перебивка
-                                  </button>
-                                </div>
-                                {/* Ракурс — решение сборки, а не текста: она
-                                    чередует камеры одного сета. Раньше это было
-                                    невидимо, и человек просил крупный план в
-                                    описании, где его никто не читает. */}
-                                {!isBroll && talkingCameras[shotIndex] && (
-                                  <span
-                                    className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400"
-                                    title="Ракурс чередуется автоматически между говорящими кадрами, чтобы соседние склейки не читались как сбой. В описании кадра его задать нельзя."
-                                  >
-                                    Камера: {CAMERA_LABELS[talkingCameras[shotIndex]]}
-                                  </span>
-                                )}
-                              </div>
-                              <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span>
-                                    {isBroll
-                                      ? 'Что в кадре'
-                                      : (shotIndex === setDefiningShotIndex && !hasOwnSet
-                                        ? 'Что в кадре — место действия всего ролика'
-                                        : 'Что делает')}
-                                  </span>
-                                  {/* Пустая сцена = случайная картинка: промпт для
-                                      видео-модели строится именно отсюда. */}
-                                  <button
-                                    type="button"
-                                    onClick={() => fillShotDetails([shot.shot_number])}
-                                    disabled={fillingShots.includes(shot.shot_number)}
-                                    className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-primary/40 hover:text-violet-200 disabled:opacity-50"
-                                    title="Заполнить сцену, камеру и действие по реплике (Gemini, бесплатно)"
-                                  >
-                                    {fillingShots.includes(shot.shot_number)
-                                      ? (<><Loader2 size={11} className="animate-spin" /> Заполняю…</>)
-                                      : (<><Sparkles size={11} /> Заполнить ИИ</>)}
-                                  </button>
-                                </div>
-                                <textarea
-                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
-                                  value={shot.scene || ''}
-                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'scene', event.target.value)}
-                                  placeholder={isBroll
-                                    ? 'Опиши, что видно в кадре'
-                                    : (shotIndex === setDefiningShotIndex && !hasOwnSet
-                                      ? 'Комната, свет, что в руках — это место остаётся до конца ролика'
-                                      : 'Поза, взгляд, что делают руки')}
-                                />
-                                {/* Место и камеру у говорящих кадров задаём не
-                                    словами: комната одна на весь ролик, ракурсы
-                                    чередует сборка. Без этой строчки поле снова
-                                    заполняли текстом вида «ракурс чуть сменился»,
-                                    которого в картинке никогда не будет. */}
-                                {!isBroll && (hasOwnSet || shotIndex !== setDefiningShotIndex) && (
-                                  <p className="text-[10px] leading-snug text-zinc-500">
-                                    {setChosenByUser
-                                      ? 'Место — из поля «Место действия ролика» выше'
-                                      : (hasOwnSet
-                                        ? 'Место — с фото ведущего, одно на весь ролик'
-                                        : `Место то же, что в кадре ${setDefiningShotIndex + 1}`)}
-                                    {' '}— новую комнату или ракурс отсюда не заказать.
-                                    Пиши, что меняется в самом человеке.
-                                  </p>
-                                )}
-                              </label>
-                              <label className="space-y-1.5 text-xs text-zinc-400 block">
-                                <span>{isBroll ? 'Текст за кадром (озвучка)' : 'Что говорит'}</span>
-                                <textarea
-                                  className="input-field min-h-[58px] resize-y py-2 text-sm leading-relaxed"
-                                  value={shot.speech || ''}
-                                  onChange={(event) => handleSelectedScriptShot(shotIndex, 'speech', event.target.value)}
-                                  placeholder={isBroll ? 'Что звучит голосом, пока показываем вставку (можно оставить пустым)' : 'Реплика для этого кадра'}
-                                />
-                                {/* Реплика короче пола клипа — единственное место,
-                                    где счёт растёт молча: на экране кадр мелькнёт,
-                                    а модель снимет и посчитает свой минимум. Видно
-                                    это должно быть здесь, до оплаты, а не в отчёте
-                                    после. Сборка потом дотянет кадр соседней
-                                    тишиной, но занимать её не всегда есть у кого. */}
-                                {shotIsShorterThanItsClip && (
-                                  <p className="text-[10px] leading-snug text-amber-400/80">
-                                    Коротко: {plannedSeconds.toFixed(1)} с речи при клипе от{' '}
-                                    {clipFloorSeconds.toFixed(1)} с — платим за полный.
-                                    Добавь слов или слей с соседним кадром.
-                                  </p>
-                                )}
-                              </label>
-                              {/* Записанная реплика: послушать именно её, увидеть
-                                  её длину (её задаёт голос, а не поле «секунды»)
-                                  и заказать другой дубль, не трогая остальные. */}
-                              {(shot.voice_url || shot.voice_seconds > 0) && (
-                                <div className="-mt-1 flex flex-wrap items-center gap-2">
-                                  {shot.voice_url && (
-                                    <audio
-                                      controls
-                                      preload="none"
-                                      src={getApiUrl(shot.voice_url)}
-                                      className="h-8 w-full max-w-[240px]"
-                                    />
-                                  )}
-                                  <span className="text-[10px] text-zinc-500">
-                                    {Number(shot.voice_seconds || 0).toFixed(1)} с
-                                    {shot.voice_clips > 1 ? ` · ${shot.voice_clips} ${pluralClips(shot.voice_clips)}` : ''}
-                                  </span>
-                                  {typeof shot.voice_speech === 'string'
-                                    && (shot.speech || '').trim() !== shot.voice_speech && (
-                                    <span className="text-[10px] text-amber-300/80">текст изменился после записи</span>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleGenerateVoice(shotNumber)}
-                                    disabled={voiceGenerating}
-                                    title="Прочитать эту реплику заново. Остальные дубли останутся как есть."
-                                    className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-sky-400/40 hover:text-sky-200 disabled:opacity-50"
-                                  >
-                                    {voiceGenerating && voiceShot === shotNumber
-                                      ? (<><Loader2 size={11} className="animate-spin" /> Пишу…</>)
-                                      : (<><Volume2 size={11} /> Перезаписать</>)}
-                                  </button>
-                                </div>
-                              )}
-                              {isBroll && (
-                                <div className="-mt-1.5 space-y-1.5">
-                                  <p className="text-[10px] text-zinc-600">
-                                    В перебивке лицо не показываем, но озвучка продолжает звучать поверх вставки.
-                                  </p>
-                                  {/* Кадр перебивки рисуется отдельно от аватара, поэтому по
-                                      тексту сцены мы не угадаем, наш это человек или чужой.
-                                      Без галочки «женский силуэт со спины» — посторонняя
-                                      женщина посреди ролика. */}
-                                  <label className="flex items-start gap-2 text-[11px] text-zinc-400">
-                                    <input
-                                      type="checkbox"
-                                      checked={Boolean(shot.actor_in_frame)}
-                                      onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_in_frame', event.target.checked)}
-                                      className="mt-0.5 w-3.5 h-3.5 rounded border-zinc-600 bg-black/50 text-violet-500 focus:ring-violet-500"
-                                    />
-                                    <span>
-                                      В кадре наш персонаж
-                                      <span className="text-zinc-600"> — со спины, руки или силуэт: кадр снимем с фото аватара, лицо не покажем</span>
-                                    </span>
-                                  </label>
-                                </div>
-                              )}
-                              {(() => {
-                                // Collapsed by default: the prompt is auto-derived from the
-                                // scene/speech and is noise for most users. They open it only
-                                // when they deliberately want to hand-tune how the shot is drawn.
-                                const promptOpen = shotIndex in openPromptShots
-                                  ? openPromptShots[shotIndex]
-                                  : false;
-                                return (
-                                  <div>
-                                    <button
-                                      type="button"
-                                      onClick={() => setOpenPromptShots((m) => ({ ...m, [shotIndex]: !promptOpen }))}
-                                      className="inline-flex items-center gap-1 text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
-                                    >
-                                      <ChevronDown size={12} className={`transition-transform ${promptOpen ? 'rotate-180' : ''}`} />
-                                      Подсказка для нейросети
-                                      <span className="text-zinc-600">— ручной промпт, перебивает «Что в кадре»</span>
-                                    </button>
-                                    {promptOpen && (
-                                      <div className="mt-1.5 space-y-1">
-                                        <input
-                                          className="input-field py-2 text-sm"
-                                          value={shot.generation_prompt || ''}
-                                          onChange={(event) => updateSelectedScriptShot(shotIndex, { generation_prompt: event.target.value, prompt_manual: true })}
-                                          placeholder="English prompt: close-up, warm light, realistic"
-                                        />
-                                        {shot.prompt_manual && (
-                                          <button
-                                            type="button"
-                                            onClick={() => updateSelectedScriptShot(shotIndex, { prompt_manual: false })}
-                                            className="text-[10px] text-zinc-500 transition-colors hover:text-zinc-300"
-                                          >
-                                            Сбросить — строить кадр из «Что в кадре»
-                                          </button>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                );
-                              })()}
-                              {(() => {
-                                const advOpen = Boolean(openAdvancedShots[shotIndex]);
-                                return (
-                                  <div>
-                                    <button
-                                      type="button"
-                                      onClick={() => setOpenAdvancedShots((m) => ({ ...m, [shotIndex]: !advOpen }))}
-                                      className="inline-flex items-center gap-1 text-[11px] text-zinc-500 transition-colors hover:text-zinc-300"
-                                    >
-                                      <ChevronDown size={12} className={`transition-transform ${advOpen ? 'rotate-180' : ''}`} />
-                                      Расширенные
-                                      <span className="text-zinc-600">— роль, переход, действие, камера</span>
-                                    </button>
-                                    {advOpen && (
-                                      <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
-                                        <label className="space-y-1 text-[11px] text-zinc-500 block">
-                                          <span>Роль кадра</span>
-                                          <input
-                                            className="input-field py-1.5 text-sm"
-                                            value={shot.role || ''}
-                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'role', event.target.value)}
-                                            placeholder="hook / problem / cta"
-                                          />
-                                        </label>
-                                        <label className="space-y-1 text-[11px] text-zinc-500 block">
-                                          <span>Переход после кадра</span>
-                                          <input
-                                            className="input-field py-1.5 text-sm"
-                                            value={shot.transition || ''}
-                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'transition', event.target.value)}
-                                            placeholder="cut / smooth_0.3s"
-                                          />
-                                        </label>
-                                        <label className="space-y-1 text-[11px] text-zinc-500 block sm:col-span-2">
-                                          <span>Действие актёра</span>
-                                          <textarea
-                                            className="input-field min-h-[48px] resize-y py-1.5 text-sm leading-relaxed"
-                                            value={shot.actor_action || shot.action || ''}
-                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'actor_action', event.target.value)}
-                                          />
-                                        </label>
-                                        <label className="space-y-1 text-[11px] text-zinc-500 block sm:col-span-2">
-                                          <span>Камера</span>
-                                          <input
-                                            className="input-field py-1.5 text-sm"
-                                            value={shot.camera || ''}
-                                            onChange={(event) => handleSelectedScriptShot(shotIndex, 'camera', event.target.value)}
-                                            placeholder="крупный план, лёгкая ручная камера"
-                                          />
-                                        </label>
-                                      </div>
-                                    )}
-                                  </div>
-                                );
-                              })()}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => addSelectedScriptShot()}
-                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 py-2.5 text-sm text-zinc-400 transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-violet-200"
-                  >
-                    <Plus size={16} /> Добавить кадр
-                  </button>
-
-                  {/* Реплики исходного сценария, которых нет ни в одном кадре —
-                      для старых роликов это всё, что уцелело от удалённых кадров. */}
-                  {leftoverNarration.length > 0 && (
-                    <details className="rounded-xl border border-white/10 bg-black/20">
-                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200">
-                        Текст сценария вне кадров ({leftoverNarration.length}) — можно вернуть кадром
-                      </summary>
-                      <div className="space-y-2 border-t border-white/10 p-3">
-                        {leftoverNarration.map((sentence, i) => (
-                          <div key={i} className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-2">
-                            <p className="min-w-0 flex-1 text-xs text-zinc-300">{sentence}</p>
-                            <button
-                              type="button"
-                              onClick={() => addShotWithSpeech(sentence)}
-                              className="shrink-0 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
-                            >
-                              Добавить кадром
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  )}
-
-                  {/* Удалённые кадры: текст никуда не девается, кадр возвращается
-                      одной кнопкой. Уезжает в метаданные ролика вместе с раскадровкой. */}
-                  {(scripts[selectedScript].shots_archived || []).length > 0 && (
-                    <details className="rounded-xl border border-white/10 bg-black/20">
-                      <summary className="cursor-pointer list-none px-3 py-2 text-xs text-zinc-400 hover:text-zinc-200">
-                        Удалённые кадры ({(scripts[selectedScript].shots_archived || []).length}) — текст сохранён, вернутся на свои места
-                      </summary>
-                      <div className="space-y-2 border-t border-white/10 p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-[11px] text-zinc-500">
-                            Кадры помнят свои позиции — можно спокойно разобрать раскадровку
-                            на тестовый рендер и собрать обратно.
-                          </p>
-                          <button
-                            type="button"
-                            onClick={restoreAllArchivedShots}
-                            className="shrink-0 rounded-md border border-primary/40 px-2 py-1 text-[11px] text-violet-200 transition-colors hover:bg-primary/10"
-                          >
-                            Вернуть все ({(scripts[selectedScript].shots_archived || []).length})
-                          </button>
-                        </div>
-                        {(scripts[selectedScript].shots_archived || []).map((shot, i) => (
-                          <div key={i} className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-2">
-                            <div className="min-w-0 flex-1">
-                              <p className="truncate text-xs text-zinc-300">{shot.speech || shot.scene || 'Пустой кадр'}</p>
-                              {shot.scene && shot.speech && (
-                                <p className="truncate text-[10px] text-zinc-600">{shot.scene}</p>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => restoreArchivedShot(i)}
-                              className="shrink-0 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:border-primary/40 hover:text-violet-200"
-                            >
-                              Вернуть
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => dropArchivedShot(i)}
-                              aria-label="Забыть кадр"
-                              title="Забыть окончательно"
-                              className="shrink-0 rounded-md p-1 text-zinc-600 transition-colors hover:text-red-300"
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  )}
-                </div>
-              )}
-
-              {storyboardSelected && (
-                <div>
-                  <label className="block text-sm font-medium text-zinc-300 mb-2 flex items-center gap-2">
-                    <Film size={14} /> Способ генерации видео
-                  </label>
-                  <div className="grid sm:grid-cols-2 gap-2">
-                    {STORYBOARD_GENERATION_OPTIONS.map((option) => (
-                      <button
-                        key={option.id}
-                        onClick={() => setStoryboardGenerationMode(option.id)}
-                        className={`p-3 rounded-lg border text-left transition-all ${
-                          storyboardGenerationMode === option.id
-                            ? 'border-violet-500/50 bg-violet-500/10 text-violet-200'
-                            : 'border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10'
-                        }`}
-                      >
-                        <div className="text-sm font-semibold">{option.label}</div>
-                        <div className="text-[10px] text-zinc-500 mt-1">{option.desc}</div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               {/* B-roll Mode */}
               {!storyboardSelected && (
@@ -5843,85 +5698,7 @@ export default function SaaShortsTab({
                 </div>
               )}
 
-              {/* Cost Estimate */}
-              {(() => {
-                const estimate = estimateSaasVideoCost({
-                  text: editedNarration,
-                  videoMode,
-                  ttsProvider,
-                  brollMode,
-                  hasSelectedActor: Boolean(selectedActor),
-                  hasReusableHead: Boolean(selectedHeadTemplate),
-                  lipsyncModel: lipSyncModel,
-                  script: scripts[selectedScript],
-                  storyboardGenerationMode,
-                });
-                const costDetails =
-                  selectedHeadTemplate
-                    ? 'Сохранённый talking-head + новая озвучка + Sync Lipsync. Быстрее, чем заново генерировать Kling/Hailuo.'
-                    : videoMode === 'storyboard_v3_standard'
-                    ? (storyboardGenerationMode === 'sliced_avatar'
-                        ? 'Озвучка ElevenLabs. Говорящие кадры — Kling Avatar (липсинк), b-roll — Kling V3; под каждый кадр ещё Flux-кадр.'
-                        : 'Озвучка ElevenLabs + видео Kling V3: кадры генерятся отдельно, липсинк не гарантирован.')
-                    : videoMode === 'storyboard_v3_pro'
-                    ? 'Озвучка ElevenLabs + видео Kling V3 Pro: выше детализация лиц и движений, тариф выше.'
-                    : videoMode === 'storyboard_veo31_quality'
-                    ? 'Озвучка ElevenLabs + видео Google Veo 3.1 — самая качественная и самая дорогая картинка.'
-                    : videoMode === 'lowcost'
-                    ? 'Озвучка + Hailuo 2.3 + VEED Lipsync. Дешёвый черновик: качество может плыть.'
-                    : videoMode === 'premium'
-                      ? 'Озвучка + Kling Avatar v2 Pro: чётче лицо и движения, тариф примерно вдвое выше.'
-                      : 'Озвучка + Kling Avatar v2 Standard. Основной режим: хорошее качество по разумной цене.';
-
-                // Пересъёмка: в счёт идёт только то, что снимается заново, —
-                // иначе карточка обещала бы полную цену рядом с кнопкой
-                // «Пересобрать ролик (бесплатно)».
-                const shotCount = (currentScript?.shots || []).length;
-                const rows = reshootEstimate
-                  ? [
-                      ['Длительность', `~${estimate.seconds} сек`],
-                      ['Переснимаем', `${renderPlan.reshoot.length} из ${shotCount}`],
-                      ['Озвучка', formatUsd(reshootEstimate.voiceCost)],
-                      ['Видео', formatUsd(reshootEstimate.videoCost)],
-                      ['B-roll', formatUsd(reshootEstimate.brollCost)],
-                    ]
-                  : [
-                      ['Длительность', `~${estimate.seconds} сек`],
-                      ['Озвучка', formatUsd(estimate.voiceCost)],
-                      ['Видео', formatUsd(estimate.videoCost)],
-                      ['Аватар', formatUsd(estimate.actorCost)],
-                      ['B-roll', formatUsd(estimate.brollCost)],
-                    ];
-
-                return (
-                  <div className="max-w-2xl p-4 bg-white/5 rounded-xl border border-white/10">
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <div className="text-sm font-semibold text-zinc-300">
-                          {reshootEstimate ? 'Стоимость пересъёмки' : 'Примерная стоимость'}
-                        </div>
-                        <div className="text-[11px] text-zinc-600 mt-1">
-                          {reshootEstimate
-                            ? `Кадры, которые не менялись, переезжают из прошлого рендера бесплатно. С нуля этот ролик стоил бы ${formatUsd(estimate.total)}.`
-                            : costDetails}
-                        </div>
-                      </div>
-                      <span className="text-lg text-green-400 font-semibold whitespace-nowrap">
-                        {formatUsd(reshootEstimate ? reshootEstimate.total : estimate.total)}
-                      </span>
-                    </div>
-
-                    <div className="mt-4 space-y-2 text-sm">
-                      {rows.map(([label, value]) => (
-                        <div key={label} className="flex items-center justify-between gap-4 border-t border-white/5 pt-2 first:border-t-0 first:pt-0">
-                          <span className="text-zinc-500">{label}</span>
-                          <span className="font-mono text-zinc-300">{value}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })()}
+              {renderCostEstimate()}
 
               {/* Missing keys warning */}
               {(!falKey || (ttsProvider === 'elevenlabs' && !elevenLabsKey)) && (
@@ -5934,7 +5711,7 @@ export default function SaaShortsTab({
             </div>
 
             <div className="flex justify-between">
-              <button onClick={() => setStep(1)} className="btn-secondary px-4 py-2 text-sm flex items-center gap-2">
+              <button onClick={() => setStep(previousReadyStep)} className="btn-secondary px-4 py-2 text-sm flex items-center gap-2">
                 <ChevronLeft size={14} /> Назад
               </button>
               <button
@@ -5946,15 +5723,6 @@ export default function SaaShortsTab({
                   <><Loader2 size={14} className="animate-spin" /> Генерирую...</>
                 ) : (!storyboardSelected && !selectedActor && !selectedHeadTemplate) ? (
                   <><User size={14} /> Выбери аватара на шаге «Setup»</>
-                ) : storyboardSelected && reshootCost !== null ? (
-                  // Пересъёмка: снятые кадры переезжают из прошлого джоба, в цене
-                  // только то, что снимается заново. Ничего не менялось — значит
-                  // ролик просто пересобирается из готовых клипов.
-                  renderPlan.reshoot.length === 0
-                    ? (<><Film size={14} /> Пересобрать ролик (бесплатно)</>)
-                    : (<><Film size={14} /> Переснять {renderPlan.reshoot.length} {pluralShots(renderPlan.reshoot.length)} ({formatUsd(reshootCost)})</>)
-                ) : storyboardSelected ? (
-                  <><Film size={14} /> Сгенерировать видео ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: false, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : selectedHeadTemplate ? (
                   <><Volume2 size={14} /> Видео из сохранённой головы ({formatUsd(estimateSaasVideoCost({ text: editedNarration, videoMode, ttsProvider, brollMode, hasSelectedActor: Boolean(selectedActor), hasReusableHead: true, lipsyncModel: lipSyncModel, script: scripts[selectedScript], storyboardGenerationMode }).total)})</>
                 ) : (
@@ -6155,10 +5923,11 @@ export default function SaaShortsTab({
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Video Player */}
                 <div className="aspect-[9/16] max-h-[500px] bg-black rounded-xl overflow-hidden relative">
-                  <video
+                  <MediaPlayer
                     src={getApiUrl(genResult.video_url)}
-                    controls
-                    className="w-full h-full object-contain"
+                    label="Готовый ролик"
+                    className="w-full h-full"
+                    mediaClassName="object-contain"
                     autoPlay
                   />
                 </div>
@@ -6464,6 +6233,9 @@ export default function SaaShortsTab({
         )}
       </div>
 
+    </div>
+      )}
+
       {/* Отказ редактора кадра: показываем дословный ответ модели и даём выбрать
           другую. Молчаливой подмены больше нет — она оплачивалась пользователем,
           который о ней не знал. */}
@@ -6489,6 +6261,6 @@ export default function SaaShortsTab({
         caption={lightbox?.caption || ''}
         onClose={() => setLightbox(null)}
       />
-    </div>
+    </>
   );
 }

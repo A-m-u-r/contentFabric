@@ -1,5 +1,6 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Download, Youtube, Instagram, Video, Copy, Check, Play } from 'lucide-react';
+import MediaPlayer from './MediaPlayer';
 
 export default function GalleryCard({ clip }) {
     const [copied, setCopied] = useState(null);
@@ -72,11 +73,12 @@ export default function GalleryCard({ clip }) {
             {/* Video Player - Lazy loaded */}
             <div className="aspect-[9/16] bg-black relative group/video">
                 {isVisible ? (
-                    <video
+                    <MediaPlayer
                         ref={videoRef}
                         src={clip.url}
-                        controls
-                        className="w-full h-full object-cover"
+                        label={clip.title || 'Видео из галереи'}
+                        className="w-full h-full"
+                        mediaClassName="object-cover"
                         playsInline
                         preload="metadata"
                         onLoadedData={() => setHasLoaded(true)}

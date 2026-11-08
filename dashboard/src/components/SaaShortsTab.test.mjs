@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { createServer } from 'vite';
 
 let server;
@@ -12,17 +14,111 @@ let videoPrefsForContentItem;
 let initializeGenerationPreferences;
 let generationPresetPreferences;
 let generationSpeech;
+let SaaShortsTab;
 
 before(async () => {
   server = await createServer({
     root: fileURLToPath(new URL('../..', import.meta.url)),
     appType: 'custom',
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
   });
-  ({ buildSaaSAnalyzeHeaders, isManualStoryboardImport, elevenLabsTtsSettings, contentPlanScriptDefaults, videoPrefsForContentItem, initializeGenerationPreferences, generationPresetPreferences, generationSpeech } = await server.ssrLoadModule('/src/components/SaaShortsTab.jsx'));
+  ({ default: SaaShortsTab, buildSaaSAnalyzeHeaders, isManualStoryboardImport, elevenLabsTtsSettings, contentPlanScriptDefaults, videoPrefsForContentItem, initializeGenerationPreferences, generationPresetPreferences, generationSpeech } = await server.ssrLoadModule('/src/components/SaaShortsTab.jsx'));
 });
 
 after(async () => server?.close());
+
+function renderSavedShorts(snapshot, props = {}) {
+  const saved = JSON.stringify({ version: 2, timestamp: Date.now(), ...snapshot });
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: (key) => key === 'saasshorts_cache' ? saved : null,
+  } });
+  try {
+    return renderToStaticMarkup(createElement(SaaShortsTab, props));
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else delete globalThis.localStorage;
+  }
+}
+
+test('a saved storyboard shows the ordered shots with one preview and editable reply', () => {
+  const html = renderSavedShorts({ step: 2, scripts: [{
+    format: 'storyboard_v3', title: 'Ужин', shots: [
+      { shot_number: 1, speech: 'Первый кадр', scene: 'Кухня', start: 0, end: 4 },
+      { shot_number: 2, speech: 'Второй кадр', scene: 'Тарелка', start: 4, end: 16 },
+    ],
+  }] }, { falKey: '__saved__' });
+  assert.ok(html.includes('data-storyboard-editor'), 'saved storyboard should open the dedicated editor');
+  assert.equal((html.match(/data-storyboard-shot=/g) || []).length, 2);
+  assert.ok(html.includes('data-storyboard-timeline'));
+  assert.equal((html.match(/data-timeline-clip=/g) || []).length, 2);
+  assert.match(html, /aria-label="Позиция на таймлайне"/);
+  assert.match(html, /grid-template-columns:25% 75%/);
+  assert.ok(html.includes('aria-label="Предпросмотр"'));
+  assert.match(html, /<textarea[^>]*>Первый кадр<\/textarea>/);
+  assert.doesNotMatch(html, /<textarea[^>]*>Второй кадр<\/textarea>/);
+});
+
+test('the storyboard uses saved cut times only while the preview matches the current shots', () => {
+  const shots = [
+    { speech: 'Первый кадр', start: 0, end: 4, timeline_start: 0, timeline_end: 2 },
+    { speech: 'Второй кадр', start: 4, end: 8, timeline_start: 2, timeline_end: 8 },
+  ];
+  const script = { format: 'storyboard_v3', title: 'Ужин', shots,
+    _source_video_url: '/preview.mp4', _render_baseline: shots };
+  const render = (data) => renderSavedShorts({ step: 2, scripts: [data] }, { falKey: '__saved__' });
+  const saved = render(script);
+  assert.match(saved, /<video [^>]*src="[^"]*\/preview\.mp4"/);
+  assert.match(saved, /grid-template-columns:25% 75%/);
+  const edited = render({ ...script, shots: [{ ...shots[0], speech: 'Новая реплика' }, shots[1]] });
+  assert.doesNotMatch(edited, /<video [^>]*src="[^"]*\/preview\.mp4"/);
+  assert.match(edited, /grid-template-columns:50% 50%/);
+});
+
+test('the storyboard warns when spoken length misses the brief target', () => {
+  const snapshot = { step: 2, scriptMode: 'ai', targetDurationSeconds: 15, scripts: [{
+    format: 'storyboard_v3', title: 'Ужин', shots: [{ speech: 'Короткая реплика', scene: 'Кухня', start: 0, end: 15 }],
+  }] };
+  const props = { falKey: '__saved__', elevenLabsKey: '__saved__' };
+  assert.match(renderSavedShorts(snapshot, props), /Сценарий короче цели на 10 с/);
+  assert.doesNotMatch(renderSavedShorts({ ...snapshot, scriptMode: 'custom' }, props), /короче цели/);
+});
+
+test('brief displays the current step and explains a missing key beside its action', () => {
+  const html = renderSavedShorts({ step: 0 });
+  assert.match(html, /data-shorts-workflow="0"/);
+  assert.match(html, /data-shorts-studio="true"/);
+  assert.match(html, /class="shorts-workflow__next-step".*?Написать сценарии.*?data-shorts-api-note/);
+  assert.match(html, /aria-current="step"/);
+  assert.match(html, /data-shorts-setup/);
+  assert.match(html, /data-shorts-api-note/);
+});
+
+test('manual storyboard import keeps the keyless path available', () => {
+  const html = renderSavedShorts({ step: 0, scriptMode: 'custom', scriptFormat: 'storyboard_v3',
+    customScript: '## КАДР 1 — 0:00–0:04\nОна говорит: Привет',
+  });
+  assert.match(html, /data-shorts-setup/);
+  const importButton = html.match(/<button[^>]*>Импортировать раскадровку<\/button>/)?.[0];
+  assert.ok(importButton);
+  assert.doesNotMatch(importButton, /\bdisabled\b/);
+  assert.doesNotMatch(html, /data-shorts-api-note/);
+});
+
+test('the script review exposes its choices separately from the selected scenario', () => {
+  const html = renderSavedShorts({ step: 1, analysis: { product_name: 'Ужин' }, selectedScript: 1, scripts: [
+    { title: 'Первый вариант', format: 'storyboard_v3', shots: [{ speech: 'Первая реплика' }] },
+    { title: 'Второй вариант', format: 'storyboard_v3', shots: [{ speech: 'Вторая реплика' }] },
+  ] });
+  assert.match(html, /data-shorts-workflow="1"/);
+  assert.match(html, /data-shorts-studio="true"/);
+  assert.match(html, /<header class="shorts-workflow__studio-header">.*?К раскадровке.*?<\/header>/);
+  assert.equal((html.match(/data-shorts-script-option=/g) || []).length, 2);
+  assert.match(html, /data-shorts-script-detail/);
+  assert.match(html, /Вторая реплика/);
+  assert.doesNotMatch(html, /Первая реплика/);
+  assert.match(html, /К раскадровке/);
+});
 
 test('calm preview comparison uses spoken text, not removed acting tags', () => {
   const tagged = '[whispers] Привет. [curious] Как дела?';

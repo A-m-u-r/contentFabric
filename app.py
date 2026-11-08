@@ -151,17 +151,19 @@ def init_auth_db() -> None:
                 style TEXT NOT NULL DEFAULT 'ugc',
                 language TEXT NOT NULL DEFAULT 'ru',
                 actor_gender TEXT NOT NULL DEFAULT 'female',
+                presenter_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
         )
-        try:
-            conn.execute("ALTER TABLE business_profiles ADD COLUMN text_model TEXT NOT NULL DEFAULT 'fast'")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                raise
+        for column in ("text_model TEXT NOT NULL DEFAULT 'fast'", "presenter_json TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE business_profiles ADD COLUMN {column}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS content_workspaces (
@@ -405,6 +407,7 @@ def list_user_api_key_status(user_id: str) -> dict:
 def _public_business_profile(row) -> Optional[dict]:
     if not row:
         return None
+    presenter_json = row["presenter_json"] if "presenter_json" in row.keys() else None
     return {
         "id": row["id"],
         "name": row["name"],
@@ -416,9 +419,29 @@ def _public_business_profile(row) -> Optional[dict]:
         "style": row["style"],
         "language": row["language"],
         "actor_gender": row["actor_gender"],
+        **({"presenter": json.loads(presenter_json)} if presenter_json is not None else {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _validate_business_presenter(user_id: str, presenter: dict) -> None:
+    photo_urls = {presenter[field] for field in ("actor_url", "face_url") if presenter.get(field)}
+    if photo_urls:
+        images = list_local_actor_gallery(owner_user_id=user_id)
+        owned_urls = {image.get("url") for image in images}
+        owned_urls.update(f"/videos/{image['key']}" for image in images if image.get("key"))
+        if not photo_urls <= owned_urls:
+            raise ValueError("Аватар или портрет должен быть из твоей галереи.")
+
+    for camera, url in (presenter.get("plate_urls") or {}).items():
+        path = _safe_output_subpath(url) if url.startswith("/videos/storyboard_frames/") else None
+        if (camera not in PLATE_CAMERA_KEYS or not path or not os.path.isfile(path)
+                or os.path.splitext(path)[1].lower() not in STORYBOARD_FRAME_EXTENSIONS):
+            raise ValueError("Ракурс нужно загрузить в своём аккаунте для выбранной камеры.")
+        photo = _read_local_actor_metadata(path)
+        if photo.get("url") != url or photo.get("owner_user_id") != user_id or photo.get("camera") != camera:
+            raise ValueError("Ракурс нужно загрузить в своём аккаунте для выбранной камеры.")
 
 
 def upsert_business_profile(user_id: str, profile: dict) -> dict:
@@ -428,6 +451,12 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
         raise ValueError("Business name is required")
     if not description:
         raise ValueError("Business description is required")
+
+    presenter_supplied = "presenter" in profile
+    presenter = profile.get("presenter")
+    if presenter is not None:
+        _validate_business_presenter(user_id, presenter)
+    presenter_json = json.dumps(presenter, ensure_ascii=False) if presenter_supplied else None
 
     profile_id = (profile.get("id") or "").strip() or str(uuid.uuid4())
     now = _utc_now()
@@ -441,9 +470,9 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
             """
             INSERT INTO business_profiles (
                 id, user_id, name, description, topic, script_mode, script_format, text_model,
-                style, language, actor_gender, created_at, updated_at
+                style, language, actor_gender, presenter_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
@@ -454,7 +483,9 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
                 style = excluded.style,
                 language = excluded.language,
                 actor_gender = excluded.actor_gender,
+                presenter_json = CASE WHEN ? THEN excluded.presenter_json ELSE business_profiles.presenter_json END,
                 updated_at = excluded.updated_at
+            WHERE business_profiles.user_id = excluded.user_id
             """,
             (
                 profile_id,
@@ -468,14 +499,18 @@ def upsert_business_profile(user_id: str, profile: dict) -> dict:
                 profile.get("style") or "ugc",
                 profile.get("language") or "ru",
                 profile.get("actor_gender") or "female",
+                presenter_json,
                 created_at,
                 now,
+                presenter_supplied,
             ),
         )
         row = conn.execute(
             "SELECT * FROM business_profiles WHERE id = ? AND user_id = ?",
             (profile_id, user_id),
         ).fetchone()
+    if row is None:
+        raise ValueError("Business profile not found")
     return _public_business_profile(row)
 
 
@@ -969,6 +1004,19 @@ class ApiKeySaveRequest(BaseModel):
     api_key: str
 
 
+class BusinessPresenterPreset(BaseModel):
+    actor_url: Optional[str] = Field(default=None, max_length=2048)
+    face_url: Optional[str] = Field(default=None, max_length=2048)
+    plate_urls: Optional[Dict[str, str]] = Field(default=None, max_length=20)
+    voice_id: Optional[str] = Field(default=None, max_length=256)
+    voice_name: Optional[str] = Field(default=None, max_length=256)
+    tts_provider: Optional[Literal["auto", "elevenlabs", "fal_minimax"]] = None
+    minimax_voice_id: Optional[str] = Field(default=None, max_length=256)
+    elevenlabs_model: Optional[Literal["eleven_v3", "eleven_v4"]] = None
+    elevenlabs_stability: Optional[float] = Field(default=None, ge=0, le=1)
+    elevenlabs_similarity: Optional[float] = Field(default=None, ge=0, le=1)
+
+
 class BusinessProfileRequest(BaseModel):
     id: Optional[str] = None
     name: str
@@ -980,6 +1028,11 @@ class BusinessProfileRequest(BaseModel):
     style: str = "ugc"
     language: str = "ru"
     actor_gender: str = "female"
+    presenter: Optional[BusinessPresenterPreset] = None
+
+
+class BusinessPresenterUpdateRequest(BaseModel):
+    presenter: Optional[BusinessPresenterPreset]
 
 
 class ContentWorkspaceRequest(BaseModel):
@@ -1265,10 +1318,37 @@ async def user_save_business_profile(
 ):
     user = require_user_from_authorization(authorization)
     try:
-        profile = upsert_business_profile(user["id"], req.dict())
+        profile = upsert_business_profile(user["id"], req.model_dump(exclude_unset=True))
         return {"profile": profile, "profiles": list_business_profiles(user["id"])}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/api/user/business-profiles/{profile_id}/presenter")
+async def user_update_business_presenter(
+    profile_id: str,
+    req: BusinessPresenterUpdateRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    user_id = require_user_from_authorization(authorization)["id"]
+    presenter = req.model_dump(exclude_unset=True)["presenter"]
+    if presenter is not None:
+        try:
+            _validate_business_presenter(user_id, presenter)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    with _auth_db() as conn:
+        update = conn.execute(
+            "UPDATE business_profiles SET presenter_json = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(presenter, ensure_ascii=False), _utc_now(), profile_id, user_id),
+        )
+        if not update.rowcount:
+            raise HTTPException(status_code=404, detail="Business profile not found")
+        row = conn.execute(
+            "SELECT * FROM business_profiles WHERE id = ? AND user_id = ?", (profile_id, user_id),
+        ).fetchone()
+    return {"profile": _public_business_profile(row), "profiles": list_business_profiles(user_id)}
 
 
 @app.delete("/api/user/business-profiles/{profile_id}")
@@ -4237,19 +4317,15 @@ async def saasshorts_actor_options(
         urls = []
         for p in paths:
             s3_url = upload_actor_to_s3(p, description=desc)
-            if s3_url:
-                urls.append(s3_url)
-            else:
-                # Fallback to local URL if S3 fails
-                local_url = f"/videos/saas_actors_{job_id}/{os.path.basename(p)}"
-                _write_local_actor_metadata(
-                    p,
-                    local_url,
-                    description=desc,
-                    storage="local",
-                    owner_user_id=user.get("id") if user else None,
-                )
-                urls.append(local_url)
+            url = s3_url or _output_file_url(p)
+            _write_local_actor_metadata(
+                p,
+                url,
+                description=desc,
+                storage="s3" if s3_url else "local",
+                owner_user_id=user.get("id") if user else None,
+            )
+            urls.append(url)
 
         return {"images": urls}
 
@@ -4846,7 +4922,7 @@ def _sync_music_workspaces(owner: str, job_id: str, metadata: dict):
             for key in ("genResult", "result"):
                 if isinstance(snapshot.get(key), dict):
                     snapshot[key].update({field: metadata[field] for field in
-                                          ("video_url", "duration", "background_music", "music_track", "music_volume", "versions")
+                                          ("video_url", "duration", "background_music", "music_track", "music_volume", "versions", "shots")
                                           if field in metadata})
             snapshot.setdefault("videoPrefs", {}).update(backgroundMusic=metadata["background_music"],
                                                          musicTrack=metadata["music_track"], musicVolume=metadata["music_volume"])
@@ -4907,7 +4983,8 @@ def remix_local_saas_music(job_id: str, user: dict, music_track: str, music_volu
         filename = f"__music_{uuid.uuid4().hex}.mp4"
         output = os.path.join(job_dir, filename)
         # This is deliberately only FFmpeg: no TTS, image, video or vision API calls.
-        composite_storyboard_video(clips, audio, subtitles, output, music_path=music_path, music_volume=music_volume)
+        composite_storyboard_video(clips, audio, subtitles, output, music_path=music_path, music_volume=music_volume,
+                                   timeline_shots=metadata["shots"])
         versions = _build_saas_video_versions(metadata, prefix + filename, "", "", None)
         versions[-1].update(label="Музыка" if background_music else "Без музыки", edit_kind="music",
                             music_track=music_track, music_volume=music_volume, additional_cost=0)
@@ -4920,7 +4997,7 @@ def remix_local_saas_music(job_id: str, user: dict, music_track: str, music_volu
         _sync_music_workspaces(user["id"], job_id, metadata)
         result = (saas_jobs.get(job_id) or {}).get("result")
         if isinstance(result, dict):
-            result.update({key: metadata[key] for key in ("video_url", "duration", "music_track", "music_volume", "background_music")})
+            result.update({key: metadata[key] for key in ("video_url", "duration", "music_track", "music_volume", "background_music", "shots")})
         return metadata
     finally:
         lock.release()

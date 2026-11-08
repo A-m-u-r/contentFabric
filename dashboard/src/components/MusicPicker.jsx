@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useState } from 'react';
 import { Music2 } from 'lucide-react';
 import { getApiUrl } from '../config';
+import MediaPlayer from './MediaPlayer';
 
 export function musicRequestSettings(enabled, track = 'auto', volume = 1) {
   return { background_music: enabled, music_track: track, music_volume: volume };
@@ -50,8 +51,8 @@ export default function MusicPicker({ enabled, value, volume, onEnabledChange, o
             className="min-w-0 flex-1 accent-violet-500" />
           <output className="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-400">{Math.round(volume * 100)}%</output>
         </div>
-        {selected && <audio key={selected.id} aria-label={`Прослушать ${selected.name}`} controls preload="none"
-          src={getApiUrl(selected.preview_url)} className="h-9 w-full max-w-full" />}
+        {selected && <MediaPlayer key={selected.id} kind="audio" label={selected.name} compact disabled={disabled} preload="none"
+          src={getApiUrl(selected.preview_url)} className="w-full max-w-full" />}
       </>}
       {error && <p role="alert" className="text-xs text-red-300">{error}</p>}
     </fieldset>

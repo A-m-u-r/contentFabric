@@ -3082,13 +3082,14 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
             config = {
                 "fal_key": "k", "tts_provider": "fal_minimax", "language": "ru",
                 "actor_gender": "female", "video_mode": "storyboard_v3_standard",
-                "storyboard_generation_mode": "per_shot",
+                "storyboard_generation_mode": "per_shot", "background_music": False,
             }
 
-            def fake_voiceover(text, output_path, **kwargs):
+            def fake_voiceover(shots, output_dir, title_slug, **kwargs):
+                output_path = os.path.join(output_dir, f"{title_slug}_voice.mp3")
                 with open(output_path, "wb") as f:
                     f.write(b"voice")
-                return {"path": output_path, "provider": "fal_minimax", "voice_id": "v"}
+                return {"path": output_path, "provider": "fal_minimax", "bounds": {}}
 
             def fake_shot(shot, fal_key, output_path, tier="standard", **kwargs):
                 with open(output_path, "wb") as f:
@@ -3100,22 +3101,30 @@ class SaaSAnalyzePacingContractTests(unittest.TestCase):
                     f.write("[Script Info]\n")
                 return output_path
 
-            def fake_composite(clips, audio_path, srt_path, output_path, **kwargs):
-                with open(output_path, "wb") as f:
-                    f.write(b"final")
-                return output_path
+            def fake_ffmpeg(command, **kwargs):
+                if "-filter_complex" in command and command[-1].endswith("_storyboard_final.mp4"):
+                    with open(command[-1], "wb") as f:
+                        f.write(b"final")
+                return MagicMock(stdout="", stderr="")
 
-            with patch("saasshorts.generate_voiceover_with_fallback", side_effect=fake_voiceover), \
+            with patch("saasshorts.build_incremental_voiceover", side_effect=fake_voiceover), \
                  patch("saasshorts.generate_storyboard_shot_clip", side_effect=fake_shot), \
                  patch("saasshorts.generate_storyboard_ass_subtitles", side_effect=fake_subs), \
-                 patch("saasshorts.composite_storyboard_video", side_effect=fake_composite), \
-                 patch("saasshorts._decodable_audio_duration", return_value=20), \
+                 patch("saasshorts.prepare_voiceover_for_video_generation", side_effect=lambda path, **_: {"path": path}), \
+                 patch("saasshorts.transcribe_audio_for_subs", return_value=[]), \
+                 patch("saasshorts._measure_final_loudness", return_value=None), \
+                 patch("saasshorts.subprocess.run", side_effect=fake_ffmpeg), \
+                 patch("saasshorts._get_media_stream_duration", return_value=19.966667), \
                  patch("saasshorts._get_media_duration", return_value=20):
                 result = generate_storyboard_video(script, config, tmp)
 
             durations = [round(s["end"] - s["start"]) for s in result["storyboard_shots"]]
             # 4 spoken words over 20s: the 2-word shot gets double the 1-word shots.
             self.assertEqual(durations, [5, 5, 10])
+            self.assertEqual(
+                [(s.get("timeline_start"), s.get("timeline_end")) for s in result["storyboard_shots"]],
+                [(0.0, 5.0), (5.0, 10.0), (10.0, 599 / 30)],
+            )
 
     def test_prompt_fallback_mentions_reference_only_for_actor_shots(self):
         neutral_broll = saasshorts._build_storyboard_generation_prompt({

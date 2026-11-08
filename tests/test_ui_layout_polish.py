@@ -277,11 +277,9 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_app_shell_uses_mobile_bottom_navigation_instead_of_persistent_sidebar(self):
         app = APP.read_text(encoding="utf-8")
 
-        self.assertIn("MobileTabBar", app)
-        self.assertIn("hidden md:flex", app)
-        self.assertIn("fixed inset-x-0 bottom-0", app)
-        self.assertIn("mb-20", app)
-        self.assertIn("md:mb-0", app)
+        self.assertRegex(app, r'<aside className="app-chrome__sidebar\b[^"]*\bhidden\b[^"]*\bmd:flex\b')
+        self.assertRegex(app, r'<nav className="app-chrome__mobile-nav\b[^"]*\bmd:hidden\b')
+        self.assertRegex(app, r'</main>\s*<MobileTabBar />')
 
     def test_sidebar_does_not_show_open_source_github_card(self):
         app = APP.read_text(encoding="utf-8")
@@ -399,10 +397,11 @@ class UILayoutPolishTests(unittest.TestCase):
         )
         self.assertIn("fallbackSeconds: targetDurationSeconds", tab)
         self.assertIn("fallbackSeconds = TYPICAL_VIDEO_SECONDS", tab)
-        self.assertIn('role="group"', tab)
-        self.assertIn('aria-labelledby="target-duration-label"', tab)
-        self.assertIn("Длина ролика", tab)
-        self.assertIn("Применяется ко всем вариантам сценария", tab)
+        duration = tab.split('data-section="target-duration-section"', 1)[1].split("</select>", 1)[0]
+        self.assertIn('<label htmlFor="shorts-setup-duration">Длина ролика</label>', duration)
+        self.assertIn('id="shorts-setup-duration"', duration)
+        self.assertIn("setTargetDurationSeconds(Number(event.target.value))", duration)
+        self.assertIn("По длительности озвучки", duration)
 
     def test_storyboard_editor_can_generate_frames_before_paid_video(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -506,34 +505,15 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("reshootEstimate ? reshootEstimate.total : estimate.total", tab)
         self.assertIn("пересборка бесплатна", tab)
 
-    def test_shot_frame_preview_stays_a_thumbnail_on_narrow_screens(self):
-        tab = SAAS_SHORTS.read_text(encoding="utf-8")
-
-        # Кадр 9:16 во всю ширину карточки давал 734x1306 px на каждый кадр и
-        # растягивал раскадровку на 10 000 px — превью держим миниатюрой.
-        self.assertIn("grid gap-3 sm:grid-cols-[120px,minmax(0,1fr)]", tab)
-        self.assertNotIn("grid gap-3 lg:grid-cols-[120px,minmax(0,1fr)]", tab)
-        self.assertIn('aspect-[9/16] w-[104px] shrink-0', tab)
-
     def test_avatar_and_voice_selection_live_on_setup_step(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        # Аватар + голос выбираются на шаге Setup (ДО платного превью кадров),
-        # а не на шаге раскадровки. Модалка «Настройки аватара» убрана —
-        # пол/загрузка/озвучка видны прямо в блоке ведущего.
-        self.assertIn('data-section="presenter-section"', tab)
-        self.assertIn("Движок озвучки", tab)
-        self.assertIn("Голос озвучки", tab)
-        self.assertIn("Аватар проекта", tab)
-        self.assertIn("Сохранённые аватары", tab)
-        # Раскладка модалки удалена вместе с её состоянием.
-        self.assertNotIn("avatarSettingsOpen", tab)
-        self.assertNotIn("setActorSource", tab)
-        # Блок ведущего живёт в Setup — до раздела анализа (шаг 1).
-        self.assertLess(tab.index('data-section="presenter-section"'), tab.index("Step 1: Analysis Results"))
-        # …и после выбора видео-модели, но до перехода к раскадровке (шаг 2).
-        self.assertLess(tab.index('data-section="video-mode-section"'), tab.index('data-section="presenter-section"'))
-        self.assertLess(tab.index('data-section="presenter-section"'), tab.index("── Step 2: Configure"))
+        # Аватар и голос можно выбрать в брифе до платного превью кадров.
+        brief = tab.split("data-shorts-setup", 1)[1].split("Step 1: Analysis Results", 1)[0]
+        presenter = brief.split('data-section="presenter-section"', 1)[1]
+        self.assertIn("Движок озвучки", presenter)
+        self.assertIn("Голос озвучки", presenter)
+        self.assertIn("Сохранённые аватары", presenter)
 
     def test_selected_voice_does_not_drift_between_generations(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -605,10 +585,8 @@ class UILayoutPolishTests(unittest.TestCase):
 
         # Юзер терялся в блоке ведущего: пол, 9 плиток аватаров, загрузка,
         # движок озвучки, список голосов и ручной ID лежали одной простынёй.
-        self.assertIn("avatarPickerOpen", tab)
-        self.assertIn("voicePickerOpen", tab)
-        self.assertIn("Сменить аватар", tab)
-        self.assertIn("Сменить голос", tab)
+        self.assertIn('aria-expanded={avatarPickerOpen}', tab)
+        self.assertIn('aria-expanded={voicePickerOpen}', tab)
         self.assertIn("selectedVoiceLabel", tab)
         self.assertIn("Ввести ID голоса вручную", tab)
         # Английские огрызки в русском UI убраны.
@@ -658,7 +636,7 @@ class UILayoutPolishTests(unittest.TestCase):
         add = tab[tab.index("const addShotWithSpeech"):]
         self.assertIn("fillShotDetails", add[:add.index("\n  };")])
 
-    def test_the_reel_set_is_its_own_field_above_the_shots(self):
+    def test_the_reel_set_is_its_own_field_in_storyboard_settings(self):
         """Место действия — свойство сценария, а не текст, спрятанный в кадре 1.
 
         Пока оно жило внутри кадра, туда писали и камеру, и позу, и внешность —
@@ -668,15 +646,13 @@ class UILayoutPolishTests(unittest.TestCase):
 
         self.assertIn("/api/saasshorts/storyboard-set", tab)
         self.assertIn("pickReelSet", tab)
-        self.assertIn("Место действия ролика", tab)
-        self.assertIn("Подобрать ИИ", tab)
-        self.assertIn("set_prompt", tab)
-        # Карточка стоит до списка кадров.
-        self.assertLess(tab.index("Место действия ролика"), tab.index("Добавить кадр"))
-        # У сценариев со своим полем кадр 1 перестаёт быть «тем самым», у старых
-        # остаётся: подпись обязана говорить правду про обе схемы.
+        settings = tab.split("const renderStoryboardSettings", 1)[1].split("Место действия ролика", 1)[1]
+        self.assertIn("onClick={pickReelSet}", settings)
+        self.assertIn("value={currentScript?.set_scene || ''}", settings)
+        self.assertIn("set_prompt: event.target.value", settings)
+        self.assertIn("settings={renderStoryboardSettings()}", tab)
+        # Старые раскадровки без отдельного места используют первый говорящий кадр.
         self.assertIn("shotIndex === setDefiningShotIndex && !hasOwnSet", tab)
-        self.assertIn("Место — из поля «Место действия ролика» выше", tab)
 
     def test_storyboard_duration_estimate_tracks_voiceover_not_a_flat_floor(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -687,8 +663,6 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertNotIn("Math.max(12, Math.min(75, Math.round(words / 2.5)))", tab)
         # Учитываем паузы/теги, чтобы оценка держалась не НИЖЕ реального аудио.
         self.assertIn("tags * 0.8 + pauses * 0.4", tab)
-        # И явно поясняем, что видео не длиннее речи.
-        self.assertIn("видео не длиннее речи", tab)
 
     def test_script_cards_always_show_narration_derived_duration(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -699,11 +673,11 @@ class UILayoutPolishTests(unittest.TestCase):
     def test_ai_shorts_exposes_ai_storyboard_format_selector_in_setup(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
 
-        self.assertIn("Формат сценария", tab)
-        self.assertIn("ИИ сгенерирует кадры, действия, текст на экране и промпты для выбранной видео-модели.", tab)
-        self.assertNotIn('<div id="script-format-section" className="hidden">', tab)
-        self.assertLess(tab.index("Источник сценария"), tab.index("Формат сценария"))
-        self.assertLess(tab.index("Формат сценария"), tab.index("video-mode-section"))
+        format_field = tab.split('data-section="script-format-section"', 1)[1].split("</select>", 1)[0]
+        self.assertIn('<label htmlFor="shorts-setup-format">Формат сценария</label>', format_field)
+        self.assertIn('id="shorts-setup-format"', format_field)
+        self.assertIn("setScriptFormat(event.target.value)", format_field)
+        self.assertIn("SCRIPT_FORMAT_OPTIONS.map", format_field)
 
     def test_ai_shorts_storyboard_setup_supports_business_profiles_and_frame_uploads(self):
         tab = SAAS_SHORTS.read_text(encoding="utf-8")
@@ -730,11 +704,9 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertNotIn("Good baseline for tests and daily volume", tab)
         self.assertNotIn("Best choice when the video is going to publish", tab)
         self.assertIn("Количество вариантов сценария", tab)
-        self.assertIn("Сейчас:", tab)
-        self.assertIn("selectedBusinessProfileId", tab)
+        self.assertIn("value={selectedBusinessProfile ? String(businessProfileKey(selectedBusinessProfile)) : ''}", tab)
         self.assertIn("Управлять проектами", tab)
-        self.assertIn("Аватар проекта", tab)
-        self.assertIn("Сохранённые аватары", tab)
+        self.assertIn("Ведущий и голос", tab)
 
     def test_wizard_steps_can_be_walked_forward_again_after_going_back(self):
         """Уйдя назад в настройку, к своему готовому ролику можно вернуться.
@@ -749,26 +721,9 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("const nextReadyStep =", tab)
         self.assertIn("setStep(nextReadyStep)", tab)
         self.assertIn("setStep(previousReadyStep)", tab)
-        self.assertIn('aria-label="Вперёд"', tab)
-        self.assertIn('aria-label="Назад"', tab)
         # Шаг без данных отрисуется пустым, поэтому переход в него закрыт.
-        self.assertIn("disabled={!stepReady[i] || i === step}", tab)
-        self.assertIn("пока нечего показать", tab)
-
-    def test_storyboard_flags_a_duration_that_missed_the_target(self):
-        """«Выбрал 15 секунд — сгенерилось на 24» должно быть видно до рендера.
-
-        Допуск и оценка те же, что на бэкенде, и пересчитываются на каждой правке
-        кадров: длину ролика задаёт озвучка, поэтому лишний текст — это лишние
-        секунды и лишние оплаченные кадры.
-        """
-        tab = SAAS_SHORTS.read_text(encoding="utf-8")
-
-        self.assertIn("const durationGap =", tab)
-        self.assertIn("Math.abs(storyboardSeconds - targetDurationSeconds) > 2", tab)
-        self.assertIn("{durationGap !== 0 && (", tab)
-        self.assertIn("длиннее", tab)
-        self.assertIn("короче", tab)
+        self.assertIn("disabled={!stepReady[index] || index === step}", tab)
+        self.assertIn("onClick={() => setStep(index)}", tab)
 
     def test_storyboard_says_who_owns_the_place_and_the_camera(self):
         """Раскадровка перестаёт обещать то, чего снимающий код не делает.
@@ -784,12 +739,11 @@ class UILayoutPolishTests(unittest.TestCase):
         self.assertIn("const talkingCameras = (() => {", tab)
         self.assertIn("isWhisperShot(shot)", tab)
         self.assertIn("order % 2 === 0 ? 'front' : 'side'", tab)
-        self.assertIn("Камера: {CAMERA_LABELS[talkingCameras[shotIndex]]}", tab)
+        self.assertIn("CAMERA_LABELS[talkingCameras[shotIndex]]", tab)
         # Место действия принадлежит одному кадру, а не каждому.
         self.assertIn("const setDefiningShotIndex =", tab)
         self.assertIn("место действия всего ролика", tab)
         self.assertIn("Поза, взгляд, что делают руки", tab)
-        self.assertIn("новую комнату или", tab)
 
     def test_talking_shots_are_told_to_describe_the_moment_not_the_room(self):
         """То же правило — в промптах моделей, иначе они пишут про камеру.

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Target, CalendarDays } from 'lucide-react';
+import { Upload, Download, Archive, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, RotateCcw, Calendar, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Target, CalendarDays } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -13,6 +13,8 @@ import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import { getApiUrl } from './config';
 import { useRuntimeLocalization } from './localization/runtimeLocalization';
+import './AppChrome.css';
+import './AppLegacyLight.css';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -68,22 +70,24 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
   const selectedProfile = profiles.find(p => p.username === selectedUserId) || profiles[0];
 
   return (
-    <div className="relative z-50">
+    <div className="app-chrome__profile relative z-50 min-w-0">
       <button
+        type="button"
         onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center justify-between bg-surface border border-white/10 rounded-lg px-3 py-2 text-sm text-zinc-300 hover:bg-white/5 transition-colors min-w-[180px]"
+        aria-expanded={isOpen}
+        className="app-chrome__profile-toggle"
       >
-        <span className="flex items-center gap-2">
-          <div className="w-5 h-5 rounded-full bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center text-[10px] font-bold text-white">
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="app-chrome__profile-avatar h-5 w-5 text-[10px]">
             {selectedProfile?.username?.substring(0, 1).toUpperCase() || "U"}
-          </div>
-          <span className="font-medium text-white truncate max-w-[100px]">{selectedProfile?.username || "Select User"}</span>
+          </span>
+          <span className="truncate font-medium">{selectedProfile?.username || 'Выбрать профиль'}</span>
         </span>
-        <ChevronDown size={14} className={`text-zinc-500 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown size={14} className={`shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
       {isOpen && (
-        <div className="absolute top-full mt-2 right-0 w-64 bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
+        <div className="app-chrome__menu app-chrome__profile-menu absolute right-0 top-full mt-2 overflow-hidden">
           <div className="max-h-60 overflow-y-auto custom-scrollbar">
             {profiles.map((profile) => (
               <button
@@ -92,31 +96,32 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
                   onSelect(profile.username);
                   setIsOpen(false);
                 }}
-                className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/5 transition-colors text-left group border-b border-white/5 last:border-0"
+                type="button"
+                className="app-chrome__profile-row flex w-full items-center justify-between px-4 py-3 text-left"
               >
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-primary/20 to-purple-500/20 flex items-center justify-center text-xs font-bold text-white border border-white/10 shrink-0">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="app-chrome__profile-avatar h-8 w-8 text-xs">
                     {profile.username.substring(0, 2).toUpperCase()}
                   </div>
                   <div className="min-w-0">
-                    <div className="text-sm font-medium text-zinc-200 group-hover:text-white transition-colors truncate">
+                    <div className="truncate text-sm font-medium">
                       {profile.username}
                     </div>
                     <div className="flex gap-2 mt-0.5">
                       {/* Status indicators */}
-                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('tiktok') ? 'text-zinc-300' : 'text-zinc-600'}`}>
+                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('tiktok') ? 'app-chrome__ink' : 'app-chrome__muted'}`}>
                         <TikTokIcon size={10} />
                       </div>
-                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('instagram') ? 'text-pink-400' : 'text-zinc-600'}`}>
+                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('instagram') ? 'text-pink-700' : 'app-chrome__muted'}`}>
                         <Instagram size={10} />
                       </div>
-                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('youtube') ? 'text-red-400' : 'text-zinc-600'}`}>
+                      <div className={`flex items-center gap-1 text-[10px] ${profile.connected.includes('youtube') ? 'text-red-700' : 'app-chrome__muted'}`}>
                         <Youtube size={10} />
                       </div>
                     </div>
                   </div>
                 </div>
-                {selectedUserId === profile.username && <Check size={14} className="text-primary shrink-0" />}
+                {selectedUserId === profile.username && <Check size={14} className="app-chrome__accent shrink-0" />}
               </button>
             ))}
           </div>
@@ -145,13 +150,13 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
   const isRegister = mode === 'register';
 
   return (
-    <div className="app-shell min-h-screen bg-background flex items-center justify-center p-6">
-      <div className="w-full max-w-md glass-panel p-8 space-y-6">
+    <div className="app-shell app-chrome__auth min-h-dvh flex items-center justify-center p-6" data-theme="light">
+      <div className="app-chrome__surface w-full max-w-md space-y-6 p-6 sm:p-8">
         <div className="space-y-2">
-          <div className="w-11 h-11 rounded-xl bg-violet-500/15 text-violet-300 flex items-center justify-center">
+          <div className="app-chrome__brand-mark flex h-10 w-10 items-center justify-center">
             <Shield size={22} />
           </div>
-          <h1 className="text-2xl font-bold text-white">
+          <h1 className="text-2xl font-semibold">
             {isRegister ? 'Создать аккаунт' : 'Войти в аккаунт'}
           </h1>
         </div>
@@ -159,7 +164,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
         <div className="space-y-3">
           {isRegister && (
             <input
-              className="input-field"
+              className="app-chrome__input"
               aria-label="Имя"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -167,7 +172,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
             />
           )}
           <input
-            className="input-field"
+            className="app-chrome__input"
             type="email"
             aria-label="Email"
             value={email}
@@ -175,7 +180,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
             placeholder="email@example.com"
           />
           <input
-            className="input-field"
+            className="app-chrome__input"
             type="password"
             aria-label="Пароль"
             value={password}
@@ -183,12 +188,12 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
             placeholder="Пароль, минимум 8 символов"
           />
           {error && (
-            <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            <div className="app-chrome__notice app-chrome__notice--error px-3 py-2 text-sm" role="alert">
               {error}
             </div>
           )}
           <button
-            className="btn-primary w-full py-3"
+            className="app-chrome__button app-chrome__button--primary w-full"
             disabled={loading}
             onClick={() => onSubmit({ email, password, name })}
           >
@@ -198,7 +203,7 @@ const AuthScreen = ({ mode, setMode, loading, error, onSubmit }) => {
 
         <button
           type="button"
-          className="inline-flex rounded-lg px-2 py-2 text-sm text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
+          className="app-chrome__button app-chrome__button--quiet"
           onClick={() => setMode(isRegister ? 'login' : 'register')}
         >
           {isRegister ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Зарегистрироваться'}
@@ -244,17 +249,13 @@ const ProviderKeyInput = ({
   };
 
   return (
-    <div className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+    <div className="app-chrome__setting-row space-y-4 py-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1">
-          <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
-          <p className="text-xs leading-relaxed text-zinc-500">{description}</p>
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="app-chrome__muted text-xs leading-relaxed">{description}</p>
         </div>
-        <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
-          hasAccountKey
-            ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-200'
-            : 'border-amber-500/25 bg-amber-500/10 text-amber-200'
-        }`}>
+        <span className={`app-chrome__status ${hasAccountKey ? 'app-chrome__status--success' : ''}`}>
           {hasAccountKey ? <CheckCircle2 size={13} /> : <KeyRound size={13} />}
           {hasAccountKey ? savedLabel : 'Не сохранено'}
         </span>
@@ -268,7 +269,7 @@ const ProviderKeyInput = ({
             onChange(e.target.value);
             setMessage('');
           }}
-          className="input-field"
+          className="app-chrome__input"
           placeholder={hasAccountKey ? 'Ключ скрыт. Вставь новый, чтобы заменить.' : placeholder}
           autoComplete="off"
         />
@@ -276,24 +277,20 @@ const ProviderKeyInput = ({
           type="button"
           onClick={handleSave}
           disabled={saving}
-          className="btn-primary whitespace-nowrap px-4 py-3 text-sm"
+          className="app-chrome__button app-chrome__button--primary whitespace-nowrap"
         >
           {saving ? 'Сохраняю...' : hasAccountKey ? 'Заменить' : actionLabel}
         </button>
       </div>
 
       {message && (
-        <p className={`rounded-lg border px-3 py-2 text-xs ${
-          message === savedLabel
-            ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
-            : 'border-amber-500/20 bg-amber-500/10 text-amber-200'
-        }`}>
+        <p className={`app-chrome__notice px-3 py-2 text-xs ${message === savedLabel ? 'app-chrome__status--success' : ''}`}>
           {message}
         </p>
       )}
 
       {(help || links.length > 0) && (
-        <div className="space-y-3 text-xs leading-relaxed text-zinc-500">
+        <div className="app-chrome__muted space-y-3 text-xs leading-relaxed">
           {help && <p>{help}</p>}
           {links.length > 0 && (
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -303,13 +300,13 @@ const ProviderKeyInput = ({
                   href={link.href}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="rounded-xl border border-white/10 bg-black/20 p-3 transition-colors hover:border-white/20 hover:bg-white/[0.04]"
+                  className="app-chrome__setting-link p-3"
                 >
-                  <span className="flex items-center gap-2 font-medium text-zinc-300">
+                  <span className="app-chrome__ink flex items-center gap-2 font-medium">
                     {link.label}
-                    <ExternalLink size={12} className="text-zinc-500" />
+                    <ExternalLink size={12} className="app-chrome__muted" />
                   </span>
-                  {link.caption && <span className="mt-1 block text-[11px] text-zinc-600">{link.caption}</span>}
+                  {link.caption && <span className="mt-1 block text-[11px]">{link.caption}</span>}
                 </a>
               ))}
             </div>
@@ -319,6 +316,20 @@ const ProviderKeyInput = ({
     </div>
   );
 };
+
+export function GeminiKeyNotice({ activeTab, hasKey, onOpenSettings }) {
+  if (hasKey || !['dashboard', 'content-plan'].includes(activeTab)) return null;
+
+  return (
+    <div className="app-chrome__strip">
+      <p className="flex min-w-0 items-center gap-2" role="status">
+        <KeyRound size={15} className="shrink-0" aria-hidden="true" />
+        Для генерации нужен API-ключ Gemini.
+      </p>
+      <button type="button" className="app-chrome__button app-chrome__button--quiet" onClick={onOpenSettings}>Настройки</button>
+    </div>
+  );
+}
 
 // Russian plural for "клип": 1 клип, 2 клипа, 5 клипов.
 const clipsPlural = (n) => {
@@ -779,21 +790,17 @@ function App() {
     { id: 'thumbnails', label: 'YouTube-студия', shortLabel: 'YouTube', icon: Image },
     { id: 'settings', label: 'Настройки', shortLabel: 'Ключи', icon: Settings },
   ];
-  const NAV_ACTIVE = 'bg-primary/10 text-primary';
-  const NAV_INACTIVE = 'text-zinc-400 hover:text-white hover:bg-white/5';
   const activeNavItem = navItems.find((item) => item.id === activeTab) || navItems[0];
   const ActiveHeaderIcon = activeNavItem.icon;
 
   const Sidebar = () => (
-    <div className="relative z-20 hidden w-20 shrink-0 flex-col border-r border-white/5 bg-surface transition-all duration-300 md:flex xl:w-64">
-      <div className="p-6 flex items-center gap-3">
-        <div className="w-8 h-8 bg-white/5 rounded-lg flex items-center justify-center shrink-0 overflow-hidden border border-white/5">
-          <img src="/favicon.svg" alt="" className="w-full h-full object-cover" />
-        </div>
-        <span className="font-bold text-lg text-white hidden xl:block tracking-tight">Контентфабрика</span>
+    <aside className="app-chrome__sidebar relative z-20 hidden w-20 shrink-0 flex-col md:flex xl:w-56">
+      <div className="app-chrome__brand flex items-center justify-center gap-2.5 px-4 xl:justify-start">
+        <img src="/favicon.svg" alt="" width="26" height="26" className="shrink-0" />
+        <span className="hidden text-sm font-semibold xl:block">Контентфабрика</span>
       </div>
 
-      <nav className="flex-1 px-4 py-4 space-y-1.5">
+      <nav className="flex-1 space-y-1 px-3 py-3" aria-label="Разделы приложения">
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
@@ -805,16 +812,16 @@ function App() {
               aria-current={isActive ? 'page' : undefined}
               title={item.label}
               onClick={() => setActiveTab(item.id)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-colors ${isActive ? NAV_ACTIVE : NAV_INACTIVE}`}
+              className="app-chrome__nav-button flex w-full items-center justify-center gap-2.5 px-2 py-2.5 text-sm xl:justify-start"
             >
-              <Icon size={20} className="shrink-0" />
+              <Icon size={18} className="shrink-0" aria-hidden="true" />
               <span className="font-medium hidden xl:block">{item.label}</span>
             </button>
           );
         })}
       </nav>
 
-    </div>
+    </aside>
   );
 
   // Bottom bar keeps one clean row: the 4 primary tabs + an «Ещё» button that
@@ -824,17 +831,14 @@ function App() {
     const primary = navItems.slice(0, 4);
     const overflow = navItems.slice(4);
     const overflowActive = overflow.some((item) => item.id === activeTab);
-    const tabButtonClass = (isActive) =>
-      `flex min-h-[54px] flex-col items-center justify-center gap-1 rounded-xl px-0.5 text-[10px] font-semibold transition-colors ${
-        isActive ? 'bg-primary/10 text-primary' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
-      }`;
+    const tabButtonClass = 'app-chrome__nav-button flex min-h-12 min-w-0 flex-col items-center justify-center gap-1 px-0.5 text-[10px] font-semibold';
 
     return (
-      <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-background/95 px-2 pb-3 pt-2 backdrop-blur md:hidden">
+      <nav className="app-chrome__mobile-nav relative z-40 shrink-0 px-2 pt-1.5 md:hidden" aria-label="Разделы приложения">
         {mobileMoreOpen && (
           <>
             <div className="fixed inset-0 z-0" onClick={() => setMobileMoreOpen(false)} />
-            <div className="absolute bottom-full right-2 z-10 mb-2 w-56 rounded-2xl border border-white/10 bg-[#1a1a1a] p-2 shadow-2xl">
+            <div className="app-chrome__menu absolute bottom-full right-2 z-10 mb-2 w-56 p-1">
               {overflow.map((item) => {
                 const Icon = item.icon;
                 const isActive = activeTab === item.id;
@@ -844,9 +848,7 @@ function App() {
                     type="button"
                     onClick={() => { setActiveTab(item.id); setMobileMoreOpen(false); }}
                     aria-current={isActive ? 'page' : undefined}
-                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-colors ${
-                      isActive ? 'bg-primary/10 text-primary' : 'text-zinc-300 hover:bg-white/5'
-                    }`}
+                    className="app-chrome__nav-button flex w-full items-center gap-2.5 px-3 py-2.5 text-sm"
                   >
                     <Icon size={18} className="shrink-0" />
                     <span className="truncate">{item.label}</span>
@@ -867,7 +869,7 @@ function App() {
                 onClick={() => { setActiveTab(item.id); setMobileMoreOpen(false); }}
                 aria-label={item.label}
                 aria-current={isActive ? 'page' : undefined}
-                className={tabButtonClass(isActive)}
+                className={tabButtonClass}
               >
                 <Icon size={18} className="shrink-0" />
                 <span className="max-w-full truncate">{item.shortLabel}</span>
@@ -879,7 +881,8 @@ function App() {
             onClick={() => setMobileMoreOpen((v) => !v)}
             aria-label="Ещё разделы"
             aria-expanded={mobileMoreOpen}
-            className={tabButtonClass(overflowActive || mobileMoreOpen)}
+            data-active={overflowActive || mobileMoreOpen}
+            className={tabButtonClass}
           >
             <Menu size={18} className="shrink-0" />
             <span className="max-w-full truncate">Ещё</span>
@@ -891,7 +894,7 @@ function App() {
 
   if (authLoading && !authUser) {
     return (
-      <div className="min-h-screen bg-background flex items-center justify-center text-zinc-400">
+      <div className="app-shell app-chrome__auth flex min-h-dvh items-center justify-center" data-theme="light">
         Загрузка аккаунта...
       </div>
     );
@@ -910,29 +913,22 @@ function App() {
   }
 
   return (
-    <div className="app-shell flex h-dvh bg-background overflow-hidden selection:bg-primary/30">
+    <div className="app-shell app-shell--authenticated flex h-dvh flex-col overflow-hidden md:flex-row" data-theme="light">
       <Sidebar />
 
-      <main className="relative mb-20 flex min-w-0 flex-1 flex-col overflow-hidden md:mb-0">
-        {/* Background Gradients */}
-        <div className="absolute inset-0 overflow-hidden -z-10 pointer-events-none">
-          <div className="absolute -top-[10%] -right-[10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
-        </div>
-
+      <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {/* Top Header */}
-        <header className="h-16 border-b border-white/5 bg-background/50 backdrop-blur-md flex items-center justify-between px-4 md:px-6 shrink-0 z-10">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 md:hidden">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/5 text-violet-300">
-                <ActiveHeaderIcon size={17} />
-              </div>
-              <span className="text-sm font-semibold text-zinc-100">{activeNavItem.label}</span>
+        <header className="app-chrome__header relative z-10 flex shrink-0 items-center justify-between gap-2 px-3 md:px-5">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <ActiveHeaderIcon size={17} className="app-chrome__accent shrink-0" aria-hidden="true" />
+              <span className="truncate text-sm font-semibold">{activeNavItem.label}</span>
             </div>
-            {status !== 'idle' && (
+            {activeTab === 'dashboard' && status !== 'idle' && (
               <button
                 type="button"
                 onClick={handleReset}
-                className="hidden sm:flex items-center gap-2 rounded-lg px-2 py-2 text-sm text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
+                className="app-chrome__button app-chrome__button--quiet app-chrome__reset shrink-0"
               >
                 <PlusCircle size={16} />
                 <span>Новый проект</span>
@@ -940,22 +936,18 @@ function App() {
             )}
           </div>
 
-          <div className="flex items-center gap-4">
-            <div className="hidden md:flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-300">
-              <Users size={13} />
-              <span>{authUser.email}</span>
-              <span className={`rounded-full px-2 py-0.5 ${
-                authUser.subscription_status === 'active'
-                  ? 'bg-green-500/15 text-green-300'
-                  : 'bg-zinc-500/15 text-zinc-400'
-              }`}>
-                {authUser.subscription_status === 'active' ? 'Подписка active' : 'Free'}
+          <div className="flex min-w-0 items-center gap-1.5 md:gap-3">
+            <div className="app-chrome__muted hidden min-w-0 items-center gap-2 text-xs lg:flex">
+              <Users size={13} className="shrink-0" aria-hidden="true" />
+              <span className="max-w-40 truncate" title={authUser.email}>{authUser.email}</span>
+              <span className={`app-chrome__status ${authUser.subscription_status === 'active' ? 'app-chrome__status--success' : ''}`}>
+                {authUser.subscription_status === 'active' ? 'Подписка активна' : 'Бесплатный тариф'}
               </span>
             </div>
             <button
               type="button"
               onClick={handleLogout}
-              className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-xs text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
+              className="app-chrome__button app-chrome__button--quiet shrink-0"
             >
               <LogOut size={14} /> Выйти
             </button>
@@ -971,41 +963,20 @@ function App() {
           </div>
         </header>
 
-        {/* Persistent Missing Key Banner — visible on every screen */}
-        {!effectiveGeminiKey && activeTab !== 'settings' && (
-          <div className="mx-6 mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-4 shrink-0 animate-[fadeIn_0.3s_ease-out]">
-            <div className="flex items-center gap-3 text-sm text-amber-200">
-              <KeyRound size={16} className="shrink-0 text-amber-400" />
-              <div>
-                <span className="font-semibold">Не хватает обязательного API-ключа.</span>{' '}
-                <span className="text-amber-200/80">
-                  Укажи API-ключ Gemini, чтобы пользоваться Контентфабрикой.
-                </span>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setActiveTab('settings')}
-              className="shrink-0 rounded-lg bg-amber-500 px-3 py-2 text-xs font-medium text-black transition-colors hover:bg-amber-400"
-            >
-              Настройки
-            </button>
-          </div>
-        )}
+        <GeminiKeyNotice activeTab={activeTab} hasKey={Boolean(effectiveGeminiKey)} onOpenSettings={() => setActiveTab('settings')} />
 
         {/* Session Recovery Banner */}
         {sessionRecovered && (
-          <div className="mx-6 mt-2 p-3 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-between animate-[fadeIn_0.3s_ease-out] shrink-0">
-            <div className="flex items-center gap-2 text-sm text-primary">
-              <RotateCcw size={16} />
-              <span className="font-medium">Сессия восстановлена</span>
-              <span className="text-zinc-400 text-xs">Предыдущая работа возвращена.</span>
-            </div>
+          <div className="app-chrome__strip">
+            <p className="flex items-center gap-2" role="status">
+              <RotateCcw size={15} className="shrink-0" aria-hidden="true" />
+              Предыдущая сессия восстановлена.
+            </p>
             <button
               type="button"
               aria-label="Скрыть сообщение восстановления"
               onClick={() => setSessionRecovered(false)}
-              className="rounded-lg p-2 text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
+              className="app-chrome__button app-chrome__button--quiet"
             >
               <X size={14} aria-hidden="true" />
             </button>
@@ -1013,26 +984,37 @@ function App() {
         )}
 
         {/* Main Workspace */}
-        <div className="flex-1 overflow-hidden relative">
+        <div
+          className={`app-shell__workspace relative min-h-0 flex-1 overflow-hidden ${['saasshorts', 'settings'].includes(activeTab) ? '' : 'app-chrome__legacy'}`}
+          data-tab={activeTab}
+        >
 
           {/* View: Settings */}
           {activeTab === 'settings' && (
-            <div className="h-full overflow-y-auto p-6 pb-28 md:p-8 md:pb-8 max-w-2xl mx-auto animate-[fadeIn_0.3s_ease-out]">
-              <div className="flex items-center justify-between mb-8">
-                <h1 className="text-2xl font-bold">Настройки</h1>
-                <div className="px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[10px] text-green-400 font-medium flex items-center gap-2">
-                  <Shield size={12} /> Ключи хранятся в аккаунте на backend
+            <div className="app-chrome__settings mx-auto h-full max-w-2xl overflow-y-auto px-4 py-5 md:px-8 md:py-7">
+              <div className="mb-6 flex flex-wrap items-center justify-between gap-2">
+                <h1 className="text-2xl font-semibold">Настройки</h1>
+                <div className="app-chrome__status app-chrome__status--success">
+                  <Shield size={13} aria-hidden="true" /> Ключи хранятся в аккаунте
                 </div>
               </div>
-              <div className="glass-panel p-5 mb-8 space-y-3">
-                <div className="flex items-center justify-between gap-3">
+              <div className="app-chrome__gemini app-chrome__setting-row mb-3 py-4">
+                <KeyInput
+                  onKeySet={setApiKey}
+                  savedKey={apiKey}
+                  onAccountSave={(key) => handleSaveApiKey('gemini', key)}
+                  hasAccountKey={hasSavedKey('gemini')}
+                />
+              </div>
+              <div className="app-chrome__setting-row mb-5 space-y-3 py-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-semibold">Аккаунт и подписка</h2>
-                    <p className="text-xs text-zinc-500 mt-1">
+                    <p className="app-chrome__muted mt-1 break-all text-xs">
                       {authUser.email} · статус: {authUser.subscription_status}
                     </p>
                   </div>
-                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                  <label className="flex items-center gap-2 text-sm">
                     <input
                       type="checkbox"
                       checked={usePlatformKeys}
@@ -1043,35 +1025,35 @@ function App() {
                   </label>
                 </div>
                 {!canUsePlatformKeys && (
-                  <p className="text-xs text-amber-300">
-                    Platform keys будут доступны после активации подписки. Сейчас можно использовать только свои сохранённые ключи.
+                  <p className="app-chrome__muted text-xs">
+                    Ключи платформы доступны по подписке. Свои ключи можно использовать без подписки.
                   </p>
                 )}
-                <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div className="app-chrome__setting-row flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="text-sm font-semibold text-zinc-200">Старые локальные данные</p>
-                    <p className="text-xs text-zinc-500">Перенести legacy-видео, аватары и talking-head шаблоны в текущий аккаунт.</p>
+                    <p className="text-sm font-semibold">Старые локальные данные</p>
+                    <p className="app-chrome__muted text-xs">Перенести прежние видео, аватары и шаблоны говорящей головы в текущий аккаунт.</p>
                   </div>
                   <button
                     type="button"
                     onClick={handleClaimLegacyAssets}
-                    className="btn-secondary px-3 py-2 text-xs"
+                    className="app-chrome__button shrink-0"
                   >
                     Забрать старые данные
                   </button>
                 </div>
                 {legacyClaimStatus && (
-                  <p className="text-xs text-zinc-400">{legacyClaimStatus}</p>
+                  <p className="app-chrome__muted text-xs" role="status">{legacyClaimStatus}</p>
                 )}
-                <div className="rounded-xl border border-sky-500/20 bg-sky-500/[0.06] p-4">
+                <div className="app-chrome__setting-row py-3">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div className="flex min-w-0 gap-3">
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-500/10 text-sky-300">
+                      <div className="app-chrome__brand-mark flex h-9 w-9 shrink-0 items-center justify-center">
                         <Archive size={18} />
                       </div>
                       <div className="min-w-0">
-                        <p className="text-sm font-semibold text-zinc-100">Перенос на другой компьютер</p>
-                        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                        <p className="text-sm font-semibold">Перенос на другой компьютер</p>
+                        <p className="app-chrome__muted mt-1 text-xs leading-relaxed">
                           ZIP включает аккаунты, сохранённые API-ключи, видео, аватары, шаблоны talking-head, uploads и секрет расшифровки.
                         </p>
                       </div>
@@ -1080,12 +1062,12 @@ function App() {
                       <button
                         type="button"
                         onClick={handleExportBackup}
-                        className="btn-primary inline-flex items-center justify-center gap-2 px-3 py-2 text-xs"
+                        className="app-chrome__button"
                       >
                         <Download size={14} />
-                        Скачать backup
+                        Скачать архив
                       </button>
-                      <label className={`btn-secondary inline-flex cursor-pointer items-center justify-center gap-2 px-3 py-2 text-xs ${backupImporting ? 'pointer-events-none opacity-60' : ''}`}>
+                      <label className={`app-chrome__button cursor-pointer ${backupImporting ? 'pointer-events-none opacity-60' : ''}`}>
                         <Upload size={14} />
                         {backupImporting ? 'Импортирую...' : 'Импортировать'}
                         <input
@@ -1101,32 +1083,22 @@ function App() {
                       </label>
                     </div>
                   </div>
-                  <p className="mt-3 text-[11px] leading-relaxed text-sky-100/70">
+                  <p className="app-chrome__muted mt-3 text-xs leading-relaxed">
                     Архив содержит чувствительные данные. Храни его как пароль: не отправляй в публичные чаты и не загружай в чужие облака.
                   </p>
                   {backupStatus && (
-                    <p className="mt-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-zinc-300">{backupStatus}</p>
+                    <p className="app-chrome__notice mt-3 px-3 py-2 text-xs" role="status">{backupStatus}</p>
                   )}
                 </div>
               </div>
-              <KeyInput
-                onKeySet={setApiKey}
-                savedKey={apiKey}
-                onAccountSave={(key) => handleSaveApiKey('gemini', key)}
-                hasAccountKey={hasSavedKey('gemini')}
-              />
-
-              <div className="glass-panel p-6 mt-8">
-                <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div className="app-chrome__setting-row mt-3 py-4">
+                <div className="mb-4">
                   <div>
                     <h2 className="text-lg font-semibold">Интеграции и API-ключи</h2>
-                    <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-                      Секреты хранятся в backend vault текущего аккаунта. Мы показываем только статус, сам ключ обратно не раскрываем.
+                    <p className="app-chrome__muted mt-1 text-xs leading-relaxed">
+                      Сохранённые ключи скрыты. В настройках виден их статус.
                     </p>
                   </div>
-                  <span className="w-fit rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
-                    Хранилище аккаунта
-                  </span>
                 </div>
 
                 <div className="space-y-4">
@@ -1200,6 +1172,7 @@ function App() {
               authToken={authToken}
               usePlatformKeys={usingPlatformKeys}
               onManageProjects={() => setActiveTab('projects')}
+              onOpenSettings={() => setActiveTab('settings')}
             />
           )}
 
@@ -1514,23 +1487,23 @@ function App() {
 
       {/* Missing API Key Modal */}
       {showKeyModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowKeyModal(false)}>
-          <div className="bg-[#18181b] border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-bold text-white">Нужен API-ключ Gemini</h2>
-            <p className="text-sm text-zinc-400">
-              Контентфабрике нужен API-ключ <strong className="text-zinc-200">Gemini</strong> для анализа и генерации сценариев. Upload-Post опционален и нужен только для публикации.
+        <div className="app-chrome__backdrop fixed inset-0 z-50 flex items-center justify-center" onClick={() => setShowKeyModal(false)}>
+          <div className="app-chrome__surface mx-4 max-h-[90dvh] w-full max-w-md space-y-4 overflow-y-auto p-5" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="app-gemini-dialog-title">
+            <h2 className="text-lg font-semibold" id="app-gemini-dialog-title">Нужен API-ключ Gemini</h2>
+            <p className="app-chrome__muted text-sm">
+              Контентфабрике нужен API-ключ <strong className="app-chrome__ink">Gemini</strong> для анализа и генерации сценариев. Upload-Post нужен для публикации.
             </p>
 
             {/* Gemini block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveGeminiKey ? 'bg-primary/5 border-primary/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
-              <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {effectiveGeminiKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
-                Ключ Gemini {effectiveGeminiKey && <span className="text-green-400">— задан</span>}
+            <div className="app-chrome__setting-row space-y-2 pt-3">
+              <p className="flex items-center gap-2 text-xs font-semibold">
+                {effectiveGeminiKey ? <Check size={12} className="app-chrome__accent" /> : <KeyRound size={12} className="app-chrome__muted" />}
+                Ключ Gemini {effectiveGeminiKey && <span className="app-chrome__muted">сохранён</span>}
               </p>
               {!effectiveGeminiKey && (
                 <>
-                  <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
-                    <li>Открой <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-primary underline">aistudio.google.com/app/apikey</a></li>
+                  <ol className="app-chrome__muted list-inside list-decimal space-y-1 text-xs">
+                    <li>Открой <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="app-chrome__accent underline">aistudio.google.com/app/apikey</a></li>
                     <li>Войди под своим аккаунтом Google</li>
                     <li>Нажми «Create API Key»</li>
                     <li>Скопируй ключ и вставь ниже</li>
@@ -1538,7 +1511,7 @@ function App() {
                   <input
                     type="text"
                     placeholder="Вставь сюда API-ключ Gemini..."
-                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-primary"
+                    className="app-chrome__input"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && e.target.value.trim()) {
                         setApiKey(e.target.value.trim());
@@ -1550,26 +1523,26 @@ function App() {
             </div>
 
             {/* Upload-Post block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!effectiveUploadPostKey ? 'bg-white/5 border-white/10' : 'bg-white/5 border-white/10 opacity-70'}`}>
-              <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {effectiveUploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-zinc-500" />}
-                Ключ Upload-Post {effectiveUploadPostKey && <span className="text-green-400">— задан</span>}
+            <div className="app-chrome__setting-row space-y-2 pt-3">
+              <p className="flex items-center gap-2 text-xs font-semibold">
+                {effectiveUploadPostKey ? <Check size={12} className="app-chrome__accent" /> : <KeyRound size={12} className="app-chrome__muted" />}
+                Ключ Upload-Post {effectiveUploadPostKey && <span className="app-chrome__muted">сохранён</span>}
               </p>
               {!effectiveUploadPostKey && (
                 <>
-                  <p className="text-xs text-zinc-400">
+                  <p className="app-chrome__muted text-xs">
                     Опционально. Добавь, только если хочешь публиковать прямо в TikTok, Instagram Reels и YouTube Shorts.
                   </p>
-                  <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
-                    <li>Зарегистрируйся на <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-primary underline">app.upload-post.com</a></li>
+                  <ol className="app-chrome__muted list-inside list-decimal space-y-1 text-xs">
+                    <li>Зарегистрируйся на <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="app-chrome__accent underline">app.upload-post.com</a></li>
                     <li>Подключи аккаунты TikTok, Instagram или YouTube</li>
-                    <li>Открой <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-primary underline">API Keys</a> и создай ключ</li>
+                    <li>Открой <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="app-chrome__accent underline">API Keys</a> и создай ключ</li>
                     <li>Вставь его ниже</li>
                   </ol>
                   <input
                     type="text"
                     placeholder="Вставь сюда API-ключ Upload-Post..."
-                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-primary"
+                    className="app-chrome__input"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && e.target.value.trim()) {
                         setUploadPostKey(e.target.value.trim());
@@ -1583,13 +1556,13 @@ function App() {
             <div className="flex gap-3">
               <button
                 onClick={() => setShowKeyModal(false)}
-                className="flex-1 text-sm text-zinc-400 py-2 rounded-lg border border-white/10 hover:bg-white/5 transition-colors"
+                className="app-chrome__button flex-1"
               >
                 Отмена
               </button>
               <button
                 onClick={() => { setShowKeyModal(false); setActiveTab('settings'); }}
-                className="flex-1 text-sm text-white py-2 rounded-lg bg-primary hover:bg-violet-600 transition-colors font-medium"
+                className="app-chrome__button app-chrome__button--primary flex-1"
               >
                 Открыть настройки
               </button>
@@ -1598,14 +1571,16 @@ function App() {
         </div>
       )}
 
-      <ScheduleWeekModal
-        isOpen={showScheduleWeek}
-        onClose={() => setShowScheduleWeek(false)}
-        clips={results?.clips || []}
-        jobId={jobId}
-        uploadPostKey={uploadPostKey}
-        uploadUserId={uploadUserId}
-      />
+      <div className="app-chrome__legacy contents">
+        <ScheduleWeekModal
+          isOpen={showScheduleWeek}
+          onClose={() => setShowScheduleWeek(false)}
+          clips={results?.clips || []}
+          jobId={jobId}
+          uploadPostKey={uploadPostKey}
+          uploadUserId={uploadUserId}
+        />
+      </div>
     </div>
   );
 }

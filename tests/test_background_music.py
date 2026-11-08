@@ -74,6 +74,8 @@ class MusicRemixTests(unittest.TestCase):
                 self.assertEqual(audio, os.path.join(job_dir, "__voice.mp3"))
                 self.assertEqual(subtitles, os.path.join(job_dir, "__subs.ass"))
                 self.assertEqual(kwargs["music_volume"], .8)
+                self.assertEqual(len(kwargs["timeline_shots"]), 2)
+                kwargs["timeline_shots"][1].update(timeline_start=3, timeline_end=6)
                 with open(output, "wb") as handle:
                     handle.write(b"remixed-video")
 
@@ -89,6 +91,7 @@ class MusicRemixTests(unittest.TestCase):
             self.assertEqual(result["hashtags"], meta["hashtags"])
             self.assertEqual(result["cost_details"], meta["cost_details"])
             self.assertEqual(result["music_track"], "warm_groove_104.wav")
+            self.assertEqual(result["shots"][1]["timeline_start"], 3)
             self.assertTrue(result["video_url"].startswith(f"/videos/saas_{self.JOB}/__music_"))
             self.assertEqual(sum(version["current"] for version in result["versions"]), 1)
             self.assertEqual(result["versions"][-1]["video_url"], result["video_url"])

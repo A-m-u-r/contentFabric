@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Target, Plus, Pencil, Trash2, Check, X, Save, Sparkles, CalendarDays, AlertCircle } from 'lucide-react';
+import { Target, Plus, Pencil, Trash2, Check, X, Save, Sparkles, CalendarDays, AlertCircle, User } from 'lucide-react';
 import { getApiUrl } from '../config';
 import {
   loadBusinessProfiles,
@@ -7,6 +7,7 @@ import {
   loadSelectedProfileId,
   saveSelectedProfileId,
   profileId,
+  mergeProjectMetadata,
 } from '../lib/businessProfiles';
 
 const LANGUAGE_OPTIONS = [
@@ -38,6 +39,7 @@ const EMPTY_DRAFT = {
 function draftFromProfile(profile) {
   return {
     id: profile.id || '',
+    sourceId: profileId(profile),
     name: profile.name || '',
     description: profile.description || '',
     topic: profile.topic || '',
@@ -47,6 +49,60 @@ function draftFromProfile(profile) {
   };
 }
 
+export function prepareProjectSave(draft, existing, id) {
+  const payload = {
+    id,
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    topic: draft.topic.trim(),
+    language: draft.language,
+    actor_gender: draft.actorGender,
+    script_format: draft.scriptFormat,
+    script_mode: existing?.scriptMode || existing?.script_mode || 'ai',
+    text_model: existing?.textModel || existing?.text_model || 'fast',
+    style: existing?.style || 'ugc',
+  };
+  // Account edits leave the newest preset on the server. A local project can carry it on first sync.
+  if (existing?.presenter && !existing.created_at) payload.presenter = existing.presenter;
+
+  return {
+    payload,
+    profile: {
+      ...existing,
+      ...payload,
+      actorGender: draft.actorGender,
+      scriptFormat: draft.scriptFormat,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
+function ProjectPresenterSummary({ presenter, showHelp = false }) {
+  const avatar = typeof presenter?.actor_url === 'string' ? presenter.actor_url : '';
+  const voice = typeof presenter?.voice_name === 'string' && presenter.voice_name
+    ? `Голос: ${presenter.voice_name}`
+    : presenter?.voice_id || presenter?.minimax_voice_id ? 'Голос сохранён' : '';
+
+  return (
+    <div className="space-y-2 border-t border-white/10 pt-3">
+      {(avatar || voice) && (
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="grid h-12 w-9 shrink-0 place-items-center overflow-hidden rounded-md bg-slate-100 text-slate-600">
+            {avatar ? <img src={getApiUrl(avatar)} alt="" loading="lazy" className="h-full w-full object-cover" /> : <User size={16} aria-hidden="true" />}
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-zinc-200">{avatar ? 'Аватар сохранён' : 'Ведущий и голос'}</p>
+            {voice && <p className="break-words text-xs text-zinc-500">{voice}</p>}
+          </div>
+        </div>
+      )}
+      {(showHelp || (!avatar && !voice)) && (
+        <p className="text-xs text-zinc-500">Аватар и голос можно сохранить в брифе AI Shorts.</p>
+      )}
+    </div>
+  );
+}
+
 export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPlan }) {
   const [profiles, setProfiles] = useState(() => loadBusinessProfiles());
   const [selectedId, setSelectedId] = useState(() => loadSelectedProfileId());
@@ -54,17 +110,19 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
   const [formError, setFormError] = useState('');
   const [status, setStatus] = useState('');
   const [confirmDeleteId, setConfirmDeleteId] = useState('');
+  const draftProfile = draft?.sourceId ? profiles.find((profile) => profileId(profile) === draft.sourceId) : undefined;
 
   const authHeaders = () => (authToken ? { Authorization: `Bearer ${authToken}` } : {});
 
   useEffect(() => {
     if (!authToken) return;
     fetch(getApiUrl('/api/user/business-profiles'), { headers: authHeaders() })
-      .then((res) => (res.ok ? res.json() : { profiles: [] }))
+      .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
-        if (Array.isArray(data.profiles) && data.profiles.length > 0) {
-          setProfiles(data.profiles);
-          saveBusinessProfiles(data.profiles);
+        if (Array.isArray(data?.profiles)) {
+          const merged = mergeProjectMetadata(data.profiles, loadBusinessProfiles(), { includeLocalOnly: true });
+          setProfiles(merged);
+          saveBusinessProfiles(merged);
         }
       })
       .catch(() => {});
@@ -89,19 +147,8 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
 
     setFormError('');
     const id = draft.id || `${Date.now()}`;
-    const profile = {
-      id,
-      name,
-      description,
-      topic: draft.topic.trim(),
-      language: draft.language,
-      actorGender: draft.actorGender,
-      actor_gender: draft.actorGender,
-      scriptFormat: draft.scriptFormat,
-      script_format: draft.scriptFormat,
-      updatedAt: new Date().toISOString(),
-    };
-    const next = [profile, ...profiles.filter((item) => profileId(item) !== id)].slice(0, 20);
+    const { profile, payload } = prepareProjectSave(draft, draftProfile, id);
+    const next = [profile, ...profiles.filter((item) => ![id, draft.sourceId].includes(profileId(item)))].slice(0, 20);
     persist(next);
     handleSelect(profile);
     setDraft(null);
@@ -112,21 +159,14 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
         const res = await fetch(getApiUrl('/api/user/business-profiles'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({
-            id,
-            name,
-            description,
-            topic: draft.topic.trim(),
-            language: draft.language,
-            actor_gender: draft.actorGender,
-            script_format: draft.scriptFormat,
-          }),
+          body: JSON.stringify(payload),
         });
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.profiles)) persist(data.profiles);
-          setStatus(`Проект «${name}» сохранён в аккаунте.`);
+        if (!res.ok) throw new Error('Project save failed');
+        const data = await res.json();
+        if (Array.isArray(data.profiles)) {
+          persist(mergeProjectMetadata(data.profiles, next, { includeLocalOnly: true }));
         }
+        setStatus(`Проект «${name}» сохранён в аккаунте.`);
       } catch {
         setStatus(`Проект «${name}» сохранён локально, в аккаунт не записался.`);
       }
@@ -135,7 +175,8 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
 
   const handleDelete = async (profile) => {
     const id = profileId(profile);
-    persist(profiles.filter((item) => profileId(item) !== id));
+    const next = profiles.filter((item) => profileId(item) !== id);
+    persist(next);
     setConfirmDeleteId('');
     if (selectedId === id) {
       setSelectedId('');
@@ -151,7 +192,7 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
         });
         if (res.ok) {
           const data = await res.json();
-          if (Array.isArray(data.profiles)) persist(data.profiles);
+          if (Array.isArray(data.profiles)) persist(mergeProjectMetadata(data.profiles, next, { includeLocalOnly: true }));
         }
       } catch { /* локально уже удалён */ }
     }
@@ -182,7 +223,7 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
         </div>
 
         {status && (
-          <p className="mb-4 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-400">
+          <p className="mb-4 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-400" role="status">
             {status}
           </p>
         )}
@@ -192,7 +233,7 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
           <div className="glass-panel p-6 mb-6 space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-zinc-100">
-                {draft.id ? 'Редактирование проекта' : 'Новый проект'}
+                {draft.sourceId ? 'Редактирование проекта' : 'Новый проект'}
               </h2>
               <button
                 type="button"
@@ -294,6 +335,8 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
                 </div>
               </div>
             </div>
+
+            {draft.sourceId && <ProjectPresenterSummary presenter={draftProfile?.presenter} showHelp />}
 
             {formError && (
               <div className="flex items-center gap-2 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">
@@ -408,6 +451,8 @@ export default function ProjectsTab({ authToken, onUseInShorts, onOpenContentPla
                     {lang && <span className="rounded-full bg-white/5 px-2 py-0.5">{lang.flag} {lang.label}</span>}
                     {format && <span className="rounded-full bg-white/5 px-2 py-0.5">{format.label}</span>}
                   </div>
+
+                  <ProjectPresenterSummary presenter={profile.presenter} />
 
                   <div className="mt-auto flex flex-wrap gap-2 pt-1">
                     {!active && (

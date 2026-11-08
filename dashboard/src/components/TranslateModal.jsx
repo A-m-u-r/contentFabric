@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Loader2, Globe, Languages, AlertCircle } from 'lucide-react';
 import { getApiUrl } from '../config';
+import MediaPlayer from './MediaPlayer';
 
 const LANGUAGES = {
     "es": "Spanish",
@@ -76,13 +77,14 @@ export default function TranslateModal({ isOpen, onClose, onTranslate, isProcess
 
                 {/* Preview */}
                 <div className="mb-6 rounded-xl overflow-hidden bg-black aspect-video relative">
-                    <video
+                    <MediaPlayer
                         src={videoUrl}
-                        className="w-full h-full object-contain"
+                        label="Исходный ролик для перевода"
+                        className="w-full h-full"
+                        mediaClassName="object-contain"
                         muted
                         playsInline
                     />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
                 </div>
 
                 {/* Language Selection */}

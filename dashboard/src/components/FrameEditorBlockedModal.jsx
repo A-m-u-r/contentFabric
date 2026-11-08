@@ -55,25 +55,27 @@ export default function FrameEditorBlockedModal({
   const downloadFailure = block.reason === 'download';
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-      <div className="bg-[#121214] border border-white/10 p-6 rounded-2xl w-full max-w-lg shadow-2xl relative max-h-[90vh] overflow-y-auto">
+    <dialog ref={(dialog) => { if (dialog && !dialog.open) dialog.showModal(); }}
+      aria-label="Результат создания кадра" onCancel={(event) => { event.preventDefault(); onClose(); }}
+      className="relative m-auto max-h-[90vh] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-md border border-[#dfe1e7] bg-white p-6 text-[#242631] backdrop:bg-black/40">
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 text-zinc-500 hover:text-white"
+          className="absolute top-4 right-4 text-[#545967] hover:text-[#242631]"
           type="button"
+          aria-label="Закрыть сообщение"
         >
           <X size={18} />
         </button>
 
         <div className="flex items-start gap-3 pr-6">
-          <ShieldAlert size={20} className="text-amber-400 shrink-0 mt-0.5" />
+          <ShieldAlert size={20} className="text-[#674619] shrink-0 mt-0.5" />
           <div>
-            <h3 className="text-[15px] font-semibold text-white">
+            <h3 className="text-[15px] font-semibold">
               {downloadFailure
                 ? `${block.title} нарисовал кадр, но файл не скачался`
                 : `${block.title} не стал рисовать кадр`}
             </h3>
-            <p className="text-[12px] text-zinc-400 mt-1">
+            <p className="mt-1 text-sm text-[#545967]">
               {REASON_TEXT[block.reason] || REASON_TEXT.moderation}
             </p>
           </div>
@@ -81,16 +83,16 @@ export default function FrameEditorBlockedModal({
 
         {flags && (
           <div className="mt-4">
-            <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">
+            <p className="mb-1.5 text-xs text-[#545967]">
               Что ответила модель
             </p>
-            <pre className="text-[11px] text-amber-100/90 bg-black/40 border border-white/5 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all">
+            <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-[#dfe1e7] bg-[#f0f1f3] p-3 text-xs">
               {JSON.stringify(flags, null, 2)}
             </pre>
           </div>
         )}
 
-        <p className="text-[11px] text-zinc-500 mt-3">
+        <p className="mt-3 text-xs text-[#545967]">
           {downloadFailure
             ? `Генерация завершилась и оплачена${spentUsd ? `: списано ${spentUsd}` : ''}. Новый платный запрос автоматически не отправлялся.`
             : block.charged
@@ -99,9 +101,9 @@ export default function FrameEditorBlockedModal({
         </p>
 
         {networkFailure ? (
-          <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3 flex gap-2.5">
-            <ImageOff size={16} className="text-zinc-400 shrink-0 mt-0.5" />
-            <p className="text-[12px] text-zinc-300">
+          <div className="mt-5 flex gap-2.5 border-t border-[#dfe1e7] pt-3">
+            <ImageOff size={16} className="text-[#545967] shrink-0 mt-0.5" />
+            <p className="text-sm text-[#545967]">
               {downloadFailure
                 ? 'Другая модель не поможет и создаст новый платный запрос. Проверь сеть; повторная генерация возможна только после твоего ручного нажатия.'
                 : 'Другая модель не поможет — она живёт по тому же адресу. Проверь сеть и нажми «Перегенерить» ещё раз той же моделью.'}
@@ -109,7 +111,7 @@ export default function FrameEditorBlockedModal({
           </div>
         ) : options.length > 0 ? (
           <div className="mt-5">
-            <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2">
+            <p className="mb-2 text-sm font-medium">
               Попробовать другой моделью
             </p>
             <div className="space-y-2">
@@ -119,29 +121,29 @@ export default function FrameEditorBlockedModal({
                   type="button"
                   disabled={busy || model.blocked}
                   onClick={() => onPick(model.id)}
-                  className="w-full text-left rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] disabled:opacity-40 disabled:hover:bg-white/[0.03] p-3 transition-colors"
+                  className="w-full rounded-md border border-[#dfe1e7] p-3 text-left transition-colors hover:bg-[#f0f1f3] disabled:opacity-50"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-[13px] text-white">{model.title}</span>
-                    <span className="text-[10px] text-zinc-500">
+                    <span className="text-sm">{model.title}</span>
+                    <span className="text-xs text-[#545967]">
                       {model.blocked ? 'уже отказала на этом фото' : model.vendor}
                     </span>
                   </div>
                   {model.note && (
-                    <p className="text-[11px] text-zinc-400 mt-0.5">{model.note}</p>
+                    <p className="mt-0.5 text-xs text-[#545967]">{model.note}</p>
                   )}
                 </button>
               ))}
             </div>
-            <p className="text-[11px] text-zinc-500 mt-2">
+            <p className="mt-2 text-xs text-[#545967]">
               Одна попытка — один платный запрос (~$0.05). Выбранная модель останется
               и для генерации видео.
             </p>
           </div>
         ) : (
-          <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3 flex gap-2.5">
-            <ImageOff size={16} className="text-zinc-400 shrink-0 mt-0.5" />
-            <p className="text-[12px] text-zinc-300">
+          <div className="mt-5 flex gap-2.5 border-t border-[#dfe1e7] pt-3">
+            <ImageOff size={16} className="text-[#545967] shrink-0 mt-0.5" />
+            <p className="text-sm text-[#545967]">
               На этом фото отказались все редакторы. Дело в самой фотографии — поставь
               ведущим одиночный вертикальный портрет: это бесплатно и решает такое чаще,
               чем перебор моделей.
@@ -150,16 +152,15 @@ export default function FrameEditorBlockedModal({
         )}
 
         <div className="mt-5 flex items-center justify-end gap-2">
-          {busy && <Loader2 size={14} className="animate-spin text-zinc-400" />}
+          {busy && <Loader2 size={14} className="animate-spin text-[#545967]" />}
           <button
             type="button"
             onClick={onClose}
-            className="btn-secondary px-3 py-2 text-[12px]"
+            className="rounded-md border border-[#dfe1e7] px-3 py-2 text-sm hover:bg-[#f0f1f3]"
           >
             Закрыть
           </button>
         </div>
-      </div>
-    </div>
+    </dialog>
   );
 }

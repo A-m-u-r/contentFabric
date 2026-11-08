@@ -4,6 +4,7 @@ import { getApiUrl } from '../config';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
+import MediaPlayer from './MediaPlayer';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
 export default function ResultCard({
@@ -402,11 +403,12 @@ export default function ResultCard({
         <div className="bg-surface border border-white/5 rounded-2xl overflow-hidden flex flex-col md:flex-row group hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] min-h-[300px] h-auto" style={{ animationDelay: `${index * 0.1}s` }}>
             {/* Left: Video Preview (Responsive Width) */}
             <div className="w-full md:w-[180px] lg:w-[200px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto group/video">
-                <video
+                <MediaPlayer
                     ref={videoRef}
                     src={currentVideoUrl}
-                    controls
-                    className="w-full h-full object-cover"
+                    label={`Ролик ${index + 1}`}
+                    className="w-full h-full"
+                    mediaClassName="object-cover"
                     playsInline
                     onPlay={() => {
                         const currentTime = videoRef.current ? videoRef.current.currentTime : 0;

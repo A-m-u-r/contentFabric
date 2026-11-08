@@ -7274,6 +7274,46 @@ def _reel_layout(clips: list, master_path: str = "") -> list:
     return layout
 
 
+def _attach_rendered_shot_timeline(shots: list, layout: list, video_duration: float) -> None:
+    """Store the composed visual range when one shot owns it unambiguously."""
+    for shot in shots:
+        shot.pop("timeline_start", None)
+        shot.pop("timeline_end", None)
+    if not math.isfinite(video_duration) or video_duration <= 0:
+        return
+
+    video_frames = round(video_duration * _REEL_FPS)
+    ranges = {}
+    ambiguous = set()
+    for index, segment in enumerate(layout):
+        start = round(segment["reel_start"] * _REEL_FPS)
+        # The mux may truncate the last range or include its cloned tail.
+        end = video_frames
+        if index + 1 < len(layout):
+            end = min(end, round(layout[index + 1]["reel_start"] * _REEL_FPS))
+        if end <= start:
+            break
+
+        clip = segment["clip"]
+        members = [*(clip.get("shots") or []), clip.get("shot") or {}]
+        numbers = {member["shot_number"] for member in members if member.get("shot_number") is not None}
+        # A model-generated multi-shot clip has no reliable internal cuts.
+        if len(numbers) != 1:
+            ambiguous.update(numbers)
+            continue
+        number = next(iter(numbers))
+        previous = ranges.get(number)
+        if previous and previous[1] != start:
+            ambiguous.add(number)
+        ranges[number] = (previous[0] if previous else start, end)
+
+    for shot in shots:
+        number = shot.get("shot_number")
+        if number in ranges and number not in ambiguous:
+            start, end = ranges[number]
+            shot.update(timeline_start=start / _REEL_FPS, timeline_end=end / _REEL_FPS)
+
+
 _VOICE_STITCH_FORMAT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 
 # Ровный фон под всей дорожкой. Каждый источник несёт свой шум (astats на job
@@ -7461,6 +7501,8 @@ def composite_storyboard_video(
     music_path: Optional[str] = None,
     # Бед нормализуется к _MUSIC_BED_DBFS, так что это просто подстройка сверху.
     music_volume: float = 1.0,
+    *,
+    timeline_shots: Optional[list] = None,
 ) -> str:
     """Concatenate storyboard clips and lay the voiceover/subtitles on top.
 
@@ -7666,6 +7708,8 @@ def composite_storyboard_video(
         output_path,
     ]
     subprocess.run(cmd, check=True)
+    if timeline_shots is not None:
+        _attach_rendered_shot_timeline(timeline_shots, layout, _get_media_stream_duration(output_path, "video"))
     return output_path
 
 
@@ -11631,7 +11675,7 @@ def generate_storyboard_video(
     else:
         log("[4/5] Assembling storyboard edit...")
     composite_storyboard_video(clips, audio_path, srt_path, final_path, music_path=music_path,
-                               music_volume=config.get("music_volume", 1.0))
+                               music_volume=config.get("music_volume", 1.0), timeline_shots=shots)
 
     # Surface each shot's rendered frame/clip so the editor can show generated
     # results after a run (no extra generation — pulled from the job's files).

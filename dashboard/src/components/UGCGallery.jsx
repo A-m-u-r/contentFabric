@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import MusicPicker, { musicPreferencesFromVideo, musicRequestSettings } from './MusicPicker';
+import MediaPlayer from './MediaPlayer';
 import {
   Film,
   Download,
@@ -663,6 +664,7 @@ export default function UGCGallery({ falKey, authToken, usePlatformKeys = false,
             try {
               localStorage.setItem(PENDING_STORYBOARD_KEY, JSON.stringify({
                 video_id: video.video_id,
+                video_url: video.video_url,
                 // Джоб, в котором лежат оплаченные клипы и кадры: пересъёмка
                 // берёт из него всё, что пользователь не менял.
                 job_id: video.job_id || jobIdFromVideoUrl(video.video_url),
@@ -935,12 +937,13 @@ function VideoActionModal({
         <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto custom-scrollbar p-4 sm:p-5 lg:grid-cols-[minmax(260px,340px),1fr]">
           <div className="space-y-3">
             <div className="rounded-2xl overflow-hidden bg-black border border-white/10">
-              <video
+              <MediaPlayer
                 src={mediaUrl(video.video_url)}
                 poster={mediaUrl(video.cover_url || video.actor_url)}
-                controls
+                label={video.title || 'Просмотр ролика'}
                 playsInline
-                className="w-full aspect-[9/16] object-contain bg-black"
+                className="w-full aspect-[9/16] bg-black"
+                mediaClassName="object-contain"
               />
             </div>
             <div className="grid grid-cols-2 gap-2">

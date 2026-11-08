@@ -1,0 +1,181 @@
+.app-chrome__legacy {
+  --legacy-surface: var(--app-white);
+  --legacy-panel: var(--app-toolbar);
+  --legacy-inset: var(--app-canvas);
+  --legacy-ink: var(--app-ink);
+  --legacy-muted: var(--app-muted);
+  --legacy-line: var(--app-line);
+  --legacy-accent: var(--app-accent);
+  --legacy-selection: var(--app-selected);
+  --legacy-success: #28573f;
+  --legacy-warning: #715023;
+  --legacy-danger: #9b2c40;
+  --legacy-info: #24576b;
+}
+
+/* Keep contrast on video canvases, lightbox controls and thumbnail overlays. */
+.app-chrome__legacy :is(.bg-black, .bg-black\/0, .bg-black\/60, .bg-black\/70, .bg-black\/90) {
+  --legacy-surface: #18181b;
+  --legacy-panel: #18181b;
+  --legacy-inset: rgb(255 255 255 / 10%);
+  --legacy-ink: #fff;
+  --legacy-muted: #d4d4d8;
+  --legacy-line: rgb(255 255 255 / 15%);
+  --legacy-accent: #c4b5fd;
+  --legacy-selection: rgb(139 92 246 / 22%);
+  --legacy-success: #86efac;
+  --legacy-warning: #fcd34d;
+  --legacy-danger: #fda4af;
+  --legacy-info: #a5f3fc;
+
+  color: var(--legacy-ink);
+  color-scheme: dark;
+}
+
+.app-chrome__legacy :is(
+  .bg-background, .bg-surface, .bg-zinc-900, .bg-zinc-950,
+  .bg-\[\#121214\], .bg-\[\#0c0c0e\]
+) { background-color: var(--legacy-surface); }
+
+.app-chrome__legacy :is(.bg-white\/5, .bg-white\/\[0\.02\], .bg-white\/\[0\.03\], .bg-white\/\[0\.035\]) {
+  background-color: var(--legacy-panel);
+}
+
+.app-chrome__legacy :is(.bg-white\/10, .bg-white\/15, .bg-black\/20, .bg-black\/30, .bg-zinc-700) {
+  background-color: var(--legacy-inset);
+}
+
+.app-chrome__legacy :is(
+  .hover\:bg-white\/5, .hover\:bg-white\/10, .hover\:bg-white\/15, .hover\:bg-white\/20
+):hover { background-color: var(--legacy-inset); }
+
+.app-chrome__legacy :is(
+  .border-white\/5, .border-white\/10, .border-white\/15, .border-white\/20, .border-white\/30,
+  .border-zinc-600, .border-zinc-700, .border-zinc-800,
+  .divide-white\/5 > :not([hidden]) ~ :not([hidden]),
+  .divide-white\/10 > :not([hidden]) ~ :not([hidden])
+) { border-color: var(--legacy-line); }
+
+.app-chrome__legacy :is(.hover\:border-white\/10, .hover\:border-white\/20):hover {
+  border-color: var(--legacy-line);
+}
+
+.app-chrome__legacy :is(.text-white, .text-zinc-100, .text-zinc-200, .text-zinc-300) {
+  color: var(--legacy-ink);
+}
+
+.app-chrome__legacy :is(.hover\:text-white, .hover\:text-zinc-200, .hover\:text-zinc-300):hover {
+  color: var(--legacy-ink);
+}
+
+.app-chrome__legacy :is(
+  .text-zinc-400, .text-zinc-500, .text-zinc-600, .text-zinc-700,
+  .text-white\/50, .text-white\/70
+) { color: var(--legacy-muted); }
+
+.app-chrome__legacy :is(
+  .text-primary, .text-primary\/70, .text-primary\/80,
+  .text-violet-200, .text-violet-300, .text-violet-300\/80, .text-violet-400,
+  .text-purple-300, .text-purple-400, .text-indigo-400
+) { color: var(--legacy-accent); }
+
+.app-chrome__legacy :is(.hover\:text-violet-300, .hover\:text-purple-200):hover { color: var(--legacy-accent); }
+
+.app-chrome__legacy :is(
+  .text-emerald-200, .text-emerald-300, .text-green-200, .text-green-300, .text-green-400
+) { color: var(--legacy-success); }
+
+.app-chrome__legacy :is(
+  .text-amber-100, .text-amber-200, .text-amber-300, .text-amber-300\/70,
+  .text-amber-400, .text-amber-400\/70, .text-yellow-200, .text-yellow-400
+) { color: var(--legacy-warning); }
+
+.app-chrome__legacy :is(.text-red-200, .text-red-300, .text-red-400) { color: var(--legacy-danger); }
+.app-chrome__legacy :is(.hover\:text-red-200, .hover\:text-red-400):hover { color: var(--legacy-danger); }
+
+.app-chrome__legacy :is(
+  .text-blue-300, .text-cyan-200, .text-cyan-400, .text-sky-300\/80
+) { color: var(--legacy-info); }
+
+.app-chrome__legacy :is(
+  .bg-primary\/5, .bg-primary\/10, .bg-primary\/15, .bg-primary\/20,
+  .bg-violet-500\/5, .bg-violet-500\/10, .bg-violet-500\/15, .bg-violet-500\/20,
+  .bg-purple-500\/20
+) { background-color: var(--legacy-selection); }
+
+.app-chrome__legacy .glass-panel {
+  border-color: var(--legacy-line);
+  border-radius: var(--app-radius);
+  background: var(--legacy-panel);
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.app-chrome__legacy :is(.input-field, input.bg-black\/40, textarea.bg-black\/40, select.bg-black\/40) {
+  border-color: var(--app-field);
+  border-radius: var(--app-radius);
+  background: var(--legacy-surface);
+  color: var(--legacy-ink);
+  color-scheme: light;
+}
+
+.app-chrome__legacy :is(.input-field, input.bg-black\/40, textarea.bg-black\/40)::placeholder {
+  color: var(--legacy-muted);
+}
+
+.app-chrome__legacy .btn-secondary {
+  border: 1px solid var(--legacy-line);
+  border-radius: var(--app-radius);
+  background: var(--legacy-surface);
+  color: var(--legacy-ink);
+}
+
+.app-chrome__legacy .btn-secondary:hover { background: var(--legacy-inset); }
+.app-chrome__legacy .btn-secondary:is(.text-violet-200, .text-violet-300) { color: var(--legacy-accent); }
+
+.app-chrome__legacy :is(
+  .btn-primary, button.bg-primary, button.bg-violet-500, a.bg-primary,
+  .bg-gradient-to-r.from-purple-600.to-indigo-600,
+  .bg-gradient-to-r.from-purple-500.to-indigo-600,
+  .bg-gradient-to-r.from-violet-500.to-purple-600,
+  :is(button, a).bg-gradient-to-r:is(.from-amber-400, .from-yellow-500, .from-yellow-600, .from-green-500)
+) {
+  border-radius: var(--app-radius);
+  background: var(--app-accent);
+  box-shadow: none;
+  color: #fff;
+}
+
+.app-chrome__legacy :is(.btn-primary, button.bg-primary, button.bg-violet-500, a.bg-primary):hover:not(:disabled) {
+  background-color: #493972;
+}
+
+.app-chrome__legacy :is(button, a).bg-red-600 { color: #fff; }
+
+.app-chrome__legacy :is(
+  .bg-gradient-to-br.from-violet-500.to-fuchsia-500,
+  .bg-gradient-to-br.from-orange-500.to-pink-600,
+  .bg-gradient-to-br.from-purple-500.to-indigo-600
+) {
+  border-radius: var(--app-radius);
+  background: var(--legacy-selection);
+  color: var(--legacy-accent);
+}
+
+.app-chrome__legacy :is(
+  .bg-gradient-to-br.from-violet-500.to-fuchsia-500,
+  .bg-gradient-to-br.from-orange-500.to-pink-600,
+  .bg-gradient-to-br.from-purple-500.to-indigo-600
+) > .text-white { color: inherit; }
+
+.app-chrome__legacy .bg-clip-text.text-transparent {
+  background-image: none;
+  color: var(--legacy-ink);
+}
+
+.app-chrome__legacy :is(input[type='checkbox'], input[type='range']) { accent-color: var(--app-accent); }
+
+.app-chrome__legacy :focus-visible:where(:not(.cf-media-player, .cf-media-player *)) {
+  outline: 2px solid var(--legacy-accent);
+  outline-offset: 2px;
+}
